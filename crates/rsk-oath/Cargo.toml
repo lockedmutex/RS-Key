@@ -1,0 +1,17 @@
+[package]
+name = "rsk-oath"
+version = "0.1.0"
+license = "AGPL-3.0-only"
+edition = "2024"
+publish = false
+
+# YKOATH applet: TOTP/HOTP credential store + calculate over CCID; what Yubico
+# Authenticator's OATH tab and `ykman oath` speak to.
+[dependencies]
+rsk-sdk = { workspace = true }
+rsk-fs = { workspace = true }
+rsk-crypto = { workspace = true }
+
+[dev-dependencies]
+# RamStorage for the host tests (the same backend rsk-fido/rsk-openpgp use).
+rsk-fs = { workspace = true, features = ["test-util"] }

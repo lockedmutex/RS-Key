@@ -1,0 +1,39 @@
+# cargo-deny policy. Run: cargo deny check  (part of ./scripts/check.sh)
+
+[advisories]
+# Unmaintained transitive crates pulled in by embassy/cortex-m; no fix upstream.
+# The sole *vulnerability* ignored below (rsa) is a deliberate, documented
+# exception: no fixed release exists, it is the chosen OpenPGP RSA backend,
+# we already use its blinded sign/decrypt APIs, and the Marvin attack
+# needs precise decryption-timing measurements over many queries — outside this
+# local-USB-token threat model. Everything else here is merely "unmaintained".
+ignore = [
+    "RUSTSEC-2024-0436", # paste — unmaintained, via pio-core
+    "RUSTSEC-2026-0110", # bare-metal — deprecated, via cortex-m
+    "RUSTSEC-2026-0173", # proc-macro-error2 — unmaintained, build-time only (pio-proc -> embassy-rp)
+    "RUSTSEC-2023-0071", # rsa — Marvin timing side-channel; no fix upstream, mitigated by blinding (see above)
+]
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "Zlib",
+    "Unicode-3.0",
+    "BlueOak-1.0.0", # minicbor — permissive, with a patent grant
+]
+confidence-threshold = 0.9
+# Our own firmware crates are `publish = false`; don't license-scan them.
+private = { ignore = true }
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = [
+    "https://github.com/embassy-rs/embassy",
+    "https://github.com/embassy-rs/rp-pac",
+]

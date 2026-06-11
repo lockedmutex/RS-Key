@@ -1,0 +1,201 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 RS-Key contributors
+
+//! `rsk_fs::Storage` (FID -> bytes) backed by `sequential-storage` maps over the
+//! reserved flash partitions.
+
+use core::cell::RefCell;
+use core::ops::Range;
+
+use embassy_embedded_hal::adapter::BlockingAsync;
+use embassy_futures::block_on;
+use embassy_rp::flash::{Blocking, Flash};
+use embassy_rp::peripherals::FLASH;
+use embedded_storage_async::nor_flash::{ErrorType, MultiwriteNorFlash, NorFlash, ReadNorFlash};
+use sequential_storage::cache::{KeyCacheImpl, KeyPointerCache};
+use sequential_storage::map::{MapConfig, MapStorage};
+
+use rsk_fs::Storage;
+use rsk_sdk::error::{Error, Result};
+
+/// External QSPI flash on the Waveshare RP2350-One (4 MB).
+pub const FLASH_SIZE: usize = 4 * 1024 * 1024;
+
+/// Scratch for one map op; must fit the largest stored key+value (EF_META ≤ 1 KiB).
+const KV_BUF: usize = 2048;
+
+/// Flash erase-sector size (RP2350 QSPI), = one `sequential-storage` page.
+const SECTOR: usize = 4096;
+
+// The KV store is split into two flash partitions (see `memory.x`) so the hot
+// counters can't force the credential pages to migrate:
+//
+// * **main** (1408 KiB) — credentials, keys, OpenPGP data objects. Written only on
+//   registration / key generation / personalisation, so its pages fill slowly and a
+//   (cold, expensive) page migration is rare.
+// * **counter** (128 KiB) — the per-operation counters (FIDO `EF_COUNTER`, OpenPGP
+//   `EF_SIG_COUNT`, the vendor counter), rewritten on *every* signature/assertion.
+//   That churn is what fills flash; isolating it here means it reclaims only its own
+//   small pages (cheap — a handful of always-cached keys) instead of advancing the
+//   main partition's ring into the credential pages (a multi-second cold-migration
+//   stall).
+const MAIN_LEN: usize = 1408 * 1024;
+const COUNTER_LEN: usize = 128 * 1024;
+const MAIN_PAGES: usize = MAIN_LEN / SECTOR; // 352
+const COUNTER_PAGES: usize = COUNTER_LEN / SECTOR; // 32
+
+/// Cached key→location maps. A hit lets `store_item`'s `migrate_items` take the O(1)
+/// path per item instead of a full-partition scan — the difference between a ~0.2 s
+/// and a multi-second migration. Main covers ~250 resident credentials (two FIDs
+/// each) + the fixed FIDO files + OpenPGP DOs; counter only needs its few keys.
+const MAIN_CACHE_KEYS: usize = 512;
+const COUNTER_CACHE_KEYS: usize = 16;
+
+pub type AsyncFlash = BlockingAsync<Flash<'static, FLASH, Blocking, FLASH_SIZE>>;
+type MainCache = KeyPointerCache<MAIN_PAGES, u16, MAIN_CACHE_KEYS>;
+type CounterCache = KeyPointerCache<COUNTER_PAGES, u16, COUNTER_CACHE_KEYS>;
+
+/// A `'static`, shared handle to the one flash peripheral, so the two partitions can
+/// each own a `MapStorage` over it. `MapStorage` takes its flash *by value* and the
+/// `Flash` peripheral is a singleton, so the two maps share it through this `RefCell`.
+/// It is borrowed only inside one synchronous `block_on` op — `BlockingAsync` resolves
+/// on the first poll and `block_on` never yields to another task, so the borrow can't
+/// overlap with the other partition's.
+#[derive(Clone, Copy)]
+pub struct SharedFlash {
+    inner: &'static RefCell<AsyncFlash>,
+}
+
+impl ErrorType for SharedFlash {
+    type Error = <AsyncFlash as ErrorType>::Error;
+}
+// The inner `BlockingAsync` futures are ready on the first poll, so each op is driven
+// to completion by an inner `block_on` *inside* the borrow scope — the `RefCell` guard
+// is created and dropped within that synchronous call, never held across a real
+// suspension. (This also satisfies clippy's `await_holding_refcell_ref`; there is no
+// live `.await` here.)
+impl ReadNorFlash for SharedFlash {
+    const READ_SIZE: usize = <AsyncFlash as ReadNorFlash>::READ_SIZE;
+    async fn read(
+        &mut self,
+        offset: u32,
+        bytes: &mut [u8],
+    ) -> core::result::Result<(), Self::Error> {
+        block_on(self.inner.borrow_mut().read(offset, bytes))
+    }
+    fn capacity(&self) -> usize {
+        self.inner.borrow().capacity()
+    }
+}
+impl NorFlash for SharedFlash {
+    const WRITE_SIZE: usize = <AsyncFlash as NorFlash>::WRITE_SIZE;
+    const ERASE_SIZE: usize = <AsyncFlash as NorFlash>::ERASE_SIZE;
+    async fn erase(&mut self, from: u32, to: u32) -> core::result::Result<(), Self::Error> {
+        block_on(self.inner.borrow_mut().erase(from, to))
+    }
+    async fn write(&mut self, offset: u32, bytes: &[u8]) -> core::result::Result<(), Self::Error> {
+        block_on(self.inner.borrow_mut().write(offset, bytes))
+    }
+}
+impl MultiwriteNorFlash for SharedFlash {}
+
+/// Wrap the raw blocking flash for the `'static` `RefCell` the two partitions share
+/// (called once from `main` before constructing [`FlashStorage`]).
+pub fn wrap_flash(flash: Flash<'static, FLASH, Blocking, FLASH_SIZE>) -> AsyncFlash {
+    BlockingAsync::new(flash)
+}
+
+/// FID → bytes persistence over the two flash partitions (see [`is_counter_fid`]).
+pub struct FlashStorage {
+    main: MapStorage<u16, SharedFlash, MainCache>,
+    counter: MapStorage<u16, SharedFlash, CounterCache>,
+    buf: [u8; KV_BUF],
+}
+
+/// Route the hot per-operation counters to the dedicated counter partition so their
+/// churn never reclaims a credential/key page in the main partition. Values are
+/// `EF_COUNTER` (FIDO 0xC000), `EF_SIG_COUNT` (OpenPGP 0x0093) and the vendor
+/// test counter (0xCC01).
+fn is_counter_fid(fid: u16) -> bool {
+    matches!(fid, 0xC000 | 0x0093 | 0xCC01)
+}
+
+impl FlashStorage {
+    /// `main_range` / `counter_range` are erase-aligned, non-overlapping flash-offset
+    /// windows (from `memory.x`); `flash` is the shared `'static` handle.
+    pub fn new(
+        flash: &'static RefCell<AsyncFlash>,
+        main_range: Range<u32>,
+        counter_range: Range<u32>,
+    ) -> Self {
+        debug_assert!((main_range.end - main_range.start) as usize == MAIN_LEN);
+        debug_assert!((counter_range.end - counter_range.start) as usize == COUNTER_LEN);
+        let flash = SharedFlash { inner: flash };
+        Self {
+            main: MapStorage::new(flash, MapConfig::new(main_range), MainCache::new()),
+            counter: MapStorage::new(flash, MapConfig::new(counter_range), CounterCache::new()),
+            buf: [0; KV_BUF],
+        }
+    }
+}
+
+// sequential-storage is async-only; the blocking flash is wrapped in BlockingAsync,
+// whose futures are ready on first poll, so block_on drives them synchronously.
+impl Storage for FlashStorage {
+    fn read(&mut self, fid: u16, buf: &mut [u8]) -> Option<usize> {
+        let value = if is_counter_fid(fid) {
+            block_on(self.counter.fetch_item::<&[u8]>(&mut self.buf, &fid)).ok()??
+        } else {
+            block_on(self.main.fetch_item::<&[u8]>(&mut self.buf, &fid)).ok()??
+        };
+        let n = value.len().min(buf.len());
+        buf[..n].copy_from_slice(&value[..n]);
+        Some(value.len())
+    }
+
+    fn write(&mut self, fid: u16, data: &[u8]) -> Result<()> {
+        if is_counter_fid(fid) {
+            block_on(self.counter.store_item::<&[u8]>(&mut self.buf, &fid, &data))
+        } else {
+            block_on(self.main.store_item::<&[u8]>(&mut self.buf, &fid, &data))
+        }
+        .map_err(|_| Error::MemoryFatal)
+    }
+
+    fn remove(&mut self, fid: u16) -> Result<()> {
+        if is_counter_fid(fid) {
+            block_on(self.counter.remove_item(&mut self.buf, &fid))
+        } else {
+            block_on(self.main.remove_item(&mut self.buf, &fid))
+        }
+        .map_err(|_| Error::MemoryFatal)
+    }
+
+    fn size(&mut self, fid: u16) -> Option<usize> {
+        let value = if is_counter_fid(fid) {
+            block_on(self.counter.fetch_item::<&[u8]>(&mut self.buf, &fid)).ok()??
+        } else {
+            block_on(self.main.fetch_item::<&[u8]>(&mut self.buf, &fid)).ok()??
+        };
+        Some(value.len())
+    }
+
+    fn for_each_key(&mut self, f: &mut dyn FnMut(u16)) {
+        for_each_in(&mut self.main, &mut self.buf, f);
+        for_each_in(&mut self.counter, &mut self.buf, f);
+    }
+}
+
+/// Iterate every live key in one partition (used by `for_each_key` over both).
+fn for_each_in<C: KeyCacheImpl<u16>>(
+    map: &mut MapStorage<u16, SharedFlash, C>,
+    buf: &mut [u8],
+    f: &mut dyn FnMut(u16),
+) {
+    let Ok(mut iter) = block_on(map.fetch_all_items(buf)) else {
+        return;
+    };
+    while let Ok(Some((key, _))) = block_on(iter.next::<&[u8]>(buf)) {
+        f(key);
+    }
+}

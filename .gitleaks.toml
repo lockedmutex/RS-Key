@@ -1,0 +1,8 @@
+# gitleaks config — defaults plus an allowlist for vendored content.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "third_party/ holds vendored upstream test suites: public test vectors and key-constant identifiers, not secrets"
+paths = ['''third_party/.*''']

@@ -1,0 +1,21 @@
+[package]
+name = "rsk-usb"
+version = "0.1.0"
+license = "AGPL-3.0-only"
+edition = "2024"
+publish = false
+
+# Hardware-agnostic USB transport: CTAPHID and CCID. Generic over any
+# embassy-usb driver, so it builds without a HAL and stays host-testable.
+[dependencies]
+embassy-usb = { workspace = true }
+# RX-path receive-timeout (incomplete message) + keepalive needs timers + select.
+# `run()` is generic over the driver, so host tests (which never instantiate it)
+# don't pull in a time driver.
+embassy-time = { workspace = true }
+embassy-futures = { workspace = true }
+# Message/response buffers carry PINs and key material; wiped after dispatch.
+zeroize = { workspace = true }
+# Shared firmware-version const for the CTAPHID INIT device-version bytes, which
+# ykman/yubikit read to gate the Management-over-FIDO DeviceInfo read.
+rsk-sdk = { workspace = true }

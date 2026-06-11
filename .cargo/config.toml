@@ -1,0 +1,12 @@
+[build]
+target = "thumbv8m.main-none-eabihf"
+
+[target.thumbv8m.main-none-eabihf]
+# `cargo run` flashes a board sitting in BOOTSEL over USB (no debug probe needed).
+# Otherwise: build, `picotool uf2 convert`, and drag the .uf2 onto the RP2350 drive.
+runner = "picotool load -u -v -x -t elf"
+rustflags = [
+  "-C", "link-arg=--nmagic",
+  "-C", "link-arg=-Tlink.x",
+  "-C", "target-cpu=cortex-m33",
+]

@@ -1,0 +1,35 @@
+# Standalone host TUI — NOT part of the firmware workspace (the empty [workspace]
+# table below detaches it from the parent so it builds for the host, not thumbv8m).
+[package]
+name = "rsk-tui"
+version = "0.1.0"
+license = "AGPL-3.0-only"
+edition = "2024"
+description = "rs-key device dashboard — a self-contained ratatui cockpit"
+
+[[bin]]
+name = "rsk-tui"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+pcsc = "2"        # CCID (rescue/vendor applets) over PC/SC
+hidapi = "2"      # FIDO CTAPHID transport
+ciborium = "0.2"  # CTAP2 CBOR encode/decode
+
+# Native seed backup: the MSE channel (P-256 ECDH -> HKDF -> ChaCha20-Poly1305),
+# the clientPIN protocol-two token (ECDH + HKDF + AES-CBC + HMAC), and BIP-39.
+p256 = { version = "0.13", features = ["ecdh"] }
+sha2 = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
+aes = "0.8"
+cbc = "0.1"
+cipher = { version = "0.4", features = ["block-padding"] }
+chacha20poly1305 = "0.10"
+bip39 = "2"
+rand_core = { version = "0.6", features = ["getrandom"] }
+zeroize = "1"
+
+[workspace]

@@ -1,0 +1,12 @@
+[package]
+name = "rsk-sdk"
+version = "0.1.0"
+license = "AGPL-3.0-only"
+edition = "2024"
+publish = false
+
+# Core smartcard machinery: APDU, status words, BER-TLV, AID applet registry.
+# Pure logic, no HAL — `no_std` on target, but unit-tested on the host.
+[dependencies]
+# The dispatcher's chaining buffer can hold private-key import data.
+zeroize = { workspace = true }

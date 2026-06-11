@@ -1,0 +1,23 @@
+[package]
+name = "rsk-otp"
+version = "0.1.0"
+license = "AGPL-3.0-only"
+edition = "2024"
+publish = false
+
+# Yubico OTP applet: the CCID side (slot configure/update/swap/delete, status,
+# HMAC-SHA1 / Yubico-mode challenge-response) plus the keyboard HID interface —
+# the `hid` frame codec and the `ticket` typed-OTP generator (modhex / HOTP /
+# static password).
+[dependencies]
+rsk-sdk = { workspace = true }
+rsk-fs = { workspace = true }
+rsk-crypto = { workspace = true }
+rsk-mgmt = { workspace = true }
+
+[dev-dependencies]
+# RamStorage for the host tests (the same backend the other applets use).
+rsk-fs = { workspace = true, features = ["test-util"] }
+# An independent AES-128 for the typed Yubico-OTP round-trip test (decrypt the
+# emitted modhex token and check its embedded fields).
+aes = { workspace = true }

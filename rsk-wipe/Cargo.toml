@@ -1,0 +1,26 @@
+[package]
+name = "rsk-wipe"
+version = "0.1.0"
+license = "AGPL-3.0-only"
+edition = "2024"
+publish = false
+
+# RAM-only flash-erase utility — a Rust/embassy port of upstream
+# polhenarejos/pico-nuke (itself the pico-sdk flash_nuke example). Wipes all of
+# flash, leaves a "NUKE" eyecatcher, blinks the LED, and drops back to BOOTSEL.
+# Must run from SRAM (see memory.x); built as its own target: `cargo build -p rsk-wipe`.
+[dependencies]
+embassy-executor = { workspace = true, features = ["platform-cortex-m", "executor-thread"] }
+embassy-rp = { workspace = true, features = ["rp235xa", "time-driver", "critical-section-impl"] }
+embassy-time = { workspace = true }
+
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+critical-section = "1"
+panic-halt = "1"
+smart-leds = "0.4"
+
+[[bin]]
+name = "rsk-wipe"
+test = false
+bench = false

@@ -1,0 +1,76 @@
+[package]
+name = "firmware"
+version = "0.1.0"
+license = "AGPL-3.0-only"
+edition = "2024"
+publish = false
+
+[dependencies]
+# `executor-interrupt`: the high-priority InterruptExecutor that runs USB + the
+# transports so they stay responsive (streaming keepalives) while the worker on
+# the thread executor blocks in synchronous crypto / flash.
+embassy-executor = { workspace = true, features = ["platform-cortex-m", "executor-thread", "executor-interrupt"] }
+embassy-rp = { workspace = true, features = ["rp235xa", "time-driver", "critical-section-impl"] }
+embassy-time = { workspace = true }
+embassy-usb = { workspace = true }
+embassy-futures = { workspace = true }
+# Cross-executor handshake (Mutex/Signal) between the transports and the worker.
+embassy-sync = { workspace = true }
+# `'static` storage for the USB stack so the transports can be spawned on the
+# interrupt executor.
+static_cell = "2"
+rsk-usb = { workspace = true }
+rsk-sdk = { workspace = true }
+rsk-fs = { workspace = true }
+rsk-fido = { workspace = true }
+rsk-openpgp = { workspace = true }
+rsk-mgmt = { workspace = true }
+rsk-oath = { workspace = true }
+rsk-otp = { workspace = true }
+rsk-piv = { workspace = true }
+rsk-rescue = { workspace = true }
+rp-pac = { workspace = true }
+rsk-crypto = { workspace = true }
+# Zeroize the transient TRNG seed/reseed buffers in `FidoRng` (workspace dep, already
+# pulled by rsk-crypto — no new version).
+zeroize = { workspace = true }
+
+cortex-m-rt = "0.7"
+# SCB::sys_reset for the warm-reboot path of the secure-reboot vendor command
+# (already in the tree via embassy-rp; the BOOTSEL path uses embassy-rp rom_data).
+cortex-m = "0.7"
+panic-halt = "1"
+smart-leds = "0.4"
+
+# Heap for the OpenPGP RSA path: the `rsa` crate's big-integer arithmetic needs
+# an allocator. FIDO and the rest of the device stay no-alloc — only RSA touches it.
+embedded-alloc = "0.6"
+
+# Flash key/value backend for rsk-fs::Storage. sequential-storage is async-first;
+# embassy-rp's blocking Flash is adapted to async via embassy-embedded-hal's
+# BlockingAsync (the futures resolve immediately — flash ops block the executor,
+# the accepted RP2350 XIP-stall caveat).
+sequential-storage = "7"
+embassy-embedded-hal = { workspace = true }
+# The async NorFlash traits (the same 0.4 sequential-storage uses) for `SharedFlash`,
+# the adapter that lets the main + counter partitions share the one Flash peripheral.
+embedded-storage-async = "0.4"
+
+[features]
+# Physical BOOTSEL touch for user presence:
+# ON BY DEFAULT — the shipped firmware requires a touch for makeCredential /
+# getAssertion / selection / reset / U2F and the OpenPGP UIF DOs. The automated test
+# suites (python-fido2, Gnuk, the raw m* tools) can't press the button, so build
+# those WITHOUT presence: `cargo build --release -p firmware --no-default-features`.
+default = ["up-button"]
+up-button = []
+# Advertise ML-DSA-44 in getInfo `algorithms` — OFF by default because shipped
+# Firefoxes reject the whole getInfo on an unknown COSE id (see rsk-fido). The
+# PQC capability works either way; this only changes the advertisement:
+# `cargo build --release -p firmware --features advertise-pqc`.
+advertise-pqc = ["rsk-fido/advertise-pqc"]
+
+[[bin]]
+name = "firmware"
+test = false
+bench = false

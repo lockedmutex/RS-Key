@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 RS-Key contributors
+
+"""OpenPGP applet test — drive the card over PC/SC (pyscard).
+
+    nix develop -c python tests/31_openpgp_select.py
+    # or from the validation venv (has pyscard):
+    nix develop -c python tests/31_openpgp_select.py
+
+Read-only card-status surface over CCID, HID-free: SELECT the OpenPGP AID,
+then read the data objects `gpg --card-status` reads — full AID (4F),
+historical bytes (5F52), PW status (C4), application related data (6E).
+Needs pyscard + a running PC/SC daemon (built in on macOS).
+"""
+import sys
+
+try:
+    from smartcard.System import readers
+    from smartcard.util import toHexString
+except ImportError:
+    sys.exit("missing dependency: pip install pyscard")
+
+OPENPGP_AID = [0xD2, 0x76, 0x00, 0x01, 0x24, 0x01]
+SELECT = [0x00, 0xA4, 0x04, 0x00, len(OPENPGP_AID)] + OPENPGP_AID + [0x00]
+
+
+def get_data(tag):
+    """GET DATA APDU for a 16-bit tag, Le = 0 (case 2)."""
+    return [0x00, 0xCA, (tag >> 8) & 0xFF, tag & 0xFF, 0x00]
+
+
+VERSION = [0x00, 0xF1, 0x00, 0x00, 0x00]
+
+# Expected ROM values (rsk-openpgp::files).
+HISTORICAL_BYTES = [0x00, 0x31, 0x84, 0x73, 0x80, 0x01, 0xC0, 0x05, 0x90, 0x00]
+PW_STATUS = [0x01, 127, 127, 127, 3, 3, 3]
+PIPGP_VERSION = [0x04, 0x06, 0x00]
+
+
+def fail(msg):
+    print("FAIL:", msg)
+    sys.exit(1)
+
+
+def expect_ok(conn, apdu, what):
+    data, sw1, sw2 = conn.transmit(apdu)
+    print("%-28s -> %s %02X%02X" % (what, toHexString(data) or "(empty)", sw1, sw2))
+    if (sw1, sw2) != (0x90, 0x00):
+        fail(f"{what} not 9000 (got {sw1:02X}{sw2:02X})")
+    return data
+
+
+def main():
+    rs = readers()
+    print("readers:", [str(r) for r in rs])
+    if not rs:
+        fail("no PC/SC readers — is the device flashed and the CCID driver bound?")
+
+    target = next((r for r in rs if "RSK" in str(r)), rs[0])
+    print("using:", target)
+
+    conn = target.createConnection()
+    conn.connect()
+    print("ATR:", toHexString(list(conn.getATR())))
+
+    fci = expect_ok(conn, SELECT, "SELECT OpenPGP AID")
+    if not fci or fci[0] != 0x6F:
+        fail(f"SELECT FCI should start with 6F, got {toHexString(fci)}")
+
+    aid = expect_ok(conn, get_data(0x004F), "GET DATA 4F (full AID)")
+    if aid[:6] != OPENPGP_AID:
+        fail(f"full AID does not start with the OpenPGP AID: {toHexString(aid)}")
+    if len(aid) != 16:
+        fail(f"full AID should be 16 bytes, got {len(aid)}")
+    print("  serial bytes:", toHexString(aid[10:14]))
+
+    hist = expect_ok(conn, get_data(0x5F52), "GET DATA 5F52 (historical)")
+    if hist != HISTORICAL_BYTES:
+        fail(f"historical bytes mismatch: {toHexString(hist)}")
+
+    pw = expect_ok(conn, get_data(0x00C4), "GET DATA C4 (PW status)")
+    if pw != PW_STATUS:
+        fail(f"PW status mismatch: {toHexString(pw)} != {toHexString(PW_STATUS)}")
+
+    app = expect_ok(conn, get_data(0x006E), "GET DATA 6E (app data)")
+    if not app:
+        fail("application related data (6E) is empty")
+    # The 4F (full AID) DO must be nested somewhere inside the 6E composite.
+    if bytes(OPENPGP_AID) not in bytes(app):
+        fail("6E composite does not contain the AID")
+
+    ver = expect_ok(conn, VERSION, "VERSION (F1)")
+    if ver != PIPGP_VERSION:
+        fail(f"version mismatch: {toHexString(ver)} != {toHexString(PIPGP_VERSION)}")
+
+    print("PASS")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

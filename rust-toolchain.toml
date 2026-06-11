@@ -1,0 +1,6 @@
+# Used only on the rustup (non-Nix) path. With `nix develop`, the flake provides
+# the toolchain and this file is ignored.
+[toolchain]
+channel = "stable"
+targets = ["thumbv8m.main-none-eabihf"]
+components = ["rust-src", "rustfmt", "clippy", "llvm-tools"]

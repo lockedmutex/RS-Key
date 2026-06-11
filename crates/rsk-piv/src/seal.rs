@@ -1,0 +1,240 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 RS-Key contributors
+
+//! At-rest sealing for PIV key material: private keys are AES-256-GCM-sealed
+//! with key = HKDF-SHA256(salt = serial_hash, ikm = kbase, info = "PIV/KEYS"),
+//! blob = `nonce(12) ‖ ct ‖ tag(16)`, AAD = serial_hash. Deliberately NOT
+//! PIN-bound (unlike the OpenPGP DEK): management-key-only flows (keygen,
+//! import) must reach the keys without a PIN session. With the OTP MKEK
+//! provisioned, `kbase` — and so this seal — roots in the hardware fuse key.
+
+use rsa::traits::PrivateKeyParts;
+use rsa::{BigUint, RsaPrivateKey};
+use rsk_crypto::{Device, aes256gcm_decrypt, aes256gcm_encrypt, hkdf_sha256};
+use rsk_fs::{Fs, Storage};
+use rsk_openpgp::Rng;
+use rsk_openpgp::keys::{Curve, PrivKey};
+use rsk_sdk::Sw;
+use zeroize::Zeroize;
+
+const NONCE_LEN: usize = 12;
+const TAG_LEN: usize = 16;
+/// Largest sealed plaintext: RSA-2048 `P ‖ Q` (the largest key the applet
+/// stores; keygen/import are gated to RSA ≤ 2048).
+const MAX_PLAIN: usize = 256;
+const MAX_BLOB: usize = NONCE_LEN + MAX_PLAIN + TAG_LEN;
+
+const INFO_PIV_KEYS: &[u8] = b"PIV/KEYS";
+
+fn kenc(dev: &Device) -> [u8; 32] {
+    let mut kbase = dev.derive_kbase();
+    let mut out = [0u8; 32];
+    hkdf_sha256(dev.serial_hash, &kbase, INFO_PIV_KEYS, &mut out)
+        .expect("32-byte HKDF output is in range");
+    kbase.zeroize();
+    out
+}
+
+/// Seal `plain` and write it to `fid` as `nonce ‖ ct ‖ tag`.
+pub fn seal_put<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    rng: &mut dyn Rng,
+    fid: u16,
+    plain: &[u8],
+) -> Result<(), Sw> {
+    if plain.len() > MAX_PLAIN {
+        return Err(Sw::WRONG_LENGTH);
+    }
+    let mut blob = [0u8; MAX_BLOB];
+    let n = NONCE_LEN + plain.len() + TAG_LEN;
+    rng.fill(&mut blob[..NONCE_LEN]);
+    let mut nonce = [0u8; NONCE_LEN];
+    nonce.copy_from_slice(&blob[..NONCE_LEN]);
+    blob[NONCE_LEN..NONCE_LEN + plain.len()].copy_from_slice(plain);
+    let mut key = kenc(dev);
+    let tag = aes256gcm_encrypt(
+        &key,
+        &nonce,
+        dev.serial_hash,
+        &mut blob[NONCE_LEN..NONCE_LEN + plain.len()],
+    );
+    key.zeroize();
+    blob[NONCE_LEN + plain.len()..n].copy_from_slice(&tag);
+    let r = fs.put(fid, &blob[..n]).map_err(|_| Sw::MEMORY_FAILURE);
+    blob.zeroize();
+    r
+}
+
+/// Read and unseal `fid` into `out`; returns the plaintext length.
+/// `REFERENCE_NOT_FOUND` when the file is missing or empty.
+pub fn seal_read<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    fid: u16,
+    out: &mut [u8],
+) -> Result<usize, Sw> {
+    let mut blob = [0u8; MAX_BLOB];
+    let n = fs.read(fid, &mut blob).ok_or(Sw::REFERENCE_NOT_FOUND)?;
+    if !(NONCE_LEN + TAG_LEN..=MAX_BLOB).contains(&n) {
+        return Err(Sw::MEMORY_FAILURE);
+    }
+    let pt_len = n - NONCE_LEN - TAG_LEN;
+    if out.len() < pt_len {
+        return Err(Sw::WRONG_LENGTH);
+    }
+    let mut nonce = [0u8; NONCE_LEN];
+    nonce.copy_from_slice(&blob[..NONCE_LEN]);
+    let mut tag = [0u8; TAG_LEN];
+    tag.copy_from_slice(&blob[n - TAG_LEN..n]);
+    let mut key = kenc(dev);
+    let r = aes256gcm_decrypt(
+        &key,
+        &nonce,
+        dev.serial_hash,
+        &mut blob[NONCE_LEN..NONCE_LEN + pt_len],
+        &tag,
+    );
+    key.zeroize();
+    if r.is_err() {
+        blob.zeroize();
+        return Err(Sw::MEMORY_FAILURE);
+    }
+    out[..pt_len].copy_from_slice(&blob[NONCE_LEN..NONCE_LEN + pt_len]);
+    blob.zeroize();
+    Ok(pt_len)
+}
+
+/// Boot-pass migration: re-seal every sealed key slot under the OTP kbase.
+/// GCM authenticates, so generations are told apart by trial decrypt: a blob
+/// that opens under the current `dev` is already migrated; one that opens only
+/// under the pre-OTP arm is re-sealed; one that opens under neither is left
+/// untouched (corrupt — re-sealing garbage would only destroy evidence).
+/// Idempotent and crash-safe per slot.
+pub fn migrate_kbase<S: Storage>(dev: &Device, fs: &mut Fs<S>, rng: &mut dyn Rng) {
+    if dev.otp_key.is_none() {
+        return;
+    }
+    let old = dev.without_otp();
+    // Retired (82–95), active (9A–9E incl. the 9B management key), attestation.
+    let slots = (0x82..=0x95).chain(0x9A..=0x9E).chain([0xF9u8]);
+    for slot in slots {
+        let fid = crate::files::key_fid(slot);
+        if !fs.has_data(fid) {
+            continue;
+        }
+        let mut plain = [0u8; MAX_PLAIN];
+        if seal_read(dev, fs, fid, &mut plain).is_ok() {
+            plain.zeroize();
+            continue;
+        }
+        if let Ok(n) = seal_read(&old, fs, fid, &mut plain) {
+            let _ = seal_put(dev, fs, rng, fid, &plain[..n]);
+        }
+        plain.zeroize();
+    }
+}
+
+/// Seal an EC key as `[curve_id] ‖ scalar` (the OpenPGP blob layout).
+pub fn store_ec_key<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    rng: &mut dyn Rng,
+    fid: u16,
+    key: &PrivKey,
+) -> Result<(), Sw> {
+    let scalar = key.scalar();
+    let mut plain = [0u8; 1 + 66];
+    plain[0] = curve_id(key.curve());
+    plain[1..1 + scalar.len()].copy_from_slice(scalar);
+    let r = seal_put(dev, fs, rng, fid, &plain[..1 + scalar.len()]);
+    plain.zeroize();
+    r
+}
+
+/// Load an EC key sealed by [`store_ec_key`].
+pub fn load_ec_key<S: Storage>(dev: &Device, fs: &mut Fs<S>, fid: u16) -> Result<PrivKey, Sw> {
+    let mut plain = [0u8; 1 + 66];
+    let n = seal_read(dev, fs, fid, &mut plain)?;
+    let r = (|| {
+        if n < 2 {
+            return Err(Sw::MEMORY_FAILURE);
+        }
+        let curve = curve_from_id(plain[0]).ok_or(Sw::MEMORY_FAILURE)?;
+        PrivKey::from_scalar(curve, &plain[1..n]).ok_or(Sw::MEMORY_FAILURE)
+    })();
+    plain.zeroize();
+    r
+}
+
+/// Seal an RSA key as `P ‖ Q` (even halves, the OpenPGP blob layout).
+pub fn store_rsa_key<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    rng: &mut dyn Rng,
+    fid: u16,
+    key: &RsaPrivateKey,
+) -> Result<(), Sw> {
+    let primes = key.primes();
+    if primes.len() != 2 {
+        return Err(Sw::EXEC_ERROR);
+    }
+    let mut pb = primes[0].to_bytes_be();
+    let mut qb = primes[1].to_bytes_be();
+    let half = pb.len().max(qb.len());
+    let n = 2 * half;
+    let mut plain = [0u8; MAX_PLAIN];
+    let r = (|| {
+        if n > MAX_PLAIN {
+            return Err(Sw::WRONG_LENGTH);
+        }
+        plain[half - pb.len()..half].copy_from_slice(&pb);
+        plain[n - qb.len()..n].copy_from_slice(&qb);
+        seal_put(dev, fs, rng, fid, &plain[..n])
+    })();
+    pb.zeroize();
+    qb.zeroize();
+    plain.zeroize();
+    r
+}
+
+/// Load an RSA key sealed by [`store_rsa_key`] (`E` is fixed at 65537).
+pub fn load_rsa_key<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    fid: u16,
+) -> Result<RsaPrivateKey, Sw> {
+    let mut plain = [0u8; MAX_PLAIN];
+    let n = seal_read(dev, fs, fid, &mut plain)?;
+    let r = (|| {
+        if n < 2 || n % 2 != 0 {
+            return Err(Sw::MEMORY_FAILURE);
+        }
+        let half = n / 2;
+        let p = BigUint::from_bytes_be(&plain[..half]);
+        let q = BigUint::from_bytes_be(&plain[half..n]);
+        RsaPrivateKey::from_p_q(p, q, BigUint::from(65_537u32)).map_err(|_| Sw::MEMORY_FAILURE)
+    })();
+    plain.zeroize();
+    r
+}
+
+/// Our internal curve tags (shared values with rsk-openpgp's blob format).
+fn curve_id(c: Curve) -> u8 {
+    match c {
+        Curve::P256 => 3,
+        Curve::P384 => 4,
+        Curve::P521 => 5,
+        Curve::K256 => 12,
+        Curve::Ed25519 => 30,
+        Curve::X25519 => 31,
+    }
+}
+
+fn curve_from_id(b: u8) -> Option<Curve> {
+    Some(match b {
+        3 => Curve::P256,
+        4 => Curve::P384,
+        _ => return None, // PIV only ever stores P-256/P-384
+    })
+}

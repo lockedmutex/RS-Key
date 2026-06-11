@@ -1,0 +1,16 @@
+/target
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/coverage
+**/*.rs.bk
+*.uf2
+__pycache__/
+.direnv/
+result
+result-*
+.DS_Store
+/secrets/
+secure_boot_*.pem
+*.pem
+/tools/tui/target/

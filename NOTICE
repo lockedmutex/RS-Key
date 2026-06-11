@@ -1,0 +1,19 @@
+RS-Key (RSK) — an open security-key firmware for the RP2350
+Copyright (C) 2026 RS-Key contributors
+
+Licensed under the GNU Affero General Public License, version 3 only
+(AGPL-3.0-only). See the LICENSE file.
+
+RS-Key is a from-scratch Rust reimplementation of the pico-keys firmware
+family by Pol Henarejos — pico-fido, pico-openpgp and pico-keys-sdk
+(https://github.com/polhenarejos) — which is licensed under the GNU
+Affero General Public License v3. The protocol behaviour, file layouts
+and applet semantics follow that work; the Rust implementation, the
+embassy-based runtime and the host tooling are original to this project.
+
+rsk-wipe is a Rust port of polhenarejos/pico-nuke, itself derived from
+the Raspberry Pi pico-examples flash_nuke utility.
+
+This product is not affiliated with, or endorsed by, Yubico, Nitrokey or
+Raspberry Pi. The default USB identity mimics a YubiKey for local tool
+interoperability only and must not be used for distribution.

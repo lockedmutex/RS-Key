@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 RS-Key contributors
+
+# Fast pre-commit gate. Run the full suite with ./scripts/check.sh (or in CI).
+set -euo pipefail
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+    echo "pre-commit: gitleaks not found — commit from inside 'nix develop'." >&2
+    exit 1
+fi
+
+# Secret detection over the staged diff only.
+gitleaks protect --staged --redact --no-banner
+
+# Formatting + lint gate on the workspace (libs + firmware, no test targets).
+cargo fmt --all --check
+cargo clippy --workspace -- -D warnings

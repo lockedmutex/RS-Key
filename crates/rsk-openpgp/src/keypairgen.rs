@@ -1,0 +1,226 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 RS-Key contributors
+
+//! GENERATE ASYMMETRIC KEY PAIR (INS 0x47): `P1 = 0x80` generates a fresh key
+//! pair into the slot named by the control-reference template (`B6`→SIG,
+//! `B8`→DEC, `A4`→AUT) and returns its public-key DO; `P1 = 0x81` reads it back.
+
+use rsk_crypto::Device;
+use rsk_fs::{Fs, Storage};
+use rsk_sdk::Sw;
+
+use crate::Rng;
+use crate::consts::*;
+use crate::keys::{
+    MAX_EC_POINT, MAX_RSA_PUBDO, PrivKey, curve_from_attr, generate_rsa, make_ec_pubkey_do,
+    make_rsa_response, reset_sig_count, store_aes_key, store_ec_key, store_rsa_key,
+};
+use crate::pin::Session;
+use rsa::RsaPrivateKey;
+
+/// Status 0x6A80 (wrong data).
+const WRONG_DATA: Sw = Sw::INCORRECT_PARAMS;
+
+/// Default algorithm attribute when the slot has no `EF_ALGO_PRIV*` —
+/// RSA-2048, gpg's default.
+const DEFAULT_ALGO: &[u8] = &[ALGO_RSA, 0x08, 0x00, 0x00, 0x20, 0x00];
+
+/// GENERATE ASYMMETRIC KEY PAIR (INS 0x47). Returns `(response_len, status)`;
+/// the response (written to `out`) is the public-key DO `7F49 { … }`.
+#[allow(clippy::too_many_arguments)]
+pub fn keypair_gen<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    sess: &Session,
+    rng: &mut dyn Rng,
+    p1: u8,
+    p2: u8,
+    data: &[u8],
+    out: &mut [u8],
+) -> (usize, Sw) {
+    if p2 != 0x00 {
+        return (0, Sw::WRONG_P1P2);
+    }
+    if data.len() != 2 && data.len() != 5 {
+        return (0, Sw::WRONG_LENGTH);
+    }
+    // Generating overwrites a key, so it is an admin (PW3) operation; reading the
+    // public key is not gated.
+    if !sess.has_pw3 && p1 == 0x80 {
+        return (0, Sw::SECURITY_STATUS_NOT_SATISFIED);
+    }
+    let fid = match data.first() {
+        Some(0xB6) => EF_PK_SIG,
+        Some(0xB8) => EF_PK_DEC,
+        Some(0xA4) => EF_PK_AUT,
+        _ => return (0, WRONG_DATA),
+    };
+
+    let r = match p1 {
+        0x80 => generate(dev, fs, sess, rng, fid, out),
+        0x81 => read_public(fs, fid, out),
+        _ => return (0, Sw::WRONG_P1P2),
+    };
+    match r {
+        Ok(n) => (n, Sw::OK),
+        Err(sw) => (0, sw),
+    }
+}
+
+/// `P1 = 0x80`: generate the key pair, seal it, store + return its public-key DO.
+fn generate<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    sess: &Session,
+    rng: &mut dyn Rng,
+    fid: u16,
+    out: &mut [u8],
+) -> Result<usize, Sw> {
+    // The algorithm attribute (slot FID − 0x10) decides RSA vs EC and the curve.
+    let mut algo_buf = [0u8; 16];
+    let algo: &[u8] = match fs.read(fid - 0x10, &mut algo_buf) {
+        Some(n) if n > 0 => &algo_buf[..n],
+        _ => DEFAULT_ALGO,
+    };
+
+    let n = match algo[0] {
+        ALGO_RSA => {
+            let nbits = ((algo[1] as usize) << 8) | algo[2] as usize;
+            let key = generate_rsa(rng, nbits)?;
+            store_rsa_key(dev, fs, sess, fid, &key)?;
+            let mut pub_do = [0u8; MAX_RSA_PUBDO];
+            let n = make_rsa_response(&key, &mut pub_do);
+            store_public(fs, fid, &pub_do[..n], out)?
+        }
+        ALGO_ECDSA | ALGO_ECDH | ALGO_EDDSA => {
+            let curve = curve_from_attr(algo).ok_or(Sw::FUNC_NOT_SUPPORTED)?;
+            let key = PrivKey::generate(curve, rng).ok_or(Sw::EXEC_ERROR)?;
+            store_ec_key(dev, fs, sess, fid, &key)?;
+            let mut point = [0u8; MAX_EC_POINT];
+            let plen = key.public_point(&mut point)?;
+            let mut pub_do = [0u8; 8 + MAX_EC_POINT];
+            let n = make_ec_pubkey_do(&point[..plen], &mut pub_do);
+            store_public(fs, fid, &pub_do[..n], out)?
+        }
+        _ => return Err(Sw::FUNC_NOT_SUPPORTED),
+    };
+
+    keygen_tail(dev, fs, sess, rng, fid)?;
+    Ok(n)
+}
+
+/// The post-store tail shared by EC and RSA generate: reset the signature
+/// counter on the SIG slot; mint a fresh AES-256 key on the DEC slot (OpenPGP
+/// cannot generate a symmetric key directly; a storage failure is non-fatal).
+fn keygen_tail<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    sess: &Session,
+    rng: &mut dyn Rng,
+    fid: u16,
+) -> Result<(), Sw> {
+    if fid == EF_PK_SIG {
+        reset_sig_count(fs)?;
+    } else if fid == EF_PK_DEC {
+        let mut aes = [0u8; 32];
+        rng.fill(&mut aes);
+        let _ = store_aes_key(dev, fs, sess, &aes);
+        use zeroize::Zeroize;
+        aes.zeroize();
+    }
+    Ok(())
+}
+
+/// Persist the public-key DO to `EF_PB_*` (slot FID + 3) and copy it into the
+/// response.
+fn store_public<S: Storage>(
+    fs: &mut Fs<S>,
+    fid: u16,
+    pub_do: &[u8],
+    out: &mut [u8],
+) -> Result<usize, Sw> {
+    fs.put(fid + 3, pub_do).map_err(|_| Sw::MEMORY_FAILURE)?;
+    out[..pub_do.len()].copy_from_slice(pub_do);
+    Ok(pub_do.len())
+}
+
+/// `P1 = 0x81`: return the stored public-key DO from `EF_PB_*` (slot FID + 3).
+fn read_public<S: Storage>(fs: &mut Fs<S>, fid: u16, out: &mut [u8]) -> Result<usize, Sw> {
+    if !fs.has_data(fid + 3) {
+        return Err(Sw::REFERENCE_NOT_FOUND);
+    }
+    fs.read(fid + 3, out).ok_or(Sw::REFERENCE_NOT_FOUND)
+}
+
+// --- CCID keepalive path: split RSA generate so the slow keygen can run async ---
+//
+// RSA key generation runs for seconds and would exceed the CCID transaction
+// timeout, so the transport drives [`crate::keys::RsaKeygen`] itself, sending
+// time-extensions between candidates. These two helpers are the bookends; EC
+// generate and read-public stay synchronous in [`keypair_gen`].
+
+/// Validate a GENERATE (0x47) and, for an RSA slot, return `(fid, nbits)` so
+/// the caller can run the keygen asynchronously; `Ok(None)` means EC or
+/// read-public — fall back to the synchronous [`keypair_gen`].
+pub fn rsa_generate_params<S: Storage>(
+    fs: &mut Fs<S>,
+    sess: &Session,
+    p1: u8,
+    p2: u8,
+    data: &[u8],
+) -> Result<Option<(u16, usize)>, Sw> {
+    if p1 != 0x80 {
+        return Ok(None); // read-public (0x81) is fast
+    }
+    if p2 != 0x00 {
+        return Err(Sw::WRONG_P1P2);
+    }
+    if data.len() != 2 && data.len() != 5 {
+        return Err(Sw::WRONG_LENGTH);
+    }
+    if !sess.has_pw3 {
+        return Err(Sw::SECURITY_STATUS_NOT_SATISFIED);
+    }
+    let fid = match data.first() {
+        Some(0xB6) => EF_PK_SIG,
+        Some(0xB8) => EF_PK_DEC,
+        Some(0xA4) => EF_PK_AUT,
+        _ => return Err(WRONG_DATA),
+    };
+    let mut algo_buf = [0u8; 16];
+    let algo: &[u8] = match fs.read(fid - 0x10, &mut algo_buf) {
+        Some(n) if n > 0 => &algo_buf[..n],
+        _ => DEFAULT_ALGO,
+    };
+    if algo[0] != ALGO_RSA {
+        return Ok(None); // EC generate — synchronous path handles it
+    }
+    let nbits = ((algo[1] as usize) << 8) | algo[2] as usize;
+    Ok(Some((fid, nbits)))
+}
+
+/// Finish an RSA GENERATE once the key has been produced (by stepping
+/// [`crate::keys::RsaKeygen`]): seal it, store + return the public-key DO, and run
+/// the shared SIG/DEC tail. Mirrors the RSA branch + tail of [`keypair_gen`].
+pub fn rsa_generate_finish<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    sess: &Session,
+    rng: &mut dyn Rng,
+    fid: u16,
+    key: &RsaPrivateKey,
+    out: &mut [u8],
+) -> (usize, Sw) {
+    let r = (|| {
+        store_rsa_key(dev, fs, sess, fid, key)?;
+        let mut pub_do = [0u8; MAX_RSA_PUBDO];
+        let n = make_rsa_response(key, &mut pub_do);
+        let resp_len = store_public(fs, fid, &pub_do[..n], out)?;
+        keygen_tail(dev, fs, sess, rng, fid)?;
+        Ok(resp_len)
+    })();
+    match r {
+        Ok(n) => (n, Sw::OK),
+        Err(sw) => (0, sw),
+    }
+}

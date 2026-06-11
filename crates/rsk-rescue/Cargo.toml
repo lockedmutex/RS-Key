@@ -1,0 +1,17 @@
+[package]
+name = "rsk-rescue"
+version = "0.1.0"
+license = "AGPL-3.0-only"
+edition = "2024"
+publish = false
+
+[dependencies]
+rsk-sdk = { workspace = true }
+rsk-fs = { workspace = true }
+rsk-crypto = { workspace = true }
+k256 = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+# RamStorage for the host tests (the same backend the other applet crates use).
+rsk-fs = { workspace = true, features = ["test-util"] }

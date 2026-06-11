@@ -1,0 +1,27 @@
+[package]
+name = "rsk-piv"
+version = "0.1.0"
+license = "AGPL-3.0-only"
+edition = "2024"
+publish = false
+
+# The PIV applet (NIST SP 800-73-4 subset + the Yubico extensions ykman
+# speaks), reached over CCID. Pure and host-testable like the other applet
+# crates; reuses rsk-openpgp's key machinery (PrivKey, RsaKeygen) with its
+# own kbase-rooted sealing.
+[dependencies]
+rsk-sdk = { workspace = true }
+rsk-fs = { workspace = true }
+rsk-crypto = { workspace = true }
+rsk-openpgp = { workspace = true }
+rsk-mgmt = { workspace = true }
+rsa = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+rsk-fs = { workspace = true, features = ["test-util"] }
+p256 = { workspace = true }
+p384 = { workspace = true }
+sha2 = { workspace = true }
+# Independent X.509 parser to cross-check the hand-built DER certs (host only).
+x509-parser = "0.16"

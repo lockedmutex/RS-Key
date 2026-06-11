@@ -1,0 +1,16 @@
+[package]
+name = "rsk-fs"
+version = "0.1.0"
+license = "AGPL-3.0-only"
+edition = "2024"
+publish = false
+
+# ISO-7816 file API over a backend-agnostic FID->bytes Storage.
+# HAL-agnostic: the flash Storage impl lives in `firmware`; tests use a RAM one.
+[dependencies]
+rsk-sdk = { workspace = true }
+heapless = "0.8"
+
+[features]
+# Exposes the in-memory `RamStorage` to other crates' tests (needs std).
+test-util = []

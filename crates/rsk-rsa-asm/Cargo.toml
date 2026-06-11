@@ -1,0 +1,24 @@
+[package]
+name = "rsk-rsa-asm"
+version = "0.1.0"
+license = "AGPL-3.0-only"
+edition = "2024"
+publish = false
+build = "build.rs"
+
+# Fast RSA bignum modular exponentiation for ARMv7E-M (Cortex-M33 + DSP), wrapping
+# the vendored C + hand-written ARM assembly from rsa-armv7 (Emil Lenngren,
+# BSD-2-Clause; see csrc/LICENSE.txt). Used by rsk-openpgp's on-card RSA key
+# generation: the Miller-Rabin / Fermat modexp is ~10x faster than the pure-Rust
+# bignum, turning a ~150 s keygen into a few seconds. On the host (no ARM asm) it
+# falls back to num-bigint-dig so the prime-search logic stays testable.
+[dependencies]
+# The modexp working buffers hold prime-candidate state.
+zeroize = { workspace = true }
+
+[build-dependencies]
+cc = "1"
+
+# Host-only: the modexp fallback + the cross-checks in the unit tests.
+[target.'cfg(not(target_os = "none"))'.dependencies]
+num-bigint-dig = { workspace = true }

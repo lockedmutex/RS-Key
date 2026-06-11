@@ -1,0 +1,90 @@
+[workspace]
+resolver = "2"
+members = ["firmware", "rsk-wipe", "crates/rsk-sdk", "crates/rsk-fs", "crates/rsk-usb", "crates/rsk-crypto", "crates/rsk-fido", "crates/rsk-openpgp", "crates/rsk-rsa-asm", "crates/rsk-mgmt", "crates/rsk-oath", "crates/rsk-otp", "crates/rsk-piv", "crates/rsk-rescue"]
+
+# Embassy crates are versioned together; pin them all to one git revision so they
+# stay mutually compatible. The exact commit is recorded in Cargo.lock.
+[workspace.dependencies]
+embassy-executor = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+embassy-rp = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+embassy-time = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+embassy-usb = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+embassy-futures = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+embassy-embedded-hal = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+embassy-sync = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+# The RP2350 PAC, pinned to the exact revision embassy-rp uses (its `pac` re-export
+# is pub(crate)); the rescue applet reads OTP_DATA_RAW for the secure-boot status.
+rp-pac = { git = "https://github.com/embassy-rs/rp-pac", rev = "c2e27609b021c444f634673155318977d7f0bdf6", features = ["rp235x"] }
+rsk-sdk = { path = "crates/rsk-sdk" }
+rsk-fs = { path = "crates/rsk-fs" }
+rsk-usb = { path = "crates/rsk-usb" }
+rsk-crypto = { path = "crates/rsk-crypto" }
+rsk-fido = { path = "crates/rsk-fido" }
+rsk-openpgp = { path = "crates/rsk-openpgp" }
+rsk-rsa-asm = { path = "crates/rsk-rsa-asm" }
+rsk-mgmt = { path = "crates/rsk-mgmt" }
+rsk-oath = { path = "crates/rsk-oath" }
+rsk-otp = { path = "crates/rsk-otp" }
+rsk-piv = { path = "crates/rsk-piv" }
+rsk-rescue = { path = "crates/rsk-rescue" }
+minicbor = { version = "2.2", default-features = false }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic", "ecdh"] }
+# Additional FIDO2 signing curves; same 0.13 RustCrypto ecosystem as p256.
+p384 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic", "ecdh"] }
+# p521 0.13 has no deterministic ECDSA (no DigestPrimitive); its newtype signs with
+# a random nonce (SHA-512 internally), which is no_std-friendly.
+p521 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic", "ecdh"] }
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic", "ecdh"] }
+# EdDSA (Ed25519) — OKP key, deterministic 64-byte signature.
+ed25519-dalek = { version = "2", default-features = false, features = ["zeroize"] }
+# X25519 ECDH for OpenPGP Cv25519. Same curve25519-dalek 4 backend as
+# ed25519-dalek, so no version split. The bare `x25519()` needs no extra feature.
+x25519-dalek = { version = "2", default-features = false }
+
+# PQC. fips204 = ML-DSA (FIPS 204) signatures; only the ML-DSA-44 parameter
+# set is enabled (the primary COSE -48 target — smallest signatures, lowest stack).
+# ml-kem = ML-KEM (FIPS 203) encapsulation, scaffolding for a future PQC PIN/UV
+# protocol. Both no_std, no alloc, pure Rust.
+fips204 = { version = "0.4.6", default-features = false, features = ["ml-dsa-44"] }
+ml-kem = { version = "0.3.2", default-features = false, features = ["zeroize"] }
+
+# RustCrypto (no_std). Pinned together; bump as a set.
+# SHA-1 is for the YKOATH HOTP/TOTP PRF only (RFC 4226 mandates HMAC-SHA1).
+sha1 = { version = "0.10", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+hmac = { version = "0.12", default-features = false }
+hkdf = { version = "0.12", default-features = false }
+# `zeroize` wipes the expanded round keys when a cipher instance drops.
+aes = { version = "0.8", default-features = false, features = ["zeroize"] }
+# 3DES for the legacy PIV management-key algorithm only; default is AES-192.
+des = { version = "0.8", default-features = false, features = ["zeroize"] }
+cbc = { version = "0.1", default-features = false, features = ["block-padding"] }
+cfb-mode = { version = "0.8", default-features = false }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
+chacha20poly1305 = { version = "0.10", default-features = false }
+zeroize = { version = "1", default-features = false }
+# RSA for the OpenPGP applet. no_std but needs `alloc` (firmware provides
+# a heap). PKCS#1 v1.5 sign/decrypt + from_p_q import; we pass our own RNG.
+# `hazmat` exposes the blinded raw private op (`rsa_decrypt_and_check`) that PIV
+# GENERAL AUTHENTICATE needs — the host supplies pre-padded messages.
+rsa = { version = "0.9", default-features = false, features = ["hazmat"] }
+# num-bigint-dig is rsa's bignum (re-exported as `rsa::BigUint`). On-card RSA
+# keygen drives `prime::probably_prime` directly so the prime search can yield
+# between candidates (the CCID keepalive). Features match rsa's own selection.
+num-bigint-dig = { version = "0.8.6", default-features = false, features = ["i128", "prime", "zeroize"] }
+
+[profile.release]
+codegen-units = 1
+debug = 2          # keep symbols; UF2 size unaffected (debug info isn't flashed)
+lto = "fat"
+opt-level = "s"    # our crates stay size-optimized…
+
+# …but speed-optimize the dependencies — the pure-Rust elliptic-curve arithmetic
+# (p384/p521 especially) is a tight big-int multiply loop that `opt-level="s"`
+# penalizes badly on the in-order Cortex-M33 (a P-384 makeCredential takes ~3 s
+# at "s"). opt-level 3 here fixes that without bloating our glue.
+[profile.release.package."*"]
+opt-level = 3
+
+[profile.dev]
+opt-level = "s"    # embassy/HAL needs some opt even in dev to fit/behave

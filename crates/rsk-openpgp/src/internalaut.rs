@@ -1,0 +1,63 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 RS-Key contributors
+
+//! INTERNAL AUTHENTICATE (INS 0x88): signs the challenge with the
+//! authentication slot (`sess.pk_aut`/`sess.algo_aut`, repointed by MSE 0x22);
+//! needs PW2 (or PW3). Unlike PSO:CDS it does not touch the signature counter.
+
+use rsk_crypto::Device;
+use rsk_fs::{Fs, Storage};
+use rsk_sdk::{Apdu, Sw};
+
+use crate::consts::*;
+use crate::keys::{load_ec_key, load_rsa_key, rsa_sign};
+use crate::pin::Session;
+use crate::{Rng, UserPresence, check_uif};
+
+const DEFAULT_ALGO: &[u8] = &[ALGO_RSA, 0x08, 0x00, 0x00, 0x20, 0x00];
+
+/// INTERNAL AUTHENTICATE (INS 0x88, P1P2 = 00 00).
+pub fn internal_aut<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    sess: &Session,
+    rng: &mut dyn Rng,
+    presence: &mut dyn UserPresence,
+    apdu: &Apdu,
+    out: &mut [u8],
+) -> (usize, Sw) {
+    match try_internal_aut(dev, fs, sess, rng, presence, apdu, out) {
+        Ok(n) => (n, Sw::OK),
+        Err(sw) => (0, sw),
+    }
+}
+
+fn try_internal_aut<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    sess: &Session,
+    rng: &mut dyn Rng,
+    presence: &mut dyn UserPresence,
+    apdu: &Apdu,
+    out: &mut [u8],
+) -> Result<usize, Sw> {
+    if apdu.p1 != 0x00 || apdu.p2 != 0x00 {
+        return Err(Sw::WRONG_P1P2);
+    }
+    if !sess.has_pw3 && !sess.has_pw2 {
+        return Err(Sw::SECURITY_STATUS_NOT_SATISFIED);
+    }
+    // UIF (touch policy): AUT → 0xD8. No-op unless DO set.
+    check_uif(fs, EF_UIF_AUT, presence)?;
+    let mut algo_buf = [0u8; 16];
+    let algo0 = match fs.read(sess.algo_aut, &mut algo_buf) {
+        Some(n) if n > 0 => algo_buf[0],
+        _ => DEFAULT_ALGO[0],
+    };
+    if algo0 == ALGO_RSA {
+        let key = load_rsa_key(dev, fs, sess, sess.pk_aut)?;
+        return rsa_sign(&key, apdu.data, rng, out);
+    }
+    let key = load_ec_key(dev, fs, sess, sess.pk_aut)?;
+    key.sign(apdu.data, rng, out)
+}

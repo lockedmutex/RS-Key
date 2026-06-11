@@ -1,0 +1,35 @@
+[package]
+name = "rsk-fido"
+version = "0.1.0"
+license = "AGPL-3.0-only"
+edition = "2024"
+publish = false
+
+# The FIDO2 (CTAP2) + U2F (CTAP1) applet. Pure and host-testable: device seed /
+# serial / RNG and flash come from the caller.
+[dependencies]
+minicbor = { workspace = true }
+p256 = { workspace = true }
+p384 = { workspace = true }
+p521 = { workspace = true }
+k256 = { workspace = true }
+ed25519-dalek = { workspace = true }
+rsk-crypto = { workspace = true }
+rsk-fs = { workspace = true }
+rsk-sdk = { workspace = true }
+zeroize = { workspace = true }
+
+[build-dependencies]
+# Host-side P-521 arithmetic to generate the fixed-base comb table (build.rs).
+p521 = { workspace = true }
+
+[dev-dependencies]
+minicbor = { workspace = true }
+rsk-fs = { workspace = true, features = ["test-util"] }
+
+[features]
+# Advertise ML-DSA-44 (-48) in getInfo `algorithms` (0x0A). OFF by default:
+# shipped Firefoxes (authenticator-rs before 2026-06-02) hard-fail the whole
+# getInfo parse on an unknown COSE id. The PQC capability itself is always on —
+# makeCredential negotiates -48 from the request regardless of this flag.
+advertise-pqc = []

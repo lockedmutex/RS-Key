@@ -1,0 +1,75 @@
+# rsk-wipe
+
+A RAM-only flash-erase utility for the Waveshare RP2350-One — a Rust/embassy
+port of upstream [pico-nuke](https://github.com/polhenarejos/pico-nuke)
+(itself the pico-sdk `flash_nuke` example).
+
+It wipes the whole device so `rs-key` flash-persistence behaviour can be
+verified from a blank slate between firmware tests. On run it:
+
+1. **white strobe ×8** — the SRAM image is alive (see *Reading the LED*),
+2. erases all 4 MB of flash via the bootrom sequence (`connect_internal_flash`
+   → `flash_exit_xip` → `flash_range_erase` → `flash_flush_cache` →
+   `flash_enter_cmd_xip`) — **solid blue** while erasing,
+3. writes a `"NUKE"` eyecatcher into page 0 (so picotool can spot a wiped device),
+4. **green ×3** — the sequence completed,
+5. reboots to BOOTSEL (`reset_to_usb_boot`) so the `RP2350` drive reappears.
+
+The bootrom flash sequence (rather than embassy's flash driver) is used because
+it re-initialises the QSPI/XIP from scratch — necessary in a RAM boot, where the
+normal second-stage XIP setup never ran.
+
+## Reading the LED
+
+The WS2812 is GPIO16. The startup **white strobe** is the key diagnostic — no
+flashed firmware blinks white, so:
+
+| You see | Meaning |
+|---------|---------|
+| white strobe → blue → **green ×3** | the erase sequence ran — confirm the wipe functionally (below) |
+| white strobe → blue → *nothing* (hang) | a bootrom flash call faulted mid-erase |
+| **no white strobe**, just red/green/blue cycling | the RAM image never launched — the board booted the old flashed firmware instead (a UF2/boot-handoff problem, not a flash problem) |
+
+Green means the erase + eyecatcher sequence ran to completion — **not** that flash
+was read back and checked. The ROM flash calls report no status, and reading flash
+back immediately after a manual flash sequence in a RAM image is unreliable (XIP
+returns stale/garbage data even via the no-cache alias). So confirm the wipe
+functionally: flash `firmware.uf2` and run `tests/01_flash_persistence.py` —
+`counter before = 0` means the KV partition really was erased.
+
+## Why RAM-only
+
+Erasing flash means erasing offset 0 too — the sectors a flash-resident image
+would be executing from. Returning into just-erased flash would fault, so the
+entire program runs from SRAM. `memory.x` places code, rodata and data all in
+the RP2350's 512 KB of contiguous main SRAM (`0x2000_0000`); there is no flash
+load region. The bootrom loads the SRAM image (via the BOOTSEL UF2) and runs it
+from there, leaving flash free to be wiped.
+
+## Build & run
+
+Built as its own workspace target (own `memory.x`):
+
+```sh
+nix develop -c cargo build --release -p rsk-wipe
+nix develop -c picotool uf2 convert \
+  target/thumbv8m.main-none-eabihf/release/rsk-wipe -t elf rsk-wipe.uf2
+
+# Enter BOOTSEL (hold BOOT, tap RESET) then copy it across:
+cp rsk-wipe.uf2 /Volumes/RP2350/
+```
+
+`picotool info -a rsk-wipe.uf2` should report family `rp2350-arm-s`, image type
+**ARM Secure**, with the image-def at a `0x2000_xxxx` (SRAM) address — confirming
+it is a RAM image. The board wipes flash, blinks, and re-enumerates as the
+BOOTSEL drive; flash `rs-key` next to test it from a clean device.
+
+> ⚠️ **This erases the entire device.** Anything in flash, including a flashed
+> `rs-key` and its CONFIG/KV partition, is gone.
+
+## Testing
+
+There is no host-testable logic here: every step is an irreducible HAL
+side-effect (flash erase/program, PIO LED, ROM reboot), so there are no unit
+tests or fuzz targets — correctness is established by the on-device procedure
+above.

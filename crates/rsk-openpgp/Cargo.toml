@@ -1,0 +1,28 @@
+[package]
+name = "rsk-openpgp"
+version = "0.1.0"
+license = "AGPL-3.0-only"
+edition = "2024"
+publish = false
+
+# The OpenPGP card applet, reached over the CCID transport. Pure and
+# host-testable: device seed / serial / RNG and flash come from the caller,
+# as in rsk-fido.
+[dependencies]
+rsk-sdk = { workspace = true }
+rsk-fs = { workspace = true }
+rsk-crypto = { workspace = true }
+# `alloc` for the Vec impls (RSA prime bytes + decipher plaintext).
+zeroize = { workspace = true, features = ["alloc"] }
+p256 = { workspace = true }
+p384 = { workspace = true }
+p521 = { workspace = true }
+k256 = { workspace = true }
+ed25519-dalek = { workspace = true }
+x25519-dalek = { workspace = true }
+rsa = { workspace = true }
+num-bigint-dig = { workspace = true }
+rsk-rsa-asm = { workspace = true }
+
+[dev-dependencies]
+rsk-fs = { workspace = true, features = ["test-util"] }

@@ -1,0 +1,258 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 RS-Key contributors
+
+//! GET DATA / GET NEXT DATA: build the DO ([`DoWriter`]) and, for a non-flash
+//! DO whose whole response is a single TLV, strip the outer tag+length —
+//! returning the bare value, as `gpg`/`opensc` expect.
+
+use rsk_fs::{Fs, Storage};
+use rsk_sdk::Sw;
+
+use crate::consts::*;
+use crate::dobj::DoWriter;
+use crate::files::{DoSource, source};
+
+/// If `buf` is exactly one BER-TLV, return its header length (tag + length
+/// bytes); otherwise 0.
+fn outer_tlv_header(buf: &[u8]) -> usize {
+    let data_len = buf.len();
+    if data_len < 2 {
+        return 0;
+    }
+    let tag_bytes = if buf[0] & 0x1f == 0x1f { 2 } else { 1 };
+    if tag_bytes >= data_len {
+        return 0;
+    }
+    let len_byte = buf[tag_bytes];
+    let (tg_len, header) = if len_byte & 0x80 == 0 {
+        (len_byte as usize, tag_bytes + 1)
+    } else {
+        let n = (len_byte & 0x7f) as usize;
+        if n == 0 || n > 2 || tag_bytes + 1 + n > data_len {
+            return 0;
+        }
+        let mut v = 0usize;
+        for i in 0..n {
+            v = (v << 8) | buf[tag_bytes + 1 + i] as usize;
+        }
+        (v, tag_bytes + 1 + n)
+    };
+    if tg_len + header == data_len {
+        header
+    } else {
+        0
+    }
+}
+
+/// Resolve the tag, enforce the read ACL, build the DO into `out`, and strip
+/// the outer wrapper for non-flash DOs. Returns `(len, sw)` and records the
+/// selected DO in `current_ef` for a following GET NEXT DATA.
+pub fn get_data<S: Storage>(
+    fid: u16,
+    has_pw2: bool,
+    has_pw3: bool,
+    fs: &mut Fs<S>,
+    full_aid: &[u8; 16],
+    current_ef: &mut Option<u16>,
+    out: &mut [u8],
+) -> (usize, Sw) {
+    let src = source(fid);
+    match src {
+        DoSource::None => return (0, Sw::REFERENCE_NOT_FOUND),
+        // Internal EFs (keys, PINs, DEK) are found but read is denied by their ACL.
+        DoSource::Internal => return (0, Sw::SECURITY_STATUS_NOT_SATISFIED),
+        _ => {}
+    }
+    // Private DOs 3/4 are gated on PW2/PW3.
+    if fid == EF_PRIV_DO_3 && !has_pw2 && !has_pw3 {
+        return (0, Sw::SECURITY_STATUS_NOT_SATISFIED);
+    }
+    if fid == EF_PRIV_DO_4 && !has_pw3 {
+        return (0, Sw::SECURITY_STATUS_NOT_SATISFIED);
+    }
+
+    let mut data_len = {
+        let mut w = DoWriter::new(out, fs, full_aid);
+        w.build(fid)
+    };
+    if !matches!(src, DoSource::Flash) {
+        let dec = outer_tlv_header(&out[..data_len]);
+        if dec > 0 {
+            out.copy_within(dec..data_len, 0);
+            data_len -= dec;
+        }
+    }
+    *current_ef = Some(fid);
+    (data_len, Sw::OK)
+}
+
+/// Walk the private DOs (`0101`..`0104`): requires a prior GET DATA (sets
+/// `current_ef`), the same DO group, and PW3; then reads `current_ef + 1`.
+pub fn get_next_data<S: Storage>(
+    fid: u16,
+    has_pw2: bool,
+    has_pw3: bool,
+    fs: &mut Fs<S>,
+    full_aid: &[u8; 16],
+    current_ef: &mut Option<u16>,
+    out: &mut [u8],
+) -> (usize, Sw) {
+    let cur = match *current_ef {
+        Some(f) => f,
+        None => return (0, Sw::RECORD_NOT_FOUND),
+    };
+    if matches!(source(fid), DoSource::None) {
+        return (0, Sw::REFERENCE_NOT_FOUND);
+    }
+    // The next-DO walk is an update-class operation, gated on PW3.
+    if !has_pw3 {
+        return (0, Sw::SECURITY_STATUS_NOT_SATISFIED);
+    }
+    if (cur & 0x1ff0) != (fid & 0x1ff0) {
+        return (0, Sw::WRONG_P1P2);
+    }
+    let next = cur + 1;
+    if matches!(source(next), DoSource::None) {
+        return (0, Sw::REFERENCE_NOT_FOUND);
+    }
+    get_data(next, has_pw2, has_pw3, fs, full_aid, current_ef, out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::files::full_aid;
+    use rsk_fs::storage::ram::RamStorage;
+
+    fn fs() -> Fs<RamStorage> {
+        let mut fs = Fs::new(RamStorage::new(), &[]);
+        fs.scan();
+        fs
+    }
+
+    fn aid() -> [u8; 16] {
+        full_aid(&[1, 2, 3, 4])
+    }
+
+    #[test]
+    fn full_aid_returns_16_raw_bytes() {
+        let mut fs = fs();
+        let a = aid();
+        let mut out = [0u8; 64];
+        let mut cur = None;
+        let (n, sw) = get_data(EF_FULL_AID, false, false, &mut fs, &a, &mut cur, &mut out);
+        assert_eq!(sw, Sw::OK);
+        assert_eq!(n, 16);
+        assert_eq!(&out[..6], OPENPGP_AID);
+        assert_eq!(&out[10..14], &[1, 2, 3, 4]);
+        assert_eq!(cur, Some(EF_FULL_AID));
+    }
+
+    #[test]
+    fn algo_sig_is_stripped_to_bare_value() {
+        let mut fs = fs();
+        let a = aid();
+        let mut out = [0u8; 64];
+        let mut cur = None;
+        // C1 06 01 08 00 00 20 00 -> strip outer C1 06 -> bare rsa2k attributes.
+        let (n, sw) = get_data(EF_ALGO_SIG, false, false, &mut fs, &a, &mut cur, &mut out);
+        assert_eq!(sw, Sw::OK);
+        assert_eq!(&out[..n], &[ALGO_RSA, 0x08, 0x00, 0x00, 0x20, 0x00]);
+    }
+
+    #[test]
+    fn app_data_strips_6e_wrapper() {
+        let mut fs = fs();
+        let a = aid();
+        let mut out = [0u8; 512];
+        let mut cur = None;
+        let (n, sw) = get_data(EF_APP_DATA, false, false, &mut fs, &a, &mut cur, &mut out);
+        assert_eq!(sw, Sw::OK);
+        // The 6E 82 LL LL wrapper is gone; the first nested DO (4F full AID) leads.
+        assert_eq!(out[0], 0x4F);
+        assert_eq!(out[1], 16);
+        assert_eq!(&out[2..8], OPENPGP_AID);
+        assert!(n > 16);
+    }
+
+    #[test]
+    fn pw_status_reads_ef_pw_priv() {
+        let mut fs = fs();
+        fs.put(EF_PW_PRIV, crate::files::PW_STATUS_DEFAULT).unwrap();
+        let a = aid();
+        let mut out = [0u8; 64];
+        let mut cur = None;
+        let (n, sw) = get_data(EF_PW_STATUS, false, false, &mut fs, &a, &mut cur, &mut out);
+        assert_eq!(sw, Sw::OK);
+        assert_eq!(&out[..n], crate::files::PW_STATUS_DEFAULT);
+    }
+
+    #[test]
+    fn flash_do_returns_raw_no_strip() {
+        let mut fs = fs();
+        // A login-data value that happens to look like a TLV must NOT be stripped.
+        fs.put(EF_LOGIN_DATA, &[0x05, 0x02, 0xAA, 0xBB]).unwrap();
+        let a = aid();
+        let mut out = [0u8; 64];
+        let mut cur = None;
+        let (n, sw) = get_data(EF_LOGIN_DATA, false, false, &mut fs, &a, &mut cur, &mut out);
+        assert_eq!(sw, Sw::OK);
+        assert_eq!(&out[..n], &[0x05, 0x02, 0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn unknown_tag_is_reference_not_found() {
+        let mut fs = fs();
+        let a = aid();
+        let mut out = [0u8; 16];
+        let mut cur = None;
+        let (_, sw) = get_data(0x4242, false, false, &mut fs, &a, &mut cur, &mut out);
+        assert_eq!(sw, Sw::REFERENCE_NOT_FOUND);
+    }
+
+    #[test]
+    fn internal_ef_read_is_denied() {
+        let mut fs = fs();
+        let a = aid();
+        let mut out = [0u8; 16];
+        let mut cur = None;
+        let (_, sw) = get_data(EF_PW1, false, false, &mut fs, &a, &mut cur, &mut out);
+        assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
+    }
+
+    #[test]
+    fn priv_do_3_needs_pw2_or_pw3() {
+        let mut fs = fs();
+        let a = aid();
+        let mut out = [0u8; 16];
+        let mut cur = None;
+        let (_, sw) = get_data(EF_PRIV_DO_3, false, false, &mut fs, &a, &mut cur, &mut out);
+        assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
+        // With PW2 it becomes readable (a plain flash DO).
+        let (_, sw) = get_data(EF_PRIV_DO_3, true, false, &mut fs, &a, &mut cur, &mut out);
+        assert_eq!(sw, Sw::OK);
+    }
+
+    #[test]
+    fn get_next_without_prior_get_data_is_record_not_found() {
+        let mut fs = fs();
+        let a = aid();
+        let mut out = [0u8; 16];
+        let mut cur = None;
+        let (_, sw) = get_next_data(EF_PRIV_DO_1, false, true, &mut fs, &a, &mut cur, &mut out);
+        assert_eq!(sw, Sw::RECORD_NOT_FOUND);
+    }
+
+    #[test]
+    fn get_next_walks_to_following_priv_do() {
+        let mut fs = fs();
+        fs.put(EF_PRIV_DO_2, &[0xCA, 0xFE]).unwrap();
+        let a = aid();
+        let mut out = [0u8; 16];
+        let mut cur = Some(EF_PRIV_DO_1);
+        let (n, sw) = get_next_data(EF_PRIV_DO_1, false, true, &mut fs, &a, &mut cur, &mut out);
+        assert_eq!(sw, Sw::OK);
+        assert_eq!(&out[..n], &[0xCA, 0xFE]);
+        assert_eq!(cur, Some(EF_PRIV_DO_2));
+    }
+}

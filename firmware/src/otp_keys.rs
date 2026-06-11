@@ -1,0 +1,110 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 RS-Key contributors
+
+//! Boot-time, READ-ONLY view of the two provisioned OTP keys (all of page 58):
+//!
+//!   DEVK @ rows 0xE80..=0xE8F — the rescue keydev secp256k1 scalar
+//!   MKEK @ rows 0xE90..=0xE9F — the kbase root (`Device.otp_key`)
+//!   chaff complements @ 0xEA0 / 0xEB0, hard page lock = PAGE58_LOCK1
+//!
+//! Key provisioning is a deliberate host-side picotool ritual; blank rows (the
+//! factory state) read as `None` → the pre-OTP kbase arm, so this build is safe
+//! on every board. The ONE thing the firmware writes to OTP is the page-58
+//! access lock ([`apply_page58_lock`]), triggered explicitly via the rescue
+//! applet — never at boot — because the burn ritual cannot reach that lock row
+//! (bootloader-read-only OTP page 63). `FAKE_MKEK` / `FAKE_DEVK` (build.rs env)
+//! bake a fake key into the image INSTEAD of reading OTP — test builds only.
+
+use embassy_rp::otp;
+use rsk_rescue::otp_lock::{PAGE58_LOCK_VALUE, PAGE58_LOCK1_ROW};
+
+const DEVK_ROW: usize = 0xE80;
+const MKEK_ROW: usize = 0xE90;
+/// 32 bytes = 16 ECC rows of 16 data bits.
+const KEY_ROWS: usize = 16;
+/// The OTP page holding both keys and their chaff (0xE80 >> 6).
+const KEY_PAGE: usize = 58;
+
+/// Read the provisioned (MKEK, DEVK) pair. `None` per key when unprovisioned.
+pub fn read_keys() -> (Option<[u8; 32]>, Option<[u8; 32]>) {
+    let mkek = match option_env!("PK_FAKE_MKEK") {
+        Some(hex) => Some(parse_hex32(hex)),
+        None => read_key(MKEK_ROW),
+    };
+    let devk = match option_env!("PK_FAKE_DEVK") {
+        Some(hex) => Some(parse_hex32(hex)),
+        None => read_key(DEVK_ROW),
+    };
+    (mkek, devk)
+}
+
+/// The volatile, every-boot half of the key-page lock: block non-secure access
+/// to the key page for this power cycle via SW_LOCK (secure access stays
+/// read-write — this firmware runs entirely secure). The irreversible LOCK1
+/// fuse below is the permanent counterpart.
+pub fn sw_lock_key_page() {
+    rp_pac::OTP.sw_lock(KEY_PAGE).write(|w| {
+        w.set_nsec(rp_pac::otp::vals::SwLockNsec::Inaccessible);
+    });
+}
+
+/// Raw 24-bit value of PAGE58_LOCK1, or `None` on a read error. Drives the
+/// rescue applet's idempotency / refuse-foreign decision before any write.
+pub fn read_page58_lock() -> Option<u32> {
+    otp::read_raw_word(PAGE58_LOCK1_ROW)
+        .ok()
+        .map(|w| w & 0x00FF_FFFF)
+}
+
+/// Burn the permanent page-58 access lock (PAGE58_LOCK_VALUE → PAGE58_LOCK1)
+/// from secure firmware — the half the host burn ritual cannot do, since that
+/// lock row lives in bootloader-read-only OTP page 63 (page 63 `LOCK_S` = rw, so
+/// secure code can). The row and value are fixed constants here, so this call
+/// can only ever write that one lock; it is reached only after the rescue applet
+/// has confirmed the row is blank and the keys are provisioned. IRREVERSIBLE.
+/// Returns whether the bootrom write succeeded.
+pub fn apply_page58_lock() -> bool {
+    otp::write_raw_word(PAGE58_LOCK1_ROW, PAGE58_LOCK_VALUE).is_ok()
+}
+
+/// One 32-byte key at `row`: presence test first (all 16 raw rows zero =
+/// unprovisioned), then the ECC-corrected data. Read errors (a page locked away
+/// even from secure reads — a misconfiguration, not a factory state) also yield
+/// `None`: fail to the pre-OTP arm, never panic at boot.
+fn read_key(row: usize) -> Option<[u8; 32]> {
+    let mut any = false;
+    for i in 0..KEY_ROWS {
+        match otp::read_raw_word(row + i) {
+            Ok(w) => any |= w & 0x00FF_FFFF != 0,
+            Err(_) => return None,
+        }
+    }
+    if !any {
+        return None;
+    }
+    let mut key = [0u8; 32];
+    for i in 0..KEY_ROWS {
+        let w = otp::read_ecc_word(row + i).ok()?;
+        key[2 * i] = w as u8;
+        key[2 * i + 1] = (w >> 8) as u8;
+    }
+    Some(key)
+}
+
+/// Decode a build.rs-validated 64-char hex string; build.rs rejects anything
+/// else at compile time, so the panic arms are unreachable in a real image.
+fn parse_hex32(hex: &str) -> [u8; 32] {
+    fn nib(b: u8) -> u8 {
+        match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'f' => b - b'a' + 10,
+            _ => unreachable!(),
+        }
+    }
+    let bytes = hex.as_bytes();
+    let mut out = [0u8; 32];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = (nib(bytes[2 * i]) << 4) | nib(bytes[2 * i + 1]);
+    }
+    out
+}

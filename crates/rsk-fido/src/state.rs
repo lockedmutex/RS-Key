@@ -1,0 +1,312 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 RS-Key contributors
+
+//! Cross-CTAPHID-message FIDO state: the firmware owns one [`FidoState`] per
+//! power cycle and threads `&mut` into each [`crate::Ctx`]. The authenticator's
+//! ephemeral ECDH key is held as its 32-byte scalar and regenerated on first
+//! use and on PIN mismatch.
+
+use zeroize::Zeroize;
+
+use rsk_crypto::pinproto::{self, PinProto, public_xy};
+
+use crate::Rng;
+use crate::consts::MAX_LARGE_BLOB_SIZE;
+
+// pinUvAuthToken permission bits.
+pub const PERM_MC: u8 = 0x01; // makeCredential
+pub const PERM_GA: u8 = 0x02; // getAssertion
+pub const PERM_CM: u8 = 0x04; // credentialManagement
+pub const PERM_BE: u8 = 0x08; // bioEnrollment (unsupported)
+pub const PERM_LBW: u8 = 0x10; // largeBlobWrite
+pub const PERM_ACFG: u8 = 0x20; // authenticatorConfiguration
+pub const PERM_PCMR: u8 = 0x40; // per-credential-management read-only
+
+/// Max credentials tracked for `getNextAssertion` (`MAX_CREDENTIAL_COUNT_IN_LIST`).
+pub const MAX_ASSERTION_CREDS: usize = 16;
+
+/// State carried between `getAssertion` and `getNextAssertion` when resident
+/// discovery finds more than one credential. Holds EF_CRED slot offsets (newest
+/// first) rather than the credentials themselves; `getNextAssertion` re-reads them.
+pub struct AssertionState {
+    pub active: bool,
+    pub rp_id_hash: [u8; 32],
+    pub client_data_hash: [u8; 32],
+    pub uv: bool,
+    pub slots: [u16; MAX_ASSERTION_CREDS],
+    pub total: u8,
+    pub counter: u8,
+    /// Uptime at the originating getAssertion — the 30 s validity window.
+    pub started_ms: u64,
+    /// The originating request's extension inputs, re-evaluated per credential
+    /// for each getNextAssertion response.
+    pub hmac_present: bool,
+    pub hmac_proto: u64,
+    pub hmac_peer_x: [u8; 32],
+    pub hmac_peer_y: [u8; 32],
+    pub hmac_salt_enc: [u8; 80],
+    pub hmac_salt_enc_len: u8,
+    pub hmac_salt_auth: [u8; 48],
+    pub hmac_salt_auth_len: u8,
+    pub ext_cred_blob: bool,
+    pub ext_third_party_payment: bool,
+}
+
+impl AssertionState {
+    const fn new() -> Self {
+        Self {
+            active: false,
+            rp_id_hash: [0; 32],
+            client_data_hash: [0; 32],
+            uv: false,
+            slots: [0; MAX_ASSERTION_CREDS],
+            total: 0,
+            counter: 0,
+            started_ms: 0,
+            hmac_present: false,
+            hmac_proto: 1,
+            hmac_peer_x: [0; 32],
+            hmac_peer_y: [0; 32],
+            hmac_salt_enc: [0; 80],
+            hmac_salt_enc_len: 0,
+            hmac_salt_auth: [0; 48],
+            hmac_salt_auth_len: 0,
+            ext_cred_blob: false,
+            ext_third_party_payment: false,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.active = false;
+        self.total = 0;
+        self.counter = 0;
+        self.hmac_present = false;
+        self.ext_cred_blob = false;
+        self.ext_third_party_payment = false;
+    }
+}
+
+/// State carried across `credentialManagement` enumerate begin/next calls.
+/// The *Begin* subcommands reset the counters; the *Next* variants read them.
+/// `FidoState::reset` clears it.
+pub struct CredMgmtState {
+    pub rp_counter: u8,
+    pub rp_total: u8,
+    pub cred_counter: u8,
+    pub cred_total: u8,
+    pub rp_id_hash: [u8; 32],
+}
+
+impl CredMgmtState {
+    const fn new() -> Self {
+        Self {
+            rp_counter: 1,
+            rp_total: 0,
+            cred_counter: 1,
+            cred_total: 0,
+            rp_id_hash: [0; 32],
+        }
+    }
+}
+
+/// Multi-fragment `authenticatorLargeBlobs` write buffer. The platform sends
+/// the serialized large-blob array in fragments across separate commands; they
+/// accumulate in `temp` until the whole array (length fixed by the first
+/// fragment) has arrived, then commit to EF_LARGEBLOB.
+pub struct LargeBlobState {
+    pub expected_length: usize,
+    pub expected_next_offset: usize,
+    pub temp: [u8; MAX_LARGE_BLOB_SIZE],
+}
+
+impl LargeBlobState {
+    const fn new() -> Self {
+        Self {
+            expected_length: 0,
+            expected_next_offset: 0,
+            temp: [0; MAX_LARGE_BLOB_SIZE],
+        }
+    }
+}
+
+/// The session pinUvAuthToken plus its presence/permission flags.
+pub struct PinUvAuthToken {
+    pub token: [u8; 32],
+    pub in_use: bool,
+    pub permissions: u8,
+    pub rp_id_hash: [u8; 32],
+    pub has_rp_id: bool,
+    pub user_present: bool,
+    pub user_verified: bool,
+}
+
+impl PinUvAuthToken {
+    const fn new() -> Self {
+        Self {
+            token: [0; 32],
+            in_use: false,
+            permissions: 0,
+            rp_id_hash: [0; 32],
+            has_rp_id: false,
+            user_present: false,
+            user_verified: false,
+        }
+    }
+}
+
+/// All clientPIN state that must survive between CBOR commands within one power
+/// cycle.
+pub struct FidoState {
+    ephemeral: [u8; 32],
+    ephemeral_set: bool,
+    pub paut: PinUvAuthToken,
+    /// The persistent (PCMR) token. RAM-resident; not persisted across reboots.
+    pub ppaut_token: [u8; 32],
+    pub ppaut_permissions: u8,
+    pub needs_power_cycle: bool,
+    pub new_pin_mismatches: u8,
+    /// `getNextAssertion` carry-over.
+    pub gna: AssertionState,
+    /// `credentialManagement` enumerate carry-over.
+    pub cm: CredMgmtState,
+    /// `authenticatorLargeBlobs` multi-fragment write buffer. Cleared by
+    /// `reset()`; a write resuming across an interleaved reset (no real platform
+    /// does this) restarts from `offset == 0`.
+    pub lba: LargeBlobState,
+    /// `enableEnterpriseAttestation` (authenticatorConfig 0x01); gates the EA
+    /// levels in makeCredential and the getInfo `ep` option. RAM-only (not
+    /// persisted across reboots).
+    pub enterprise_attestation: bool,
+    /// MSE seed-backup channel: once a `VENDOR_MSE` key agreement succeeds,
+    /// `mse_active` is set and `mse_key`/`mse_pub` hold the derived
+    /// ChaCha20-Poly1305 channel key and the device ephemeral public key (the
+    /// AEAD AAD). RAM-only; the key is zeroized on `Drop` and a reset.
+    pub mse_active: bool,
+    pub mse_key: [u8; 32],
+    pub mse_pub: [u8; 65],
+    /// Soft-lock: the seed decrypted by a vendor `UNLOCK`. RAM-only — held until
+    /// power-off, a reset, or an `AUT_DISABLE`; zeroized on `Drop` and on overwrite.
+    pub keydev_dec: Option<[u8; 32]>,
+}
+
+impl Default for FidoState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FidoState {
+    pub const fn new() -> Self {
+        Self {
+            ephemeral: [0; 32],
+            ephemeral_set: false,
+            paut: PinUvAuthToken::new(),
+            ppaut_token: [0; 32],
+            ppaut_permissions: 0,
+            needs_power_cycle: false,
+            new_pin_mismatches: 0,
+            gna: AssertionState::new(),
+            cm: CredMgmtState::new(),
+            lba: LargeBlobState::new(),
+            enterprise_attestation: false,
+            mse_active: false,
+            mse_key: [0; 32],
+            mse_pub: [0; 65],
+            keydev_dec: None,
+        }
+    }
+
+    /// Drop the unlocked seed copy (disable / reset), zeroizing it first.
+    pub fn clear_keydev_dec(&mut self) {
+        if let Some(k) = self.keydev_dec.as_mut() {
+            k.zeroize();
+        }
+        self.keydev_dec = None;
+    }
+
+    /// Clear all session state after a reset (the `Drop` impl zeroizes the old
+    /// token / session key / ephemeral scalar).
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    /// `initialize`: on the first clientPIN command, generate the ephemeral ECDH
+    /// key and a fresh pinUvAuthToken.
+    pub fn ensure_initialized(&mut self, rng: &mut impl Rng) {
+        if !self.ephemeral_set {
+            self.regenerate(rng);
+            self.reset_pin_uv_auth_token(rng);
+        }
+    }
+
+    /// `regenerate`: draw a new ephemeral ECDH scalar (in range `[1, n)`).
+    pub fn regenerate(&mut self, rng: &mut impl Rng) {
+        loop {
+            rng.fill(&mut self.ephemeral);
+            if public_xy(&self.ephemeral).is_some() {
+                break;
+            }
+        }
+        self.ephemeral_set = true;
+    }
+
+    pub fn ephemeral_scalar(&self) -> &[u8; 32] {
+        &self.ephemeral
+    }
+
+    /// The ephemeral public key `(x, y)` returned by `getKeyAgreement`.
+    pub fn ephemeral_public(&self) -> Option<([u8; 32], [u8; 32])> {
+        public_xy(&self.ephemeral)
+    }
+
+    /// `resetPinUvAuthToken`: new random token, cleared permissions / flags.
+    pub fn reset_pin_uv_auth_token(&mut self, rng: &mut impl Rng) {
+        rng.fill(&mut self.paut.token);
+        self.paut.permissions = 0;
+        self.paut.in_use = false;
+        self.paut.has_rp_id = false;
+        self.paut.rp_id_hash = [0; 32];
+        self.paut.user_present = false;
+        self.paut.user_verified = false;
+    }
+
+    /// `resetPersistentPinUvAuthToken`.
+    pub fn reset_persistent_token(&mut self, rng: &mut impl Rng) {
+        rng.fill(&mut self.ppaut_token);
+        self.ppaut_permissions = 0;
+    }
+
+    /// `beginUsingPinUvAuthToken`.
+    pub fn begin_using_token(&mut self, user_is_present: bool) {
+        self.paut.user_present = user_is_present;
+        self.paut.user_verified = true;
+        self.paut.in_use = true;
+    }
+
+    /// `getUserVerifiedFlagValue` — false unless a token is in use.
+    pub fn user_verified(&self) -> bool {
+        self.paut.in_use && self.paut.user_verified
+    }
+
+    /// `getUserPresentFlagValue` — false unless a token is in use.
+    pub fn user_present(&self) -> bool {
+        self.paut.in_use && self.paut.user_present
+    }
+
+    /// Verify a `pinUvAuthParam` MAC over `data` under the current token.
+    pub fn verify_token(&self, proto: PinProto, data: &[u8], param: &[u8]) -> bool {
+        pinproto::verify(proto, &self.paut.token, data, param)
+    }
+}
+
+impl Drop for FidoState {
+    fn drop(&mut self) {
+        self.ephemeral.zeroize();
+        self.paut.token.zeroize();
+        self.ppaut_token.zeroize();
+        self.mse_key.zeroize();
+        if let Some(k) = self.keydev_dec.as_mut() {
+            k.zeroize();
+        }
+    }
+}

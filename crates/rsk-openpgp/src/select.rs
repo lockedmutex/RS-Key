@@ -1,0 +1,163 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 RS-Key contributors
+
+//! SELECT: the FCI returned on applet selection, the in-application SELECT, and
+//! SELECT DATA.
+
+use rsk_sdk::{Apdu, Sw};
+
+use crate::consts::{EF_CH_CERT, OPENPGP_AID};
+use crate::files::{DoSource, source};
+use crate::pin::Session;
+
+/// Reported free memory in the SELECT FCI (`64 06 53 04 <heap>`) — a fixed
+/// hint, not a live heap figure.
+const HEAP_FREE: u32 = 0x0008_0000;
+
+/// Build the SELECT-by-AID response FCI into `out`, returning its length:
+/// `6F 20 | 62 16 (81 02 0000 · 82 01 01 · 83 02 0000 · 84 06 <AID> · 8A 01 05)
+/// | 64 06 53 04 <heap32>` — the application DF (fid 0x0000, name = the full
+/// 6-byte AID, working EF, transparent, activated).
+pub fn build_fci(out: &mut [u8]) -> usize {
+    const FCP: [u8; 22] = [
+        0x81, 0x02, 0x00, 0x00, // file size (DF → 0)
+        0x82, 0x01, 0x01, // descriptor: working EF, transparent
+        0x83, 0x02, 0x00, 0x00, // file id 0x0000
+        0x84, 0x06, 0xD2, 0x76, 0x00, 0x01, 0x24, 0x01, // DF name = AID
+        0x8A, 0x01, 0x05, // life-cycle: activated
+    ];
+    let heap = HEAP_FREE.to_be_bytes();
+    let body_len = 2 + FCP.len() + 8; // 62-template + the 8-byte 64 DO
+    let total = 2 + body_len;
+    if out.len() < total {
+        return 0;
+    }
+    let mut p = 0;
+    out[p] = 0x6F;
+    out[p + 1] = body_len as u8;
+    p += 2;
+    out[p] = 0x62;
+    out[p + 1] = FCP.len() as u8;
+    p += 2;
+    out[p..p + FCP.len()].copy_from_slice(&FCP);
+    p += FCP.len();
+    out[p..p + 4].copy_from_slice(&[0x64, 0x06, 0x53, 0x04]);
+    p += 4;
+    out[p..p + 4].copy_from_slice(&heap);
+    p += 4;
+    p
+}
+
+/// In-application SELECT (the dispatcher already handles SELECT-by-AID before
+/// this is reached). Returns `(len, sw)`; the FCI body is emitted only for
+/// `P2 & 0xFC == 0x04`.
+pub fn cmd_select(apdu: &Apdu, out: &mut [u8]) -> (usize, Sw) {
+    let (p1, p2) = (apdu.p1, apdu.p2);
+    let fid = if apdu.nc >= 2 {
+        ((apdu.data[0] as u16) << 8) | apdu.data[1] as u16
+    } else {
+        0
+    };
+    let found = match p1 {
+        0x00 if apdu.nc == 0 => true, // select MF / application root
+        0x00..=0x02 if apdu.nc == 2 => !matches!(source(fid), DoSource::None),
+        0x04 => {
+            let aid = OPENPGP_AID;
+            apdu.nc >= aid.len() && &apdu.data[..aid.len()] == aid
+        }
+        _ => false,
+    };
+    if !found {
+        return (0, Sw::REFERENCE_NOT_FOUND);
+    }
+    if p2 & 0xfc != 0x00 && p2 & 0xfc != 0x04 {
+        return (0, Sw::INCORRECT_P1P2);
+    }
+    if p2 & 0xfc == 0x04 {
+        let n = build_fci(out);
+        return (n, Sw::OK);
+    }
+    (0, Sw::OK)
+}
+
+/// SELECT DATA (INS 0xA5): choose the occurrence (`P1` = 0/1/2) of a DO with
+/// several instances — here only the cardholder certificate (7F21, occurrences
+/// `EF_CH_1/2/3`); the choice is recorded in the session for GET / PUT DATA.
+///
+/// Command data is `60 <Lc> 5C <taglen> <tag>` with `P2 = 0x04`. Occurrence
+/// selection is deliberately not PW3-gated: it is not itself a security
+/// operation (the PUT DATA write stays PW3-gated), and it lets a non-admin
+/// host read occurrences 1/2.
+pub fn select_data(apdu: &Apdu, sess: &mut Session) -> Sw {
+    if apdu.p2 != 0x04 {
+        return Sw::INCORRECT_P1P2;
+    }
+    let d = apdu.data;
+    // 60 <Lc> 5C <taglen> <tag…> — Lc counts everything after the length byte.
+    if d.len() < 4 || d[0] != 0x60 || d.len() != d[1] as usize + 2 {
+        return Sw::WRONG_LENGTH;
+    }
+    let taglen = d[3] as usize;
+    if d[2] != 0x5C || taglen == 0 || taglen > 2 || d.len() < 4 + taglen {
+        return Sw::INCORRECT_PARAMS; // 0x6A80 (wrong data)
+    }
+    let tag = if taglen == 2 {
+        ((d[4] as u16) << 8) | d[5] as u16
+    } else {
+        d[4] as u16
+    };
+    // Only the cardholder certificate has occurrences; three of them (EF_CH_1/2/3).
+    if tag != EF_CH_CERT || apdu.p1 >= 3 {
+        return Sw::REFERENCE_NOT_FOUND;
+    }
+    sess.cert_occ = apdu.p1;
+    Sw::OK
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consts::*;
+
+    #[test]
+    fn fci_shape_is_faithful() {
+        let mut out = [0u8; 64];
+        let n = build_fci(&mut out);
+        assert_eq!(n, 34);
+        assert_eq!(out[0], 0x6F);
+        assert_eq!(out[1], 0x20); // 32 = 24 (62 template) + 8 (64 DO)
+        assert_eq!(out[2], 0x62);
+        assert_eq!(out[3], 0x16); // FCP template length = 22
+        assert_eq!(&out[15..17], &[0x84, 0x06]); // 84 06 <AID>
+        assert_eq!(&out[17..23], OPENPGP_AID);
+        // 64 06 53 04 <heap>
+        assert_eq!(&out[26..30], &[0x64, 0x06, 0x53, 0x04]);
+    }
+
+    fn parse(raw: &[u8]) -> Apdu<'_> {
+        Apdu::parse(raw).unwrap()
+    }
+
+    #[test]
+    fn select_by_name_matches_aid() {
+        let mut raw = vec![0x00, INS_SELECT, 0x04, 0x00, OPENPGP_AID.len() as u8];
+        raw.extend_from_slice(OPENPGP_AID);
+        let (n, sw) = cmd_select(&parse(&raw), &mut [0u8; 64]);
+        assert_eq!(sw, Sw::OK);
+        assert_eq!(n, 0); // P2 == 0x00 → no FCI body
+    }
+
+    #[test]
+    fn select_by_fid_known_do() {
+        let raw = [0x00, INS_SELECT, 0x02, 0x00, 0x02, 0x00, 0x6E];
+        let (_, sw) = cmd_select(&parse(&raw), &mut [0u8; 64]);
+        assert_eq!(sw, Sw::OK);
+    }
+
+    #[test]
+    fn select_unknown_fid_not_found() {
+        let raw = [0x00, INS_SELECT, 0x02, 0x00, 0x02, 0x42, 0x42];
+        let (_, sw) = cmd_select(&parse(&raw), &mut [0u8; 64]);
+        assert_eq!(sw, Sw::REFERENCE_NOT_FOUND);
+    }
+}

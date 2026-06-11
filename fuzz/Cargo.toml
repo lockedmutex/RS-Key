@@ -1,0 +1,266 @@
+[package]
+name = "rsk-fuzz"
+version = "0.0.0"
+license = "AGPL-3.0-only"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rsk-sdk = { path = "../crates/rsk-sdk" }
+rsk-fs = { path = "../crates/rsk-fs", features = ["test-util"] }
+rsk-usb = { path = "../crates/rsk-usb" }
+rsk-crypto = { path = "../crates/rsk-crypto" }
+rsk-fido = { path = "../crates/rsk-fido" }
+rsk-openpgp = { path = "../crates/rsk-openpgp" }
+rsk-mgmt = { path = "../crates/rsk-mgmt" }
+rsk-oath = { path = "../crates/rsk-oath" }
+rsk-otp = { path = "../crates/rsk-otp" }
+rsk-piv = { path = "../crates/rsk-piv" }
+rsk-rescue = { path = "../crates/rsk-rescue" }
+# The piv_apdu seed runs the AES-192 management-key auth dance host-side.
+aes = { version = "0.8", default-features = false }
+
+[[bin]]
+name = "apdu"
+path = "fuzz_targets/apdu.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tlv"
+path = "fuzz_targets/tlv.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fs_meta"
+path = "fuzz_targets/fs_meta.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ctaphid"
+path = "fuzz_targets/ctaphid.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ctaphid_roundtrip"
+path = "fuzz_targets/ctaphid_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "base64url"
+path = "fuzz_targets/base64url.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "aes_gcm"
+path = "fuzz_targets/aes_gcm.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chachapoly"
+path = "fuzz_targets/chachapoly.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fido_cbor"
+path = "fuzz_targets/fido_cbor.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fido_vendor"
+path = "fuzz_targets/fido_vendor.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fido_cred"
+path = "fuzz_targets/fido_cred.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fido_cred_ext"
+path = "fuzz_targets/fido_cred_ext.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fido_hmac_secret"
+path = "fuzz_targets/fido_hmac_secret.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fido_credmgmt"
+path = "fuzz_targets/fido_credmgmt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fido_u2f"
+path = "fuzz_targets/fido_u2f.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pin_kdf"
+path = "fuzz_targets/pin_kdf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pinproto"
+path = "fuzz_targets/pinproto.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fido_largeblobs"
+path = "fuzz_targets/fido_largeblobs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "openpgp_import"
+path = "fuzz_targets/openpgp_import.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "openpgp_apdu"
+path = "fuzz_targets/openpgp_apdu.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ccid"
+path = "fuzz_targets/ccid.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "openpgp_ecdh"
+path = "fuzz_targets/openpgp_ecdh.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "openpgp_ec_key"
+path = "fuzz_targets/openpgp_ec_key.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "openpgp_rsa_sign"
+path = "fuzz_targets/openpgp_rsa_sign.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "drbg"
+path = "fuzz_targets/drbg.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pqc"
+path = "fuzz_targets/pqc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mgmt_apdu"
+path = "fuzz_targets/mgmt_apdu.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "oath_apdu"
+path = "fuzz_targets/oath_apdu.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "otp_apdu"
+path = "fuzz_targets/otp_apdu.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "otp_hid"
+path = "fuzz_targets/otp_hid.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "piv_apdu"
+path = "fuzz_targets/piv_apdu.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rescue_apdu"
+path = "fuzz_targets/rescue_apdu.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "phy_tlv"
+path = "fuzz_targets/phy_tlv.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "seed_blob"
+path = "fuzz_targets/seed_blob.rs"
+test = false
+doc = false
+bench = false
+
+# Standalone workspace so the parent (thumbv8m) build never pulls these in.
+[workspace]
