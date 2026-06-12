@@ -28,7 +28,7 @@
 //!   is out, nothing more will be posted") has no window for a late find.
 
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use embassy_rp::Peri;
 use embassy_rp::multicore::{Stack, spawn_core1};
@@ -79,11 +79,48 @@ static MAILBOX: Mutex<CriticalSectionRawMutex, RefCell<Mailbox>> =
 static STOP: AtomicBool = AtomicBool::new(false);
 /// Core1 → core0: a search is running (raised atomically with taking the job).
 static BUSY: AtomicBool = AtomicBool::new(false);
+/// Core0 → core1: a job sits in the mailbox. The idle loop polls ONLY this
+/// atomic — embassy's executors on core0 broadcast SEV constantly, so WFE
+/// falls through ~continuously and the idle loop is effectively a spin; one
+/// SRAM load per spin keeps it off the spinlock and (nearly) off XIP, instead
+/// of hammering both through the Mutex on every spurious wake.
+static JOB_PENDING: AtomicBool = AtomicBool::new(false);
+/// Latched when core1 stops answering (BUSY stuck past the entry deadline):
+/// from then on every search runs single-core. A halted core1 (panic, fault)
+/// must degrade keygen, never hang the worker — the worker is the device.
+static DEGRADED: AtomicBool = AtomicBool::new(false);
 
 /// Core1's stack. The deep frame is `passes_fermat_base2` → `modexp_priv`
 /// (~6 KiB of fixed buffers); 16 KiB leaves comfortable headroom for the
 /// Baillie-PSW bignum work on top.
 static CORE1_STACK: StaticCell<Stack<16384>> = StaticCell::new();
+
+/// Liveness counters, readable over the vendor applet (INS 0x12) — the only
+/// window into core1, which has no debugger and no UART: idle-loop wakes and
+/// jobs taken on core1, then candidates tried / primes found per core (the
+/// per-core rates expose cross-core XIP/bus contention). Relaxed throughout —
+/// monotonic telemetry, not synchronization.
+static WAKES: AtomicU32 = AtomicU32::new(0);
+static JOBS: AtomicU32 = AtomicU32::new(0);
+static C1_TRIES: AtomicU32 = AtomicU32::new(0);
+static C1_FINDS: AtomicU32 = AtomicU32::new(0);
+static C0_TRIES: AtomicU32 = AtomicU32::new(0);
+static C0_FINDS: AtomicU32 = AtomicU32::new(0);
+
+/// The six counters plus the live flags (busy, stop, job-pending, degraded),
+/// little-endian packed for the vendor read.
+pub fn stats() -> [u8; 28] {
+    let mut out = [0u8; 28];
+    let counters = [&WAKES, &JOBS, &C1_TRIES, &C1_FINDS, &C0_TRIES, &C0_FINDS];
+    for (slot, c) in out.chunks_exact_mut(4).take(6).zip(counters) {
+        slot.copy_from_slice(&c.load(Ordering::Relaxed).to_le_bytes());
+    }
+    let flags = [&BUSY, &STOP, &JOB_PENDING, &DEGRADED];
+    for (b, f) in out[24..].iter_mut().zip(flags) {
+        *b = f.load(Ordering::Relaxed) as u8;
+    }
+    out
+}
 
 /// Boot the engine (idle in WFE until the first job). Called once from `main`;
 /// from that point embassy-rp's flash driver pauses/resumes core1 around every
@@ -105,7 +142,22 @@ fn scrub_found(mb: &mut Mailbox) {
 
 /// Core1 entry: wait for a job, search until satisfied or told to stop, repeat.
 fn core1_main() -> ! {
+    // Whether the late-find scrub already ran for the current STOP edge.
+    let mut stop_scrubbed = false;
     loop {
+        // The cheap idle gate: one SRAM atomic, no lock (see JOB_PENDING).
+        if !JOB_PENDING.load(Ordering::Acquire) {
+            // STOP up means core0 has assembled and drained: anything still
+            // in the found slots is OUR late post — scrub it (once per edge).
+            if STOP.load(Ordering::Acquire) && !stop_scrubbed {
+                MAILBOX.lock(|mb| scrub_found(&mut mb.borrow_mut()));
+                stop_scrubbed = true;
+            }
+            cortex_m::asm::wfe();
+            continue;
+        }
+        stop_scrubbed = false;
+        WAKES.fetch_add(1, Ordering::Relaxed);
         // Take the job and raise BUSY in ONE critical section — the wind-down
         // in `run_rsa_search` relies on never observing "job taken, BUSY not
         // yet visible".
@@ -113,15 +165,16 @@ fn core1_main() -> ! {
             let job = mb.borrow_mut().job.take();
             if job.is_some() {
                 BUSY.store(true, Ordering::Relaxed);
+                JOB_PENDING.store(false, Ordering::Relaxed);
             }
             job
         });
         let Some(mut job) = job else {
-            // Sleep until core0 signals. Spurious wakes — any event, including
-            // the flash-pause FIFO interrupt — just re-poll.
+            // Raced with the wind-down's un-post: nothing to do after all.
             cortex_m::asm::wfe();
             continue;
         };
+        JOBS.fetch_add(1, Ordering::Relaxed);
         search(&job);
         job.seed.zeroize();
         BUSY.store(false, Ordering::Release);
@@ -147,10 +200,12 @@ fn search(job: &Job) {
     }
     let mut rng = DrbgRng(HmacDrbg::new(&job.seed));
     while !STOP.load(Ordering::Acquire) {
+        C1_TRIES.fetch_add(1, Ordering::Relaxed);
         let mut le = [0u8; MAX_HALF];
         let Some(len) = RsaKeygen::try_candidate_le(&mut rng, job.half_bytes, &mut le) else {
             continue;
         };
+        C1_FINDS.fetch_add(1, Ordering::Relaxed);
         let pool_full = MAILBOX.lock(|mb| {
             let mut mb = mb.borrow_mut();
             if let Some(slot) = mb.found.iter_mut().find(|s| s.is_none()) {
@@ -180,20 +235,43 @@ pub fn run_rsa_search(nbits: usize, rng: &mut dyn Rng) -> Option<Box<RsaPrivateK
         return None;
     }
 
-    // Post the job: stale finds scrubbed, fresh DRBG seed for core1.
-    let mut job = Job {
-        half_bytes: kg.half_bytes(),
-        seed: [0u8; SEED_LEN],
+    // The PREVIOUS search's core1 tail (one candidate at most — STOP is
+    // checked between candidates) may still be running; wait it out here,
+    // off that keygen's critical path, before reusing the mailbox. The wait
+    // is BOUNDED: a core1 that stops answering (halted by a panic or fault)
+    // must cost us the speedup, never the worker — latch DEGRADED and run
+    // every search single-core from then on.
+    let engaged = !DEGRADED.load(Ordering::Relaxed) && {
+        let deadline = embassy_time::Instant::now() + embassy_time::Duration::from_secs(2);
+        loop {
+            if !BUSY.load(Ordering::Acquire) {
+                break true;
+            }
+            if embassy_time::Instant::now() > deadline {
+                DEGRADED.store(true, Ordering::Relaxed);
+                break false;
+            }
+            core::hint::spin_loop();
+        }
     };
-    rng.fill(&mut job.seed[..SEED_LEN - SEED_TAG.len()]);
-    job.seed[SEED_LEN - SEED_TAG.len()..].copy_from_slice(SEED_TAG);
-    STOP.store(false, Ordering::Release);
-    MAILBOX.lock(|mb| {
-        let mut mb = mb.borrow_mut();
-        scrub_found(&mut mb);
-        mb.job = Some(job);
-    });
-    cortex_m::asm::sev();
+
+    if engaged {
+        // Post the job: stale finds scrubbed, fresh DRBG seed for core1.
+        let mut job = Job {
+            half_bytes: kg.half_bytes(),
+            seed: [0u8; SEED_LEN],
+        };
+        rng.fill(&mut job.seed[..SEED_LEN - SEED_TAG.len()]);
+        job.seed[SEED_LEN - SEED_TAG.len()..].copy_from_slice(SEED_TAG);
+        STOP.store(false, Ordering::Release);
+        MAILBOX.lock(|mb| {
+            let mut mb = mb.borrow_mut();
+            scrub_found(&mut mb);
+            mb.job = Some(job);
+        });
+        JOB_PENDING.store(true, Ordering::Release);
+        cortex_m::asm::sev();
+    }
 
     // `Some(Some(key))` = assembled, `Some(None)` = the old `Failed`.
     let mut outcome: Option<Option<Box<RsaPrivateKey>>> = None;
@@ -221,8 +299,10 @@ pub fn run_rsa_search(nbits: usize, rng: &mut dyn Rng) -> Option<Box<RsaPrivateK
             continue; // re-poll before sinking into a slow own candidate
         }
         // …then one own candidate (the slow part, one Baillie-PSW).
+        C0_TRIES.fetch_add(1, Ordering::Relaxed);
         let mut le = [0u8; MAX_HALF];
         if let Some(len) = RsaKeygen::try_candidate_le(rng, kg.half_bytes(), &mut le) {
+            C0_FINDS.fetch_add(1, Ordering::Relaxed);
             match kg.offer_le(&mut le[..len]) {
                 RsaStep::More => {}
                 RsaStep::Done(k) => outcome = Some(Some(k)),
@@ -232,21 +312,20 @@ pub fn run_rsa_search(nbits: usize, rng: &mut dyn Rng) -> Option<Box<RsaPrivateK
         le.zeroize();
     }
 
-    // Wind down: un-post the job if core1 never took it, then stop a running
-    // search, wait for it to wind out, and scrub whatever it still found.
+    // Wind down — OFF the critical path: un-post the job if core1 never took
+    // it, drain-scrub what is posted right now, raise STOP, and return the key
+    // immediately. A candidate still in flight on core1 finishes in the
+    // background; core1 scrubs its own late find when it notices STOP, and the
+    // next job's entry gate (the BUSY wait above) keeps the mailbox exclusive.
     MAILBOX.lock(|mb| {
-        if let Some(mut j) = mb.borrow_mut().job.take() {
+        let mut mb = mb.borrow_mut();
+        if let Some(mut j) = mb.job.take() {
             j.seed.zeroize();
         }
+        JOB_PENDING.store(false, Ordering::Relaxed);
+        scrub_found(&mut mb);
     });
     STOP.store(true, Ordering::Release);
     cortex_m::asm::sev();
-    while BUSY.load(Ordering::Acquire) {
-        // Bounded by one candidate test on core1 (its loop checks STOP between
-        // candidates); USB stays alive on the interrupt executor meanwhile.
-        core::hint::spin_loop();
-    }
-    MAILBOX.lock(|mb| scrub_found(&mut mb.borrow_mut()));
-    STOP.store(false, Ordering::Release);
     outcome.flatten()
 }

@@ -13,11 +13,12 @@ are marked.
   of Curve448 is thin and unaudited. Cv25519/Ed25519 plus the NIST curves and
   secp256k1 cover practical use. *Status: until a serious crate exists.*
 - **RSA-3072/4096 on-card generation is slow** — the prime search dominates;
-  it runs on both cores ([architecture](architecture.md)), which roughly
-  halves the expected search time against the single-core figures of ~35 s /
-  ~65 s. The device streams keepalives either way, so tools wait it out.
-  Import is fast. *Status: inherent to the hardware class, now at the
-  two-core limit.*
+  it runs on both cores with the modexp hot path in SRAM
+  ([architecture](architecture.md)). Measured on hardware for RSA-2048:
+  ~8.9 s single-core → ~4.3 s mean (2.07×, n = 10); the single-core 3072/4096
+  figures were ~35 s / ~65 s and scale by a similar factor. The device
+  streams keepalives either way, so tools wait it out. Import is fast.
+  *Status: inherent to the hardware class, now at the two-core limit.*
 - **ML-KEM is scaffolding** — compiled, tested, unused: no CTAP PIN/UV
   protocol number for PQC key agreement exists yet to implement.
   *Status: waiting on standards.*

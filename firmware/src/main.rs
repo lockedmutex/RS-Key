@@ -57,14 +57,17 @@ use worker::{ClientCcid, ClientCtap, Worker};
 
 use panic_halt as _;
 
-// Heap for the OpenPGP RSA big-integer arithmetic. Nothing else allocates;
-// 64 KiB of the RP2350's 520 KiB SRAM covers an RSA-4096 private op with blinding.
+// Heap for the RSA big-integer arithmetic. Nothing else allocates; 64 KiB
+// covered one RSA-4096 private op with blinding, and the dual-core keygen can
+// now run a Baillie-PSW tail on core1 CONCURRENTLY with the finish path's
+// certificate signing on core0 — double it so the two peaks always fit
+// (an allocation failure is a panic, and a panic halts the core).
 use embedded_alloc::LlffHeap as Heap;
 
 #[global_allocator]
 static HEAP: Heap = Heap::empty();
 
-const HEAP_SIZE: usize = 64 * 1024;
+const HEAP_SIZE: usize = 128 * 1024;
 
 // RP2350 bootrom image definition (`.start_block`).
 #[unsafe(link_section = ".start_block")]
@@ -278,7 +281,7 @@ async fn main(_spawner: Spawner) {
     config.serial_number = Some("rs-key-0001");
     config.max_power = 100;
     config.max_packet_size_0 = 64;
-    config.device_release = 0x074B; // bcdDevice: our build counter
+    config.device_release = 0x0750; // bcdDevice: our build counter
 
     let mut builder = Builder::new(
         driver,

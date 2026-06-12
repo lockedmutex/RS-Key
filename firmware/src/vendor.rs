@@ -28,6 +28,10 @@ const INS_GET: u8 = 0x02;
 // SET LED: P1 = brightness (0–255), P2 = color(0–7) | steady(0x08) | status<<4.
 const INS_SET_LED: u8 = 0x10;
 const INS_GET_LED: u8 = 0x11;
+// CORE1 STATS: 28 bytes LE — core1 wakes + jobs, candidates tried / primes
+// found per core, then the live flags (busy, stop, job-pending, degraded).
+// The second core has no debugger and no UART; this is its only window.
+const INS_CORE1_STATS: u8 = 0x12;
 const INS_REBOOT: u8 = 0x1F; // P1: 0 = warm reboot, 1 = secure reboot to BOOTSEL
 
 /// Pending reboot request: 0 = none, 1 = warm reboot,
@@ -88,6 +92,10 @@ impl<S: Storage> Applet<Fs<S>> for VendorApplet {
             }
             INS_GET_LED => {
                 res.extend(&crate::led::config_block());
+                Sw::OK
+            }
+            INS_CORE1_STATS => {
+                res.extend(&crate::core1::stats());
                 Sw::OK
             }
             INS_REBOOT => {

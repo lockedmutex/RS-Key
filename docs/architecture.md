@@ -39,8 +39,15 @@ upstream design used a second core and hand-rolled queues for. Core 1 is
 kept out of the transport picture and has exactly one job: during on-card
 RSA generation both cores race the prime search — independent random
 candidates, each core with its own DRBG stream, one shared two-prime pool
-(`firmware/src/core1.rs`) — which roughly halves the expected keygen time.
-Outside keygen it parks in WFE, and embassy-rp pauses it around every flash
+(`firmware/src/core1.rs`). Measured: RSA-2048 generation drops from ~8.9 s
+to ~4.3 s mean (2.07×). Three details make that real: the Fermat-filter
+modexp (C + asm) executes from SRAM, because two cores running it from XIP
+throttle each other on the shared flash cache (~40% per core, measured); the
+key returns the moment the pool completes, with core1's last candidate
+finishing in the background; and a core1 that ever stops answering latches
+the engine into single-core mode rather than stalling the worker (`INS 0x12`
+on the vendor applet reads the engine's counters and flags). Outside keygen
+core1 parks in WFE, and embassy-rp pauses it around every flash
 erase/program, so its XIP fetches never collide with flash writes.
 
 ## Crates
