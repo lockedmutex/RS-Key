@@ -69,6 +69,11 @@ up-button = []
 # PQC capability works either way; this only changes the advertisement:
 # `cargo build --release -p firmware --features advertise-pqc`.
 advertise-pqc = ["rsk-fido/advertise-pqc"]
+# FIPS-style policy profile, OFF by default (the default image is unchanged).
+# Opt-in: `cargo build --release -p firmware --features fips-profile` bakes the
+# locked algorithm policy into the image — and secure boot seals it there.
+# What it locks: docs/guides/fips.md. A profile, not a FIPS validation.
+fips-profile = ["rsk-fido/fips-profile", "rsk-piv/fips-profile"]
 
 [[bin]]
 name = "firmware"

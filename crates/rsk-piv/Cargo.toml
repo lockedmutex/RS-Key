@@ -25,3 +25,10 @@ p384 = { workspace = true }
 sha2 = { workspace = true }
 # Independent X.509 parser to cross-check the hand-built DER certs (host only).
 x509-parser = "0.16"
+
+[features]
+# FIPS-style policy profile, OFF by default — the default build is unchanged.
+# When enabled: no new 3DES management keys and no RSA-1024 generation/import
+# (SP 800-131A); an existing 3DES key still authenticates so it can be
+# migrated to AES. See docs/guides/fips.md.
+fips-profile = []

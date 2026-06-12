@@ -49,7 +49,9 @@ fn alg_to_curve(alg: i64) -> Option<(i64, u8)> {
         ALG_ES256 | ALG_ESP256 => Some((ALG_ES256, CURVE_P256)),
         ALG_ES384 | ALG_ESP384 => Some((ALG_ES384, CURVE_P384)),
         ALG_ES512 | ALG_ESP512 => Some((ALG_ES512, CURVE_P521)),
-        ALG_ES256K => Some((ALG_ES256K, CURVE_P256K1)),
+        // The FIPS-style profile keeps secp256k1 out of new credentials
+        // (existing K1 credentials still assert — creation is the policy gate).
+        ALG_ES256K if cfg!(not(feature = "fips-profile")) => Some((ALG_ES256K, CURVE_P256K1)),
         ALG_EDDSA | ALG_ED25519 => Some((ALG_EDDSA, CURVE_ED25519)),
         // ML-DSA-44 only — -49/-50 fall through as unsupported (no enabled backend).
         ALG_MLDSA44 => Some((ALG_MLDSA44, CURVE_MLDSA44)),
@@ -993,6 +995,16 @@ mod tests {
             make_credential(&mut ctx, &buf[..n], &mut out),
             Err(CtapError::UnsupportedAlgorithm)
         );
+    }
+
+    #[cfg(feature = "fips-profile")]
+    #[test]
+    fn fips_es256k_not_negotiable() {
+        // The profile drops secp256k1 from negotiation; the approved set stays.
+        assert_eq!(alg_to_curve(ALG_ES256K), None);
+        assert!(alg_to_curve(ALG_ES256).is_some());
+        assert!(alg_to_curve(ALG_EDDSA).is_some());
+        assert!(alg_to_curve(ALG_MLDSA44).is_some());
     }
 
     #[test]

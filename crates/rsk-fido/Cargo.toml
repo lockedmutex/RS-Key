@@ -33,3 +33,8 @@ rsk-fs = { workspace = true, features = ["test-util"] }
 # getInfo parse on an unknown COSE id. The PQC capability itself is always on —
 # makeCredential negotiates -48 from the request regardless of this flag.
 advertise-pqc = []
+# FIPS-style policy profile, OFF by default — the default build changes in no
+# way. When enabled: ES256K (secp256k1) leaves the FIDO menu, the minimum PIN
+# rises to 6 and the vendor seed export is refused. A build profile, not a
+# FIPS validation — see docs/guides/fips.md.
+fips-profile = []

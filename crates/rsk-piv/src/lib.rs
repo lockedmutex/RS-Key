@@ -681,10 +681,14 @@ impl PivApplet<'_> {
             return Sw::WRONG_LENGTH;
         }
         let (algo, key_ref, klen) = (apdu.data[0], apdu.data[1], apdu.data[2] as usize);
+        // The FIPS-style profile refuses *new* 3DES management keys
+        // (SP 800-131A); an existing 3DES key still authenticates, so a
+        // reflashed device can migrate itself to AES.
+        let tdes = cfg!(not(feature = "fips-profile"));
         let len_ok = matches!(
             (algo, klen),
-            (ALGO_3DES, 24) | (ALGO_AES128, 16) | (ALGO_AES192, 24) | (ALGO_AES256, 32)
-        );
+            (ALGO_AES128, 16) | (ALGO_AES192, 24) | (ALGO_AES256, 32)
+        ) || (tdes && (algo, klen) == (ALGO_3DES, 24));
         if key_ref != SLOT_CARDMGM || !len_ok {
             return WRONG_DATA;
         }
@@ -1355,6 +1359,31 @@ mod tests {
         assert_eq!(sw, Sw::DATA_INVALID);
         let (sw, _) = run(&mut app, &mut fs, INS_SET_RETRIES, 5, 5, &[]);
         assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
+    }
+
+    #[cfg(feature = "fips-profile")]
+    #[test]
+    fn fips_refuses_3des_mgm_and_rsa1024() {
+        let rng = RefCell::new(TestRng(7));
+        let pres = RefCell::new(AlwaysConfirm);
+        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
+        let mut fs = new_fs();
+        select(&mut app, &mut fs);
+        auth_mgm(&mut app, &mut fs);
+        // A new 3DES management key is refused (SP 800-131A)…
+        let mut msg = vec![ALGO_3DES, 0x9B, 24];
+        msg.extend_from_slice(&DEFAULT_MGM);
+        let (sw, _) = run(&mut app, &mut fs, INS_SET_MGMKEY, 0xFF, 0xFF, &msg);
+        assert_eq!(sw, WRONG_DATA);
+        // …and so is RSA-1024 generation.
+        let tmpl = [0xAC, 0x03, 0x80, 0x01, ALGO_RSA1024];
+        let (sw, _) = run(&mut app, &mut fs, INS_ASYM_KEYGEN, 0x00, 0x9A, &tmpl);
+        assert_eq!(sw, WRONG_DATA);
+        // AES management keys are unaffected.
+        let mut msg = vec![ALGO_AES256, 0x9B, 32];
+        msg.extend_from_slice(&[0x11; 32]);
+        let (sw, _) = run(&mut app, &mut fs, INS_SET_MGMKEY, 0xFF, 0xFF, &msg);
+        assert_eq!(sw, Sw::OK);
     }
 
     #[test]

@@ -43,6 +43,11 @@ pub(crate) fn parse_gen_template(data: &[u8]) -> Result<GenReq, Sw> {
     let algo = find_tag(ac, 0x80)
         .filter(|v| !v.is_empty())
         .ok_or(WRONG_DATA)?[0];
+    // SP 800-131A: no RSA-1024 generation under the FIPS-style profile. This is
+    // the one template parser, so it also covers the firmware prime-search path.
+    if cfg!(feature = "fips-profile") && algo == ALGO_RSA1024 {
+        return Err(WRONG_DATA);
+    }
     let pin_policy = find_tag(ac, 0xAA).and_then(|v| v.first().copied());
     let touch_policy = find_tag(ac, 0xAB).and_then(|v| v.first().copied());
     Ok(GenReq {
@@ -231,6 +236,10 @@ pub(crate) fn import<S: Storage>(
     }
     if !sess.has_mgm {
         return Sw::SECURITY_STATUS_NOT_SATISFIED;
+    }
+    // SP 800-131A: no RSA-1024 import under the FIPS-style profile either.
+    if cfg!(feature = "fips-profile") && algo == ALGO_RSA1024 {
+        return WRONG_DATA;
     }
     let pin_policy = find_tag(data, 0xAA).and_then(|v| v.first().copied());
     let touch_policy = find_tag(data, 0xAB).and_then(|v| v.first().copied());

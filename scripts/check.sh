@@ -17,6 +17,12 @@ run "clippy (host tests)"      cargo clippy -p rsk-sdk -p rsk-fs -p rsk-usb -p r
 run "test (host)"              cargo test -p rsk-sdk -p rsk-fs -p rsk-usb -p rsk-crypto -p rsk-fido -p rsk-openpgp -p rsk-rsa-asm -p rsk-mgmt -p rsk-oath -p rsk-otp -p rsk-piv -p rsk-rescue --target "$HOST"
 # The PQC-advertisement opt-in changes the getInfo shape — test both forms.
 run "test (advertise-pqc)"     cargo test -p rsk-fido --features advertise-pqc --target "$HOST" getinfo
+# The FIPS-style profile changes algorithm menus / PIN floor / export policy;
+# run its tests (name-filtered: the regular fixtures assume the 4-char PIN
+# floor) and type-check the locked firmware image.
+run "test (fips: rsk-fido)"    cargo test -p rsk-fido --features fips-profile --target "$HOST" fips
+run "test (fips: rsk-piv)"     cargo test -p rsk-piv --features fips-profile --target "$HOST" fips
+run "clippy (fips firmware)"   cargo clippy -p firmware --features fips-profile -- -D warnings
 run "build firmware (release)" cargo build --release -p firmware
 # The test build: no BOOTSEL presence, so the automated suites don't hang on a touch.
 run "build firmware (test, --no-default-features)" cargo build --release -p firmware --no-default-features

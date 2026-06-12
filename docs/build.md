@@ -16,6 +16,7 @@ picotool uf2 convert target/thumbv8m.main-none-eabihf/release/firmware -t elf fi
 |---|---|---|
 | `up-button` | **on** | FIDO operations (makeCredential, getAssertion, U2F, reset, selection) and OpenPGP UIF data objects require a press of the BOOTSEL button. Build with `--no-default-features` to get the **no-touch test build** — the automated suites (`tests/`, python-fido2, OpenPGP card tests) cannot press a button and will hang on a touch build. |
 | `advertise-pqc` | off | Prepends ML-DSA-44 (COSE −48) to the getInfo `algorithms` list. Off by default because released Firefox versions abort the *entire* getInfo parse on an unknown COSE id and report the authenticator broken. **PQC capability is on regardless of this flag** — makeCredential negotiates −48 from the request's `pubKeyCredParams`; the flag only controls advertising. |
+| `fips-profile` | off | Bakes a locked FIPS-style policy into the image: ES256K (secp256k1) leaves the FIDO menu, the minimum PIN rises to 6, the vendor seed *export* is refused, and PIV refuses new 3DES management keys and RSA-1024. The default build is unchanged; with secure boot the policy is sealed by your signature. A profile, **not** a FIPS validation — details and rationale: [guides/fips.md](guides/fips.md). |
 
 ## Environment variables
 

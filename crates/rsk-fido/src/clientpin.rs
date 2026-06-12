@@ -785,6 +785,36 @@ mod tests {
         set_and_get_token(PinProto::One, 1);
     }
 
+    #[cfg(feature = "fips-profile")]
+    #[test]
+    fn fips_min_pin_floor_is_six() {
+        let (mut fs, mut rng) = setup();
+        let mut state = FidoState::new();
+        let plat = key_agreement(&mut fs, &mut rng, &mut state, PinProto::Two, 2);
+        let mut out = [0u8; 256];
+        // Four code points sit under the profile's floor…
+        assert_eq!(
+            run(
+                &mut fs,
+                &mut rng,
+                &mut state,
+                &plat.set_pin_req(b"1234"),
+                &mut out
+            ),
+            Err(CtapError::PinPolicyViolation)
+        );
+        // …six pass.
+        run(
+            &mut fs,
+            &mut rng,
+            &mut state,
+            &plat.set_pin_req(b"123456"),
+            &mut out,
+        )
+        .unwrap();
+        assert!(fs.has_data(EF_PIN));
+    }
+
     #[test]
     fn forced_pin_change_blocks_tokens_until_change_pin() {
         let (mut fs, mut rng) = setup();

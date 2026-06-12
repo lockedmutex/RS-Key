@@ -101,8 +101,11 @@ fn write_info<W: Write>(
     // 0x0A algorithms — the classic list (ES256, EdDSA, ES384, ES512, ES256K);
     // `advertise-pqc` prepends ML-DSA-44. Off by default: shipped Firefoxes
     // reject the whole getInfo on an unknown COSE id (see module docs).
+    // `fips-profile` drops ES256K — secp256k1 is not a NIST-approved curve.
     let pqc = cfg!(feature = "advertise-pqc");
-    enc.u8(0x0A)?.array(5 + u64::from(pqc))?;
+    let es256k = cfg!(not(feature = "fips-profile"));
+    enc.u8(0x0A)?
+        .array(4 + u64::from(pqc) + u64::from(es256k))?;
     if pqc {
         cose_public_key(enc, ALG_MLDSA44)?;
     }
@@ -110,7 +113,9 @@ fn write_info<W: Write>(
     cose_public_key(enc, ALG_EDDSA)?;
     cose_public_key(enc, ALG_ES384)?;
     cose_public_key(enc, ALG_ES512)?;
-    cose_public_key(enc, ALG_ES256K)?;
+    if es256k {
+        cose_public_key(enc, ALG_ES256K)?;
+    }
 
     // 0x0B maxSerializedLargeBlobArray
     enc.u8(0x0B)?.u64(MAX_LARGE_BLOB_SIZE as u64)?;
@@ -136,6 +141,35 @@ fn write_info<W: Write>(
 mod tests {
     use super::*;
     use minicbor::Decoder;
+
+    #[cfg(feature = "fips-profile")]
+    #[test]
+    fn fips_algorithms_drop_es256k() {
+        let mut out = [0u8; 1024];
+        let n = get_info(false, 6, false, false, &mut out).unwrap();
+        let mut d = Decoder::new(&out[..n]);
+        let entries = d.map().unwrap().unwrap();
+        let mut algs = std::vec::Vec::new();
+        for _ in 0..entries {
+            let key = d.u32().unwrap();
+            if key == 0x0A {
+                let m = d.array().unwrap().unwrap();
+                for _ in 0..m {
+                    assert_eq!(d.map().unwrap().unwrap(), 2);
+                    assert_eq!(d.str().unwrap(), "alg");
+                    algs.push(d.i64().unwrap());
+                    assert_eq!(d.str().unwrap(), "type");
+                    assert_eq!(d.str().unwrap(), "public-key");
+                }
+            } else {
+                d.skip().unwrap();
+            }
+        }
+        // secp256k1 is out; the NIST set and EdDSA (FIPS 186-5) stay. The
+        // `ends_with` tolerates an advertise-pqc ML-DSA-44 prefix.
+        assert!(!algs.contains(&ALG_ES256K));
+        assert!(algs.ends_with(&[ALG_ES256, ALG_EDDSA, ALG_ES384, ALG_ES512]));
+    }
 
     #[test]
     fn get_info_fields() {

@@ -316,6 +316,12 @@ fn pin_gate<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req) -> Result<(), Ct
 /// `BACKUP_EXPORT`: encrypt the 32-byte seed under the MSE channel and return it.
 /// Refused once the export window is sealed (finalize or a prior backup).
 fn backup_export<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [u8]) -> CtapResult {
+    // The FIPS-style profile seals the seed in entirely (non-exportable key
+    // material; the MSE channel is ChaCha20-Poly1305 — not approved transport).
+    // LOAD stays available: keys may migrate *into* a profile build, never out.
+    if cfg!(feature = "fips-profile") {
+        return Err(CtapError::NotAllowed);
+    }
     if ctx.fs.has_data(EF_BACKUP_SEALED) {
         return Err(CtapError::NotAllowed);
     }
@@ -584,6 +590,27 @@ mod tests {
         let mut rng = SeqRng(1);
         ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
         (fs, rng, FidoState::new())
+    }
+
+    #[cfg(feature = "fips-profile")]
+    #[test]
+    fn fips_backup_export_refused() {
+        let (mut fs, mut rng, mut st) = setup();
+        st.mse_active = true; // even over a live channel the seed is sealed in
+        let mut req = [0u8; 16];
+        let n = one_byte_req(&mut req, VENDOR_BACKUP_EXPORT);
+        let mut out = [0u8; 64];
+        assert_eq!(
+            call(
+                &mut fs,
+                &mut rng,
+                &mut st,
+                &mut AlwaysConfirm,
+                &req[..n],
+                &mut out
+            ),
+            Err(CtapError::NotAllowed)
+        );
     }
 
     #[test]

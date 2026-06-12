@@ -175,7 +175,11 @@ pub const EF_LARGEBLOB: u16 = 0x1101; // serialized large-blob array
 /// PIN retry budget.
 pub const MAX_PIN_RETRIES: u8 = 8;
 /// Default minimum PIN length when no policy is set.
+#[cfg(not(feature = "fips-profile"))]
 pub const MIN_PIN_LENGTH: u8 = 4;
+/// The FIPS-style profile raises the PIN floor to six code points.
+#[cfg(feature = "fips-profile")]
+pub const MIN_PIN_LENGTH: u8 = 6;
 
 // U2F authenticate control byte (P1) and flags.
 pub const U2F_AUTH_ENFORCE: u8 = 0x03; // enforce user presence and sign
