@@ -41,6 +41,8 @@ pub const VENDOR_BACKUP_LOAD: u64 = 0x03; // install a seed from the host (gated
 pub const VENDOR_BACKUP_FINALIZE: u64 = 0x04; // seal the one-time export window
 pub const VENDOR_BACKUP_STATE: u64 = 0x05; // read the lock/backup flags (ungated)
 pub const VENDOR_UNLOCK: u64 = 0x06; // soft-lock: decrypt EF_KEY_DEV_ENC to RAM
+pub const VENDOR_AUDIT_READ: u64 = 0x07; // export the audit journal window
+pub const VENDOR_AUDIT_CHECKPOINT: u64 = 0x08; // DEVK-signed chain checkpoint
 
 // authenticatorConfig subcommands.
 pub const CONFIG_ENABLE_EA: u64 = 0x01; // enableEnterpriseAttestation
@@ -150,6 +152,12 @@ pub const LARGEBLOB_INITIAL: [u8; 17] = [
 pub const MAX_RESIDENT_CREDENTIALS: u16 = 256;
 
 // FIDO flash file ids (device-local; fids never cross the wire).
+// Audit journal (journal.rs) — deliberately outside every reset range: FIDO's
+// authenticatorReset wipes an explicit set (reset.rs), PIV factory-reset wipes
+// 0xD100..=0xD2FF; the journal survives both by construction.
+pub const EF_AUDIT_META: u16 = 0xC100; // ver ‖ seq_next ‖ start ‖ epoch hash
+pub const EF_AUDIT_RING: u16 = 0xC110; // entry slots, 0xC110..0xC110+AUDIT_RING_SLOTS
+pub const AUDIT_RING_SLOTS: u32 = 128;
 pub const EF_KEY_DEV: u16 = 0xCC00; // device master seed, encrypted
 pub const EF_BACKUP_SEALED: u16 = 0xCC02; // [1] once the seed has been backed up
 /// Soft-locked seed: ChaCha20-Poly1305(host lock key) over the seed value.

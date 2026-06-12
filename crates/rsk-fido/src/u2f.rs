@@ -18,6 +18,7 @@ use crate::consts::{
 };
 use crate::credential::credential_load;
 use crate::ec::{MAX_DER_SIG, P256Key};
+use crate::journal;
 use crate::keyderiv::{KEY_HANDLE_LEN, derive_new, fido_load_key, verify_key};
 use crate::seed::{bump_sign_counter, get_sign_counter};
 use crate::{Ctx, Rng};
@@ -125,6 +126,7 @@ fn cmd_register<S: Storage, R: Rng>(
     q += clen;
     out[q..q + sl].copy_from_slice(&sig[..sl]);
     q += sl;
+    journal::append(ctx, journal::EV_U2F_REGISTER, 0, &apdu.data[32..40]);
     (Sw::OK, q)
 }
 
@@ -213,6 +215,7 @@ fn cmd_authenticate<S: Storage, R: Rng>(
     out[1..5].copy_from_slice(&ctr.to_be_bytes());
     out[5..5 + sl].copy_from_slice(&sig[..sl]);
     let _ = bump_sign_counter(ctx.fs);
+    journal::append(ctx, journal::EV_U2F_AUTH, 0, &app[..8]);
     (Sw::OK, 5 + sl)
 }
 

@@ -20,6 +20,7 @@ pub mod error;
 pub mod getassertion;
 pub mod getinfo;
 pub mod hmacsecret;
+pub mod journal;
 pub mod keyderiv;
 pub mod largeblobs;
 pub mod makecredential;

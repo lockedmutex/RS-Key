@@ -35,12 +35,13 @@ use rsk_fs::Storage;
 use crate::cbordec::{cbor, def_map};
 use crate::consts::{
     CTAP_VENDOR, EF_BACKUP_SEALED, EF_EE_DEV, EF_KEY_DEV, EF_KEY_DEV_ENC, EF_PIN,
-    VENDOR_BACKUP_EXPORT, VENDOR_BACKUP_FINALIZE, VENDOR_BACKUP_LOAD, VENDOR_BACKUP_STATE,
-    VENDOR_MSE, VENDOR_UNLOCK,
+    VENDOR_AUDIT_CHECKPOINT, VENDOR_AUDIT_READ, VENDOR_BACKUP_EXPORT, VENDOR_BACKUP_FINALIZE,
+    VENDOR_BACKUP_LOAD, VENDOR_BACKUP_STATE, VENDOR_MSE, VENDOR_UNLOCK,
 };
 use crate::cose::cose_key_ecdh;
 use crate::ec::P256Key;
 use crate::error::{CtapError, CtapResult};
+use crate::journal;
 use crate::seed::{LOCK_BLOB_LEN, encrypt_keydev_f1, ensure_seed, lock_engaged, open_seed_locked};
 use crate::state::PERM_ACFG;
 use crate::{Ctx, Rng};
@@ -86,7 +87,10 @@ fn parse(data: &[u8]) -> Result<Req<'_>, CtapError> {
                             }
                         }
                     } else if sk == 1
-                        && matches!(req.subcommand, VENDOR_BACKUP_LOAD | VENDOR_UNLOCK)
+                        && matches!(
+                            req.subcommand,
+                            VENDOR_BACKUP_LOAD | VENDOR_UNLOCK | VENDOR_AUDIT_CHECKPOINT
+                        )
                     {
                         req.blob = cbor(d.bytes())?;
                     } else {
@@ -133,8 +137,33 @@ pub fn vendor<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, data: &[u8], out: &mut [u
         VENDOR_BACKUP_FINALIZE => backup_finalize(ctx),
         VENDOR_BACKUP_STATE => backup_state(ctx, out),
         VENDOR_UNLOCK => unlock(ctx, &req),
+        VENDOR_AUDIT_READ => audit_read(ctx, &req, out),
+        VENDOR_AUDIT_CHECKPOINT => audit_checkpoint(ctx, &req, out),
         _ => Err(CtapError::InvalidParameter),
     }
+}
+
+/// `AUDIT_READ`: export the journal window (`journal::vendor_read`). Gated on a
+/// PIN token (when a PIN is set) only — the entries are pseudonymous and no key
+/// material moves, so no MSE channel and no touch.
+fn audit_read<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [u8]) -> CtapResult {
+    pin_gate(ctx, req)?;
+    journal::vendor_read(ctx, out)
+}
+
+/// `AUDIT_CHECKPOINT`: sign the chain head (`journal::vendor_checkpoint`).
+/// PIN token plus a physical touch; the subCommandParams blob is the host's
+/// freshness challenge (≤ 32 bytes).
+fn audit_checkpoint<S: Storage, R: Rng>(
+    ctx: &mut Ctx<S, R>,
+    req: &Req,
+    out: &mut [u8],
+) -> CtapResult {
+    pin_gate(ctx, req)?;
+    if !ctx.check_user_presence() {
+        return Err(CtapError::OperationDenied);
+    }
+    journal::vendor_checkpoint(ctx, req.blob, out)
 }
 
 /// Decrypt the channel-wrapped 32-byte lock key carried in `blob`
@@ -252,6 +281,17 @@ fn gate<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req) -> Result<(), CtapEr
     if !ctx.state.mse_active {
         return Err(CtapError::NotAllowed);
     }
+    pin_gate(ctx, req)?;
+    if !ctx.check_user_presence() {
+        return Err(CtapError::OperationDenied);
+    }
+    Ok(())
+}
+
+/// The PIN half of [`gate`], shared with the audit subcommands: when a PIN is
+/// configured, require a pinUvAuthToken with the `acfg` permission over
+/// `0xff×32 ‖ 0x41 ‖ subcommand ‖ rawSubCommandParams`.
+fn pin_gate<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req) -> Result<(), CtapError> {
     if ctx.fs.has_data(EF_PIN) {
         let param = req.pin_uv_auth_param.ok_or(CtapError::PuatRequired)?;
         let proto = PinProto::from_u64(req.proto).ok_or(CtapError::MissingParameter)?;
@@ -269,9 +309,6 @@ fn gate<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req) -> Result<(), CtapEr
         {
             return Err(CtapError::PinAuthInvalid);
         }
-    }
-    if !ctx.check_user_presence() {
-        return Err(CtapError::OperationDenied);
     }
     Ok(())
 }
@@ -300,6 +337,9 @@ fn backup_export<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [
         Ok(())
     });
     blob.zeroize();
+    if r.is_ok() {
+        journal::append(ctx, journal::EV_BACKUP_EXPORT, 0, &[]);
+    }
     r
 }
 
@@ -342,6 +382,7 @@ fn backup_load<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req) -> CtapResult
     res.map_err(|_| CtapError::Other)?;
     let _ = ctx.fs.delete(EF_EE_DEV);
     ensure_seed(&ctx.dev, ctx.fs, ctx.rng).map_err(|_| CtapError::Other)?;
+    journal::append(ctx, journal::EV_BACKUP_LOAD, 0, &[]);
     Ok(0)
 }
 
@@ -353,6 +394,7 @@ fn backup_finalize<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>) -> CtapResult {
     ctx.fs
         .put(EF_BACKUP_SEALED, &[1])
         .map_err(|_| CtapError::Other)?;
+    journal::append(ctx, journal::EV_BACKUP_FINALIZE, 0, &[]);
     Ok(0)
 }
 

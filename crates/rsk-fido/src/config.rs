@@ -19,6 +19,7 @@ use crate::consts::{
     CTAP_CONFIG, EF_KEY_DEV, EF_KEY_DEV_ENC, EF_MINPINLEN, EF_PIN, MIN_PIN_LENGTH,
 };
 use crate::error::{CtapError, CtapResult};
+use crate::journal;
 use crate::seed::{encrypt_keydev_f1, load_keydev, lock_engaged, seal_seed_locked};
 use crate::state::PERM_ACFG;
 use crate::vendor::open_channel_key;
@@ -150,6 +151,7 @@ pub fn authenticator_config<S: Storage, R: Rng>(
     match req.subcommand {
         CONFIG_ENABLE_EA => {
             ctx.state.enterprise_attestation = true;
+            journal::append(ctx, journal::EV_CFG_EA, 0, &[]);
             Ok(0)
         }
         CONFIG_SET_MIN_PIN => set_min_pin_length(
@@ -194,7 +196,10 @@ fn aut_enable<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, param: &[u8]) -> CtapResu
     });
     lock_key.zeroize();
     match r {
-        Some(Ok(())) => Ok(0),
+        Some(Ok(())) => {
+            journal::append(ctx, journal::EV_LOCK_ENGAGE, 0, &[]);
+            Ok(0)
+        }
         _ => Err(CtapError::Other),
     }
 }
@@ -220,6 +225,7 @@ fn aut_disable<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>) -> CtapResult {
         .delete(EF_KEY_DEV_ENC)
         .map_err(|_| CtapError::Other)?;
     ctx.state.clear_keydev_dec();
+    journal::append(ctx, journal::EV_LOCK_RELEASE, 0, &[]);
     Ok(0)
 }
 
@@ -272,6 +278,12 @@ fn set_min_pin_length<S: Storage, R: Rng>(
     ctx.fs
         .put(EF_MINPINLEN, &data[..len])
         .map_err(|_| CtapError::Other)?;
+    journal::append(
+        ctx,
+        journal::EV_CFG_MIN_PIN,
+        new_min as u8,
+        &[u8::from(force)],
+    );
     Ok(0)
 }
 

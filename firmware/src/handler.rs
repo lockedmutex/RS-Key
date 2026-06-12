@@ -134,13 +134,18 @@ impl<'a> AppletHandler<'a> {
         serial_id: [u8; 8],
         serial_hash: [u8; 32],
         otp_key: Option<[u8; 32]>,
+        devk: Option<[u8; 32]>,
     ) -> Self {
+        // The OTP DEVK signs audit-journal checkpoints (rsk_fido::journal); it
+        // rides in FidoState so the pure FIDO logic stays caller-supplied.
+        let mut fido_state = rsk_fido::FidoState::new();
+        fido_state.devk = devk;
         Self {
             fs,
             disp: Dispatcher::new(),
             vendor: VendorApplet,
             rng,
-            fido_state: rsk_fido::FidoState::new(),
+            fido_state,
             presence,
             serial_id,
             serial_hash,

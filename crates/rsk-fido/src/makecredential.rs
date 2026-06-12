@@ -34,6 +34,7 @@ use crate::credential::{
 use crate::ec::{CredKey, MAX_SIG_LEN, P256Key};
 use crate::error::{CtapError, CtapResult};
 use crate::hmacsecret::{self, HmacSecretReq};
+use crate::journal;
 use crate::keyderiv::fido_load_key;
 use crate::seed::{bump_sign_counter, get_sign_counter};
 use crate::state::PERM_MC;
@@ -531,6 +532,7 @@ fn make_credential_inner<S: Storage, R: Rng>(
         return Err(CtapError::KeyStoreFull);
     }
     bump_sign_counter(ctx.fs).map_err(|_| CtapError::Other)?;
+    journal::append(ctx, journal::EV_MAKE_CRED, 0, &rp_id_hash[..8]);
     Ok(resp_len)
 }
 

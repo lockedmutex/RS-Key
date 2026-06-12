@@ -28,6 +28,7 @@ use crate::credential::{
 use crate::ec::{CredKey, MAX_SIG_LEN};
 use crate::error::{CtapError, CtapResult};
 use crate::hmacsecret::{self, HmacSecretReq};
+use crate::journal;
 use crate::keyderiv::{KEY_HANDLE_LEN, fido_load_key, verify_key};
 use crate::seed::{bump_sign_counter, get_sign_counter};
 use crate::state::{MAX_ASSERTION_CREDS, PERM_GA};
@@ -261,6 +262,9 @@ pub fn get_assertion<S: Storage, R: Rng>(
     let mut seed = ctx.load_keydev().ok_or(CtapError::Other)?;
     let result = get_assertion_inner(ctx, &req, &rp_id_hash, &seed, uv, out);
     seed.zeroize();
+    if result.is_ok() {
+        journal::append(ctx, journal::EV_GET_ASSERT, 0, &rp_id_hash[..8]);
+    }
     result
 }
 

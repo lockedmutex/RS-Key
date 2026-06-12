@@ -21,6 +21,7 @@ use crate::cbordec::{cbor, def_map};
 use crate::consts::{EF_MINPINLEN, EF_PIN, MAX_PIN_RETRIES, MIN_PIN_LENGTH};
 use crate::cose::cose_key_ecdh;
 use crate::error::{CtapError, CtapResult};
+use crate::journal;
 use crate::seed::migrate_keydev_pin;
 use crate::state::{PERM_BE, PERM_GA, PERM_MC, PERM_PCMR};
 use crate::{Ctx, Rng};
@@ -176,6 +177,7 @@ fn set_pin<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [u8]) -
     let res = store_new_pin(ctx, &padded);
     padded.zeroize();
     res?;
+    journal::append(ctx, journal::EV_PIN_SET, 0, &[]);
     Ok(0)
 }
 
@@ -242,6 +244,7 @@ fn change_pin<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [u8]
     ctx.state.reset_pin_uv_auth_token(ctx.rng);
     ctx.state.reset_persistent_token(ctx.rng);
     ctx.state.needs_power_cycle = false;
+    journal::append(ctx, journal::EV_PIN_CHANGE, 0, &[]);
     Ok(0)
 }
 
@@ -414,11 +417,15 @@ fn verify_pin_hash<S: Storage, R: Rng>(
     if !matched {
         ctx.state.regenerate(ctx.rng);
         if retries == 0 {
+            // The transition into the hard lockout (later attempts are turned
+            // away before the verify, so this records exactly once).
+            journal::append(ctx, journal::EV_PIN_LOCKOUT, 0, &[]);
             return Err(CtapError::PinBlocked);
         }
         ctx.state.new_pin_mismatches += 1;
         if ctx.state.new_pin_mismatches >= 3 {
             ctx.state.needs_power_cycle = true;
+            journal::append(ctx, journal::EV_PIN_LOCKOUT, 1, &[]);
             return Err(CtapError::PinAuthBlocked);
         }
         return Err(CtapError::PinInvalid);

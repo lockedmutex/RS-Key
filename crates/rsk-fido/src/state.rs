@@ -187,6 +187,13 @@ pub struct FidoState {
     /// Soft-lock: the seed decrypted by a vendor `UNLOCK`. RAM-only — held until
     /// power-off, a reset, or an `AUT_DISABLE`; zeroized on `Drop` and on overwrite.
     pub keydev_dec: Option<[u8; 32]>,
+    /// The OTP DEVK (the reset-stable attestation root), set once by the
+    /// firmware at boot; `None` on an unprovisioned device and in most tests.
+    /// Device identity, not session state — it survives [`Self::reset`].
+    pub devk: Option<[u8; 32]>,
+    /// Whether this power cycle's `EV_BOOT` journal entry has been written
+    /// ([`crate::journal`]). Survives [`Self::reset`] — the cycle did not end.
+    pub audit_boot_logged: bool,
 }
 
 impl Default for FidoState {
@@ -213,6 +220,8 @@ impl FidoState {
             mse_key: [0; 32],
             mse_pub: [0; 65],
             keydev_dec: None,
+            devk: None,
+            audit_boot_logged: false,
         }
     }
 
@@ -225,9 +234,15 @@ impl FidoState {
     }
 
     /// Clear all session state after a reset (the `Drop` impl zeroizes the old
-    /// token / session key / ephemeral scalar).
+    /// token / session key / ephemeral scalar). The DEVK and the journal's
+    /// boot-entry flag are device/power-cycle facts, not session state — they
+    /// carry across.
     pub fn reset(&mut self) {
+        let devk = self.devk;
+        let audit_boot_logged = self.audit_boot_logged;
         *self = Self::new();
+        self.devk = devk;
+        self.audit_boot_logged = audit_boot_logged;
     }
 
     /// `initialize`: on the first clientPIN command, generate the ephemeral ECDH
@@ -306,6 +321,9 @@ impl Drop for FidoState {
         self.ppaut_token.zeroize();
         self.mse_key.zeroize();
         if let Some(k) = self.keydev_dec.as_mut() {
+            k.zeroize();
+        }
+        if let Some(k) = self.devk.as_mut() {
             k.zeroize();
         }
     }

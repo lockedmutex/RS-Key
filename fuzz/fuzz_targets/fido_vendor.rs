@@ -54,6 +54,8 @@ fuzz_target!(|data: &[u8]| {
     state.mse_active = true;
     state.mse_key = [0x5A; 32];
     state.mse_pub = [0x04; 65];
+    // A DEVK so AUDIT_CHECKPOINT's derive-and-sign path is reachable too.
+    state.devk = Some([0x42; 32]);
 
     let mut out = [0u8; 2048];
     let mut presence = rsk_fido::AlwaysConfirm;

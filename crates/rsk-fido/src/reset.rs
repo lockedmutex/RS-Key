@@ -12,6 +12,7 @@ use crate::consts::{
     EF_LARGEBLOB, EF_MINPINLEN, EF_PAUTHTOKEN, EF_PIN, EF_RP, MAX_RESIDENT_CREDENTIALS,
 };
 use crate::error::{CtapError, CtapResult};
+use crate::journal;
 use crate::seed::ensure_seed;
 use crate::{Ctx, Rng};
 
@@ -47,6 +48,10 @@ pub fn reset<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>) -> CtapResult {
     }
     ctx.state.reset();
     ensure_seed(&ctx.dev, ctx.fs, ctx.rng).map_err(|_| CtapError::Other)?;
+    // Privacy: fold the journal window into the epoch (per-event details are
+    // scrubbed, aggregate history stays attested), then record the reset.
+    journal::fold_and_scrub(ctx);
+    journal::append(ctx, journal::EV_RESET, 0, &[]);
     Ok(0)
 }
 

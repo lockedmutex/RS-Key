@@ -197,7 +197,7 @@ impl<'a> Worker<'a> {
         kv_total: u32,
     ) -> Self {
         Self {
-            ctap: AppletHandler::new(fs, rng, presence, serial_id, serial_hash, otp_key),
+            ctap: AppletHandler::new(fs, rng, presence, serial_id, serial_hash, otp_key, devk),
             ccid: CcidApplets::new(
                 fs,
                 rng,

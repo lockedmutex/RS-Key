@@ -14,6 +14,8 @@ protocols as a commercial YubiKey or Nitrokey:
 - **Wallet-style seed backup** — BIP-39 / SLIP-39 Shamir shares
 - **At-rest soft-lock** — the FIDO seed leaves flash encrypted to a key only
   you hold
+- **Signed audit trail** — a tamper-evident on-device event journal,
+  checkpointed by the OTP attestation key (`rsk audit verify`)
 - **Silicon root of trust** — OTP-fused master key + RP2350 secure boot
 
 It is written in pure Rust (`no_std`, [embassy](https://embassy.dev/)) with two
