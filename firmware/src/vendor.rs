@@ -33,6 +33,16 @@ const INS_GET_LED: u8 = 0x11;
 // job-pending, degraded). The second core has no debugger and no UART; this
 // is its only window.
 const INS_CORE1_STATS: u8 = 0x12;
+// KEYGEN MICROBENCH (debug builds only): time the two keygen hot primitives so
+// the small-prime sieve can be sized against the modexp cost. P1 selects the
+// primitive (0 = strong Miller-Rabin base 2, 1 = the full small-factor sieve),
+// data = a candidate (little-endian, length a multiple of 32). Runs it
+// BENCH_ITERS times and returns; the host times the whole APDU. Behind
+// `keygen-bench` so it never ships.
+#[cfg(feature = "keygen-bench")]
+const INS_KEYGEN_BENCH: u8 = 0x13;
+#[cfg(feature = "keygen-bench")]
+const BENCH_ITERS: u32 = 400;
 const INS_REBOOT: u8 = 0x1F; // P1: 0 = warm reboot, 1 = secure reboot to BOOTSEL
 
 /// Pending reboot request: 0 = none, 1 = warm reboot,
@@ -97,6 +107,31 @@ impl<S: Storage> Applet<Fs<S>> for VendorApplet {
             }
             INS_CORE1_STATS => {
                 res.extend(&crate::core1::stats());
+                Sw::OK
+            }
+            #[cfg(feature = "keygen-bench")]
+            INS_KEYGEN_BENCH => {
+                let cand = apdu.data;
+                if cand.is_empty() || !cand.len().is_multiple_of(32) || cand.len() > 256 {
+                    return Sw::WRONG_LENGTH;
+                }
+                // `core::hint::black_box` keeps the loop from being optimized to
+                // one iteration (the result is otherwise unused).
+                use core::hint::black_box;
+                match apdu.p1 {
+                    0 => {
+                        for _ in 0..BENCH_ITERS {
+                            black_box(rsk_rsa_asm::passes_strong_mr_base2(black_box(cand)));
+                        }
+                    }
+                    1 => {
+                        for _ in 0..BENCH_ITERS {
+                            black_box(rsk_rsa_asm::has_small_factor(black_box(cand)));
+                        }
+                    }
+                    _ => return Sw::INCORRECT_P1P2,
+                }
+                res.extend(&BENCH_ITERS.to_le_bytes());
                 Sw::OK
             }
             INS_REBOOT => {
