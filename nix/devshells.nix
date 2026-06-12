@@ -75,6 +75,14 @@
       pkgs.cargo-fuzz
     ];
     MIRIFLAGS = "-Zmiri-many-seeds -Zdeduplicate-diagnostics -Zmiri-strict-provenance";
+    # libFuzzer's runtime is C++: on Linux the fuzz binaries need
+    # libstdc++.so.6 at run time, and a nix-linked binary's loader does not
+    # search the host's /usr/lib (broke the deep-checks CI job, every target
+    # exit 127). Lazy `optionalString` keeps darwin from evaluating the gcc
+    # lib path at all — dyld finds the system libc++ there anyway.
+    LD_LIBRARY_PATH = pkgs.lib.optionalString pkgs.stdenv.isLinux (
+      pkgs.lib.makeLibraryPath [ pkgs.stdenv.cc.cc.lib ]
+    );
     shellHook = ''
       echo "rs-key fuzz devshell (nightly)"
       echo "  rustc: $(rustc --version 2>/dev/null)"
