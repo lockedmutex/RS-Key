@@ -21,10 +21,23 @@ except ImportError:
 
 
 def register(sub):
-    p = sub.add_parser("fido", help="FIDO2 management (set PIN, list passkeys)")
+    p = sub.add_parser("fido", help="FIDO2 management (set PIN, list passkeys, attestation)")
     g = p.add_subparsers(dest="cmd", required=True)
     g.add_parser("set-pin", help="set or change the FIDO2 clientPIN").set_defaults(func=set_pin)
     g.add_parser("list-passkeys", help="list discoverable credentials").set_defaults(func=list_passkeys)
+
+    a = g.add_parser("attestation", help="org attestation key/chain (enterprise)")
+    ga = a.add_subparsers(dest="acmd", required=True)
+    i = ga.add_parser("import", help="install an org attestation key + cert chain")
+    i.add_argument("--key", required=True, help="P-256 private key (PEM)")
+    i.add_argument("--chain", required=True, help="cert chain, leaf first (PEM or concatenated DER)")
+    i.add_argument("--pin", help="FIDO2 PIN (required if one is set)")
+    i.set_defaults(func=att_import)
+    c = ga.add_parser("clear", help="remove the org attestation")
+    c.add_argument("--pin", help="FIDO2 PIN (required if one is set)")
+    c.set_defaults(func=att_clear)
+    ga.add_parser("status", help="show whether an org attestation is installed").set_defaults(
+        func=att_status)
 
 
 def _ctap():
@@ -83,3 +96,84 @@ def list_passkeys(args):
             cid = cred[CM.RESULT.CREDENTIAL_ID]["id"]
             name = user.get("name") or user.get("displayName") or user.get("id")
             print(f"   user={name}  credId={cid.hex()[:24]}…")
+
+
+# --- org attestation (vendor 0x41 subcommands 0x09-0x0B) ---------------------
+# Provisions the enterprise-attestation key + chain: makeCredential with
+# enterpriseAttestation 1/2 and U2F register then attest under the org chain
+# instead of the per-device self-signed cert. The private key crosses the wire
+# ChaCha20-Poly1305-wrapped on the same MSE channel the seed backup uses.
+
+ATT_IMPORT, ATT_CLEAR, ATT_STATE = 9, 10, 11
+
+
+def _att_scalar(path):
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.serialization import load_pem_private_key
+    key = load_pem_private_key(open(path, "rb").read(), None)
+    if not isinstance(key.curve, ec.SECP256R1):
+        die(f"attestation key must be P-256 (got {key.curve.name})")
+    return key.private_numbers().private_value.to_bytes(32, "big")
+
+
+def _att_chain(path):
+    data = open(path, "rb").read()
+    if b"-----BEGIN" in data:
+        from cryptography import x509
+        from cryptography.hazmat.primitives.serialization import Encoding
+        certs = x509.load_pem_x509_certificates(data)
+        return b"".join(c.public_bytes(Encoding.DER) for c in certs)
+    return data  # already concatenated DER
+
+
+def att_import(args):
+    import os
+
+    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+
+    from .backup import _gated, _vendor, mse_handshake
+    from .common import connect_fido
+
+    scalar, chain = _att_scalar(args.key), _att_chain(args.chain)
+    if len(chain) > 2048:
+        die(f"chain too large ({len(chain)} B, max 2048)")
+    dev, cid = connect_fido()
+    key, aad = mse_handshake(dev, cid)
+    nonce = os.urandom(12)
+    blob = nonce + ChaCha20Poly1305(key).encrypt(nonce, scalar, aad)
+    print("touch the device (BOOTSEL) to authorise the import…", file=sys.stderr)
+    st, _ = _vendor(dev, cid, _gated(ATT_IMPORT, {1: blob, 2: chain}, dev, cid, args.pin))
+    if st == 0x36:
+        die("device requires a PIN — pass --pin")
+    if st != 0:
+        die(f"import failed: {st:#x}")
+    print("org attestation installed ✓ — EA makeCredential and U2F now use the org chain")
+
+
+def att_clear(args):
+    from .backup import _gated, _vendor, mse_handshake
+    from .common import connect_fido
+
+    dev, cid = connect_fido()
+    mse_handshake(dev, cid)
+    print("touch the device (BOOTSEL) to remove the attestation…", file=sys.stderr)
+    st, _ = _vendor(dev, cid, _gated(ATT_CLEAR, None, dev, cid, args.pin))
+    if st == 0x36:
+        die("device requires a PIN — pass --pin")
+    if st != 0:
+        die(f"clear failed: {st:#x}")
+    print("org attestation removed ✓ (back to the self-signed device cert)")
+
+
+def att_status(args):
+    from .backup import _vendor
+    from .common import connect_fido
+
+    dev, cid = connect_fido()
+    st, m = _vendor(dev, cid, {1: ATT_STATE})
+    if st != 0:
+        die(f"status failed: {st:#x}")
+    if m[1]:
+        print(f"org attestation : installed\nchain hash      : {m[2].hex()}")
+    else:
+        print("org attestation : not installed (self-signed device cert in use)")

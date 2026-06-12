@@ -131,7 +131,8 @@ pub fn process_cbor<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, data: &[u8], out: &
                 ctx.fs.has_data(consts::EF_PIN),
                 min_pin,
                 force,
-                ctx.state.enterprise_attestation,
+                // enableEnterpriseAttestation persists until reset (flash flag).
+                ctx.fs.has_data(consts::EF_EA_ENABLED),
                 &mut out[1..],
             )
         }

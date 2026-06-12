@@ -21,6 +21,7 @@ rsk audit verify --expect-key <hex>   # also pin the enrolled attestation key
 | `PIN_SET` / `PIN_CHANGE` / `PIN_LOCKOUT` | lockout aux: 0 = retries exhausted, 1 = per-boot block |
 | `CFG_MIN_PIN` / `CFG_ENTERPRISE_ATT` | aux = new minimum / detail[0] = forceChangePin |
 | `LOCK_ENGAGE` / `LOCK_RELEASE`, `BACKUP_*` | soft-lock and seed-backup lifecycle |
+| `ATT_IMPORT` / `ATT_CLEAR` | [org attestation](attestation.md) provisioning |
 | `CHECKPOINT` | every signed checkpoint is itself logged |
 
 There is **no wall clock** on the device: entries carry the boot-relative

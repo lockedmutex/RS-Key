@@ -29,7 +29,7 @@ use rsk_sdk::error::{Error, Result};
 use crate::Rng;
 use crate::cert::build_attestation_cert;
 use crate::consts::{
-    EF_COUNTER, EF_EE_DEV, EF_KEY_DEV, EF_KEY_DEV_ENC, EF_LARGEBLOB, LARGEBLOB_INITIAL,
+    EF_ATT_KEY, EF_COUNTER, EF_EE_DEV, EF_KEY_DEV, EF_KEY_DEV_ENC, EF_LARGEBLOB, LARGEBLOB_INITIAL,
 };
 use crate::ec::P256Key;
 
@@ -115,8 +115,24 @@ fn dev_for_tag<'a>(dev: &Device<'a>, tag: u8) -> Option<Device<'a>> {
 /// become loadable again once a successful PIN verify migrates them
 /// ([`migrate_keydev_pin`]).
 pub fn load_keydev<S: Storage>(dev: &Device, fs: &mut Fs<S>) -> Option<[u8; 32]> {
+    get_sealed32(dev, fs, EF_KEY_DEV)
+}
+
+/// The org-provisioned FIDO attestation scalar (`EF_ATT_KEY`), sealed exactly
+/// like the seed — the tag records which kbase arm wrapped it, so import
+/// before or after OTP provisioning both stay loadable.
+pub fn load_att_key<S: Storage>(dev: &Device, fs: &mut Fs<S>) -> Option<[u8; 32]> {
+    get_sealed32(dev, fs, EF_ATT_KEY)
+}
+
+pub fn store_att_key<S: Storage>(dev: &Device, fs: &mut Fs<S>, key: &[u8; 32]) -> Result<()> {
+    put_sealed32(dev, fs, EF_ATT_KEY, key)
+}
+
+/// Read and decrypt a 32-byte kbase-sealed value (format tags as above).
+fn get_sealed32<S: Storage>(dev: &Device, fs: &mut Fs<S>, fid: u16) -> Option<[u8; 32]> {
     let mut buf = [0u8; 64];
-    let n = fs.read(EF_KEY_DEV, &mut buf)?;
+    let n = fs.read(fid, &mut buf)?;
     let seal_dev = dev_for_tag(dev, buf[0]);
     if !(matches!(buf[0], FORMAT_F1 | FORMAT_F1_OTP) && n == KEYDEV_F1_LEN) || seal_dev.is_none() {
         buf.zeroize();
@@ -143,9 +159,19 @@ pub fn load_keydev<S: Storage>(dev: &Device, fs: &mut Fs<S>) -> Option<[u8; 32]>
 /// Store `seed` AES-CBC-encrypted under the device root key (tag 0x01, or 0x11
 /// once the OTP key is provisioned).
 pub fn encrypt_keydev_f1<S: Storage>(dev: &Device, fs: &mut Fs<S>, seed: &[u8; 32]) -> Result<()> {
+    put_sealed32(dev, fs, EF_KEY_DEV, seed)
+}
+
+/// Store a 32-byte value kbase-sealed behind the current format tag.
+fn put_sealed32<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    fid: u16,
+    value: &[u8; 32],
+) -> Result<()> {
     let mut kdata = [0u8; KEYDEV_F1_LEN];
     kdata[0] = plain_tag(dev);
-    kdata[1..].copy_from_slice(seed);
+    kdata[1..].copy_from_slice(value);
     let mut kbase = dev.derive_kbase();
     let mut iv = [0u8; 16];
     iv.copy_from_slice(&dev.serial_hash[..16]);
@@ -155,7 +181,7 @@ pub fn encrypt_keydev_f1<S: Storage>(dev: &Device, fs: &mut Fs<S>, seed: &[u8; 3
         kdata.zeroize();
         return Err(Error::ExecError);
     }
-    let r = fs.put(EF_KEY_DEV, &kdata);
+    let r = fs.put(fid, &kdata);
     kdata.zeroize();
     r
 }

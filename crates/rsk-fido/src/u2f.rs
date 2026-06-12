@@ -13,14 +13,14 @@ use rsk_sdk::apdu::Apdu;
 use rsk_sdk::sw::Sw;
 
 use crate::consts::{
-    CTAP_AUTHENTICATE, CTAP_REGISTER, CTAP_VERSION, EF_EE_DEV, U2F_AUTH_CHECK_ONLY,
+    CTAP_AUTHENTICATE, CTAP_REGISTER, CTAP_VERSION, EF_ATT_CHAIN, EF_EE_DEV, U2F_AUTH_CHECK_ONLY,
     U2F_AUTH_ENFORCE, U2F_AUTH_FLAG_TUP, U2F_REGISTER_ID,
 };
 use crate::credential::credential_load;
 use crate::ec::{MAX_DER_SIG, P256Key};
 use crate::journal;
 use crate::keyderiv::{KEY_HANDLE_LEN, derive_new, fido_load_key, verify_key};
-use crate::seed::{bump_sign_counter, get_sign_counter};
+use crate::seed::{bump_sign_counter, get_sign_counter, load_att_key};
 use crate::{Ctx, Rng};
 
 /// Dispatch a U2F APDU; writes the response body into `out`, returns `(SW, len)`.
@@ -70,7 +70,19 @@ fn cmd_register<S: Storage, R: Rng>(
     let (key_handle, mut scalar) = derive_new(&seed, &app, ctx.rng);
     let cred_key = P256Key::from_scalar(&scalar);
     scalar.zeroize();
-    let device_key = P256Key::from_scalar(&seed); // attestation key = the seed scalar
+    // Org-provisioned attestation (vendor ATT_IMPORT) wins — classic U2F batch
+    // attestation; otherwise the per-device key (the seed scalar) with its
+    // self-signed EF_EE_DEV cert.
+    let mut att_scalar = load_att_key(&ctx.dev, ctx.fs);
+    let org = att_scalar.is_some();
+    let device_key = match att_scalar.as_mut() {
+        Some(s) => {
+            let k = P256Key::from_scalar(s);
+            s.zeroize();
+            k
+        }
+        None => P256Key::from_scalar(&seed),
+    };
     seed.zeroize();
     let (cred_key, device_key) = match (cred_key, device_key) {
         (Some(c), Some(d)) => (c, d),
@@ -98,10 +110,23 @@ fn cmd_register<S: Storage, R: Rng>(
     let mut sig = [0u8; MAX_DER_SIG];
     let sl = device_key.sign_der(&base[..p], &mut sig);
 
-    let mut cert = [0u8; 512];
-    let clen = match ctx.fs.read(EF_EE_DEV, &mut cert) {
-        Some(n) if n > 0 => n.min(cert.len()),
-        _ => return (Sw::EXEC_ERROR, 0),
+    let mut cert = [0u8; 2064];
+    let clen = if org {
+        // The chain's leaf — a U2F response carries exactly one certificate.
+        let n = match ctx.fs.read(EF_ATT_CHAIN, &mut cert) {
+            Some(n) if n > 3 => n,
+            _ => return (Sw::EXEC_ERROR, 0),
+        };
+        let Some((off, len)) = crate::cert::att_chain_cert_range(&cert[..n], 0) else {
+            return (Sw::EXEC_ERROR, 0);
+        };
+        cert.copy_within(off..off + len, 0);
+        len
+    } else {
+        match ctx.fs.read(EF_EE_DEV, &mut cert) {
+            Some(n) if n > 0 => n.min(cert.len()),
+            _ => return (Sw::EXEC_ERROR, 0),
+        }
     };
 
     // response: 0x05 ‖ (0x04 ‖ x ‖ y) ‖ 64 ‖ keyHandle ‖ cert ‖ sig

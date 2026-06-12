@@ -16,6 +16,8 @@ protocols as a commercial YubiKey or Nitrokey:
   you hold
 - **Signed audit trail** — a tamper-evident on-device event journal,
   checkpointed by the OTP attestation key (`rsk audit verify`)
+- **Enterprise attestation** — CTAP 2.1 EA with an org-provisioned
+  attestation key/chain (`rsk fido attestation import`)
 - **Silicon root of trust** — OTP-fused master key + RP2350 secure boot
 
 It is written in pure Rust (`no_std`, [embassy](https://embassy.dev/)) with two

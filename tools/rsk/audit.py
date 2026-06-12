@@ -47,6 +47,8 @@ EVENTS = {
     0x0F: "U2F_REGISTER",
     0x10: "U2F_AUTH",
     0x11: "CHECKPOINT",
+    0x12: "ATT_IMPORT",
+    0x13: "ATT_CLEAR",
 }
 
 

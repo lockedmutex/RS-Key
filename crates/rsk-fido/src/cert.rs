@@ -85,6 +85,80 @@ pub fn build_attestation_cert(key: &P256Key, serial: &[u8; 16], out: &mut [u8]) 
     Some(q)
 }
 
+// ---- org attestation chain (EF_ATT_CHAIN) ----
+
+/// Caps for an org-provisioned attestation chain (vendor ATT_IMPORT).
+pub(crate) const ATT_CHAIN_MAX: usize = 2048;
+pub(crate) const ATT_CHAIN_MAX_CERTS: usize = 4;
+
+/// Total length of the DER TLV at the head of `b` (SEQUENCE tag), or `None`.
+fn der_seq_len(b: &[u8]) -> Option<usize> {
+    if b.len() < 2 || b[0] != 0x30 {
+        return None;
+    }
+    match b[1] {
+        l @ 0..=0x7F => Some(2 + l as usize),
+        0x81 => (b.len() >= 3).then(|| 3 + b[2] as usize),
+        0x82 => (b.len() >= 4).then(|| 4 + u16::from_be_bytes([b[2], b[3]]) as usize),
+        _ => None, // > 64 KiB cannot be a sane certificate
+    }
+}
+
+/// Validate a leaf-first concatenation of DER certificates and pack it into
+/// the `EF_ATT_CHAIN` layout: `count(1) ‖ (len(2 LE) ‖ der)*`. Framing only —
+/// the import channel is authenticated, and a key/cert mismatch is the org's
+/// own first verification failure, not a parsing concern.
+pub(crate) fn att_chain_pack(chain: &[u8], out: &mut [u8]) -> Option<usize> {
+    if chain.is_empty() || chain.len() > ATT_CHAIN_MAX {
+        return None;
+    }
+    let mut count = 0u8;
+    let (mut src, mut dst) = (0usize, 1usize);
+    while src < chain.len() {
+        let l = der_seq_len(&chain[src..])?;
+        if src + l > chain.len() || count as usize == ATT_CHAIN_MAX_CERTS || dst + 2 + l > out.len()
+        {
+            return None;
+        }
+        out[dst..dst + 2].copy_from_slice(&(l as u16).to_le_bytes());
+        out[dst + 2..dst + 2 + l].copy_from_slice(&chain[src..src + l]);
+        dst += 2 + l;
+        src += l;
+        count += 1;
+    }
+    out[0] = count;
+    Some(dst)
+}
+
+/// Number of certificates in a packed chain.
+pub(crate) fn att_chain_count(blob: &[u8]) -> u8 {
+    blob.first().copied().unwrap_or(0)
+}
+
+/// Byte range of the `i`-th certificate in a packed chain.
+pub(crate) fn att_chain_cert_range(blob: &[u8], i: u8) -> Option<(usize, usize)> {
+    let mut off = 1usize;
+    for idx in 0..att_chain_count(blob) {
+        if off + 2 > blob.len() {
+            return None;
+        }
+        let l = u16::from_le_bytes([blob[off], blob[off + 1]]) as usize;
+        if off + 2 + l > blob.len() {
+            return None;
+        }
+        if idx == i {
+            return Some((off + 2, l));
+        }
+        off += 2 + l;
+    }
+    None
+}
+
+/// The `i`-th certificate of a packed chain.
+pub(crate) fn att_chain_cert(blob: &[u8], i: u8) -> Option<&[u8]> {
+    att_chain_cert_range(blob, i).map(|(o, l)| &blob[o..o + l])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,5 +201,24 @@ mod tests {
         assert_eq!(cert[spki_key_off], 0x04);
         assert_eq!(&cert[spki_key_off + 1..spki_key_off + 33], &x);
         assert_eq!(&cert[spki_key_off + 33..spki_key_off + 65], &y);
+    }
+
+    #[test]
+    fn att_chain_pack_and_iterate() {
+        // Two fake TLVs (framing is all that is validated).
+        let c1 = [0x30, 0x03, 1, 2, 3];
+        let c2 = [0x30, 0x81, 0x02, 9, 8]; // long-form length
+        let mut chain = std::vec::Vec::new();
+        chain.extend_from_slice(&c1);
+        chain.extend_from_slice(&c2);
+        let mut out = [0u8; 64];
+        let n = att_chain_pack(&chain, &mut out).unwrap();
+        assert_eq!(att_chain_count(&out[..n]), 2);
+        assert_eq!(att_chain_cert(&out[..n], 0).unwrap(), &c1);
+        assert_eq!(att_chain_cert(&out[..n], 1).unwrap(), &c2);
+        assert!(att_chain_cert(&out[..n], 2).is_none());
+        // Truncation and a non-SEQUENCE head are refused.
+        assert!(att_chain_pack(&chain[..6], &mut out).is_none());
+        assert!(att_chain_pack(&[0x31, 0x01, 0], &mut out).is_none());
     }
 }

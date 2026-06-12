@@ -20,11 +20,13 @@ use rsk_crypto::sha256;
 use rsk_fs::{Fs, Storage};
 
 use crate::cbordec::{cbor, def_arr, def_map};
+use crate::cert;
 use crate::consts::{
     AAGUID, ALG_ED25519, ALG_EDDSA, ALG_ES256, ALG_ES256K, ALG_ES384, ALG_ES512, ALG_ESP256,
     ALG_ESP384, ALG_ESP512, ALG_MLDSA44, CRED_PROT_UV_REQUIRED, CURVE_ED25519, CURVE_MLDSA44,
-    CURVE_P256, CURVE_P256K1, CURVE_P384, CURVE_P521, EF_EE_DEV, EF_MINPINLEN, EF_PIN, FLAG_AT,
-    FLAG_ED, FLAG_UP, FLAG_UV, MAX_CREDBLOB_LENGTH, MAX_RESIDENT_CREDENTIALS, PREFER_PQC,
+    CURVE_P256, CURVE_P256K1, CURVE_P384, CURVE_P521, EF_ATT_CHAIN, EF_EA_ENABLED, EF_EE_DEV,
+    EF_MINPINLEN, EF_PIN, FLAG_AT, FLAG_ED, FLAG_UP, FLAG_UV, MAX_CREDBLOB_LENGTH,
+    MAX_RESIDENT_CREDENTIALS, PREFER_PQC,
 };
 use crate::credential::{
     CRED_RESIDENT_LEN, CredExt, CredInput, Credential, RECORD_PREFIX, credential_create,
@@ -36,7 +38,7 @@ use crate::error::{CtapError, CtapResult};
 use crate::hmacsecret::{self, HmacSecretReq};
 use crate::journal;
 use crate::keyderiv::fido_load_key;
-use crate::seed::{bump_sign_counter, get_sign_counter};
+use crate::seed::{bump_sign_counter, get_sign_counter, load_att_key};
 use crate::state::PERM_MC;
 use crate::{Ctx, Rng};
 
@@ -283,11 +285,12 @@ pub fn make_credential<S: Storage, R: Rng>(
         return Err(CtapError::MissingParameter);
     }
     // Enterprise attestation (§6.1.2): only when enabled via authenticatorConfig,
-    // and only levels 1/2. Level 1 (vendor-facilitated) is recognised but
-    // produces a normal self-attestation; level 2 (platform-managed) emits a
-    // full attestation below.
+    // and only levels 1/2. Without an org-provisioned key, level 1
+    // (vendor-facilitated) produces a normal self-attestation and level 2
+    // (platform-managed) a full device attestation; with one (vendor
+    // ATT_IMPORT), both levels emit the full org attestation below.
     if req.enterprise_attestation > 0 {
-        if !ctx.state.enterprise_attestation {
+        if !ctx.fs.has_data(EF_EA_ENABLED) {
             return Err(CtapError::InvalidParameter);
         }
         if req.enterprise_attestation != 1 && req.enterprise_attestation != 2 {
@@ -469,22 +472,49 @@ fn make_credential_inner<S: Storage, R: Rng>(
     // attestation signed by the device key, carrying its x5c cert and the `ep`
     // response flag.
     ad[ad_len..ad_len + 32].copy_from_slice(req.client_data_hash);
-    let full_ea = req.enterprise_attestation == 2;
+    // An org-provisioned attestation key (vendor ATT_IMPORT) upgrades *both*
+    // EA levels to a full attestation under the org chain; without one,
+    // level 2 falls back to the device key (the seed scalar) and its
+    // self-signed EF_EE_DEV cert — the same pair U2F register uses.
+    let org_key = if req.enterprise_attestation > 0 {
+        load_att_key(&ctx.dev, ctx.fs)
+    } else {
+        None
+    };
+    let full_ea = req.enterprise_attestation == 2 || org_key.is_some();
     let mut sig = [0u8; MAX_SIG_LEN];
-    let mut cert = [0u8; 512];
-    let (att_alg, sig_len, cert_len) = if full_ea {
-        // The device attestation key is the seed scalar (same key + EF_EE_DEV cert
-        // U2F register uses); its alg is always ES256.
-        let device_key = P256Key::from_scalar(seed).ok_or(CtapError::Other)?;
-        let sl = device_key.sign_der(&ad[..ad_len + 32], &mut sig);
-        let cl = match ctx.fs.read(EF_EE_DEV, &mut cert) {
-            Some(n) if n > 0 => n.min(cert.len()),
-            _ => return Err(CtapError::Other),
-        };
-        (ALG_ES256, sl, cl)
+    let mut chain = [0u8; cert::ATT_CHAIN_MAX + 1 + 2 * cert::ATT_CHAIN_MAX_CERTS];
+    let (att_alg, sig_len, chain_len, certs) = if full_ea {
+        if let Some(mut scalar) = org_key {
+            let k = P256Key::from_scalar(&scalar);
+            scalar.zeroize();
+            let k = k.ok_or(CtapError::Other)?;
+            let sl = k.sign_der(&ad[..ad_len + 32], &mut sig);
+            let cl = ctx
+                .fs
+                .read(EF_ATT_CHAIN, &mut chain)
+                .filter(|&n| cert::att_chain_count(&chain[..n]) > 0)
+                .ok_or(CtapError::Other)?;
+            let count = cert::att_chain_count(&chain[..cl]);
+            (ALG_ES256, sl, cl, count)
+        } else {
+            let device_key = P256Key::from_scalar(seed).ok_or(CtapError::Other)?;
+            let sl = device_key.sign_der(&ad[..ad_len + 32], &mut sig);
+            let mut one = [0u8; 512];
+            let cl = match ctx.fs.read(EF_EE_DEV, &mut one) {
+                Some(n) if n > 0 => n.min(one.len()),
+                _ => return Err(CtapError::Other),
+            };
+            // Wrap the single self-signed cert in the packed-chain layout so
+            // the x5c encode below has one shape.
+            chain[0] = 1;
+            chain[1..3].copy_from_slice(&(cl as u16).to_le_bytes());
+            chain[3..3 + cl].copy_from_slice(&one[..cl]);
+            (ALG_ES256, sl, 3 + cl, 1)
+        }
     } else {
         let sl = key.sign(&ad[..ad_len + 32], ctx.rng, &mut sig);
-        (key.alg(), sl, 0)
+        (key.alg(), sl, 0, 0)
     };
 
     // largeBlobKey response field (0x05) — resident credentials only.
@@ -507,8 +537,14 @@ fn make_credential_inner<S: Storage, R: Rng>(
             .map_err(|_| CtapError::Other)?;
         if full_ea {
             enc.str("x5c")
-                .and_then(|e| e.array(1)?.bytes(&cert[..cert_len]))
-                .and_then(|e| e.u8(4)?.bool(true)) // ep: enterprise attestation used
+                .and_then(|e| e.array(u64::from(certs)))
+                .map_err(|_| CtapError::Other)?;
+            for i in 0..certs {
+                let c = cert::att_chain_cert(&chain[..chain_len], i).ok_or(CtapError::Other)?;
+                enc.bytes(c).map_err(|_| CtapError::Other)?;
+            }
+            enc.u8(4)
+                .and_then(|e| e.bool(true)) // ep: enterprise attestation used
                 .map_err(|_| CtapError::Other)?;
         }
         if let Some(lbk) = large_blob_key {
@@ -995,6 +1031,99 @@ mod tests {
             make_credential(&mut ctx, &buf[..n], &mut out),
             Err(CtapError::UnsupportedAlgorithm)
         );
+    }
+
+    #[test]
+    fn enterprise_attestation_uses_org_chain_when_provisioned() {
+        use p256::EncodedPoint;
+        use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
+
+        let mut fs = Fs::new(RamStorage::new(), &[]);
+        let dev = Device {
+            serial_hash: &[0xAB; 32],
+            serial_id: &[1, 2, 3, 4, 5, 6, 7, 8],
+            otp_key: None,
+        };
+        let mut rng = SeqRng(1);
+        ensure_seed(&dev, &mut fs, &mut rng).unwrap();
+
+        // Org provisioning: sealed key, packed 2-cert chain, EA enabled.
+        let org_scalar = [0x21u8; 32];
+        crate::seed::store_att_key(&dev, &mut fs, &org_scalar).unwrap();
+        let c1 = [0x30u8, 0x03, 1, 2, 3];
+        let c2 = [0x30u8, 0x02, 7, 7];
+        let mut chain = std::vec::Vec::new();
+        chain.extend_from_slice(&c1);
+        chain.extend_from_slice(&c2);
+        let mut packed = [0u8; 64];
+        let plen = crate::cert::att_chain_pack(&chain, &mut packed).unwrap();
+        fs.put(EF_ATT_CHAIN, &packed[..plen]).unwrap();
+        fs.put(EF_EA_ENABLED, &[1]).unwrap();
+
+        // makeCredential with enterpriseAttestation (0x0A) = 2.
+        let mut buf = [0u8; 512];
+        let n = {
+            let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+            e.map(5).unwrap();
+            e.u8(1).unwrap().bytes(&[0xCDu8; 32]).unwrap();
+            e.u8(2)
+                .unwrap()
+                .map(1)
+                .unwrap()
+                .str("id")
+                .unwrap()
+                .str("example.com")
+                .unwrap();
+            e.u8(3).unwrap().map(2).unwrap();
+            e.str("id").unwrap().bytes(&[1, 2, 3, 4]).unwrap();
+            e.str("name").unwrap().str("alice").unwrap();
+            e.u8(4).unwrap().array(1).unwrap().map(2).unwrap();
+            e.str("alg").unwrap().i64(ALG_ES256).unwrap();
+            e.str("type").unwrap().str("public-key").unwrap();
+            e.u8(10).unwrap().u8(2).unwrap();
+            e.writer().position()
+        };
+        let mut out = [0u8; 1024];
+        let mut state = crate::FidoState::new();
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev,
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 0,
+        };
+        let rlen = make_credential(&mut ctx, &buf[..n], &mut out).unwrap();
+
+        // {1: "packed", 2: authData, 3: {alg, sig, x5c: [c1, c2]}, 4: ep true}.
+        let mut d = Decoder::new(&out[..rlen]);
+        assert_eq!(d.map().unwrap().unwrap(), 4);
+        assert_eq!(d.u8().unwrap(), 1);
+        assert_eq!(d.str().unwrap(), "packed");
+        assert_eq!(d.u8().unwrap(), 2);
+        let auth_data = d.bytes().unwrap().to_vec();
+        assert_eq!(d.u8().unwrap(), 3);
+        assert_eq!(d.map().unwrap().unwrap(), 3);
+        assert_eq!(d.str().unwrap(), "alg");
+        assert_eq!(d.i64().unwrap(), ALG_ES256);
+        assert_eq!(d.str().unwrap(), "sig");
+        let sig = d.bytes().unwrap().to_vec();
+        assert_eq!(d.str().unwrap(), "x5c");
+        assert_eq!(d.array().unwrap().unwrap(), 2);
+        assert_eq!(d.bytes().unwrap(), &c1);
+        assert_eq!(d.bytes().unwrap(), &c2);
+        assert_eq!(d.u8().unwrap(), 4);
+        assert!(d.bool().unwrap());
+
+        // The signature is the org key's, over authData ‖ clientDataHash.
+        let (x, y) = P256Key::from_scalar(&org_scalar).unwrap().public_xy();
+        let pt = EncodedPoint::from_affine_coordinates((&x).into(), (&y).into(), false);
+        let vk = VerifyingKey::from_encoded_point(&pt).unwrap();
+        let mut msg = auth_data;
+        msg.extend_from_slice(&[0xCD; 32]);
+        vk.verify(&msg, &Signature::from_der(&sig).unwrap())
+            .unwrap();
     }
 
     #[cfg(feature = "fips-profile")]
@@ -1498,14 +1627,17 @@ mod tests {
         buf[..n].to_vec()
     }
 
-    // Run makeCredential with enterprise attestation enabled/disabled in state.
+    // Run makeCredential with enterprise attestation enabled/disabled (the
+    // enable persists in flash — EF_EA_ENABLED — per CTAP 2.1).
     fn run_ea(req: &[u8], enable: bool) -> Result<(std::vec::Vec<u8>, Fs<RamStorage>), CtapError> {
         let mut fs = Fs::new(RamStorage::new(), &[]);
         let mut rng = SeqRng(1);
         ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
         let mut out = [0u8; 1024];
         let mut state = crate::FidoState::new();
-        state.enterprise_attestation = enable;
+        if enable {
+            fs.put(EF_EA_ENABLED, &[1]).unwrap();
+        }
         let len = {
             let mut presence = crate::AlwaysConfirm;
             let mut ctx = Ctx {

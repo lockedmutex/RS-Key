@@ -43,6 +43,9 @@ pub const VENDOR_BACKUP_STATE: u64 = 0x05; // read the lock/backup flags (ungate
 pub const VENDOR_UNLOCK: u64 = 0x06; // soft-lock: decrypt EF_KEY_DEV_ENC to RAM
 pub const VENDOR_AUDIT_READ: u64 = 0x07; // export the audit journal window
 pub const VENDOR_AUDIT_CHECKPOINT: u64 = 0x08; // DEVK-signed chain checkpoint
+pub const VENDOR_ATT_IMPORT: u64 = 0x09; // install org attestation key + chain
+pub const VENDOR_ATT_CLEAR: u64 = 0x0A; // remove the org attestation
+pub const VENDOR_ATT_STATE: u64 = 0x0B; // {present, chain hash} — ungated
 
 // authenticatorConfig subcommands.
 pub const CONFIG_ENABLE_EA: u64 = 0x01; // enableEnterpriseAttestation
@@ -163,6 +166,12 @@ pub const EF_BACKUP_SEALED: u16 = 0xCC02; // [1] once the seed has been backed u
 /// Soft-locked seed: ChaCha20-Poly1305(host lock key) over the seed value.
 pub const EF_KEY_DEV_ENC: u16 = 0xCC03;
 pub const EF_EE_DEV: u16 = 0xCE00; // U2F end-entity attestation certificate
+// Org-provisioned attestation (vendor ATT_IMPORT). Device identity, not user
+// data: both survive authenticatorReset; ATT_CLEAR removes them.
+pub const EF_ATT_KEY: u16 = 0xCE10; // org attestation P-256 scalar, kbase-sealed
+pub const EF_ATT_CHAIN: u16 = 0xCE11; // packed DER chain: count ‖ (len LE ‖ der)*
+/// `enableEnterpriseAttestation` — persists until reset (CTAP 2.1), hence flash.
+pub const EF_EA_ENABLED: u16 = 0xCE12;
 pub const EF_COUNTER: u16 = 0xC000; // global signature counter
 pub const EF_CRED: u16 = 0xCF00; // resident credentials, 0xCF00..0xCFFF
 pub const EF_RP: u16 = 0xD000; // relying-party metadata, 0xD000..0xD0FF

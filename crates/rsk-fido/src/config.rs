@@ -16,7 +16,7 @@ use rsk_crypto::sha256;
 use crate::cbordec::{cbor, def_arr, def_map};
 use crate::consts::{
     CONFIG_AUT_DISABLE, CONFIG_AUT_ENABLE, CONFIG_ENABLE_EA, CONFIG_SET_MIN_PIN, CONFIG_VENDOR,
-    CTAP_CONFIG, EF_KEY_DEV, EF_KEY_DEV_ENC, EF_MINPINLEN, EF_PIN, MIN_PIN_LENGTH,
+    CTAP_CONFIG, EF_EA_ENABLED, EF_KEY_DEV, EF_KEY_DEV_ENC, EF_MINPINLEN, EF_PIN, MIN_PIN_LENGTH,
 };
 use crate::error::{CtapError, CtapResult};
 use crate::journal;
@@ -150,7 +150,10 @@ pub fn authenticator_config<S: Storage, R: Rng>(
 
     match req.subcommand {
         CONFIG_ENABLE_EA => {
-            ctx.state.enterprise_attestation = true;
+            // Persists until authenticatorReset (CTAP 2.1) — flash, not RAM.
+            ctx.fs
+                .put(EF_EA_ENABLED, &[1])
+                .map_err(|_| CtapError::Other)?;
             journal::append(ctx, journal::EV_CFG_EA, 0, &[]);
             Ok(0)
         }
@@ -493,10 +496,12 @@ mod tests {
 
     #[test]
     fn enable_enterprise_attestation() {
+        let mut fs = Fs::new(RamStorage::new(), &[]);
         let mut state = armed(PERM_ACFG);
         let req = config_request(0x01, &[], &TOKEN);
-        assert_eq!(run(&mut state, &req), Ok(0));
-        assert!(state.enterprise_attestation);
+        assert_eq!(run_fs(&mut fs, &mut state, &req), Ok(0));
+        // Persisted: a fresh power cycle (new FidoState) still sees it.
+        assert!(fs.has_data(EF_EA_ENABLED));
     }
 
     #[test]

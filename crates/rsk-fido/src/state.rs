@@ -173,10 +173,6 @@ pub struct FidoState {
     /// `reset()`; a write resuming across an interleaved reset (no real platform
     /// does this) restarts from `offset == 0`.
     pub lba: LargeBlobState,
-    /// `enableEnterpriseAttestation` (authenticatorConfig 0x01); gates the EA
-    /// levels in makeCredential and the getInfo `ep` option. RAM-only (not
-    /// persisted across reboots).
-    pub enterprise_attestation: bool,
     /// MSE seed-backup channel: once a `VENDOR_MSE` key agreement succeeds,
     /// `mse_active` is set and `mse_key`/`mse_pub` hold the derived
     /// ChaCha20-Poly1305 channel key and the device ephemeral public key (the
@@ -215,7 +211,6 @@ impl FidoState {
             gna: AssertionState::new(),
             cm: CredMgmtState::new(),
             lba: LargeBlobState::new(),
-            enterprise_attestation: false,
             mse_active: false,
             mse_key: [0; 32],
             mse_pub: [0; 65],

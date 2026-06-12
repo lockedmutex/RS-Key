@@ -30,24 +30,31 @@ use zeroize::Zeroize;
 use rsk_crypto::chachapoly::{chacha20poly1305_decrypt, chacha20poly1305_encrypt};
 use rsk_crypto::mac::hkdf_sha256;
 use rsk_crypto::pinproto::{PinProto, ecdh_raw};
+use rsk_crypto::sha256;
 use rsk_fs::Storage;
 
 use crate::cbordec::{cbor, def_map};
+use crate::cert;
 use crate::consts::{
-    CTAP_VENDOR, EF_BACKUP_SEALED, EF_EE_DEV, EF_KEY_DEV, EF_KEY_DEV_ENC, EF_PIN,
-    VENDOR_AUDIT_CHECKPOINT, VENDOR_AUDIT_READ, VENDOR_BACKUP_EXPORT, VENDOR_BACKUP_FINALIZE,
-    VENDOR_BACKUP_LOAD, VENDOR_BACKUP_STATE, VENDOR_MSE, VENDOR_UNLOCK,
+    CTAP_VENDOR, EF_ATT_CHAIN, EF_ATT_KEY, EF_BACKUP_SEALED, EF_EE_DEV, EF_KEY_DEV, EF_KEY_DEV_ENC,
+    EF_PIN, VENDOR_ATT_CLEAR, VENDOR_ATT_IMPORT, VENDOR_ATT_STATE, VENDOR_AUDIT_CHECKPOINT,
+    VENDOR_AUDIT_READ, VENDOR_BACKUP_EXPORT, VENDOR_BACKUP_FINALIZE, VENDOR_BACKUP_LOAD,
+    VENDOR_BACKUP_STATE, VENDOR_MSE, VENDOR_UNLOCK,
 };
 use crate::cose::cose_key_ecdh;
 use crate::ec::P256Key;
 use crate::error::{CtapError, CtapResult};
 use crate::journal;
-use crate::seed::{LOCK_BLOB_LEN, encrypt_keydev_f1, ensure_seed, lock_engaged, open_seed_locked};
+use crate::seed::{
+    LOCK_BLOB_LEN, encrypt_keydev_f1, ensure_seed, lock_engaged, open_seed_locked, store_att_key,
+};
 use crate::state::PERM_ACFG;
 use crate::{Ctx, Rng};
 
 const BLOB_LEN: usize = 12 + 32 + 16; // nonce ‖ ciphertext(seed) ‖ tag
-const MAX_RAW_SUBPARA: usize = 96;
+// Sized for ATT_IMPORT's wrapped key + a full cert chain (≤ 2048 B); every
+// other subcommand stays tiny. The pinUvAuth MAC covers these bytes verbatim.
+const MAX_RAW_SUBPARA: usize = 2200;
 
 #[derive(Default)]
 struct Req<'a> {
@@ -55,6 +62,8 @@ struct Req<'a> {
     kax: &'a [u8],
     kay: &'a [u8],
     blob: &'a [u8],
+    /// ATT_IMPORT subCommandParams key 2: the DER cert chain, leaf first.
+    chain: &'a [u8],
     raw_subpara: &'a [u8],
     proto: u64,
     pin_uv_auth_param: Option<&'a [u8]>,
@@ -89,10 +98,15 @@ fn parse(data: &[u8]) -> Result<Req<'_>, CtapError> {
                     } else if sk == 1
                         && matches!(
                             req.subcommand,
-                            VENDOR_BACKUP_LOAD | VENDOR_UNLOCK | VENDOR_AUDIT_CHECKPOINT
+                            VENDOR_BACKUP_LOAD
+                                | VENDOR_UNLOCK
+                                | VENDOR_AUDIT_CHECKPOINT
+                                | VENDOR_ATT_IMPORT
                         )
                     {
                         req.blob = cbor(d.bytes())?;
+                    } else if sk == 2 && req.subcommand == VENDOR_ATT_IMPORT {
+                        req.chain = cbor(d.bytes())?;
                     } else {
                         cbor(d.skip())?;
                     }
@@ -139,8 +153,62 @@ pub fn vendor<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, data: &[u8], out: &mut [u
         VENDOR_UNLOCK => unlock(ctx, &req),
         VENDOR_AUDIT_READ => audit_read(ctx, &req, out),
         VENDOR_AUDIT_CHECKPOINT => audit_checkpoint(ctx, &req, out),
+        VENDOR_ATT_IMPORT => att_import(ctx, &req),
+        VENDOR_ATT_CLEAR => att_clear(ctx, &req),
+        VENDOR_ATT_STATE => att_state(ctx, out),
         _ => Err(CtapError::InvalidParameter),
     }
+}
+
+/// `ATT_IMPORT`: install an org attestation key + DER chain (leaf first). The
+/// P-256 scalar arrives ChaCha-wrapped on the MSE channel (the same 60-byte
+/// blob as the lock key); the chain is public certificate material and travels
+/// in the clear, MAC-covered like every subCommandParams. Gated like a seed
+/// move (MSE + PIN + touch). Survives authenticatorReset — it is
+/// org-provisioned *device* identity; ATT_CLEAR removes it.
+fn att_import<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req) -> CtapResult {
+    let mut packed = [0u8; cert::ATT_CHAIN_MAX + 1 + 2 * cert::ATT_CHAIN_MAX_CERTS];
+    let plen = cert::att_chain_pack(req.chain, &mut packed).ok_or(CtapError::InvalidParameter)?;
+    gate(ctx, req)?;
+    let mut scalar = open_channel_key(ctx, req.blob)?;
+    if P256Key::from_scalar(&scalar).is_none() {
+        scalar.zeroize();
+        return Err(CtapError::InvalidParameter);
+    }
+    let r = store_att_key(&ctx.dev, ctx.fs, &scalar);
+    scalar.zeroize();
+    r.map_err(|_| CtapError::Other)?;
+    ctx.fs
+        .put(EF_ATT_CHAIN, &packed[..plen])
+        .map_err(|_| CtapError::Other)?;
+    journal::append(ctx, journal::EV_ATT_IMPORT, 0, &[]);
+    Ok(0)
+}
+
+/// `ATT_CLEAR`: drop the org attestation (same gate as the import).
+fn att_clear<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req) -> CtapResult {
+    gate(ctx, req)?;
+    let _ = ctx.fs.delete(EF_ATT_KEY);
+    let _ = ctx.fs.delete(EF_ATT_CHAIN);
+    journal::append(ctx, journal::EV_ATT_CLEAR, 0, &[]);
+    Ok(0)
+}
+
+/// `ATT_STATE`: `{1: present, 2: sha256(packed chain)}` — ungated, like
+/// BACKUP_STATE; the chain itself is public.
+fn att_state<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, out: &mut [u8]) -> CtapResult {
+    let mut chain = [0u8; cert::ATT_CHAIN_MAX + 1 + 2 * cert::ATT_CHAIN_MAX_CERTS];
+    let present = ctx.fs.has_data(EF_ATT_KEY);
+    let n = ctx.fs.read(EF_ATT_CHAIN, &mut chain).unwrap_or(0);
+    encode(out, |e| {
+        e.map(if present && n > 0 { 2 } else { 1 })?
+            .u8(1)?
+            .bool(present)?;
+        if present && n > 0 {
+            e.u8(2)?.bytes(&sha256(&chain[..n]))?;
+        }
+        Ok(())
+    })
 }
 
 /// `AUDIT_READ`: export the journal window (`journal::vendor_read`). Gated on a
@@ -610,6 +678,116 @@ mod tests {
                 &mut out
             ),
             Err(CtapError::NotAllowed)
+        );
+    }
+
+    /// ChaCha-wrap a 32-byte value for the channel (the ATT_IMPORT/LOAD shape).
+    fn wrap32(host: &Host, value: &[u8; 32]) -> [u8; 60] {
+        let nonce = [0x24u8; 12];
+        let mut ct = *value;
+        let tag = chacha20poly1305_encrypt(&host.key, &nonce, &host.aad, &mut ct);
+        let mut blob = [0u8; 60];
+        blob[..12].copy_from_slice(&nonce);
+        blob[12..44].copy_from_slice(&ct);
+        blob[44..].copy_from_slice(&tag);
+        blob
+    }
+
+    fn att_import_req(buf: &mut [u8], blob: &[u8; 60], chain: &[u8]) -> usize {
+        let mut e = Encoder::new(Cursor::new(buf));
+        e.map(2)
+            .unwrap()
+            .u8(1)
+            .unwrap()
+            .u64(VENDOR_ATT_IMPORT)
+            .unwrap();
+        e.u8(2).unwrap().map(2).unwrap();
+        e.u8(1).unwrap().bytes(blob).unwrap();
+        e.u8(2).unwrap().bytes(chain).unwrap();
+        e.writer().position()
+    }
+
+    #[test]
+    fn att_import_state_clear_roundtrip() {
+        let (mut fs, mut rng, mut st) = setup();
+        let host = handshake(&mut fs, &mut rng, &mut st);
+
+        // Import an org key + two fake-TLV certs over the channel.
+        let org_scalar = [0x21u8; 32];
+        let blob = wrap32(&host, &org_scalar);
+        let chain: &[u8] = &[0x30, 0x03, 1, 2, 3, 0x30, 0x02, 7, 7];
+        let mut req = [0u8; 256];
+        let n = att_import_req(&mut req, &blob, chain);
+        let mut out = [0u8; 128];
+        call(
+            &mut fs,
+            &mut rng,
+            &mut st,
+            &mut AlwaysConfirm,
+            &req[..n],
+            &mut out,
+        )
+        .unwrap();
+
+        // The stored key decrypts back to the imported scalar; STATE says so.
+        assert_eq!(
+            crate::seed::load_att_key(&dev(), &mut fs).unwrap(),
+            org_scalar
+        );
+        let n = one_byte_req(&mut req, VENDOR_ATT_STATE);
+        let r = call(
+            &mut fs,
+            &mut rng,
+            &mut st,
+            &mut AlwaysConfirm,
+            &req[..n],
+            &mut out,
+        )
+        .unwrap();
+        let mut d = Decoder::new(&out[..r]);
+        assert_eq!(d.map().unwrap(), Some(2));
+        assert_eq!(d.u8().unwrap(), 1);
+        assert!(d.bool().unwrap());
+
+        // CLEAR drops both and STATE flips back.
+        let n = one_byte_req(&mut req, VENDOR_ATT_CLEAR);
+        call(
+            &mut fs,
+            &mut rng,
+            &mut st,
+            &mut AlwaysConfirm,
+            &req[..n],
+            &mut out,
+        )
+        .unwrap();
+        assert!(crate::seed::load_att_key(&dev(), &mut fs).is_none());
+        let n = one_byte_req(&mut req, VENDOR_ATT_STATE);
+        let r = call(
+            &mut fs,
+            &mut rng,
+            &mut st,
+            &mut AlwaysConfirm,
+            &req[..n],
+            &mut out,
+        )
+        .unwrap();
+        let mut d = Decoder::new(&out[..r]);
+        assert_eq!(d.map().unwrap(), Some(1));
+        assert_eq!(d.u8().unwrap(), 1);
+        assert!(!d.bool().unwrap());
+
+        // A malformed chain is refused before any gate is consumed.
+        let n = att_import_req(&mut req, &blob, &[0xFF, 0x01]);
+        assert_eq!(
+            call(
+                &mut fs,
+                &mut rng,
+                &mut st,
+                &mut AlwaysConfirm,
+                &req[..n],
+                &mut out
+            ),
+            Err(CtapError::InvalidParameter)
         );
     }
 
