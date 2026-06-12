@@ -85,10 +85,15 @@ static BUSY: AtomicBool = AtomicBool::new(false);
 /// SRAM load per spin keeps it off the spinlock and (nearly) off XIP, instead
 /// of hammering both through the Mutex on every spurious wake.
 static JOB_PENDING: AtomicBool = AtomicBool::new(false);
-/// Latched when core1 stops answering (BUSY stuck past the entry deadline):
-/// from then on every search runs single-core. A halted core1 (panic, fault)
-/// must degrade keygen, never hang the worker — the worker is the device.
+/// Latched after core1 misses the entry deadline twice running: from then on
+/// every search runs single-core. A halted core1 (panic, fault) must degrade
+/// keygen, never hang the worker — the worker is the device. One lone miss
+/// does NOT latch: a genuine in-flight candidate at RSA-4096 (strong MR + a
+/// software Lucas) can hold BUSY for a few seconds, and that core is alive.
 static DEGRADED: AtomicBool = AtomicBool::new(false);
+/// Consecutive entry-deadline misses; reset on any clean engage. Two in a row
+/// is a core that is not coming back.
+static MISSES: AtomicU32 = AtomicU32::new(0);
 
 /// Core1's stack. The deep frame is `passes_fermat_base2` → `modexp_priv`
 /// (~6 KiB of fixed buffers); 16 KiB leaves comfortable headroom for the
@@ -107,16 +112,18 @@ static C1_FINDS: AtomicU32 = AtomicU32::new(0);
 static C0_TRIES: AtomicU32 = AtomicU32::new(0);
 static C0_FINDS: AtomicU32 = AtomicU32::new(0);
 
-/// The six counters plus the live flags (busy, stop, job-pending, degraded),
+/// The seven counters plus the live flags (busy, stop, job-pending, degraded),
 /// little-endian packed for the vendor read.
-pub fn stats() -> [u8; 28] {
-    let mut out = [0u8; 28];
-    let counters = [&WAKES, &JOBS, &C1_TRIES, &C1_FINDS, &C0_TRIES, &C0_FINDS];
-    for (slot, c) in out.chunks_exact_mut(4).take(6).zip(counters) {
+pub fn stats() -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let counters = [
+        &WAKES, &JOBS, &C1_TRIES, &C1_FINDS, &C0_TRIES, &C0_FINDS, &MISSES,
+    ];
+    for (slot, c) in out.chunks_exact_mut(4).take(7).zip(counters) {
         slot.copy_from_slice(&c.load(Ordering::Relaxed).to_le_bytes());
     }
     let flags = [&BUSY, &STOP, &JOB_PENDING, &DEGRADED];
-    for (b, f) in out[24..].iter_mut().zip(flags) {
+    for (b, f) in out[28..].iter_mut().zip(flags) {
         *b = f.load(Ordering::Relaxed) as u8;
     }
     out
@@ -235,23 +242,32 @@ pub fn run_rsa_search(nbits: usize, rng: &mut dyn Rng) -> Option<Box<RsaPrivateK
         return None;
     }
 
-    // The PREVIOUS search's core1 tail (one candidate at most — STOP is
-    // checked between candidates) may still be running; wait it out here,
-    // off that keygen's critical path, before reusing the mailbox. The wait
-    // is BOUNDED: a core1 that stops answering (halted by a panic or fault)
-    // must cost us the speedup, never the worker — latch DEGRADED and run
-    // every search single-core from then on.
+    // The PREVIOUS search's core1 tail may still be running — one candidate at
+    // most, but at RSA-4096 that candidate can be a strong-MR plus a software
+    // Lucas, several seconds of work (STOP is only checked between
+    // candidates). Wait it out here, off this keygen's critical path, before
+    // reusing the mailbox. The wait is BOUNDED so a core1 that never releases
+    // BUSY (panicked / faulted) costs the speedup, never the worker: a lone
+    // miss just skips core1 for this search, and only two misses running latch
+    // permanent single-core mode (a core that is genuinely gone).
     let engaged = !DEGRADED.load(Ordering::Relaxed) && {
-        let deadline = embassy_time::Instant::now() + embassy_time::Duration::from_secs(2);
-        loop {
-            if !BUSY.load(Ordering::Acquire) {
-                break true;
-            }
+        let deadline = embassy_time::Instant::now() + embassy_time::Duration::from_secs(6);
+        let mut timed_out = false;
+        while BUSY.load(Ordering::Acquire) {
             if embassy_time::Instant::now() > deadline {
-                DEGRADED.store(true, Ordering::Relaxed);
-                break false;
+                timed_out = true;
+                break;
             }
             core::hint::spin_loop();
+        }
+        if timed_out {
+            if MISSES.fetch_add(1, Ordering::Relaxed) + 1 >= 2 {
+                DEGRADED.store(true, Ordering::Relaxed);
+            }
+            false
+        } else {
+            MISSES.store(0, Ordering::Relaxed);
+            true
         }
     };
 

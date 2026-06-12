@@ -20,10 +20,10 @@ use p256::elliptic_curve::rand_core;
 use p256::elliptic_curve::sec1::FromEncodedPoint;
 use p521::ecdsa::signature::hazmat::RandomizedPrehashSigner;
 
-use num_bigint_dig::prime::probably_prime;
+use num_bigint_dig::prime::probably_prime_lucas;
 use rsa::traits::{PrivateKeyParts, PublicKeyParts};
 use rsa::{BigUint, Pkcs1v15Encrypt, Pkcs1v15Sign};
-use rsk_rsa_asm::{has_small_factor, mod_small, passes_fermat_base2, self_test};
+use rsk_rsa_asm::{has_small_factor, mod_small, passes_strong_mr_base2, self_test};
 
 // Re-exported so the firmware can name the keygen result type without its own
 // `rsa` dependency (the dual-core search returns `Box<RsaPrivateKey>`).
@@ -658,20 +658,16 @@ pub fn rsa_from_pqe(e: &[u8], p: &[u8], q: &[u8]) -> Option<RsaPrivateKey> {
 
 /// The RSA public exponent, fixed at 65537 (what `load_rsa_key` assumes).
 const RSA_E: u32 = 65_537;
-/// Extra Miller-Rabin reps on top of the Baillie-PSW base in the *final*
-/// primality gate. Baillie-PSW (one strong MR + a strong Lucas test; no known
-/// composite passes it) is the vetted decider, so 0 extra reps is rigorous and
-/// avoids ~20 slow modexps per prime. `probably_prime(_, 0)` is exactly
-/// Baillie-PSW.
-const MR_REPS: usize = 0;
 
 /// The RSA prime search as a *stepper*, so the CCID transport can yield — and
 /// send time-extension keepalives — between candidates. Each
 /// [`step`](RsaKeygen::step) tests ONE random candidate (a bounded chunk: one
 /// `probably_prime`, ~tens of ms on-device), matching the `rsa` crate's keygen:
 /// two `nbits/2`-bit primes with the top two bits set and `gcd(e, prime − 1) = 1`,
-/// assembled with `RsaPrivateKey::from_p_q`. The primality test and key assembly
-/// are the vetted library routines; only the candidate draw is ours.
+/// assembled with `RsaPrivateKey::from_p_q`. The primality decision is
+/// Baillie-PSW split across backends: the strong Miller-Rabin base-2 half on
+/// the KAT-gated asm modexp (ours, differentially tested against the library),
+/// the strong Lucas half and key assembly the vetted library routines.
 ///
 /// `step` decomposes into [`try_candidate`](RsaKeygen::try_candidate) (one
 /// draw + test, stateless) and [`offer`](RsaKeygen::offer) (the two-prime
@@ -736,13 +732,15 @@ impl RsaKeygen {
 
     /// Draw and test ONE prime candidate of `half_bytes` — the bounded unit of
     /// search work. Stateless (an associated fn), so a second core can run it
-    /// concurrently with its own RNG stream. The cheap rejections (small
-    /// factors, the `gcd(e, n−1)` check) and the asm-accelerated Fermat
-    /// pre-filter run first; only a survivor reaches the vetted
-    /// `probably_prime` (Baillie-PSW), which makes the final primality
-    /// decision — so a bug in the asm path can only slow the search, never
-    /// admit a composite. The caller is responsible for the [`usable`]
-    /// (RsaKeygen::usable) gate.
+    /// concurrently with its own RNG stream. The pipeline is Baillie-PSW split
+    /// across backends: the cheap rejections (small factors, the
+    /// `gcd(e, n−1)` check), then the strong Miller-Rabin base-2 gate on the
+    /// KAT-gated asm modexp, then the vetted software strong Lucas test for
+    /// the final accept. Admitting a composite would take a simultaneous
+    /// failure of both halves — the same combined guarantee
+    /// `probably_prime(_, 0)` gives, with the modexp-heavy half on the fast
+    /// path. The caller is responsible for the
+    /// [`usable`](RsaKeygen::usable) gate.
     pub fn try_candidate(rng: &mut dyn Rng, half_bytes: usize) -> Option<BigUint> {
         let half = half_bytes;
         // A random odd candidate with the top two bits set, little-endian (so the
@@ -761,12 +759,16 @@ impl RsaKeygen {
         if mod_small(n, RSA_E) == 1 {
             return None;
         }
-        if !passes_fermat_base2(n) {
+        // The strong Miller-Rabin half of Baillie-PSW, on the asm modexp.
+        if !passes_strong_mr_base2(n) {
             return None;
         }
         let cand = BigUint::from_bytes_le(n);
         cand_le.zeroize();
-        if !probably_prime(&cand, MR_REPS) {
+        // The strong Lucas half (vetted library code). Together with the MR
+        // gate above this is exactly `probably_prime(_, 0)` — see the
+        // `keygen_bpsw_split_matches_library` test.
+        if !probably_prime_lucas(&cand) {
             return None;
         }
         Some(cand)
@@ -1322,6 +1324,27 @@ mod rsa_tests {
         assert_eq!(len, 32);
         assert_eq!(out[31] & 0xC0, 0xC0);
         assert_eq!(out[0] & 1, 1);
+    }
+
+    #[test]
+    fn keygen_bpsw_split_matches_library() {
+        // try_candidate's accept = strong-MR(asm) + strong-Lucas. Any prime it
+        // produces must satisfy the library's own one-call Baillie-PSW — the
+        // split changed backends, not the test.
+        use num_bigint_dig::prime::probably_prime;
+        let mut rng = SeqRng(7);
+        let (mut found, mut tries) = (0, 0);
+        while found < 2 {
+            tries += 1;
+            assert!(tries < 100_000, "prime search did not converge");
+            if let Some(p) = RsaKeygen::try_candidate(&mut rng, 32) {
+                assert!(
+                    probably_prime(&p, 0),
+                    "split BPSW accepted what the library rejects"
+                );
+                found += 1;
+            }
+        }
     }
 
     #[test]

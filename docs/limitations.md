@@ -12,18 +12,21 @@ are marked.
 - **X448 / Ed448 (OpenPGP)** — not offered, same reason: RustCrypto coverage
   of Curve448 is thin and unaudited. Cv25519/Ed25519 plus the NIST curves and
   secp256k1 cover practical use. *Status: until a serious crate exists.*
-- **RSA-3072/4096 on-card generation is slow** — the prime search dominates;
-  it runs on both cores with the modexp hot path in SRAM
-  ([architecture](architecture.md)). Measured on hardware against the
-  single-core figures: RSA-2048 ~8.9 s → 4.3 s mean (2.07×, n = 10);
-  RSA-3072 ~35 s → ~22 s (n = 3); RSA-4096 ~65 s → ~48 s median, 57 s mean
-  (n = 8, spread 17–124 s — prime-search luck). The speedup decays with key
-  size because the final Baillie-PSW runs in software per found prime
-  (~10 s+ each at 4096) and does not parallelize within a single find; an
-  asm-backed Miller-Rabin inside that test is the known next lever. The
-  device streams keepalives either way, so tools wait it out. Import is
-  fast. *Status: inherent to the hardware class; the parallel-scan share is
-  at the two-core limit.*
+- **RSA-3072/4096 on-card generation is slow** — the prime search dominates,
+  and the search cost is the *rejection* of hundreds of composite candidates,
+  each one asm-modexp-bound. That is already on both cores with the modexp hot
+  path in SRAM ([architecture](architecture.md)): RSA-2048 ~8.9 s → ~4–6 s,
+  RSA-3072 ~35 s → ~22 s, RSA-4096 ~65 s → ~50 s, all dominated by how many
+  candidates the draw happens to need (the per-keygen spread is wide — 17 s to
+  124 s seen at 4096 — because that count is random, not because the silicon
+  varies). Per candidate the throughput is ~6.9 ms across both cores. The
+  Baillie-PSW that confirms a *survivor* is split between an asm strong
+  Miller-Rabin and a software Lucas test, but survivors are only a handful per
+  keygen, so neither half moves the total — the remaining lever is fewer
+  candidates (a wider small-prime sieve), not a faster final test. The device
+  streams keepalives throughout, so tools wait it out; import is fast.
+  *Status: inherent to the hardware class; the parallel-scan share is at the
+  two-core limit.*
 - **ML-KEM is scaffolding** — compiled, tested, unused: no CTAP PIN/UV
   protocol number for PQC key agreement exists yet to implement.
   *Status: waiting on standards.*
