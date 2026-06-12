@@ -118,6 +118,8 @@ def cmd_verify(args):
                     _gated(AUDIT_CHECKPOINT, {1: challenge}, dev, cid, args.pin))
     if st == 0x30:
         die("checkpoint refused — no OTP DEVK provisioned (see docs/production.md)")
+    if st == 0x27:
+        die("denied — no touch within 30 s; press the button when the LED blinks")
     if st != 0:
         die(f"checkpoint failed: {st:#x}")
     head_signed, seq_signed, sig, pubkey = m[1], m[2], m[3], m[4]

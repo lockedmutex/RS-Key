@@ -4,15 +4,17 @@
 """rsk — RS-Key device CLI entry point (`python -m rsk`, or `rsk` in the shell)."""
 import argparse
 
-from . import __version__, audit, backup, fido, led, lock, openpgp, otp, reboot, secureboot, status
+from . import (__version__, audit, backup, fido, inventory, led, lock, offboard, openpgp,
+               otp, reboot, secureboot, status)
 
-GROUPS = [status, backup, lock, secureboot, otp, fido, led, openpgp, reboot, audit]
+GROUPS = [status, inventory, backup, lock, secureboot, otp, fido, led, openpgp, reboot,
+          audit, offboard]
 
 
 def main():
     p = argparse.ArgumentParser(
-        prog="rsk", description="RS-Key device CLI — status, seed backup, "
-        "seed lock, secure boot, OTP, FIDO, LED, OpenPGP, reboot, audit.",
+        prog="rsk", description="RS-Key device CLI — status, fleet inventory, seed backup, "
+        "seed lock, secure boot, OTP, FIDO, LED, OpenPGP, reboot, audit, offboard.",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--version", action="version", version=f"rsk {__version__}")
     sub = p.add_subparsers(dest="group", required=True, metavar="<group>")

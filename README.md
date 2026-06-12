@@ -119,7 +119,7 @@ The dev shell puts three tools on `PATH`:
 | [Quick start](docs/quickstart.md) | flash, enroll, first login |
 | [Build options](docs/build.md) | every flag: VID/PID presets, firmware version, touch, PQC, … |
 | [Production setup](docs/production.md) | signed boot + OTP fuses, step by step (**irreversible**) |
-| [Feature guides](docs/guides/) | FIDO2, SSH, OpenPGP, PIV, OATH, OTP slots, backup, soft-lock, LED |
+| [Feature guides](docs/guides/) | FIDO2, SSH, OpenPGP, PIV, OATH, OTP slots, backup, soft-lock, LED, audit, attestation, fleet |
 | [Threat model](docs/threat-model.md) | what it protects against, and what it does not |
 | [Architecture](docs/architecture.md) | crates, executors, flash layout |
 | [Limitations](docs/limitations.md) | what is not covered, and why |
