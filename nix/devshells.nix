@@ -40,6 +40,14 @@
       rskTui
     ];
 
+    # tools/tui links the host PC/SC and HID stacks. On Linux the pcsc-sys and
+    # hidapi build scripts resolve libpcsclite/libudev via pkg-config (the gate
+    # clippies the TUI, so CI needs them); darwin uses the system frameworks.
+    buildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [
+      pkgs.pcsclite
+      pkgs.systemd # libudev, for the hidapi crate's hidraw backend
+    ];
+
     shellHook = ''
       # the Gnuk-derived OpenPGP card suite (third_party/) dlopens libgcrypt
       export DYLD_FALLBACK_LIBRARY_PATH="${pkgs.lib.getLib pkgs.libgcrypt}/lib''${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}"

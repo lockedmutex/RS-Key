@@ -14,6 +14,11 @@ run() { echo; echo "== $1 =="; shift; "$@"; }
 run "fmt"                      cargo fmt --all --check
 run "clippy (embedded)"        cargo clippy --workspace -- -D warnings
 run "clippy (host tests)"      cargo clippy -p rsk-sdk -p rsk-fs -p rsk-usb -p rsk-crypto -p rsk-fido -p rsk-openpgp -p rsk-rsa-asm -p rsk-mgmt -p rsk-oath -p rsk-otp -p rsk-piv -p rsk-rescue --target "$HOST" --all-targets -- -D warnings
+# tools/tui is its own workspace (host-only), so the --all/--workspace runs
+# above never see it — gate it explicitly. Its lockfile was scanned by nobody
+# until Dependabot flagged a transitive advisory from the GitHub side.
+run "fmt (tui)"                cargo fmt --manifest-path tools/tui/Cargo.toml --check
+run "clippy (tui)"             cargo clippy --manifest-path tools/tui/Cargo.toml --target "$HOST" --all-targets -- -D warnings
 run "test (host)"              cargo test -p rsk-sdk -p rsk-fs -p rsk-usb -p rsk-crypto -p rsk-fido -p rsk-openpgp -p rsk-rsa-asm -p rsk-mgmt -p rsk-oath -p rsk-otp -p rsk-piv -p rsk-rescue --target "$HOST"
 # The PQC-advertisement opt-in changes the getInfo shape — test both forms.
 run "test (advertise-pqc)"     cargo test -p rsk-fido --features advertise-pqc --target "$HOST" getinfo
@@ -30,6 +35,7 @@ run "build rsk-wipe (release)" cargo build --release -p rsk-wipe
 # RUSTSEC-2023-0071: rsa Marvin timing side-channel — no fixed release; it is the
 # OpenPGP RSA backend, mitigated by blinding. Justification in deny.toml.
 run "cargo-audit (SCA)"        cargo audit --ignore RUSTSEC-2023-0071
+run "cargo-audit (tui SCA)"    cargo audit --file tools/tui/Cargo.lock
 run "cargo-deny"               cargo deny check
 run "gitleaks (tree)"          gitleaks detect --redact --no-banner
 
