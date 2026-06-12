@@ -115,7 +115,7 @@ fn write_info<W: Write>(
     // 0x0B maxSerializedLargeBlobArray
     enc.u8(0x0B)?.u64(MAX_LARGE_BLOB_SIZE as u64)?;
 
-    // 0x0C forceChangePin (EF_MINPINLEN[1]); reported as state, not yet enforced.
+    // 0x0C forceChangePin (EF_MINPINLEN[1]); enforced at token issuance (clientpin).
     enc.u8(0x0C)?.bool(force_change)?;
 
     // 0x0D minPINLength (EF_MINPINLEN[0], default MIN_PIN_LENGTH)

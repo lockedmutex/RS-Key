@@ -236,6 +236,9 @@ fn change_pin<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [u8]
     let res = store_new_pin(ctx, &padded);
     padded.zeroize();
     res?;
+    // The new PIN met minPINLength (store_new_pin), so the change satisfies a
+    // pending forced-PIN-change policy.
+    clear_force_change(ctx)?;
     ctx.state.reset_pin_uv_auth_token(ctx.rng);
     ctx.state.reset_persistent_token(ctx.rng);
     ctx.state.needs_power_cycle = false;
@@ -280,8 +283,13 @@ fn get_pin_token<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [
         return Err(e);
     }
 
-    // Forced PIN change policy (EF_MINPINLEN[1] == 1) is not enforced here.
     pin_hash.zeroize();
+
+    // CTAP 2.1 forced PIN change: while EF_MINPINLEN[1] is set, a successful
+    // PIN check still refuses the token — only changePIN lifts the flag.
+    if force_change_pending(ctx) {
+        return Err(CtapError::PinPolicyViolation);
+    }
 
     // Build the token and return it encrypted under the shared secret.
     let pdata = if permissions & PERM_PCMR != 0 {
@@ -464,6 +472,28 @@ fn min_pin_length<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>) -> u8 {
         Some(n) if n >= 1 => buf[0],
         _ => MIN_PIN_LENGTH,
     }
+}
+
+/// The pending forced-PIN-change flag (EF_MINPINLEN[1]).
+fn force_change_pending<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>) -> bool {
+    let mut buf = [0u8; 2];
+    matches!(ctx.fs.read(EF_MINPINLEN, &mut buf), Some(n) if n >= 2 && buf[1] != 0)
+}
+
+/// A successful changePIN satisfies the policy: drop the flag, keep the
+/// minimum and the RP-id hash list (EF_MINPINLEN = [min, force, hashes…]).
+fn clear_force_change<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>) -> Result<(), CtapError> {
+    let mut buf = [0u8; 2 + 32 * 8]; // matches config's MAX_MIN_PIN_RPIDS cap
+    if let Some(n) = ctx.fs.read(EF_MINPINLEN, &mut buf)
+        && n >= 2
+        && buf[1] != 0
+    {
+        buf[1] = 0;
+        ctx.fs
+            .put(EF_MINPINLEN, &buf[..n])
+            .map_err(|_| CtapError::Other)?;
+    }
+    Ok(())
 }
 
 fn pinproto_ct_eq(a: &[u8], b: &[u8]) -> bool {
@@ -746,6 +776,70 @@ mod tests {
     #[test]
     fn set_pin_then_get_token_protocol_one() {
         set_and_get_token(PinProto::One, 1);
+    }
+
+    #[test]
+    fn forced_pin_change_blocks_tokens_until_change_pin() {
+        let (mut fs, mut rng) = setup();
+        let mut state = FidoState::new();
+        let plat = key_agreement(&mut fs, &mut rng, &mut state, PinProto::Two, 2);
+        let mut out = [0u8; 256];
+        run(
+            &mut fs,
+            &mut rng,
+            &mut state,
+            &plat.set_pin_req(b"1234"),
+            &mut out,
+        )
+        .unwrap();
+
+        // setMinPINLength(forceChangePin) state: [min, force, rpIdHash…].
+        let mut mp = [0u8; 2 + 32];
+        mp[0] = 4;
+        mp[1] = 1;
+        mp[2..].copy_from_slice(&sha256(b"example.com"));
+        fs.put(EF_MINPINLEN, &mp).unwrap();
+
+        // The *correct* PIN is refused while the flag is up — and the refusal
+        // is a policy error, not a failed verify: retries stay full.
+        assert_eq!(
+            run(
+                &mut fs,
+                &mut rng,
+                &mut state,
+                &plat.get_token_req(b"1234"),
+                &mut out
+            ),
+            Err(CtapError::PinPolicyViolation)
+        );
+        let mut pf = [0u8; PIN_FILE_LEN];
+        assert_eq!(fs.read(EF_PIN, &mut pf), Some(PIN_FILE_LEN));
+        assert_eq!(pf[0], MAX_PIN_RETRIES);
+
+        // changePIN satisfies the policy: flag drops, min + RP list survive.
+        let n = run(
+            &mut fs,
+            &mut rng,
+            &mut state,
+            &plat.change_pin_req(b"1234", b"123456"),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(n, 0);
+        let mut after = [0u8; 2 + 32];
+        assert_eq!(fs.read(EF_MINPINLEN, &mut after), Some(2 + 32));
+        assert_eq!(after[..2], [4, 0]);
+        assert_eq!(after[2..], mp[2..]);
+
+        // Tokens flow again with the new PIN.
+        run(
+            &mut fs,
+            &mut rng,
+            &mut state,
+            &plat.get_token_req(b"123456"),
+            &mut out,
+        )
+        .unwrap();
     }
 
     #[test]
