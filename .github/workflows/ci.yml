@@ -1,0 +1,168 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 RS-Key contributors
+
+# Three jobs:
+#   check   — the merge gate, the same single source of truth as local work:
+#             `nix develop -c ./scripts/check.sh` (docs/testing.md, "CI parity").
+#             Green locally means green here; no CI-only logic to drift.
+#   flavors — every feature combination of the firmware (up-button ×
+#             advertise-pqc × fips-profile), each packaged as a downloadable
+#             firmware-<flavor>.uf2 artifact.
+#   knobs   — build smokes for the compile-time env knobs (docs/build.md):
+#             all VIDPID presets, FW_VERSION, XOSC_DELAY_MULT, FAKE_* test
+#             keys. Build-only; no artifacts (masquerade ids are for local
+#             interop, not for distribution).
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # gitleaks scans the commit history, not just HEAD
+          fetch-depth: 0
+
+      - uses: DeterminateSystems/nix-installer-action@v16
+
+      - uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: check.sh — fmt, clippy, host tests, fips flavor, firmware builds, audit, deny, gitleaks
+        run: nix develop -c ./scripts/check.sh
+        env:
+          HOST_TARGET: x86_64-unknown-linux-gnu
+
+  flavors:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # All 2^3 combinations of {up-button, advertise-pqc, fips-profile}.
+          # "no-touch" = --no-default-features (the test build: presence off).
+          - name: default
+            args: ""
+          - name: pqc
+            args: "--features advertise-pqc"
+          - name: fips
+            args: "--features fips-profile"
+          - name: fips-pqc
+            args: "--features fips-profile,advertise-pqc"
+          - name: no-touch
+            args: "--no-default-features"
+          - name: no-touch-pqc
+            args: "--no-default-features --features advertise-pqc"
+          - name: no-touch-fips
+            args: "--no-default-features --features fips-profile"
+          - name: no-touch-fips-pqc
+            args: "--no-default-features --features fips-profile,advertise-pqc"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@v16
+
+      - uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: build (${{ matrix.name }})
+        run: nix develop -c cargo build --release -p firmware ${{ matrix.args }}
+
+      - name: package firmware-${{ matrix.name }}.uf2
+        run: |
+          nix develop -c picotool uf2 convert \
+            target/thumbv8m.main-none-eabihf/release/firmware -t elf \
+            firmware-${{ matrix.name }}.uf2
+          sha256sum firmware-${{ matrix.name }}.uf2
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.name }}-${{ github.sha }}
+          path: firmware-${{ matrix.name }}.uf2
+
+  knobs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@v16
+
+      - uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      # Sequential on purpose: after the first build only the firmware crate
+      # relinks (the env knobs feed its build script), so each preset is cheap.
+      - name: every VIDPID preset builds
+        run: |
+          for preset in Yubikey5 YubikeyNeo YubiHSM NitroHSM NitroFIDO2 NitroStart NitroPro Nitro3 Gnuk GnuPG Pico Dev; do
+            echo "::group::VIDPID=$preset"
+            nix develop -c env VIDPID="$preset" cargo build --release -p firmware
+            echo "::endgroup::"
+          done
+
+      - name: raw USB_VID/USB_PID override
+        run: nix develop -c env VIDPID=Dev USB_VID=0xFEFF USB_PID=0x0001 cargo build --release -p firmware
+
+      - name: FW_VERSION + masquerade preset (the docs example)
+        run: nix develop -c env VIDPID=NitroFIDO2 FW_VERSION=1.4.0 cargo build --release -p firmware
+
+      - name: hardened XOSC startup delay
+        run: nix develop -c env XOSC_DELAY_MULT=512 cargo build --release -p firmware
+
+      # Test-only path: fake OTP keys baked into the image (loud warning,
+      # greppable key) — the zero-fuse-writes OTP migration test build.
+      - name: FAKE_MKEK / FAKE_DEVK test build
+        run: |
+          nix develop -c env \
+            FAKE_MKEK=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+            FAKE_DEVK=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+            cargo build --release -p firmware

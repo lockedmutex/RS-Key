@@ -1,5 +1,7 @@
 # RS-Key
 
+[![ci](https://github.com/TheMaxMur/RS-Key/actions/workflows/ci.yml/badge.svg)](https://github.com/TheMaxMur/RS-Key/actions/workflows/ci.yml)
+
 **RS-Key** (**RSK**, *Raspberry Security Key* — also a pun on "written in Rust")
 is an open-source security-key firmware for the Raspberry Pi **RP2350**. It
 turns a $5–15 RP2350 board into a USB authenticator that speaks the same
@@ -127,6 +129,8 @@ The dev shell puts three tools on `PATH`:
 | [Testing](docs/testing.md) | host tests, fuzzing, on-device suites |
 | [Linux setup](docs/linux.md) | pcscd, udev, polkit, scdaemon |
 | [Motivation](docs/motivation.md) | why this exists |
+| [Contributing](CONTRIBUTING.md) | setup, the merge gate, code rules, how PRs land |
+| [Security policy](SECURITY.md) | how to report vulnerabilities (privately) |
 
 ## Limitations (the honest short list)
 

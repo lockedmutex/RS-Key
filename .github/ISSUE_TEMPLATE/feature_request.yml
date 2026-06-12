@@ -1,0 +1,55 @@
+name: Feature request
+description: Propose a capability, a CLI affordance, or a protocol feature.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Worth a quick look first:
+        [docs/limitations.md](https://github.com/TheMaxMur/RS-Key/blob/main/docs/limitations.md)
+        lists things that are out of scope on purpose, and the
+        [threat model](https://github.com/TheMaxMur/RS-Key/blob/main/docs/threat-model.md)
+        explains why some ideas don't fit the hardware.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - FIDO2 / U2F / passkeys
+        - OpenPGP
+        - PIV
+        - OATH / OTP
+        - rsk CLI / host tools
+        - Backup / lock / audit / attestation
+        - Build / provisioning
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What can't you do today, and in what situation does it bite?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed shape
+      description: >-
+        How you imagine it working — a CLI sketch, a protocol reference
+        (CTAP / OpenPGP / PIV spec section), prior art in YubiKey/Nitrokey…
+        Rough is fine.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Including "live without it" — why is that not enough?
+    validations:
+      required: false

@@ -1,0 +1,113 @@
+name: Bug report
+description: Something misbehaves — on the device, in the rsk CLI, or in the build.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Two minutes of detail here usually saves a
+        round-trip of "cannot reproduce".
+
+        **Exploitable bugs (PIN/touch bypass, secret extraction, attestation
+        forgery, …) do not belong in a public issue** — use
+        [private vulnerability reporting](https://github.com/TheMaxMur/RS-Key/security/advisories/new)
+        instead.
+
+  - type: checkboxes
+    id: triage
+    attributes:
+      label: Before filing
+      options:
+        - label: I searched the existing issues and this is not a duplicate.
+          required: true
+        - label: This is not an exploitable security bug (those go to a private advisory, not here).
+          required: true
+        - label: I can still reproduce it on current `main`.
+          required: false
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Where does it go wrong?
+      options:
+        - FIDO2 / U2F / passkeys / ssh-sk
+        - OpenPGP
+        - PIV
+        - OATH (TOTP/HOTP)
+        - Yubico OTP / keyboard
+        - rsk CLI / host tools
+        - Seed backup / soft-lock
+        - Audit journal / attestation
+        - Secure boot / OTP provisioning
+        - Build / nix / flashing
+        - Docs
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: firmware
+    attributes:
+      label: Firmware build
+      description: >-
+        `rsk inventory list` prints firmware version and bcdDevice in one go.
+        For a build from source, the commit hash works too.
+      placeholder: "fw 5.7.4, bcdDevice 0x0748 (or: commit 19e17fa, touch build)"
+    validations:
+      required: true
+
+  - type: input
+    id: board
+    attributes:
+      label: Board
+      placeholder: "Waveshare RP2350-One"
+    validations:
+      required: true
+
+  - type: input
+    id: host
+    attributes:
+      label: Host environment
+      description: OS + what talks to the key, if relevant.
+      placeholder: "macOS 15.5, Chrome 137 / ssh 9.9 / ykman 5.8 / pcscd 2.3"
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what you got instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. rsk fido set-pin
+        2. …
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Output / logs
+      description: >-
+        Command output, `rsk status`, browser/ssh errors, kernel or pcscd
+        logs — whatever you have. Strip anything you consider private; the
+        audit journal in particular is yours to redact.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Secure boot on/off, recent reflash, multiple keys connected, lunar phase…
+    validations:
+      required: false
