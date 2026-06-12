@@ -49,7 +49,9 @@ fn parse(data: &[u8]) -> Result<Req<'_>, CtapError> {
         if key < expected {
             return Err(CtapError::InvalidCbor);
         }
-        expected = key + 1;
+        // `key + 1` would overflow on a `u64::MAX` key (no real CTAP key is
+        // anywhere near it); reject rather than wrap the ascending watermark.
+        expected = key.checked_add(1).ok_or(CtapError::InvalidCbor)?;
         match key {
             0x01 => req.get = cbor(d.u64())?,
             0x02 => req.set = Some(cbor(d.bytes())?),
@@ -483,6 +485,25 @@ mod tests {
         assert_eq!(
             run(&mut fs, &mut state, &req, &mut out),
             Err(CtapError::InvalidParameter)
+        );
+    }
+
+    #[test]
+    fn max_u64_key_rejected_not_overflow() {
+        // Regression for the fuzz crash `a1 1b ff..ff`: a map whose key is
+        // `u64::MAX`. The ascending-key watermark `key + 1` used to overflow
+        // (panic under debug-assertions, silent wrap on-device); it must now
+        // reject the request instead of either.
+        let mut fs = seeded_fs();
+        let mut state = armed(PERM_LBW);
+        let mut out = [0u8; 64];
+        // {u64::MAX: ...} — one entry, key 0xffff_ffff_ffff_ffff.
+        let req = std::vec![
+            0xA1, 0x1B, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+        ];
+        assert_eq!(
+            run(&mut fs, &mut state, &req, &mut out),
+            Err(CtapError::InvalidCbor)
         );
     }
 }
