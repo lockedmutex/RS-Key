@@ -24,8 +24,8 @@
         target = "thumbv8m.main-none-eabihf";
 
         toolchain = fx.combine [
-          fx.stable.toolchain
-          fx.targets.${target}.stable.rust-std
+          fx.latest.toolchain
+          fx.targets.${target}.latest.rust-std
         ];
 
         # cargo-fuzz needs nightly (libfuzzer + -Zsanitizer); host target only.
@@ -150,6 +150,9 @@
         # Nightly shell for cargo-fuzz: `nix develop .#fuzz -c cargo fuzz run apdu`.
         devShells.fuzz = pkgs.mkShell {
           packages = [ fuzzToolchain pkgs.cargo-fuzz ];
+
+          MIRIFLAGS = "-Zmiri-many-seeds -Zdeduplicate-diagnostics -Zmiri-strict-provenance";
+
           shellHook = ''
             echo "rs-key fuzz devshell (nightly)"
             echo "  rustc: $(rustc --version 2>/dev/null)"
