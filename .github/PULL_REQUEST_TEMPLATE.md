@@ -12,7 +12,12 @@
 
 ## Checklist
 
-- [ ] Firmware behavior changed → `config.device_release` (bcdDevice) bumped in `firmware/src/main.rs`
+<!-- Tick what applies; "N/A" is fine — most host-only PRs leave the firmware lines blank. -->
+
+- [ ] Device behavior / image changed → `config.device_release` (bcdDevice) bumped by one (hex)
+      in `firmware/src/main.rs` — host-only (CLI / docs / CI / build) does not (CONTRIBUTING.md)
+- [ ] Fixes something a downgrade would reopen → flag whether the next release should advance the
+      rollback **epoch** (`docs/production.md`, stage 3) — a seal-time `--rollback` call, not a code bump
 - [ ] New or changed `unsafe` → justified in `docs/unsafe.md`
 - [ ] User-visible behavior → the matching guide under `docs/` updated
 - [ ] New files carry the SPDX header (`AGPL-3.0-only`)
