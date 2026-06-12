@@ -7,6 +7,10 @@ publish = false
 
 # ISO-7816 file API over a backend-agnostic FID->bytes Storage.
 # HAL-agnostic: the flash Storage impl lives in `firmware`; tests use a RAM one.
+# `cfg(kani)` guards the proof harnesses (set by `cargo kani`, unknown to rustc).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
 [dependencies]
 rsk-sdk = { workspace = true }
 heapless = "0.8"

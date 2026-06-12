@@ -10,6 +10,7 @@ device reserved for end-to-end integration.
 | Host unit tests | parsers, state machines, applets, crypto (~350 tests) | `#[cfg(test)]` in each crate |
 | Fuzzing | the same logic under adversarial bytes | `fuzz/` |
 | Miri | the fuzz targets' logic under the UB checker | `fuzz/tests/miri.rs` |
+| Kani proofs | bounded model checking — every input, not a sample | `#[cfg(kani)]` in the crates |
 | `no_std` build | the crates still link for the device | default `thumbv8m` target |
 | On-device tests | real USB + flash on the board | `tests/*.py` |
 
@@ -74,6 +75,60 @@ Neither suite gates a commit. CI runs both weekly — the `deep-checks`
 workflow: the Miri suite, plus a timed libFuzzer pass over every target with
 the corpus carried between runs, crash artifacts uploaded.
 
+## Kani proofs
+
+Where a fuzzer samples inputs, [Kani](https://model-checking.github.io/kani/)
+(a bounded model checker over CBMC) checks **every** input up to a stated
+bound — no panic, no overflow, no out-of-bounds access, and the asserted
+invariants hold. The harnesses live next to the unit tests as
+`#[cfg(kani)] mod proofs` and cover the small, total, attacker- or
+crypto-critical helpers, where a proof genuinely beats a sample:
+
+- `rsk-sdk` — BER-TLV walk over arbitrary bytes; `format_len` round-trip for
+  every `u16`; APDU case-1..4 parsing over every buffer up to the bound.
+- `rsk-fs` — the `EF_META` record-walk (`rebuild_meta`) over arbitrary
+  (corrupt) blobs.
+- `rsk-rsa-asm` — `mod_small` proven *functionally* (`== v % m`, every
+  dividend up to 2 bytes and every modulus) and panic-free / `< m` for every
+  input up to 8 bytes; the `IncrementalSieve` residue invariant
+  (`res[i] == cand mod p_i` after a step, verdict identical to the flat
+  sieve) for every seed.
+
+Kani is **not** in nixpkgs and its setup downloads a prebuilt CBMC bundle, so
+this is the one deliberately non-nix tool (install once, outside the dev
+shell):
+
+```sh
+cargo install --locked kani-verifier && cargo kani setup
+cargo kani -p rsk-sdk -p rsk-fs -p rsk-rsa-asm
+```
+
+The proofs are bounded, and the bound is the honest fine print. A 16–20-byte
+symbolic buffer reaches every branch of the TLV/APDU parsers; bigger inputs
+are the fuzzers' job. Big loops (a full modexp, Baillie–PSW) are out of CBMC's
+reach by design and stay covered by the differential tests and on-device KATs.
+
+The sharpest bound is on *functional division* specs. Proving
+`mod_small == v % m` makes the solver equate two division circuits —
+`mod_small`'s byte-wise Horner reduction against one wide `%` — which is the
+shape resolution-based SAT handles worst: it discharges in ~100 s at a 2-byte
+dividend, but the cost climbs steeply per added byte and a full `u32` dividend
+(4 bytes) does not converge (it ran ~30 min without a verdict; the early
+`SATISFIABLE` lines are Kani's reachability covers, not the property). So
+`mod_small`'s exact value is pinned exhaustively at 2 bytes
+(`mod_small_matches_value`), its panic-freedom and range over the full 8
+(`mod_small_in_range`), and the full-width semantics by the 32-byte BigUint
+differential test plus the division-free `IncrementalSieve` proof. The earlier
+instinct — "never spec a division functionally" — was half right: avoid it at
+*wide* dividends; at a narrow width it is the strongest evidence there is.
+House rule: a small total helper in a parsing or arithmetic hot path gets a
+proof harness sized to what CBMC can swallow — functional where it converges,
+structural (`< m`, panic-free) where it doesn't, or relational against a
+division-free reformulation; anything bigger gets a fuzz target.
+
+CI: the weekly `deep-checks` workflow has a `kani` job (rustup-based, version
+pinned, `~/.kani` cached) running the same `cargo kani` line.
+
 ## On-device tests
 
 Numbered, self-contained scripts under `tests/`, run from the dev shell
@@ -106,4 +161,4 @@ upstream checkouts).
 `check.sh` is plain bash over the Nix dev shell — a CI job is
 `nix develop -c ./scripts/check.sh` plus, on a runner with the board
 attached, the `tests/` scripts. The scheduled `deep-checks` workflow is the
-two commands from this page, weekly. No hidden state.
+Miri, fuzz and Kani commands from this page, weekly. No hidden state.

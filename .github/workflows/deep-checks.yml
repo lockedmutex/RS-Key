@@ -8,11 +8,15 @@
 #   fuzz — a timed libFuzzer pass over every cargo-fuzz target. The corpus
 #          is carried between runs via the actions cache, so coverage
 #          accumulates week over week; crash artifacts are uploaded.
+#   kani — the #[kani::proof] bounded model-checking harnesses (docs/
+#          testing.md). Kani is not in nixpkgs and its setup downloads a
+#          prebuilt CBMC bundle, so this one job is rustup-based, not nix.
 #
 # Runs weekly, on demand (workflow_dispatch, with a per-target time knob),
 # and self-tests on any push that edits this file. Local equivalents:
 #   nix develop .#fuzz -c cargo miri test --manifest-path fuzz/Cargo.toml
 #   nix develop .#fuzz -c cargo fuzz run <target> -- -max_total_time=120
+#   cargo kani -p rsk-sdk -p rsk-fs -p rsk-rsa-asm   (cargo install kani-verifier)
 
 name: deep-checks
 
@@ -136,3 +140,31 @@ jobs:
         with:
           path: fuzz/corpus
           key: fuzz-corpus-${{ github.run_id }}
+
+  kani:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      # Pin to the version the proofs were written against; bump deliberately.
+      KANI_VERSION: "0.67.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      # ~/.kani holds the downloaded CBMC/toolchain bundle (~1 GB) — cache it
+      # alongside the cargo-installed driver.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.kani
+            ~/.cargo/bin/cargo-kani
+            ~/.cargo/bin/kani
+            ~/.cargo/registry
+          key: kani-${{ runner.os }}-${{ env.KANI_VERSION }}
+
+      - name: install kani (rustup-based — not packaged in nixpkgs)
+        run: |
+          command -v cargo-kani >/dev/null || cargo install --locked kani-verifier --version "$KANI_VERSION"
+          cargo kani setup
+
+      - name: prove every harness
+        run: cargo kani -p rsk-sdk -p rsk-fs -p rsk-rsa-asm

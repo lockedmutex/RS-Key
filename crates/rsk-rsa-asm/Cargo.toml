@@ -12,6 +12,10 @@ build = "build.rs"
 # generation: the Miller-Rabin / Fermat modexp is ~10x faster than the pure-Rust
 # bignum, turning a ~150 s keygen into a few seconds. On the host (no ARM asm) it
 # falls back to num-bigint-dig so the prime-search logic stays testable.
+# `cfg(kani)` guards the proof harnesses (set by `cargo kani`, unknown to rustc).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
 [dependencies]
 # The modexp working buffers hold prime-candidate state.
 zeroize = { workspace = true }
