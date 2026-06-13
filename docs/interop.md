@@ -30,6 +30,17 @@ is green — **7 passed, 0 failed**, `ssh-sk` skipped (touch). `ykman openpgp
 info` now prints the card (`OpenPGP version: 3.4`, app `4.6.0`, PIN counters)
 instead of the TLV error.
 
+**Touch / GUI round — 2026-06-13, firmware `0x0759`→`0x075A`** (`--features
+up-button` confirmed live): `ssh-keygen -t ed25519-sk` enrol, `fido2-cred`/
+`fido2-assert` (assertion verified), and the OTP HID keyboard (short-tap typed
+the static slot verbatim) all ✅ with a real button press; Chrome / Firefox /
+Safari WebAuthn ✅ by user attestation. `gpg --edit-card generate` was the lone
+❌ on `0x0759` — **not** a crypto failure (the APDU suites GENERATE
+P-256/Ed25519/RSA-2048 and UIF-sign fine) but a GET DATA `6E` short-`Le`
+overflow in scdaemon; **fixed in `0x075A`** (dispatcher response chaining) and
+re-verified end-to-end. See
+[Known issues](#get-data-short-le-chaining-fixed-on-0x075a).
+
 ## Status legend
 
 | Mark | Meaning |
@@ -59,19 +70,19 @@ accordingly:
 | Consumer | What it exercises | Build | How | Status |
 |---|---|---|---|---|
 | `fido2-token -L` / `-I` (libfido2) | enumeration + getInfo | no-touch | `tests/interop/run.py` | ✅ `0759` |
-| `fido2-cred` / `fido2-assert` (libfido2) | make credential / get assertion | touch | `tests/interop/run.py --touch` | ⏳ |
+| `fido2-cred` / `fido2-assert` (libfido2) | make credential / get assertion | touch | manual (`fido2-cred -M` ‖ `fido2-assert -G`) | ✅ `0759` (touch ×2, assertion verified `2026-06-13`) |
 | python-fido2 (Yubico) | full CTAP2 flows | no-touch | `pytest third_party/pico-fido-tests/pico-fido` | ⏳ |
-| Chrome WebAuthn | register + authenticate | touch | [webauthn.io](https://webauthn.io) (manual) | ⏳ |
-| Firefox WebAuthn | register + authenticate | touch | [webauthn.io](https://webauthn.io) (manual) | ⏳ |
-| Safari WebAuthn | register + authenticate | touch | [webauthn.io](https://webauthn.io) (manual) | ⏳ |
-| `ssh-keygen -t ed25519-sk` + `ssh` | sk-key enrol + auth | touch | manual | ⏳ |
+| Chrome WebAuthn | register + authenticate | touch | [webauthn.io](https://webauthn.io) (manual) | ✅ user-attested (macOS/Linux/Win, `2026-06-13`) |
+| Firefox WebAuthn | register + authenticate | touch | [webauthn.io](https://webauthn.io) (manual) | ✅ user-attested (macOS/Linux/Win, `2026-06-13`) |
+| Safari WebAuthn | register + authenticate | touch | [webauthn.io](https://webauthn.io) (manual) | ✅ user-attested (`2026-06-13`) |
+| `ssh-keygen -t ed25519-sk` + `ssh` | sk-key enrol + auth | touch | `tests/interop/run.py --touch` | ✅ `0759` (touch, ed25519-sk enrolled `2026-06-13`) |
 
 ### OpenPGP card
 
 | Consumer | What it exercises | Build | How | Status |
 |---|---|---|---|---|
 | `gpg --card-status` | application-related-data read | either | `tests/interop/run.py` | ✅ `0759` |
-| `gpg --edit-card` keygen/sign/encrypt | full card lifecycle | touch (UIF) | manual | ⏳ |
+| `gpg --edit-card` keygen/sign/encrypt | full card lifecycle | touch (UIF) | manual | ✅ `075A` (EC+RSA `generate` land on-card after the [GET DATA short-Le fix](#get-data-short-le-chaining-fixed-on-0x075a); was ❌ on `0759`) |
 | `ykman openpgp info` | `Tlv.unpack(0x6E, …)` strict parse | either | `tests/interop/run.py` | ✅ `0759` (was ❌ on `0758`) |
 | openpgp-card-tests (Gnuk-derived) | spec suite | no-touch | `pytest third_party/openpgp-card-tests/…` | ⏳ |
 
@@ -90,7 +101,7 @@ accordingly:
 | `ykman oath accounts list` | OATH credential listing | no-touch | `tests/interop/run.py` | ✅ `0759` |
 | Yubico Authenticator (app) | TOTP/HOTP GUI | no-touch | manual | ⏳ |
 | `ykman otp info` | OTP slot state | no-touch | `tests/interop/run.py` | ✅ `0759` |
-| OTP keyboard (types the code) | USB-HID keyboard emulation | touch | manual (focus a text field) | ⏳ |
+| OTP keyboard (types the code) | USB-HID keyboard emulation | touch | manual (focus a text field) | ✅ `0759` (short-tap typed the static slot verbatim, `2026-06-13`) |
 
 ## Known issues
 
@@ -113,6 +124,45 @@ Incorrect TLV length`.
 
 ```sh
 ykman openpgp info     # prints card data, no TLV traceback
+```
+
+### GET DATA short-Le chaining FIXED on 0x075A
+
+**Was (`0x0759`):** `gpg`/`scdaemon` read the application-related-data template
+with the **short** APDU `00 CA 00 6E 00` (Le = 256). Once keys are present the
+`6E` template is **269 bytes** (> 256); the firmware returned the whole 269-byte
+body instead of truncating to 256 with `61 0D` ("13 more bytes") for a
+`GET RESPONSE` follow-up. scdaemon's 256-byte buffer overflowed → PC/SC
+`SCARD_E_INSUFFICIENT_BUFFER (0x80100008)` → `apdu_send_simple … failed: invalid
+value`, so key enumeration and `gpg --edit-card generate` aborted with
+`card_key_generate … General error` / `KEY_NOT_CREATED`. Reproduced on **two
+boards**. The on-card crypto was never the problem — `tests/36_openpgp_keygen.py`
+GENERATEs P-256/Ed25519/ECDH/**RSA-2048 (3.7 s)** and `tests/52_openpgp_uif_touch.py`
+UIF-signs with a real touch, both fine, because they use **extended** Le and so
+never overran the buffer (which masked the bug). Likely surfaced by the bug-#1
+fix, which restored the `6E` wrapper and pushed the template past 256 bytes.
+
+**Fix:** the dispatcher (`crates/rsk-sdk/src/applet.rs`) now does ISO 7816-4
+outgoing response chaining — when an opted-in applet's body exceeds the command's
+short `Le` it ships the first `Le` bytes with `61xx` and serves the remainder on
+GET RESPONSE (`0xC0`); the held tail is zeroized after delivery. OpenPGP and PIV
+opt in via `Applet::response_chaining`; OATH (own `0xA5` SEND REMAINING) and the
+vendor/rescue tools (extended `Le`) are untouched, so every extended-`Le`
+consumer (ykman, the APDU suites) is byte-for-byte unchanged.
+
+**Verified on hardware `2026-06-13` (`0x075A`):** with EC keys present the `6E`
+read returns `256 + 61 0D` then `GET RESPONSE → 13 + 9000` (**0** `insufficient
+buffer` in the scdaemon log), `gpg --card-status` prints the full card, and both
+EC and RSA `gpg --edit-card generate` complete (`KEY_CREATED`, keys land
+on-card). The RSA GENERATE response itself never needed chaining — scdaemon
+issues GENERATE with extended `Le` (`em=1`), so its 270-byte pubkey is fine.
+
+```text
+# before (0x0759): short-Le 6E with keys present
+send apdu: c=00 i=CA p1=00 p2=6E  le=256 em=0  ->  pcsc: insufficient buffer (0x80100008)
+# after (0x075A): chained per ISO 7816-4
+send apdu: c=00 i=CA p1=00 p2=6E  le=256 em=0  ->  response sw=610D datalen=256
+send apdu: c=00 i=C0 00 00 ...                 ->  response sw=9000 (remaining 13 B)
 ```
 
 ## How to run the CLI sweep
