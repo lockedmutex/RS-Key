@@ -84,7 +84,7 @@ accordingly:
 | `gpg --card-status` | application-related-data read | either | `tests/interop/run.py` | ✅ `0759` |
 | `gpg --edit-card` keygen/sign/encrypt | full card lifecycle | touch (UIF) | manual | ✅ `075A` (EC+RSA `generate` land on-card after the [GET DATA short-Le fix](#get-data-short-le-chaining-fixed-on-0x075a); was ❌ on `0759`) |
 | `ykman openpgp info` | `Tlv.unpack(0x6E, …)` strict parse | either | `tests/interop/run.py` | ✅ `0759` (was ❌ on `0758`) |
-| openpgp-card-tests (Gnuk-derived) | spec suite | no-touch | `pytest third_party/openpgp-card-tests/…` | ⚠️ `075A` (`001_initial_check` 31/34; 3 Gnuk-specific DO-layout asserts differ — `6E` offsets [the bug-#1 wrapper], DS-counter `7A`, name/lang/sex) |
+| openpgp-card-tests (Gnuk-derived) | spec suite | no-touch | `pytest third_party/openpgp-card-tests/…` | ⚠️ `075A` (`001_initial_check` 31/34; the 3 fails — `6E`, `65`, `7A` — share one root: `util.get_data_object` strips the constructed-DO wrapper only when `is_yubikey=True` (never set in this Gnuk config), so our deliberately-wrapped templates (the bug-#1 ykman/real-Yubikey requirement) fail the Gnuk "unwrapped" asserts. Not a defect — wrapping is mandatory for ykman; the two expectations are mutually exclusive) |
 
 ### PIV
 
