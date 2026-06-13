@@ -28,12 +28,29 @@ has actually been checked on hardware (with dates) is in
 [docs/interop.md](docs/interop.md). Treat anything not in that matrix as
 unverified.
 
+## Documentation
+
+The docs live in [docs/](docs/) and are published as a site:
+**<https://themaxmur.github.io/RS-Key/>**.
+
+| | |
+|---|---|
+| [Quick start](docs/quickstart.md) | flash, enroll, first login |
+| [Hardware](docs/hardware.md) | supported boards and build knobs |
+| [Build options](docs/build.md) | every flag: VID/PID presets, version, touch, PQC, FIPS profile |
+| [Production setup](docs/production.md) | OTP fuses + secure boot, step by step (**irreversible**) |
+| [Feature guides](docs/guides/) | FIDO2, SSH, OpenPGP, PIV, OATH, OTP, backup, soft-lock, LED, audit, … |
+| [Threat model](docs/threat-model.md) · [Limitations](docs/limitations.md) | what it protects against, and what it does not |
+| [Architecture](docs/architecture.md) · [`unsafe` audit](docs/unsafe.md) | how it's built; every `unsafe` site |
+| [Testing](docs/testing.md) · [Interop](docs/interop.md) | host tests, fuzzing; real-tool results |
+| [Linux setup](docs/linux.md) · [Motivation](docs/motivation.md) | pcscd/udev/polkit; why this exists |
+
 ## What it supports
 
 - **FIDO2 / WebAuthn / U2F** — passkeys, two-factor logins, `ssh ed25519-sk`
 - **OpenPGP card 3.4** — `gpg` signing, decryption, authentication (EC + RSA)
-- **PIV** — X.509 smart-card via `ykman piv` / PKCS#11
-- **OATH** — TOTP / HOTP codes (`ykman oath`, Yubico Authenticator)
+- **PIV** — X.509 smart-card via PKCS#11 (or `ykman piv`, which needs the opt-in `VIDPID=Yubikey5` build)
+- **OATH** — TOTP / HOTP codes (`ykman oath`, Yubico Authenticator — both need the opt-in `VIDPID=Yubikey5` build)
 - **Yubico-style OTP** — four slots, plus a USB-keyboard interface that types the code
 - **Seed backup** — export the FIDO master seed as BIP-39 / SLIP-39 words
 - **At-rest soft-lock** — keep the FIDO seed in flash encrypted to a key only you hold
@@ -144,28 +161,6 @@ Separately, **`rsk-wipe`** is a RAM-only flash-erase *image* you flash
 deliberately to wipe a board for clean-slate testing — it is built and flashed
 like firmware, not run from `PATH` ([rsk-wipe/README.md](rsk-wipe/README.md)).
 
-## Documentation
-
-The docs live in [docs/](docs/) and are published as a site:
-**<https://themaxmur.github.io/RS-Key/>**.
-
-| | |
-|---|---|
-| [Quick start](docs/quickstart.md) | flash, enroll, first login |
-| [Hardware](docs/hardware.md) | supported boards and build knobs |
-| [Build options](docs/build.md) | every flag: VID/PID presets, version, touch, PQC, FIPS profile |
-| [Production setup](docs/production.md) | OTP fuses + secure boot, step by step (**irreversible**) |
-| [Feature guides](docs/guides/) | FIDO2, SSH, OpenPGP, PIV, OATH, OTP, backup, soft-lock, LED, audit, … |
-| [Threat model](docs/threat-model.md) · [Limitations](docs/limitations.md) | what it protects against, and what it does not |
-| [Architecture](docs/architecture.md) · [`unsafe` audit](docs/unsafe.md) | how it's built; every `unsafe` site |
-| [Testing](docs/testing.md) · [Interop](docs/interop.md) | host tests, fuzzing; real-tool results |
-| [Linux setup](docs/linux.md) · [Motivation](docs/motivation.md) | pcscd/udev/polkit; why this exists |
-
-Preview the site locally with `nix develop -c ./scripts/docs.sh serve`
-(`build` / `check` also available). To publish it, enable Pages once in the
-repo: **Settings → Pages → Build and deployment → Source = "GitHub Actions"**;
-the [pages workflow](.github/workflows/pages.yml) does the rest on push to `main`.
-
 ## Limitations (short list)
 
 - **No secure element.** OTP + secure boot is real hardening, but physical
@@ -174,8 +169,9 @@ the [pages workflow](.github/workflows/pages.yml) does the rest on push to `main
   OpenPGP and PIV keys do not survive a board swap.
 - **No Brainpool / X448 / Ed448** OpenPGP curves (no mature `no_std` Rust
   implementations).
-- The default USB identity **matches a YubiKey's** for tool compatibility; this
-  is a local convenience, not for distribution.
+- The default USB identity is **RS-Key's own** pid.codes id `0x1209:0x0001`;
+  the YubiKey USB identity that `ykman` / Yubico Authenticator auto-recognize is
+  the opt-in `VIDPID=Yubikey5` build, not for distribution.
 
 Details and reasoning: [docs/limitations.md](docs/limitations.md).
 
@@ -186,4 +182,4 @@ Details and reasoning: [docs/limitations.md](docs/limitations.md).
 the AGPL-3.0-**only** [pico-keys](https://github.com/polhenarejos) firmware
 family (pico-fido / pico-openpgp / pico-keys-sdk) by Pol Henarejos; the upstream
 grant is version-3-only, so RS-Key inherits it and so must forks. Not affiliated
-with or endorsed by Yubico, Nitrokey, or Raspberry Pi.
+with or endorsed by Yubico, Nitrokey, or Raspberry Pi. See [motivation](docs/motivation.md).
