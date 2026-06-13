@@ -19,6 +19,11 @@ run "clippy (host tests)"      cargo clippy -p rsk-sdk -p rsk-fs -p rsk-usb -p r
 # until Dependabot flagged a transitive advisory from the GitHub side.
 run "fmt (tui)"                cargo fmt --manifest-path tools/tui/Cargo.toml --check
 run "clippy (tui)"             cargo clippy --manifest-path tools/tui/Cargo.toml --target "$HOST" --all-targets -- -D warnings
+# fuzz/ is also its own (nightly) workspace. rustfmt needs no toolchain, so the
+# stable gate can format-check it here; building/clippy stay in the .#fuzz shell
+# (deep-checks CI). Format fuzz/ with this same stable rustfmt — not the .#fuzz
+# nightly one, which lays imports out differently.
+run "fmt (fuzz)"               cargo fmt --manifest-path fuzz/Cargo.toml --check
 run "test (host)"              cargo test -p rsk-sdk -p rsk-fs -p rsk-usb -p rsk-crypto -p rsk-fido -p rsk-openpgp -p rsk-rsa-asm -p rsk-mgmt -p rsk-oath -p rsk-otp -p rsk-piv -p rsk-rescue --target "$HOST"
 # The PQC-advertisement opt-in changes the getInfo shape — test both forms.
 run "test (advertise-pqc)"     cargo test -p rsk-fido --features advertise-pqc --target "$HOST" getinfo
