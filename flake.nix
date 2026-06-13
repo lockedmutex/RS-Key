@@ -45,9 +45,16 @@
 
         hostTools = import ./nix/host-tools.nix { inherit pkgs; };
         firmware = import ./nix/firmware.nix { inherit pkgs target toolchain; };
+        apps' = import ./nix/apps.nix {
+          inherit pkgs self toolchain;
+          inherit (hostTools) rskPython;
+          firmwarePackage = firmware.packages.firmware;
+        };
       in
       {
-        inherit (firmware) packages lib;
+        packages = firmware.packages // apps'.packages;
+        inherit (firmware) lib;
+        apps = apps'.apps;
 
         devShells = import ./nix/devshells.nix (
           {

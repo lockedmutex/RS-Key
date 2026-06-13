@@ -150,6 +150,33 @@ Two caveats:
   works for a quick throwaway — but the declarative arg is the reproducible path
   and needs no `--impure`.
 
+## `nix run` — host tools without the dev shell
+
+The host tooling is also exposed as flake apps, so it runs straight from the
+flake without `nix develop` (Nix pins every dependency):
+
+```sh
+nix run .#rsk -- status          # the Python device CLI (rsk --help for groups)
+nix run .#rsk-tui                # the live ratatui dashboard (prebuilt binary)
+nix run .#flash -- --help        # build + sign + flash, one command (secure boot)
+```
+
+`#rsk` wraps the bundled `tools/rsk` package on the pinned interpreter; `#rsk-tui`
+is a prebuilt host binary (no compile-on-run). Both are also buildable as
+packages (`nix build .#rsk-tui`).
+
+**`nix run .#flash`** wraps the secure-boot flash ritual end to end: it seals
+(signs) an unsigned image, reboots the device into BOOTSEL, loads it, then
+reboots. With no argument it seals the reproducible default firmware
+(`.#firmware`); pass a path to seal a flavor you built yourself
+(`nix run .#flash -- firmware-no-touch.uf2`). It reads the signing key from the
+host — `~/.rs-key-secrets/{secure_boot_key.pem,otp_secureboot.json}` by default,
+override the directory with `RS_KEY_SECRETS` — and stamps `--rollback 1` into the
+seal (set `RSK_ROLLBACK` to change). It prompts before flashing (`-y` skips). The
+device must already run secure boot with the matching boot key provisioned; the
+full ritual, the anti-rollback rules, and recovery are in
+[production.md](production.md) and [anti-rollback.md](anti-rollback.md).
+
 ## Runtime overrides (phy record)
 
 The rescue applet can store a small config record in flash (`rsk` /
