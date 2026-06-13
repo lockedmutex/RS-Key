@@ -53,14 +53,29 @@ the phy TLV codec (parse∘serialize round-trip is an asserted invariant), the
 PIN protocols, AEADs, the DRBG, ML-DSA/ML-KEM decoding, and the seed-blob
 format/migration state machine.
 
-Most targets drive one applet from a fresh state. One — `cross_applet` — is
-**stateful**: it wires the real `Dispatcher` to the OpenPGP / Management / OATH
-/ OTP / PIV set over a single shared `Fs`, then replays an attacker-chosen
-*sequence* of APDUs, so SELECT switches, command chaining and the file system
-persist across commands. It hunts the seams a per-applet target can't reach —
-state leaking between applets, a SELECT mid-chain, one applet's FID colliding
-with another's. (GENERATE is skipped, as on device the RSA prime search is
-fast-pathed off the dispatcher.)
+Most targets drive one applet from a fresh state. Three are **stateful** —
+they replay an attacker-chosen *sequence* against persistent state, hunting
+the multi-step seams a fresh-state target can't reach (both real bugs of this
+class — the largeBlobs overflow and the mgmt write→read mismatch — were
+multi-step):
+
+- `cross_applet` wires the real `Dispatcher` to the OpenPGP / Management /
+  OATH / OTP / PIV set over a single shared `Fs`: SELECT switches, command
+  chaining and the file system persist across APDUs — state leaking between
+  applets, a SELECT mid-chain, FID collisions. (GENERATE is skipped, as on
+  device the RSA prime search is fast-pathed off the dispatcher.)
+- `fido_session` replays a CTAPHID_CBOR message sequence against one
+  `FidoState` + `Fs` with an all-permissions token armed and a resident
+  credential provisioned: PIN/token state, the credential store, large blobs
+  and the journal persist across commands, `now_ms` advances over the
+  token-timeout edges, a mid-sequence reset wipes the store under the
+  session's feet — and getInfo must still succeed after anything.
+- `fs_ops` drives put / read / delete / meta ops / reboot
+  (`into_storage`→`scan`) over one image against a `HashMap` shadow model:
+  every read checks the full-length-returned / copy-clamped contract (the
+  mgmt bug was a caller missing it), `meta_add` is checked against the exact
+  `META_MAX` boundary, and the live key set must equal the model's after any
+  prefix of operations.
 
 ```sh
 nix develop .#fuzz -c cargo fuzz list

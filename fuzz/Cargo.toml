@@ -276,5 +276,19 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "fido_session"
+path = "fuzz_targets/fido_session.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fs_ops"
+path = "fuzz_targets/fs_ops.rs"
+test = false
+doc = false
+bench = false
+
 # Standalone workspace so the parent (thumbv8m) build never pulls these in.
 [workspace]

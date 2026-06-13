@@ -1422,3 +1422,152 @@ fn miri_seed_blob() {
         assert_eq!(after_one, load_keydev(&dev_new, &mut fs));
     }
 }
+
+// =========================================================================
+// fido_session
+// =========================================================================
+
+#[test]
+fn miri_fido_session() {
+    use rsk_fido::consts::{
+        CTAP_CLIENT_PIN, CTAP_CREDENTIAL_MGMT, CTAP_GET_INFO, CTAP_LARGE_BLOBS, CTAP_RESET,
+        CTAP_SELECTION,
+    };
+    use rsk_fido::credential::credential_store;
+    use rsk_fido::state::{PERM_ACFG, PERM_CM, PERM_GA, PERM_LBW, PERM_MC, PERM_PCMR};
+
+    let d = Device {
+        serial_hash: &[0xAB; 32],
+        serial_id: &[1, 2, 3, 4, 5, 6, 7, 8],
+        otp_key: None,
+    };
+    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut rng = SeqRng(1);
+    let _ = ensure_seed(&d, &mut fs, &mut rng);
+    let rp_hash = sha256(b"a.co");
+    if let Some(seed) = load_keydev(&d, &mut fs) {
+        let input = CredInput {
+            rp_id: "a.co",
+            user_id: &[1, 2],
+            user_name: "u",
+            user_display_name: "",
+            use_sign_count: true,
+            rk: true,
+            created_ms: 1,
+            alg: -7,
+            curve: 1,
+            ext: CredExt {
+                cred_protect: 0,
+                cred_blob: &[],
+                hmac_secret: false,
+                large_blob_key: false,
+                third_party_payment: false,
+            },
+        };
+        let mut cred_box = [0u8; 512];
+        if let Ok(len) = credential_create(&seed, &d, &input, &rp_hash, &[0x11; 12], &mut cred_box)
+        {
+            let _ = credential_store(
+                &seed,
+                &d,
+                &mut fs,
+                &cred_box[..len],
+                &rp_hash,
+                "a.co",
+                &[1, 2],
+            );
+        }
+    }
+
+    let mut state = FidoState::new();
+    state.paut.token = [0x99; 32];
+    state.paut.permissions = PERM_MC | PERM_GA | PERM_CM | PERM_LBW | PERM_ACFG | PERM_PCMR;
+    state.begin_using_token(false);
+
+    // One session: token-armed queries, a reset mid-way, then getInfo must
+    // still succeed against the wiped store.
+    let msgs: [&[u8]; 7] = [
+        &[CTAP_GET_INFO],
+        &[CTAP_SELECTION],
+        &[CTAP_CLIENT_PIN, 0xa1, 0x02, 0x01],
+        &[CTAP_CREDENTIAL_MGMT, 0xa1, 0x01, 0x01],
+        &[CTAP_LARGE_BLOBS, 0xa1, 0x01, 0x00],
+        &[CTAP_RESET],
+        &[CTAP_GET_INFO],
+    ];
+    let mut presence = rsk_fido::AlwaysConfirm;
+    let mut out = [0u8; 2048];
+    let mut now_ms: u64 = 2;
+    for msg in msgs {
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: d,
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms,
+        };
+        let w = rsk_fido::process_cbor(&mut ctx, msg, &mut out);
+        assert!(w >= 1 && w <= out.len());
+        if msg.first() == Some(&CTAP_GET_INFO) {
+            assert_eq!(out[0], rsk_fido::CTAP2_OK);
+        }
+        now_ms += 997;
+    }
+}
+
+// =========================================================================
+// fs_ops
+// =========================================================================
+
+#[test]
+fn miri_fs_ops() {
+    const F1: u16 = 0xB001;
+    const F2: u16 = 0xB002;
+
+    let mut fs = Fs::new(RamStorage::new(), &[]);
+    fs.scan();
+
+    // put / clamped read: full length back, copy truncated to the view.
+    let v1: Vec<u8> = (0..200u16).map(|j| j as u8).collect();
+    fs.put(F1, &v1).unwrap();
+    let mut small = [0u8; 16];
+    assert_eq!(fs.read(F1, &mut small), Some(200));
+    assert_eq!(&small[..], &v1[..16]);
+
+    // meta: add, replace, the META_MAX NoMemory boundary, find, delete.
+    fs.meta_add(F1, &[0x11; 8]).unwrap();
+    fs.meta_add(F1, &[0x22; 8]).unwrap();
+    assert!(fs.meta_add(F2, &[0x33; 1024]).is_err()); // 4 + 1024 + existing > META_MAX
+    let mut out = [0u8; 4];
+    assert_eq!(fs.meta_find(F1, &mut out), Some(8));
+    assert_eq!(out, [0x22; 4]);
+    assert_eq!(fs.meta_find(F2, &mut out), None);
+
+    // Reboot: same image, fresh scan; data and meta survive.
+    let storage = fs.into_storage();
+    let mut fs = Fs::new(storage, &[]);
+    fs.scan();
+    assert_eq!(fs.size(F1), Some(200));
+    assert_eq!(fs.meta_find(F1, &mut out), Some(8));
+
+    // The live key set is exactly the files plus EF_META while meta lives.
+    let mut live = std::collections::BTreeSet::new();
+    fs.for_each_key(&mut |f| {
+        live.insert(f);
+    });
+    assert_eq!(
+        live,
+        std::collections::BTreeSet::from([F1, rsk_fs::EF_META])
+    );
+
+    // delete drops contents and metadata; EF_META clears once empty.
+    fs.delete(F1).unwrap();
+    assert_eq!(fs.read(F1, &mut small), None);
+    assert_eq!(fs.meta_find(F1, &mut out), None);
+    let mut live = std::collections::BTreeSet::new();
+    fs.for_each_key(&mut |f| {
+        live.insert(f);
+    });
+    assert!(live.is_empty());
+}
