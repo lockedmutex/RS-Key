@@ -23,6 +23,11 @@ rsk-piv = { path = "../crates/rsk-piv" }
 rsk-rescue = { path = "../crates/rsk-rescue" }
 # The piv_apdu seed runs the AES-192 management-key auth dance host-side.
 aes = { version = "0.8", default-features = false }
+# power_cut: the real on-device storage stack (pinned to the firmware's
+# version) over sequential-storage's power-cut-injecting mock flash (`_test`).
+sequential-storage = { version = "=7.2.0", features = ["_test"] }
+embedded-storage-async = "0.4"
+embassy-futures = "0.1"
 
 [[bin]]
 name = "apdu"
@@ -286,6 +291,13 @@ bench = false
 [[bin]]
 name = "fs_ops"
 path = "fuzz_targets/fs_ops.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "power_cut"
+path = "fuzz_targets/power_cut.rs"
 test = false
 doc = false
 bench = false
