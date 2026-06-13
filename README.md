@@ -117,7 +117,9 @@ The dev shell puts three tools on `PATH`:
 
 - **`rsk`** — the device CLI: `rsk status`, `rsk backup`, `rsk lock`,
   `rsk secure-boot`, `rsk otp`, `rsk fido`, `rsk led`, `rsk reboot`, …
-- **`rsk-tui`** — a live terminal dashboard (device state, backup, LED)
+- **`rsk-tui`** — a live terminal cockpit: sectioned device state, seed
+  backup, LED, audit, identity verify, reboot ([guide](docs/guides/tui.md);
+  `rsk-tui --demo` needs no hardware)
 - **`rsk-wipe`** — a RAM-only flash wiper for clean-slate testing
 
 ## Documentation
@@ -128,6 +130,7 @@ The dev shell puts three tools on `PATH`:
 | [Build options](docs/build.md) | every flag: VID/PID presets, firmware version, touch, PQC, … |
 | [Production setup](docs/production.md) | signed boot + OTP fuses, step by step (**irreversible**) |
 | [Feature guides](docs/guides/) | FIDO2, SSH, OpenPGP, PIV, OATH, OTP slots, backup, soft-lock, LED, audit, attestation, fleet |
+| [Terminal cockpit](docs/guides/tui.md) | `rsk-tui`: sections, key bindings, workflows, safety model |
 | [Threat model](docs/threat-model.md) | what it protects against, and what it does not |
 | [Architecture](docs/architecture.md) | crates, executors, flash layout |
 | [Limitations](docs/limitations.md) | what is not covered, and why |
