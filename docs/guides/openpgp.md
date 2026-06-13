@@ -1,7 +1,8 @@
 # OpenPGP card
 
 A full OpenPGP card 3.4 over CCID: three key slots (signature, decryption,
-authentication), works with stock GnuPG.
+authentication), works with stock GnuPG. The same slots cover commit signing,
+SSH login (via gpg-agent), and end-to-end mail/file encryption.
 
 Prereqs: on Linux, `pcscd` + the `scdaemon.conf` lines from
 [linux.md](../linux.md). Check the card is visible:
@@ -16,84 +17,238 @@ affiliation ([build.md](../build.md)).
 
 ## PINs
 
-| | Default | Unlocks |
-|---|---|---|
-| User PIN (PW1) | `123456` | signing, decryption, authentication |
-| Admin PIN (PW3) | `12345678` | key import/generation, card settings |
-| Reset Code | unset | unblocking PW1 without PW3 |
+| | Default | Length | Unlocks |
+|---|---|---|---|
+| User PIN (PW1) | `123456` | ≥ 6 | signing, decryption, authentication |
+| Admin PIN (PW3) | `12345678` | ≥ 8 | key import/generation, card settings |
+| Reset Code (RC) | `12345678` (= PW3) | — | unblocking PW1 without PW3 |
+
+The `≥ 6` / `≥ 8` minima are gpg's own policy, not a card limit — the firmware
+only refuses a new PIN that is *shorter than the old one*; its hard maximum is
+127 bytes.
+
+A fresh card seeds the Reset Code to the same value as the admin PIN
+(`12345678`), so it is functional out of the box — set your own with `passwd`
+option 4 (below) so it isn't just a copy of PW3.
+
+Each PIN has its **own retry counter**, default **3**. A correct entry resets
+that PIN's counter; a wrong one decrements it. `gpg --card-status` prints them
+as `PIN retry counter : 3 3 3` (PW1, RC, PW3 — all three default to 3).
 
 Change them first:
 
 ```sh
 gpg --card-edit
 gpg/card> admin
-gpg/card> passwd            # menu: change PIN / Admin PIN / set Reset Code
+gpg/card> passwd            # menu: 1 change PW1 · 3 change PW3 · 4 set Reset Code
 ```
 
-Three wrong PW3 attempts lock admin operations permanently (factory reset
-required) — standard OpenPGP card behaviour.
+The same menu sets the **Reset Code** (option 4, under `admin`), which lets a
+holder who has forgotten PW1 reset it *without* the admin PIN — useful when the
+admin PIN lives somewhere offline.
+
+**Two ways admin operations lock:**
+
+- **Three wrong PW3** blocks the admin PIN. Unlike PW1, the admin PIN has no
+  higher authority to unblock it — recovery is a **factory reset** of the
+  applet (below). Plan to keep PW3 written down somewhere offline.
+- **Three wrong PW1** blocks the user PIN. This one *is* recoverable: unblock it
+  with the admin PIN or the Reset Code (see [Unblocking PW1](#unblocking-pw1)).
 
 ## Generate keys on-card
 
 ```sh
 gpg --card-edit
 gpg/card> admin
-gpg/card> key-attr           # choose per-slot: ECC (ed25519/cv25519, NIST,
-                             # secp256k1) or RSA 2048/3072/4096
+gpg/card> key-attr           # per slot, pick the algorithm (table below)
 gpg/card> generate           # makes all three keys + a gpg keyring entry
 ```
 
-On-card generation means the private keys never existed anywhere else —
-and cannot be backed up; gpg's "make an off-card backup" prompt covers the
-encryption key only if you say yes. RSA generation is slow on this hardware
-(≈22 s for 2048, ≈35 s for 3072, ≈65 s for 4096 — the device streams
-keepalives, gpg just waits); EC is instant.
+`key-attr` is asked once **per slot** (signature, then encryption, then
+authentication), so you can mix — e.g. Ed25519 for signing and authentication,
+Cv25519 for encryption (gpg's default modern pair), or RSA across the board.
+
+Supported per-slot attributes (advertised via DO `0xFA`, the list `ykman` and
+gpg read back):
+
+| Family | Choices | Notes |
+|---|---|---|
+| ECC (sign/auth) | **Ed25519**, NIST **P-256 / P-384 / P-521**, **secp256k1** | EdDSA on Ed25519; ECDSA on the Weierstrass curves |
+| ECC (encrypt) | **Cv25519** (X25519), NIST **P-256 / P-384 / P-521**, **secp256k1** | ECDH; the DEC slot only |
+| RSA | **2048 / 3072 / 4096** | exponent fixed at 65537 (what gpg imports) |
+
+Not supported — gpg will offer them, and the card even accepts the `key-attr`
+write, but **GENERATE / keytocard** then refuses with `0x6A81` "Function not
+supported": **brainpool** (P-256/384/512), **X448**, **Ed448**. (X448 and Ed448
+still appear in the `0xFA` advertisement but are non-functional; brainpool is
+not advertised at all.) RustCrypto exposes only work-in-progress arithmetic for
+those, so shipping them would mean unaudited curve math.
+
+On-card generation means the private keys never existed anywhere else — and
+**cannot be backed up**; gpg's "make an off-card backup" prompt covers the
+**encryption key only**, and only if you say yes. (A lost signing or
+authentication key is regenerated, not recovered.) RSA generation is slow on
+this hardware — the firmware races both RP2350 cores for the two primes and
+streams CCID keepalives while gpg waits:
+
+| Size | Typical on-card keygen |
+|---|---|
+| RSA-2048 | ≈ 4–6 s |
+| RSA-3072 | ≈ 22 s |
+| RSA-4096 | ≈ 50 s |
+| any EC curve | instant |
+
+The spread is wide because the prime search is random — RSA-4096 has been seen
+anywhere from ~17 s to ~120 s on the same board. See
+[../limitations.md](../limitations.md) for the measured dual-core numbers. EC
+is the pragmatic default unless a peer needs RSA.
 
 ## Or import existing keys
 
+If you already have a GnuPG key (and want a recoverable off-card copy), import
+the subkeys instead of generating:
+
 ```sh
-gpg --edit-key YOURKEY
-gpg> keytocard               # per subkey: moves it to a slot
+gpg --expert --edit-key YOURKEY
+gpg> toggle                  # show secret subkeys (ssb)
+gpg> key 1                   # select the subkey to move (repeat per subkey)
+gpg> keytocard               # pick the matching slot: 1 sig · 2 enc · 3 auth
+gpg> save
 ```
 
-Importing keeps an off-card copy in your keyring until you delete it —
-your call which way the trade-off goes.
+`keytocard` *moves* the selected subkey onto the card, replacing the on-disk
+copy with a stub that points at the device. Set `key-attr` to match the
+incoming key's algorithm **before** `keytocard`, or the card refuses the import
+— a mismatched algorithm/curve returns "Wrong data" / "Function not supported"
+and a missing admin (PW3) session returns "Security status not satisfied"; gpg
+surfaces one of these as a card refusal.
+
+Importing keeps an off-card copy in your keyring until you delete it — your call
+which way the trade-off goes. The usual recoverable setup: generate the master
+key **offline**, move only the three subkeys to the card, and store the master
+key material on encrypted offline media.
 
 ## Daily use
 
+### Signing and decryption
+
 ```sh
-gpg --sign / --decrypt …          # asks for PW1, then touches the card
-gpg --export-ssh-key YOURKEY      # the AUT slot doubles as an SSH key
+echo hi | gpg --clearsign                 # PW1, then a touch if UIF is on
+gpg --encrypt -r alice@example.com file    # public-key op, no card needed
+gpg --decrypt file.gpg                     # PW1 (PW2), card does the ECDH/RSA
 ```
 
-For SSH via gpg-agent: `enable-ssh-support` in `gpg-agent.conf`, add the
-keygrip to `~/.gnupg/sshcontrol` — the standard recipe, nothing
-device-specific.
+gpg drives the slots automatically: the SIG slot signs, the DEC slot decrypts.
+Encryption *to* a recipient is a public-key operation and never touches the
+card; only **decryption** does.
 
-**Touch policies (UIF):** per-slot, set from the card-edit `uif` commands —
-when on, every use of that key additionally requires a button press.
+By default PW1 stays valid for the session after the first signature. To force
+a PIN on **every** signature, flip the PW1 status byte:
+
+```sh
+gpg/card> admin
+gpg/card> forcesig          # toggles "PW1 valid for one signature only"
+```
+
+### SSH authentication via gpg-agent
+
+The AUT slot doubles as an SSH key through gpg-agent:
+
+```sh
+# one-time agent setup
+echo enable-ssh-support >> ~/.gnupg/gpg-agent.conf
+gpgconf --kill gpg-agent
+
+# add the authentication subkey's keygrip to sshcontrol
+gpg --list-keys --with-keygrip YOURKEY     # find the [A] subkey's keygrip
+echo <KEYGRIP> >> ~/.gnupg/sshcontrol
+
+# export the public key in OpenSSH format and install it
+gpg --export-ssh-key YOURKEY > ~/.ssh/id_rsk.pub
+ssh-copy-id -f -i ~/.ssh/id_rsk.pub you@server
+```
+
+Then `export SSH_AUTH_SOCK=$(gpgconf --list-dirs agent-ssh-socket)` (in your
+shell rc) and `ssh you@server` prompts for PW1 and logs in. This is the
+standard gpg-agent recipe — nothing device-specific.
+
+> For FIDO-backed SSH (`ed25519-sk`, no gpg) see [ssh.md](ssh.md); for signing
+> git commits and tags with the SIG slot see [git.md](git.md).
+
+### Touch policies (UIF)
+
+Each slot has an independent **user-interaction flag**. When on, every use of
+that key additionally requires a button press — the firmware polls the BOOTSEL
+button and fails the operation (`0x6600`) if it is not pressed in time. PIN
+alone is no longer enough; a remote attacker holding your unlocked session
+still cannot sign or decrypt without physical access.
+
+```sh
+gpg/card> admin
+gpg/card> uif 1 on          # 1 sig · 2 enc · 3 auth   (off to disable)
+```
+
+UIF is per-slot, so you can require a touch for signing but not decryption, or
+any mix. On a board with no button configured the check is a no-op.
 
 ## AES encryption (PSO)
 
-The card also offers symmetric AES encrypt/decrypt with an on-card key
-(`gpg-card`'s and some tooling expose it; most users never need it).
+The DEC slot carries an on-card **AES-256** key, minted automatically whenever
+the encryption keypair is generated. Tools that expose the card's symmetric
+PSO (e.g. `gpg-card`) can `ENCIPHER` / `DECIPHER` arbitrary block-aligned data
+with it (raw AES-CBC, zero IV; output is `0x02 || cryptogram`). It needs PW1
+(PW2). Most users never touch this — public-key encryption is the normal path.
 
-## Factory reset (OpenPGP only)
+## Recovery and reset
+
+### Unblocking PW1
+
+Three wrong user-PIN tries block PW1 but not the keys. Two ways back:
+
+```sh
+# with the admin PIN
+gpg --card-edit
+gpg/card> admin
+gpg/card> unblock           # verify PW3, set a new PW1
+
+# or with the Reset Code, if one was set (no admin PIN needed)
+gpg/card> passwd            # menu option 2: "unblock PIN" via Reset Code
+```
+
+Both reset PW1's retry counter and re-seal its key material under the new PIN.
+
+### Factory reset (OpenPGP only)
 
 ```sh
 rsk openpgp reset      # or: gpg --card-edit → admin → factory-reset
 ```
 
-Wipes the OpenPGP applet (keys, PINs, DOs) and nothing else — FIDO/PIV/OATH
-survive.
+`rsk openpgp reset` blocks both PINs, then drives the spec-compliant
+`TERMINATE` (0xE6) + `ACTIVATE` (0x44) and reseeds factory defaults
+(PW1 `123456`, PW3 `12345678`). It wipes the OpenPGP applet (keys, PINs, DOs,
+reset code) and **nothing else** — FIDO / PIV / OATH / OTP survive (the
+TERMINATE is scoped to the OpenPGP FIDs). This is also the only way out of a
+PW3 that you have blocked: a blocked admin PIN cannot be unblocked, only reset
+away — along with the keys it protected.
+
+It is destructive but idempotent, so it is the clean way to clear non-default
+PINs a prior gpg session left behind (which otherwise block the test suite at
+VERIFY).
 
 ## Troubleshooting
 
 - `gpg: selecting card failed: No such device` → scdaemon vs pcscd fight;
   apply [linux.md](../linux.md)'s `disable-ccid`, then
   `gpgconf --kill scdaemon`.
-- `ykman` stops seeing the device after gpg used it → same fix.
-- Wrong-PIN counters: `gpg --card-status` shows `PIN retry counter: 3 0 3`.
+- `ykman` stops seeing the device after gpg used it → same fix; gpg's scdaemon
+  holds the reader. `gpgconf --kill scdaemon` releases it.
+- A card refusal on `keytocard` / `generate` (gpg may report "Function not
+  supported", "Wrong data", or "Security status not satisfied") → the slot's
+  `key-attr` doesn't match the key, or you skipped `admin` (no PW3 session).
+- `gpg --card-status` shows `PIN retry counter : 0 …` → that PIN is blocked;
+  see [Recovery and reset](#recovery-and-reset).
+- RSA `generate` seems to hang → it isn't; on-card RSA keygen takes the times
+  above and gpg shows no progress bar. Wait it out, or use an EC curve.
 - `ykman openpgp info` → `ERROR: Incorrect TLV length` on firmware **before
   `0x0759`**: the GET DATA `6E` reply was missing its constructed-DO wrapper,
   which ykman's strict parser requires (`gpg` tolerated it). Fixed in `0x0759`;

@@ -9,6 +9,22 @@ a restore the same key files and registrations just keep working.
 **Not covered** (sealed to the chip, not derivable from the seed): resident
 passkeys, OpenPGP keys, PIV keys, OATH accounts, OTP slots.
 
+## Two ways to stay recoverable
+
+Seed backup is one strategy; a **primary + backup device pair** is the other, and
+they are complementary:
+
+- **Back up the seed** (this page) — one identity, kept recoverable by its
+  mnemonic. Restore it onto a replacement board to resurrect the *same*
+  credentials. Simple, but it is a single secret, and resident passkeys / PIV /
+  OpenPGP don't come back.
+- **Primary + backup pair** ([backup-key.md](backup-key.md)) — two independent
+  keys with *different* seeds, both registered on every account. Lose one and the
+  other already works — no restore, no shared secret to leak. The cost is
+  registering both keys everywhere (and enrolling resident passkeys on each).
+
+Many people do both: two devices *and* a written mnemonic for each.
+
 ## Export (once, at setup)
 
 ```sh

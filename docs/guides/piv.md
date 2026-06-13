@@ -1,15 +1,28 @@
 # PIV
 
-A PIV smart-card (NIST SP 800-73) over CCID: X.509 client certificates,
-S/MIME, PIV-aware OS login, PKCS#11. Driven with `ykman piv`.
+A PIV smart-card (NIST SP 800-73-4) over CCID: X.509 client certificates,
+S/MIME, PIV-aware OS login, SSH and `age` through PKCS#11. Driven with
+`ykman piv` or `yubico-piv-tool`; the applet also speaks the Yubico extensions
+(metadata, serial, attestation, move/delete, set-retries) those tools use, and
+reports itself as a YubiKey-class PIV application — a local interop convenience,
+not a Yubico affiliation ([build.md](../build.md)).
+
+Prereqs: on Linux, `pcscd` plus the polkit rule from [linux.md](../linux.md);
+if you also use GnuPG, the `disable-ccid` line so `scdaemon` and `pcscd` stop
+fighting over the reader. Check the card is visible:
+
+```sh
+ykman piv info            # PIV version 5.7.4, slot + PIN/PUK/mgmt-key state
+```
 
 ## Defaults
 
-| | Default |
-|---|---|
-| PIN | `123456` |
-| PUK | `12345678` |
-| Management key | AES-192, the well-known default |
+| | Default | Notes |
+|---|---|---|
+| PIN | `123456` | 6–8 chars; padded to 8 with `0xFF` on the wire |
+| PUK | `12345678` | 6–8 chars; unblocks a blocked PIN |
+| Management key | `010203040506070801020304050607080102030405060708` | AES-192, the well-known YubiKey 5.7-era default |
+| PIN / PUK retries | 3 / 3 | resets to full on each correct entry |
 
 Change all three before real use:
 
@@ -19,44 +32,185 @@ ykman piv access change-puk
 ykman piv access change-management-key --generate --protect
 ```
 
+`--protect` stores the new management key on the card, encrypted under the PIN,
+so `ykman` can recover it from the PIN alone (no separate hex string to carry).
+The applet accepts AES-128/192/256 management keys; under the FIPS-style build
+it refuses to *set* a new 3DES key, though an existing 3DES key still
+authenticates so a reflashed device can migrate itself to AES.
+
+> The defaults are public. Until you change the PIN, PUK and management key,
+> anyone with physical access can generate, import or delete keys. Treat a
+> default-credential card as unprovisioned.
+
 ## Slots
 
-The standard four — `9a` (authentication), `9c` (signing), `9d` (key
-management), `9e` (card auth) — plus the twenty retired key-management
-slots (`82`–`95`) and `f9` (attestation). Algorithms: ECC P-256/P-384,
-RSA 1024/2048.
+| Slot | Role | Typical use | Default PIN policy |
+|---|---|---|---|
+| `9a` | PIV Authentication | system / domain login, SSH, client TLS | once per session |
+| `9c` | Digital Signature | document & email signing | **every operation** |
+| `9d` | Key Management | decryption, key agreement (ECDH) | once per session |
+| `9e` | Card Authentication | physical-access / contactless | once per session |
+| `82`–`95` | Retired Key Management | 20 slots for old decryption keys | once per session |
+| `9b` | Management Key | admin auth (not an asymmetric key) | — |
+| `f9` | Attestation | signs slot attestation certs (on-card) | — |
 
-## Generate a key + certificate
+The signature slot (`9c`) demands the PIN before **every** private-key
+operation; the other slots cache the PIN for the rest of the session after one
+VERIFY. `9e` carries no special default on this firmware — like the other
+non-signature slots it defaults to PIN **once per session**, so a default-policy
+9e key still needs one VERIFY before use. For true card-auth / contactless
+no-PIN behaviour, generate the 9e key with an explicit `--pin-policy NEVER`.
+
+**Algorithms.** On-card generation and import accept **RSA-2048**, **RSA-1024**
+(disabled under the FIPS-style build, SP 800-131A), and **ECC P-256 / P-384**.
+RSA-3072/4096 and Ed25519/X25519 — which the OpenPGP applet does offer
+([openpgp.md](openpgp.md)) — are **not** available on the PIV applet; pick
+P-256 or P-384 for elliptic-curve PIV keys.
+
+## Generate a key on-card
 
 ```sh
-ykman piv keys generate 9a pub.pem                  # on-card key
-ykman piv certificates generate 9a pub.pem -s "CN=me"   # self-signed cert
+ykman piv keys generate --algorithm ECCP256 9a pub.pem   # on-card key, public part out
+ykman piv certificates generate --subject "CN=me" 9a pub.pem   # self-signed cert into 9a
 ykman piv info
 ```
 
-Or a CSR for a real CA: `ykman piv certificates request 9a pub.pem me.csr`.
+Generating in a slot already writes a self-signed certificate into that slot's
+certificate object, so a GET DATA serves one immediately even before you run
+`certificates generate`. Management-key auth is required to generate.
 
-**Attestation:** `ykman piv keys attest 9a attestation.pem` proves the key
-was generated on-device, chained through the `f9` slot
-(`O=RS-Key` certificates).
+For a real CA, emit a CSR instead of a self-signed cert:
 
-Touch policy per key: `ykman piv keys generate --touch-policy always …` —
-each private-key operation then needs a button press.
+```sh
+ykman piv certificates request --subject "CN=me" 9a pub.pem me.csr
+# … sign me.csr at your CA, then import the issued cert:
+ykman piv certificates import 9a issued.pem
+```
+
+On-card generation means the private key never existed off-device and cannot be
+exported or backed up — losing the card loses the key (that is the point). RSA
+generation is slow on this hardware (RSA-2048 takes roughly 4–6 s, and the prime
+search is random so run-to-run times vary; the device streams CCID keepalives so
+the connection stays alive — it is not a hang). See [limitations.md](../limitations.md)
+for the measured dual-core figures. EC generation is instant.
+
+## Or import an existing key
+
+```sh
+ykman piv keys import 9d existing.pem        # PEM with the private key
+ykman piv certificates import 9d existing-cert.pem
+```
+
+Import is management-key gated and also accepts RSA-2048/1024 and P-256/P-384.
+An imported key keeps whatever copy you imported it from — your call which way
+the trade-off goes. Imported keys **cannot be attested** (see below): attestation
+proves on-card *generation*, which import didn't do.
+
+## PIN and touch policy per key
+
+Both policies are fixed at generate/import time and stored in the slot metadata:
+
+```sh
+ykman piv keys generate --pin-policy ALWAYS --touch-policy ALWAYS 9a pub.pem
+```
+
+| `--pin-policy` | Effect |
+|---|---|
+| `NEVER` | no PIN to use the key |
+| `ONCE` | PIN once per session (default for `9a`/`9d`/`9e`/retired) |
+| `ALWAYS` | PIN before every operation (default for `9c`) |
+
+| `--touch-policy` | Effect |
+|---|---|
+| `NEVER` | no button press (default for the `9b` management key) |
+| `ALWAYS` | a physical touch before every private-key operation (default for generated slot keys) |
+| `CACHED` | treated as `ALWAYS` on this device — see below |
+
+Generated slot keys default to **touch ALWAYS**: each sign / decrypt / ECDH
+needs a button press, declined-touch fails the operation with `6982`. The
+management key ships **touch NEVER** so admin provisioning isn't gated; raise it
+with `ykman piv access change-management-key --touch` if you want admin actions
+to require a press too.
+
+> `CACHED` is treated as `ALWAYS`. The device has no wall clock, so it cannot
+> honour the 15-second touch cache a real YubiKey offers; it errs strict and
+> asks every time. If you set `CACHED`, expect `ALWAYS` behaviour.
+
+## Attestation
+
+```sh
+ykman piv keys attest 9a attestation.pem
+```
+
+Proves a slot key was generated on-device, not imported. The attestation
+certificate is signed on-card by the `f9` key (a P-384 CA key, self-signed at
+first boot) and carries the standard Yubico OIDs — firmware version, device
+serial, and the slot's pin/touch policy. Subject/issuer names are
+`C=ES, O=RS-Key, CN=RS-Key PIV …`. Read the `f9` CA cert with:
+
+```sh
+ykman piv certificates export f9 attestation-ca.pem
+```
+
+Attestation only works for **generated** keys; an imported key returns
+`6A80` / `INCORRECT PARAMS` (there is nothing to attest). For the FIDO side of
+attestation — org-provisioned enterprise attestation — see
+[attestation.md](attestation.md).
+
+## Move and delete keys
+
+`ykman piv` 5.7 can move a key (with its certificate and metadata) between
+slots, or delete it:
+
+```sh
+ykman piv keys move 9a 82          # 9a → retired slot 82, cert + metadata follow
+ykman piv keys delete 9c           # wipe the signature slot's key
+```
+
+A key in a retired slot cannot be moved back into an active slot. Both
+operations require management-key auth.
 
 ## Use it
 
-- **PKCS#11** (browsers, ssh, VPNs): point the app at your distro's
-  `opensc-pkcs11.so`; the card shows up as a PIV token.
-- **Windows/macOS native** smart-card stacks pick PIV up as-is.
-- `ssh` via PKCS#11: `ssh -I /usr/lib/opensc-pkcs11.so you@host`.
+The card shows up as a standard PIV token; nothing here is RS-Key-specific.
+
+- **PKCS#11** (browsers, VPNs, SSH, `age`): point the app at OpenSC's
+  `opensc-pkcs11.so` — `/usr/lib/x86_64-linux-gnu/opensc-pkcs11.so` on Debian,
+  `/usr/lib/opensc-pkcs11.so` on many distros, the Nix store path under NixOS
+  ([linux.md](../linux.md)).
+- **SSH** via PKCS#11:
+
+  ```sh
+  ssh-keygen -D /usr/lib/opensc-pkcs11.so          # print the slot 9a public key
+  ssh -I /usr/lib/opensc-pkcs11.so you@host        # log in with it (touch + PIN per policy)
+  ```
+
+  For an `ed25519-sk` hardware SSH key the FIDO path is simpler — see
+  [ssh.md](ssh.md). PIV-over-PKCS#11 is the route when you need an RSA or
+  NIST-curve key, a smart-card-login certificate, or a server that wants a real
+  X.509 chain.
+
+- **`age` encryption**: `age-plugin-yubikey` drives PIV slots directly for
+  identity files; or use any PKCS#11-aware `age` build against `opensc-pkcs11.so`.
+
+- **ECDH / key agreement** (`9d` and retired slots, P-256/P-384):
+  `ykman piv ... ` exposes it; at the wire level it is GENERAL AUTHENTICATE with
+  tag `0x85`, the operation `yubico-piv-tool` and OpenSC use for decryption.
+
+- **Windows / macOS native** smart-card stacks pick the PIV applet up as-is;
+  macOS CryptoTokenKit binds its `pivtoken.appex` to the reader
+  ([interop.md](../interop.md#piv)).
 
 ## At rest
 
-PIV private keys are stored **AES-GCM-sealed** under the device root. Once the
-OTP master key is [fused](../production.md), a flash dump does not yield key
-material; **before** that burn the seal's root derives from on-chip state that
-an attacker with the flash and chip could reconstruct, so at-rest protection is
-only meaningful after provisioning (see [threat-model.md](../threat-model.md)).
+PIV private keys are stored **AES-256-GCM-sealed** under the device root (the
+sealed blob is `nonce ‖ ciphertext ‖ tag`, authenticated against the device
+serial). Once the OTP master key is [fused](../otp-fuses.md), a flash dump does
+not yield key material; **before** that burn the seal's root derives from
+on-chip state an attacker with the flash and chip could reconstruct, so at-rest
+protection is only meaningful after provisioning (see
+[threat-model.md](../threat-model.md)). The seal is bound to the device, not the
+slot, so a `keys move` re-homes the blob verbatim — no re-encryption.
 
 ## Factory reset (PIV only)
 
@@ -64,12 +218,29 @@ only meaningful after provisioning (see [threat-model.md](../threat-model.md)).
 ykman piv reset
 ```
 
-Wipes PIV keys/certs/PINs only; the other applets are untouched.
+Wipes PIV keys, certificates and PINs only; the other applets are untouched.
+The reset is **only accepted once both the PIN and the PUK are blocked** —
+`ykman` blocks them for you first. To wipe *every* applet at once (PIV included),
+use `rsk offboard`, which blocks PIN+PUK then resets PIV as part of a full-device
+wipe with a signed receipt — see [fleet.md](fleet.md#offboarding).
+
+There is no `rsk piv` command group: PIV is provisioned entirely through
+`ykman piv` / `yubico-piv-tool` / PKCS#11, with `rsk` only involved for a
+whole-device offboard.
 
 ## Troubleshooting
 
-- `ykman` can't connect → [linux.md](../linux.md) (pcscd + scdaemon notes).
-- PIN blocked → `ykman piv access unblock-pin` (needs PUK); PUK blocked too →
-  `ykman piv reset`.
-- RSA-2048 generate takes ~20 s — that's the hardware, not a hang (the
-  device keeps the connection alive).
+- `ykman` can't connect → [linux.md](../linux.md) (pcscd + polkit + the
+  `disable-ccid` scdaemon note).
+- `ykman` stops seeing the card after `gpg` used it → `scdaemon` grabbed the raw
+  CCID interface; apply `disable-ccid` and `gpgconf --kill scdaemon`
+  ([openpgp.md](openpgp.md#troubleshooting)).
+- **PIN blocked** → `ykman piv access unblock-pin` (needs the PUK). PUK blocked
+  too → only `ykman piv reset` recovers, and it wipes the slots.
+- `ykman piv keys attest` fails with `INCORRECT PARAMS` → the key in that slot
+  was **imported**, not generated; attestation is generated-keys-only.
+- `change-management-key` rejects 3DES on the FIPS-style build → expected; set an
+  AES-128/192/256 key instead.
+- RSA-2048 generate takes a few seconds (≈ 4–6 s, occasionally longer since the
+  prime search is random) → that's the prime search on this hardware, not a hang;
+  the device keeps the CCID connection alive with keepalives.

@@ -108,11 +108,18 @@ Two caveats:
   ```sh
   picotool seal --sign --hash result/firmware.uf2 firmware-signed.uf2 \
       ~/.rs-key-secrets/secure_boot_key.pem ~/.rs-key-secrets/otp_secureboot.json \
-      --major 1 --minor 0 --rollback 1
+      --major 1 --minor 0
   ```
-  (`--rollback` = the anti-rollback epoch, mandatory once `ROLLBACK_REQUIRED`
-  is fused and harmless before — see
-  [production.md](production.md#stage-3--anti-rollback-optional).)
+  The `.pem` is your signing key, the `.json` is where `seal` writes the
+  boot-key fingerprint, and `--major`/`--minor` stamp an **image version** into
+  the boot metadata — a plain `major.minor` label, separate from both the
+  firmware version RS-Key reports (`5.7.x`) and the rollback version. The full
+  meaning of each flag is in [production.md](production.md#2b-sign-and-prove-a-signed-image-boots-before-any-fuse).
+
+  If you have enabled **anti-rollback**, the seal additionally needs
+  `--rollback <your board's floor>` — a separate, deliberate step with its own
+  rules and a finite OTP budget. Don't add it blindly; the full
+  flashing-with-rollback workflow is in [anti-rollback.md](anti-rollback.md).
 - **The env knobs above are declarative Nix args**, not ambient env. A plain
   `nix build` bakes the defaults; to customize, pass them to the builder. For a
   config you reuse, add a one-line preset package (the flake ships

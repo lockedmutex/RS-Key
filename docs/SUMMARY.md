@@ -15,12 +15,14 @@
 # Using the device
 
 - [FIDO2 / WebAuthn / U2F](guides/fido2.md)
-- [SSH with ed25519-sk](guides/ssh.md)
+- [SSH keys (`-sk`)](guides/ssh.md)
+- [Git: signing + auth](guides/git.md)
 - [OpenPGP card](guides/openpgp.md)
 - [PIV](guides/piv.md)
 - [OATH — TOTP / HOTP](guides/oath.md)
 - [OTP slots](guides/otp.md)
 - [Seed backup](guides/seed-backup.md)
+- [Backup key (pair)](guides/backup-key.md)
 - [Soft-lock](guides/soft-lock.md)
 - [LED](guides/led.md)
 - [Terminal cockpit (rsk-tui)](guides/tui.md)
@@ -32,6 +34,9 @@
 # Production hardening
 
 - [Production setup](production.md)
+- [Signing keys](signing-keys.md)
+- [OTP fuses (RP2350)](otp-fuses.md)
+- [Anti-rollback](anti-rollback.md)
 
 # Security
 
