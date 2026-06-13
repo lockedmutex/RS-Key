@@ -71,7 +71,7 @@ accordingly:
 |---|---|---|---|---|
 | `fido2-token -L` / `-I` (libfido2) | enumeration + getInfo | no-touch | `tests/interop/run.py` | ✅ `0759` |
 | `fido2-cred` / `fido2-assert` (libfido2) | make credential / get assertion | touch | manual (`fido2-cred -M` ‖ `fido2-assert -G`) | ✅ `0759` (touch ×2, assertion verified `2026-06-13`) |
-| python-fido2 (Yubico) | full CTAP2 flows | no-touch | `pytest third_party/pico-fido-tests/pico-fido` | ⏳ |
+| python-fido2 (Yubico) | full CTAP2 flows | no-touch | `pytest third_party/pico-fido-tests/pico-fido` | ⏳ (needs the **no-touch** build — the touch build blocks each op on the button) |
 | Chrome WebAuthn | register + authenticate | touch | [webauthn.io](https://webauthn.io) (manual) | ✅ user-attested (macOS/Linux/Win, `2026-06-13`) |
 | Firefox WebAuthn | register + authenticate | touch | [webauthn.io](https://webauthn.io) (manual) | ✅ user-attested (macOS/Linux/Win, `2026-06-13`) |
 | Safari WebAuthn | register + authenticate | touch | [webauthn.io](https://webauthn.io) (manual) | ✅ user-attested (`2026-06-13`) |
@@ -84,15 +84,15 @@ accordingly:
 | `gpg --card-status` | application-related-data read | either | `tests/interop/run.py` | ✅ `0759` |
 | `gpg --edit-card` keygen/sign/encrypt | full card lifecycle | touch (UIF) | manual | ✅ `075A` (EC+RSA `generate` land on-card after the [GET DATA short-Le fix](#get-data-short-le-chaining-fixed-on-0x075a); was ❌ on `0759`) |
 | `ykman openpgp info` | `Tlv.unpack(0x6E, …)` strict parse | either | `tests/interop/run.py` | ✅ `0759` (was ❌ on `0758`) |
-| openpgp-card-tests (Gnuk-derived) | spec suite | no-touch | `pytest third_party/openpgp-card-tests/…` | ⏳ |
+| openpgp-card-tests (Gnuk-derived) | spec suite | no-touch | `pytest third_party/openpgp-card-tests/…` | ⚠️ `075A` (`001_initial_check` 31/34; 3 Gnuk-specific DO-layout asserts differ — `6E` offsets [the bug-#1 wrapper], DS-counter `7A`, name/lang/sex) |
 
 ### PIV
 
 | Consumer | What it exercises | Build | How | Status |
 |---|---|---|---|---|
 | `ykman piv info` | discovery + slot state | no-touch | `tests/interop/run.py` | ✅ `0759` |
-| OpenSC `pkcs11-tool` | PKCS#11 module load + sign | no-touch | needs `brew install opensc` | ⏳ |
-| macOS native (`sc_auth`, Keychain) | system smartcard | no-touch | manual | ⏳ |
+| OpenSC `pkcs11-tool` | PKCS#11 module load + enumerate | no-touch | `pkcs11-tool --module …/opensc-pkcs11.so -L -O` | ✅ `075A` (loads + enumerates; OpenSC auto-selects the OpenPGP app via PKCS#15 emulation — 2 slots, metadata + object store read clean; sign/cert untested on a fresh card) |
+| macOS native (`sc_auth`, Keychain) | system smartcard discovery | no-touch | `sc_auth identities`, `system_profiler SPSmartCardsDataType` | ✅ `075A` (CryptoTokenKit sees the reader + ATR, binds `pivtoken.appex`; no paired identity on a fresh card) |
 
 ### OATH / OTP
 
