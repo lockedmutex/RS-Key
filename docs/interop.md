@@ -71,7 +71,7 @@ accordingly:
 |---|---|---|---|---|
 | `fido2-token -L` / `-I` (libfido2) | enumeration + getInfo | no-touch | `tests/interop/run.py` | ✅ `0759` |
 | `fido2-cred` / `fido2-assert` (libfido2) | make credential / get assertion | touch | manual (`fido2-cred -M` ‖ `fido2-assert -G`) | ✅ `0759` (touch ×2, assertion verified `2026-06-13`) |
-| python-fido2 (Yubico) | full CTAP2 flows | no-touch | `pytest third_party/pico-fido-tests/pico-fido` | ⏳ (needs the **no-touch** build — the touch build blocks each op on the button) |
+| python-fido2 (Yubico) | full CTAP2 flows | **no-touch** build | `pytest third_party/pico-fido-tests/pico-fido` | ⚠️ `075A` (**191 passed** / 4 failed / 9 errored, 8m26s — fails: PIN lockout + pin-attempts, getAssertion `up`-option, hmac-secret bad-auth returns `INVALID_PARAMETER` not `EXTENSION_FIRST`; the 9 errors are `test_070_oath` fixture-setup, not core CTAP2) |
 | Chrome WebAuthn | register + authenticate | touch | [webauthn.io](https://webauthn.io) (manual) | ✅ user-attested (macOS/Linux/Win, `2026-06-13`) |
 | Firefox WebAuthn | register + authenticate | touch | [webauthn.io](https://webauthn.io) (manual) | ✅ user-attested (macOS/Linux/Win, `2026-06-13`) |
 | Safari WebAuthn | register + authenticate | touch | [webauthn.io](https://webauthn.io) (manual) | ✅ user-attested (`2026-06-13`) |
