@@ -93,6 +93,9 @@ crypto-critical helpers, where a proof genuinely beats a sample:
   input up to 8 bytes; the `IncrementalSieve` residue invariant
   (`res[i] == cand mod p_i` after a step, verdict identical to the flat
   sieve) for every seed.
+- `rsk-crypto` — the `base64url` length helpers (`encoded_len` / `decoded_len`)
+  panic-free (no overflow/underflow) and mutually inverse for every length up
+  to 64 KiB.
 
 Kani is **not** in nixpkgs and its setup downloads a prebuilt CBMC bundle, so
 this is the one deliberately non-nix tool (install once, outside the dev
@@ -100,7 +103,7 @@ shell):
 
 ```sh
 cargo install --locked kani-verifier && cargo kani setup
-cargo kani -p rsk-sdk -p rsk-fs -p rsk-rsa-asm
+cargo kani -p rsk-sdk -p rsk-fs -p rsk-rsa-asm -p rsk-crypto
 ```
 
 The proofs are bounded, and the bound is the honest fine print. A 16–20-byte

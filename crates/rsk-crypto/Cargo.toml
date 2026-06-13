@@ -5,6 +5,9 @@ license = "AGPL-3.0-only"
 edition = "2024"
 publish = false
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
 # Crypto surface over RustCrypto: hashes, HMAC/HKDF, CRC-32, base64url, AES
 # CBC/CFB + AES-256-GCM, ChaCha20-Poly1305, PIN KDF, CTAP2 PIN protocol, PQC.
 # Pure and host-testable — serial-hash / OTP / RNG are passed in by the caller.

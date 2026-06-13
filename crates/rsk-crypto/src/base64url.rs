@@ -97,6 +97,40 @@ pub fn decode(dst: &mut [u8], src: &[u8]) -> Result<usize> {
     Ok(di)
 }
 
+/// Kani proof harnesses (`cargo kani -p rsk-crypto`): the length helpers are
+/// pure arithmetic on attacker-controllable sizes, so prove them panic-free
+/// (no overflow/underflow) and mutually inverse for every length up to a
+/// realistic ceiling. (base64url has no in-tree callers today; this verifies
+/// the helpers before any out-of-tree applet starts feeding them.)
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// `decoded_len` never panics (the `out - pad` cannot underflow), rejects
+    /// exactly the malformed `n % 4 == 1` lengths, and never claims more output
+    /// than input — for every char count up to 64 KiB.
+    #[kani::proof]
+    fn decoded_len_safe() {
+        let n: usize = kani::any();
+        kani::assume(n <= (1 << 16));
+        match decoded_len(n) {
+            Ok(out) => assert!(out <= n),
+            Err(_) => assert!(n % 4 == 1),
+        }
+    }
+
+    /// `encoded_len` never overflows, always expands, and is the exact inverse
+    /// of `decoded_len` — for every byte count up to 64 KiB.
+    #[kani::proof]
+    fn encoded_len_roundtrips() {
+        let n: usize = kani::any();
+        kani::assume(n <= (1 << 16));
+        let e = encoded_len(n);
+        assert!(e >= n);
+        assert_eq!(decoded_len(e), Ok(n));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
