@@ -27,9 +27,9 @@ welcome but absolutely not required.
 ## What to expect
 
 One maintainer, best effort: an acknowledgment usually within a few days, a
-fix on `main` as fast as severity warrants. Since there are no releases yet,
-"the fix" means a commit on `main` plus a note in the advisory; bcdDevice
-bumps on every change, so affected builds are easy to name precisely.
+fix on `main` as fast as severity warrants. There are no maintained release
+branches, so "the fix" means a commit on `main` plus a note in the advisory;
+bcdDevice bumps on every change, so affected builds are easy to name precisely.
 
 ## Supported versions
 
