@@ -253,7 +253,10 @@ impl Reassembler {
                 self.in_tx = false;
                 return Outcome::Error(cid, ERR_INVALID_SEQ);
             }
-            let n = CONT_DATA.min(self.bcnt - self.cur);
+            // `saturating_sub`: the in_tx state machine keeps cur < bcnt, but a
+            // saturating subtraction makes the no-underflow self-evident across
+            // refactors (a wrapped count here would index past the message).
+            let n = CONT_DATA.min(self.bcnt.saturating_sub(self.cur));
             self.msg[self.cur..self.cur + n].copy_from_slice(&f[5..5 + n]);
             self.cur += n;
             self.seq = self.seq.wrapping_add(1);

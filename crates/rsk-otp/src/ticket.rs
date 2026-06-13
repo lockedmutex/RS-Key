@@ -102,7 +102,10 @@ pub fn build(
             out[len] = b'\r';
             len += 1;
         }
-        let new_tail = (imf + 1).to_be_bytes();
+        // Roll the HOTP counter; `wrapping_add` matches the sibling config_seq
+        // bumps and removes a debug-panic/release-wrap asymmetry at the
+        // (unreachable) u64::MAX counter.
+        let new_tail = imf.wrapping_add(1).to_be_bytes();
         return Some(Typed {
             len,
             encode: true,
