@@ -177,6 +177,13 @@ impl<S: Storage> Applet<Fs<S>> for OpenpgpApplet<'_> {
         consts::OPENPGP_AID
     }
 
+    /// `gpg`/`scdaemon` read GET DATA with a short `Le` (256) and follow `61xx`
+    /// with GET RESPONSE; the application-related-data `6E` template exceeds 256
+    /// bytes once keys exist, so opt into the dispatcher's response chaining.
+    fn response_chaining(&self) -> bool {
+        true
+    }
+
     fn select(&mut self, _reselect: bool, _fs: &mut Fs<S>, res: &mut ResBuf) -> Sw {
         self.reset_session();
         let n = select::build_fci(&mut self.scratch);
