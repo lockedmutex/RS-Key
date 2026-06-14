@@ -48,6 +48,12 @@ const STATUS_TIMEEXT: u8 = 0x80;
 /// Time-extension cadence while a long op runs — well under the T=1 block waiting
 /// time, so the host's transaction never times out.
 const WTX_INTERVAL_MS: u64 = 200;
+/// Abandon a bulk-IN response if the host stops draining it for this long. A
+/// client that walks away mid-response must not block the CCID task forever in
+/// `write_transfer().await` — that would stop the bulk-OUT read and wedge the
+/// interface (the same failure mode the FIDO transport guards against). PC/SC
+/// reads each response promptly, so a gap this long means the host is gone.
+const TX_TIMEOUT_MS: u64 = 500;
 
 const HEADER: usize = 10;
 /// `dwMaxCCIDMessageLength` from the class descriptor.
@@ -244,7 +250,11 @@ impl<'d, D: Driver<'d>, H: ApduHandler> Ccid<'d, D, H> {
                             // A short packet (or ZLP on an exact multiple) ends the
                             // bulk IN transfer for the host.
                             let zlp = n.is_multiple_of(64);
-                            let _ = self.write_ep.write_transfer(&self.tx[..n], zlp).await;
+                            let _ = select(
+                                self.write_ep.write_transfer(&self.tx[..n], zlp),
+                                Timer::after_millis(TX_TIMEOUT_MS),
+                            )
+                            .await;
                         }
                     }
                 }
@@ -253,10 +263,11 @@ impl<'d, D: Driver<'d>, H: ApduHandler> Ccid<'d, D, H> {
                     put_header(&mut self.tx, CCID_DATA_BLOCK_RET, 2, 0, self.status);
                     self.tx[HEADER] = 0x6F;
                     self.tx[HEADER + 1] = 0x00;
-                    let _ = self
-                        .write_ep
-                        .write_transfer(&self.tx[..HEADER + 2], false)
-                        .await;
+                    let _ = select(
+                        self.write_ep.write_transfer(&self.tx[..HEADER + 2], false),
+                        Timer::after_millis(TX_TIMEOUT_MS),
+                    )
+                    .await;
                 }
             }
         }
@@ -286,7 +297,11 @@ impl<'d, D: Driver<'d>, H: ApduHandler> Ccid<'d, D, H> {
                     Either::Second(_) => {
                         let mut wtx = [0u8; HEADER];
                         put_header(&mut wtx, CCID_DATA_BLOCK_RET, 0, seq, STATUS_TIMEEXT);
-                        let _ = write_ep.write_transfer(&wtx, false).await;
+                        let _ = select(
+                            write_ep.write_transfer(&wtx, false),
+                            Timer::after_millis(TX_TIMEOUT_MS),
+                        )
+                        .await;
                     }
                 }
             }
@@ -296,7 +311,11 @@ impl<'d, D: Driver<'d>, H: ApduHandler> Ccid<'d, D, H> {
         put_header(tx, CCID_DATA_BLOCK_RET, n as u32, seq, *status);
         let total = HEADER + n;
         let zlp = total.is_multiple_of(64);
-        let _ = write_ep.write_transfer(&tx[..total], zlp).await;
+        let _ = select(
+            write_ep.write_transfer(&tx[..total], zlp),
+            Timer::after_millis(TX_TIMEOUT_MS),
+        )
+        .await;
         // The APDU can carry an imported private key; the response a deciphered
         // session key. Wipe both once the transfer is on the wire.
         use zeroize::Zeroize;

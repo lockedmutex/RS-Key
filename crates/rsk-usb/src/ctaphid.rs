@@ -57,6 +57,13 @@ const STATUS_UPNEEDED: u8 = 0x02;
 const KEEPALIVE_MS: u64 = 100;
 // Abort an in-progress reassembly if the next frame is this late.
 const RX_TIMEOUT_MS: u64 = 500;
+// Abandon a response if the host stops draining the IN endpoint for this long.
+// `HidWriter::write` only completes once the host reads the report, so a client
+// that walks away mid-response would otherwise block the transport task forever
+// (it then stops reading OUT → every further host write NAKs → the whole FIDO
+// interface wedges until a replug). The host polls FIDO HID every few ms, so a
+// gap this long means it is gone.
+const TX_TIMEOUT_MS: u64 = 500;
 
 const CTAPHID_IF_VERSION: u8 = 2;
 const CAPFLAG_WINK: u8 = 0x01;
@@ -539,6 +546,13 @@ impl<'d, D: Driver<'d>, H: MsgHandler> CtapHid<'d, D, H> {
 }
 
 /// Frame `data` into one INIT frame plus CONT frames and write them out.
+///
+/// Each frame write is bounded by [`TX_TIMEOUT_MS`]: if the host abandons the
+/// transaction mid-response (a cancelled/timed-out client, or a wedged host HID
+/// handle), an unbounded `write().await` would block this transport task
+/// forever — it would stop draining the OUT endpoint, NAKing every further host
+/// write and wedging the whole FIDO interface until a replug. On timeout we
+/// abandon the rest of the response and return to reading.
 async fn write_message<'d, D: Driver<'d>>(
     writer: &mut HidWriter<'d, D, HID_RPT_SIZE>,
     cid: u32,
@@ -546,7 +560,10 @@ async fn write_message<'d, D: Driver<'d>>(
     data: &[u8],
 ) {
     for frame in TxFrames::new(cid, cmd, data) {
-        let _ = writer.write(&frame).await;
+        match select(writer.write(&frame), Timer::after_millis(TX_TIMEOUT_MS)).await {
+            Either::First(_) => {}
+            Either::Second(_) => return, // host stopped draining IN — abandon response
+        }
     }
 }
 
