@@ -2,8 +2,15 @@
 resolver = "2"
 members = ["firmware", "rsk-wipe", "crates/rsk-sdk", "crates/rsk-fs", "crates/rsk-usb", "crates/rsk-crypto", "crates/rsk-fido", "crates/rsk-openpgp", "crates/rsk-rsa-asm", "crates/rsk-mgmt", "crates/rsk-oath", "crates/rsk-otp", "crates/rsk-piv", "crates/rsk-rescue"]
 
-# Embassy crates are versioned together; pin them all to one git revision so they
-# stay mutually compatible. The exact commit is recorded in Cargo.lock.
+# Embassy crates are versioned together; pin them all to the same git source so
+# they stay mutually compatible. We track `branch = "main"`, not a crates.io
+# release, because embassy-rp's RP2350 (thumbv8m) support has historically landed
+# on main well ahead of published releases. This stays reproducible: the exact
+# commit is frozen in Cargo.lock (and re-pinned by content hash for the nix build
+# in flake.nix), so `branch = "main"` names the source, not a moving target —
+# nothing updates until someone runs `cargo update` / bumps the lock on purpose.
+# Bump cadence: do it deliberately (not routinely), re-run the full gate, and do
+# an on-device smoke (USB enumerate + a FIDO/CCID round-trip) before trusting it.
 [workspace.dependencies]
 embassy-executor = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
 embassy-rp = { git = "https://github.com/embassy-rs/embassy", branch = "main" }

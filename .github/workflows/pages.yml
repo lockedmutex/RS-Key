@@ -1,8 +1,19 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 RS-Key contributors
 
-# Builds the documentation site (mdBook + mdbook-mermaid) and publishes it to
-# GitHub Pages via the official Pages deployment flow (no manual gh-pages push).
+# Builds the *versioned* documentation site (mdBook + mdbook-mermaid) and
+# publishes it to GitHub Pages via the official Pages deployment flow.
+#
+#   main     -> site root                (the default version)
+#   develop  -> /develop/
+#   v* tags  -> /<tag>/   (e.g. /v0.1.0/)
+#
+# Every run rebuilds all versions from their own git refs (see
+# scripts/pages/build-site.sh) and replaces the published site, so the version
+# set always matches the live branches + tags. Branch pushes are path-filtered
+# to docs changes; tag pushes always run (GitHub does not apply `paths` to tag
+# pushes). Versioning takes effect for tags created after this workflow lands;
+# existing tags are picked up on the next main/develop docs push.
 #
 # One-time repo setup: Settings -> Pages -> Build and deployment -> Source =
 # "GitHub Actions". The built site is never committed to the repo.
@@ -11,11 +22,14 @@ name: pages
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
     paths:
       - "docs/**"
       - "book.toml"
       - ".github/workflows/pages.yml"
+      - "scripts/pages/**"
+    tags:
+      - "v*"
   workflow_dispatch:
 
 permissions:
@@ -33,29 +47,34 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0 # all branches + tags, so every version can be built
 
-      - uses: DeterminateSystems/nix-installer-action@v16
+      - uses: DeterminateSystems/nix-installer-action@e50d5f73bfe71c2dd0aa4218de8f4afa59f8f81d # v16
 
-      - uses: nix-community/cache-nix-action@v6
+      - uses: nix-community/cache-nix-action@135667ec418502fa5a3598af6fb9eb733888ce6a # v6
         with:
           primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-
 
-      - uses: actions/configure-pages@v5
+      - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+        id: pages
 
       # mdbook + mdbook-mermaid only (not the firmware dev shell), pinned to the
       # flake's nixpkgs via --inputs-from so the versions match the dev shell.
-      - name: Build the book
+      # PAGES_BASE comes from configure-pages so the per-version site-url is
+      # correct regardless of the repo name.
+      - name: Build the versioned site
+        env:
+          PAGES_BASE: ${{ steps.pages.outputs.base_path }}/
         run: |
-          nix shell --inputs-from . nixpkgs#mdbook nixpkgs#mdbook-mermaid -c bash -c '
-            mdbook-mermaid install .
-            mdbook build
-          '
+          nix shell --inputs-from . nixpkgs#mdbook nixpkgs#mdbook-mermaid -c \
+            ./scripts/pages/build-site.sh site
 
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
         with:
-          path: book
+          path: site
 
   deploy:
     needs: build
@@ -65,4 +84,4 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4

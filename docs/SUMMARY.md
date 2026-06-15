@@ -11,6 +11,7 @@
 - [Hardware](hardware.md)
 - [Build options](build.md)
 - [Releases & verification](releases.md)
+- [Supply chain](supply-chain.md)
 - [Linux host setup](linux.md)
 
 # Using the device
@@ -29,6 +30,7 @@
 - [Terminal cockpit (rsk-tui)](guides/tui.md)
 - [Audit journal](guides/audit.md)
 - [Enterprise attestation](guides/attestation.md)
+- [AAGUID & metadata](guides/aaguid-metadata.md)
 - [Fleet tooling](guides/fleet.md)
 - [FIPS-style profile](guides/fips.md)
 
@@ -44,12 +46,14 @@
 - [Threat model](threat-model.md)
 - [Limitations](limitations.md)
 - [`unsafe` audit](unsafe.md)
+- [Constant-time audit](ct-audit.md)
 
 # Internals
 
 - [Architecture](architecture.md)
 - [Testing](testing.md)
 - [Interop matrix](interop.md)
+- [Versions](versioning.md)
 - [Motivation](motivation.md)
 
 <!-- The governance files (CONTRIBUTING, SECURITY, COMPLIANCE) live at the repo

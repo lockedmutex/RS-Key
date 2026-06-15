@@ -399,6 +399,17 @@ fn verify_pin_hash<S: Storage, R: Rng>(
     ctx.fs
         .put(EF_PIN, &pin_data)
         .map_err(|_| CtapError::Other)?;
+    // Read the decremented counter back before trusting it. This single flash
+    // write is the anti-bruteforce gate; a glitch or partial program during put()
+    // could persist the old (higher) count while RAM marches on, silently widening
+    // the retry budget. If the stored value doesn't match, fail closed (treat as
+    // blocked) rather than continue on an unverified count — the same read-back the
+    // OTP fuse writes already do (firmware/src/otp_keys.rs).
+    let mut readback = [0u8; PIN_FILE_LEN];
+    match ctx.fs.read(EF_PIN, &mut readback) {
+        Some(PIN_FILE_LEN) if readback[0] == pin_data[0] => {}
+        _ => return Err(CtapError::PinBlocked),
+    }
     let retries = pin_data[0];
 
     let cand = ctx.dev.pin_derive_verifier(pin_hash);
@@ -504,14 +515,7 @@ fn clear_force_change<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>) -> Result<(), Cta
 }
 
 fn pinproto_ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    rsk_crypto::ct_eq(a, b)
 }
 
 fn encode<F>(out: &mut [u8], f: F) -> Result<usize, CtapError>
@@ -1155,5 +1159,103 @@ mod tests {
             now_ms: 0,
         };
         verify_pin_hash(&mut ctx3, &pin_hash[..16]).unwrap();
+    }
+
+    #[test]
+    fn pin_verify_fails_closed_when_the_retry_write_does_not_persist() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        // A backend that, once armed, accepts the EF_PIN write (returns Ok) but
+        // silently fails to persist it — modelling a glitch / partial flash
+        // program. The decremented retry counter never reaches storage, so a later
+        // read sees the stale (higher) count: exactly what verify_pin_hash's
+        // read-back must catch before trusting the count.
+        struct StaleEfPin {
+            inner: RamStorage,
+            drop_ef_pin_writes: Rc<Cell<bool>>,
+        }
+        impl Storage for StaleEfPin {
+            fn read(&mut self, fid: u16, buf: &mut [u8]) -> Option<usize> {
+                self.inner.read(fid, buf)
+            }
+            fn write(&mut self, fid: u16, data: &[u8]) -> rsk_sdk::error::Result<()> {
+                if fid == EF_PIN && self.drop_ef_pin_writes.get() {
+                    return Ok(()); // reports success, persists nothing
+                }
+                self.inner.write(fid, data)
+            }
+            fn remove(&mut self, fid: u16) -> rsk_sdk::error::Result<()> {
+                self.inner.remove(fid)
+            }
+            fn size(&mut self, fid: u16) -> Option<usize> {
+                self.inner.size(fid)
+            }
+            fn for_each_key(&mut self, f: &mut dyn FnMut(u16)) {
+                self.inner.for_each_key(f)
+            }
+        }
+
+        let drop_writes = Rc::new(Cell::new(false));
+        let mut fs = Fs::new(
+            StaleEfPin {
+                inner: RamStorage::new(),
+                drop_ef_pin_writes: drop_writes.clone(),
+            },
+            &[],
+        );
+        let mut rng = SeqRng(1);
+        ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
+
+        // Enroll PIN "1234" with writes persisting normally.
+        let mut padded = [0u8; PADDED_PIN_LEN];
+        padded[..4].copy_from_slice(b"1234");
+        {
+            let mut presence = crate::AlwaysConfirm;
+            let mut ctx = Ctx {
+                presence: &mut presence,
+                dev: dev(),
+                fs: &mut fs,
+                rng: &mut rng,
+                state: &mut FidoState::new(),
+                now_ms: 0,
+            };
+            store_new_pin(&mut ctx, &padded).unwrap();
+        }
+
+        let pin_hash = sha256(b"1234");
+
+        // Control: with the backend healthy, the correct PIN verifies (and resets
+        // the counter to full) — so a PinBlocked below can only be the read-back.
+        {
+            let mut presence = crate::AlwaysConfirm;
+            let mut ctx = Ctx {
+                presence: &mut presence,
+                dev: dev(),
+                fs: &mut fs,
+                rng: &mut rng,
+                state: &mut FidoState::new(),
+                now_ms: 0,
+            };
+            verify_pin_hash(&mut ctx, &pin_hash[..16]).unwrap();
+        }
+
+        // Arm the fault: the decremented counter no longer reaches storage. Even
+        // with the CORRECT PIN, the read-back sees the stale count and must fail
+        // closed rather than proceed on an unverified (un-decremented) counter.
+        drop_writes.set(true);
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut FidoState::new(),
+            now_ms: 0,
+        };
+        assert_eq!(
+            verify_pin_hash(&mut ctx, &pin_hash[..16]),
+            Err(CtapError::PinBlocked),
+        );
     }
 }

@@ -10,6 +10,8 @@
 //! commands (INIT, PING, WINK, LOCK, VERSION, UUID, CANCEL) are answered in the
 //! transport; MSG (U2F APDU) and CBOR (CTAP2) route to a [`MsgHandler`].
 
+use core::future::Future;
+
 use embassy_futures::select::{Either, select};
 use embassy_time::Timer;
 use embassy_usb::class::hid::{HidReader, HidWriter};
@@ -57,6 +59,13 @@ const STATUS_UPNEEDED: u8 = 0x02;
 const KEEPALIVE_MS: u64 = 100;
 // Abort an in-progress reassembly if the next frame is this late.
 const RX_TIMEOUT_MS: u64 = 500;
+// Abandon a response if the host stops draining the IN endpoint for this long.
+// `HidWriter::write` only completes once the host reads the report, so a client
+// that walks away mid-response would otherwise block the transport task forever
+// (it then stops reading OUT → every further host write NAKs → the whole FIDO
+// interface wedges until a replug). The host polls FIDO HID every few ms, so a
+// gap this long means it is gone.
+const TX_TIMEOUT_MS: u64 = 500;
 
 const CTAPHID_IF_VERSION: u8 = 2;
 const CAPFLAG_WINK: u8 = 0x01;
@@ -126,6 +135,13 @@ pub trait MsgHandler {
     async fn handle_vendor(&mut self, _cmd: u8, _data: &[u8], _out: &mut [u8]) -> Option<usize> {
         None
     }
+
+    /// Called when a `CTAPHID_INIT` starts a fresh logical session, so the handler
+    /// can drop any applet it had selected over this (MSG) transport. U2F/CTAP1 has
+    /// no SELECT and must not inherit a prior vendor-AID selection; without this a
+    /// sticky selection silently routes U2F REGISTER/AUTHENTICATE/VERSION to the
+    /// vendor applet (→ `0x6D00`). Default: no-op.
+    fn reset_app_selection(&mut self) {}
 }
 
 /// What the transport should do after [`Reassembler::feed`] consumes a frame.
@@ -405,6 +421,9 @@ impl<'d, D: Driver<'d>, H: MsgHandler> CtapHid<'d, D, H> {
     async fn dispatch(&mut self, cid: u32, cmd: u8) {
         match cmd {
             CTAPHID_INIT => {
+                // A fresh session: drop any applet selected over this transport so
+                // U2F (which has no SELECT) can't inherit a prior vendor selection.
+                self.handler.reset_app_selection();
                 // resp: nonce(8) | newcid(4) | iface(1) | major | minor | build | caps
                 let nonce = self.asm.message();
                 let mut resp = [0u8; 17];
@@ -538,16 +557,62 @@ impl<'d, D: Driver<'d>, H: MsgHandler> CtapHid<'d, D, H> {
     }
 }
 
-/// Frame `data` into one INIT frame plus CONT frames and write them out.
+/// One outgoing 64-byte HID report. The future completes only once the host
+/// drains the report from the IN endpoint — exactly where the FIDO interface can
+/// wedge (see [`write_frames`]). Splitting it behind a trait lets a host test
+/// substitute a sink that never completes, proving the timeout abandons a stalled
+/// write instead of blocking the transport task forever.
+#[allow(async_fn_in_trait)] // crate-internal, single-threaded executor — no Send bound needed
+trait FrameSink {
+    async fn write_frame(&mut self, frame: &[u8; HID_RPT_SIZE]);
+}
+
+impl<'d, D: Driver<'d>> FrameSink for HidWriter<'d, D, HID_RPT_SIZE> {
+    async fn write_frame(&mut self, frame: &[u8; HID_RPT_SIZE]) {
+        // A write error (endpoint disabled / reset) ends the response the same as
+        // a timeout: there is nothing more to send for this transaction.
+        let _ = self.write(frame).await;
+    }
+}
+
+/// Frame `data` into one INIT frame plus CONT frames and write them out, bounding
+/// each frame write by a fresh `timeout` future.
+///
+/// If the host abandons the transaction mid-response (a cancelled/timed-out
+/// client, or a wedged host HID handle), an unbounded `write().await` would block
+/// this transport task forever — it would stop draining the OUT endpoint, NAKing
+/// every further host write and wedging the whole FIDO interface until a replug.
+/// On timeout we abandon the rest of the response and return to reading.
+///
+/// Generic over the sink and a timeout-future factory so the abandon-on-stall
+/// path is exercised on the host without a USB driver or an embassy time driver
+/// (see the `write_frames_*` tests).
+async fn write_frames<S, T, F>(sink: &mut S, cid: u32, cmd: u8, data: &[u8], mut timeout: F)
+where
+    S: FrameSink,
+    F: FnMut() -> T,
+    T: Future<Output = ()>,
+{
+    for frame in TxFrames::new(cid, cmd, data) {
+        match select(sink.write_frame(&frame), timeout()).await {
+            Either::First(_) => {}
+            Either::Second(_) => return, // host stopped draining IN — abandon response
+        }
+    }
+}
+
+/// [`write_frames`] with the production timeout: bound every frame to
+/// [`TX_TIMEOUT_MS`] of host-drain time.
 async fn write_message<'d, D: Driver<'d>>(
     writer: &mut HidWriter<'d, D, HID_RPT_SIZE>,
     cid: u32,
     cmd: u8,
     data: &[u8],
 ) {
-    for frame in TxFrames::new(cid, cmd, data) {
-        let _ = writer.write(&frame).await;
-    }
+    write_frames(writer, cid, cmd, data, || {
+        Timer::after_millis(TX_TIMEOUT_MS)
+    })
+    .await;
 }
 
 #[cfg(test)]
@@ -847,5 +912,84 @@ mod tests {
             assert_eq!(last, Outcome::Message(cid, cmd), "len={len}");
             assert_eq!(asm.message(), &data[..len], "len={len}");
         }
+    }
+
+    // ---- TX abandon-on-stall: regression guard for the USB-wedge fix (63cde79) ----
+
+    // Bounded manual poll with a no-op waker: returns None if `fut` is still
+    // pending after `max_polls`, so a TX path that fails to abandon a stalled
+    // frame surfaces as a failed assertion instead of hanging the test runner.
+    fn poll_bounded<F: core::future::Future>(fut: F, max_polls: usize) -> Option<F::Output> {
+        use core::task::{Context, Poll};
+        let mut cx = Context::from_waker(core::task::Waker::noop());
+        let mut fut = core::pin::pin!(fut);
+        for _ in 0..max_polls {
+            if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    // A sink whose every frame write never completes — models the host that has
+    // stopped draining the IN endpoint (the wedge condition).
+    struct StallSink {
+        attempts: usize,
+    }
+    impl FrameSink for StallSink {
+        async fn write_frame(&mut self, _frame: &[u8; HID_RPT_SIZE]) {
+            self.attempts += 1;
+            core::future::pending::<()>().await
+        }
+    }
+
+    // A sink that accepts every frame immediately — models a host that keeps draining.
+    struct CountingSink {
+        written: usize,
+    }
+    impl FrameSink for CountingSink {
+        async fn write_frame(&mut self, _frame: &[u8; HID_RPT_SIZE]) {
+            self.written += 1;
+        }
+    }
+
+    #[test]
+    fn write_frames_abandons_when_host_stalls() {
+        let mut sink = StallSink { attempts: 0 };
+        let data = [0xAB; 200]; // multi-frame: a non-abandoning path would attempt >1 frame
+        // Timeout is always ready, so the stalled write must lose the race and the
+        // response is abandoned after the very first undeliverable frame.
+        let done = poll_bounded(
+            write_frames(&mut sink, 0x0100_0000, CTAPHID_PING, &data, || {
+                core::future::ready(())
+            }),
+            10_000,
+        );
+        assert!(
+            done.is_some(),
+            "write_frames hung on a stalled host — the IN-endpoint timeout no longer abandons the write (USB-wedge regression)"
+        );
+        assert_eq!(
+            sink.attempts, 1,
+            "must abandon after the first stalled frame, not keep retrying"
+        );
+    }
+
+    #[test]
+    fn write_frames_writes_every_frame_when_host_drains() {
+        let mut sink = CountingSink { written: 0 };
+        let data = [0xCD; 200]; // 57 + 59 + 59 + 25 → 4 frames
+        // Timeout never fires, so each write wins its race and all frames go out.
+        let done = poll_bounded(
+            write_frames(&mut sink, 0x0100_0000, CTAPHID_MSG, &data, || {
+                core::future::pending::<()>()
+            }),
+            10_000,
+        );
+        assert!(done.is_some(), "write_frames stalled with a draining host");
+        assert_eq!(
+            sink.written, 4,
+            "every frame written when the host keeps draining"
+        );
     }
 }
