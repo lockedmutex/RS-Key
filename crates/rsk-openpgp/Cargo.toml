@@ -5,6 +5,9 @@ license = "AGPL-3.0-only"
 edition = "2024"
 publish = false
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
 # The OpenPGP card applet, reached over the CCID transport. Pure and
 # host-testable: device seed / serial / RNG and flash come from the caller,
 # as in rsk-fido.

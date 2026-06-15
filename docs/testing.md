@@ -154,7 +154,7 @@ shell):
 
 ```sh
 cargo install --locked kani-verifier && cargo kani setup
-cargo kani -p rsk-sdk -p rsk-fs -p rsk-rsa-asm -p rsk-crypto -p rsk-rescue
+cargo kani -p rsk-sdk -p rsk-fs -p rsk-rsa-asm -p rsk-crypto -p rsk-rescue -p rsk-openpgp
 ```
 
 The proofs are bounded, and the bound is the honest fine print. A 16–20-byte
