@@ -51,6 +51,7 @@
 - [Architecture](architecture.md)
 - [Testing](testing.md)
 - [Interop matrix](interop.md)
+- [Versions](versioning.md)
 - [Motivation](motivation.md)
 
 <!-- The governance files (CONTRIBUTING, SECURITY, COMPLIANCE) live at the repo
