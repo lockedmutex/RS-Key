@@ -15,6 +15,17 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Fixed
 
+- **PIV tab *still* slow after the present-cache fix below: `GET METADATA` over
+  empty key slots.** That bitmap guarded `read` and `size`, but `has_data` — a
+  third absent-probe method — still called the backend directly, so a missing
+  FID scanned the whole partition. PIV `GET METADATA` checks `has_data(slot)`
+  first, and `ykman piv info` / Yubico Authenticator's PIV tab read metadata for
+  ~24 mostly-empty slots (`9A/9C/9D/9E` + 20 retired), so each tab switch paid
+  ~24 full scans ≈ 4 s of green-blinking even though every individual APDU
+  answered in ~30 ms. `has_data` now consults the same bitmap → `O(1)` for an
+  absent slot; measured `ykman piv info` **4.16 s → 0.26 s** (~16×) on hardware.
+  `bcdDevice` `0x0762` → `0x0763`.
+
 - **Slow applet listing (PIV especially), seen as long green-blinking when
   switching tabs in Yubico Authenticator.** A backend `read`/`size` of an
   *absent* file scanned the entire ~1.4 MB KV partition to confirm absence, so

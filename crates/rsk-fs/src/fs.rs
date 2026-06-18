@@ -159,6 +159,9 @@ impl<S: Storage> Fs<S> {
 
     /// Whether the file exists with non-empty contents.
     pub fn has_data(&mut self, fid: u16) -> bool {
+        if !self.present_bit(fid) {
+            return false; // absent — skip the backend's full-partition scan
+        }
         self.storage.size(fid).is_some_and(|n| n > 0)
     }
 
@@ -390,6 +393,42 @@ mod tests {
         Fs::new(RamStorage::new(), TABLE)
     }
 
+    /// A `Storage` that counts backend probes, proving the present-cache answers
+    /// absent lookups without the (on-device, O(flash)) `fetch_item` scan.
+    struct CountingStorage {
+        inner: RamStorage,
+        read_calls: u32,
+        size_calls: u32,
+    }
+    impl CountingStorage {
+        fn new() -> Self {
+            Self {
+                inner: RamStorage::new(),
+                read_calls: 0,
+                size_calls: 0,
+            }
+        }
+    }
+    impl Storage for CountingStorage {
+        fn read(&mut self, fid: u16, buf: &mut [u8]) -> Option<usize> {
+            self.read_calls += 1;
+            self.inner.read(fid, buf)
+        }
+        fn write(&mut self, fid: u16, data: &[u8]) -> Result<()> {
+            self.inner.write(fid, data)
+        }
+        fn remove(&mut self, fid: u16) -> Result<()> {
+            self.inner.remove(fid)
+        }
+        fn size(&mut self, fid: u16) -> Option<usize> {
+            self.size_calls += 1;
+            self.inner.size(fid)
+        }
+        fn for_each_key(&mut self, f: &mut dyn FnMut(u16)) {
+            self.inner.for_each_key(f)
+        }
+    }
+
     #[test]
     fn put_read_size() {
         let mut fs = fs();
@@ -468,6 +507,27 @@ mod tests {
         assert_eq!(&buf[..8], b"sig-cert");
         assert_eq!(fs2.read(0xCF09, &mut buf), Some(8));
         assert_eq!(fs2.read(0xD20B, &mut buf), None); // never-written sibling
+    }
+
+    #[test]
+    fn absent_probes_never_touch_the_backend() {
+        // On device a backend read/size of an absent FID scans the whole flash
+        // partition (~160 ms via sequential-storage `fetch_item`). The present
+        // cache MUST answer every absent probe — `read`, `size`, AND `has_data`
+        // — without the backend. PIV GET METADATA probes ~24 empty key slots, so
+        // a missing guard on `has_data` alone cost ~4 s per `ykman piv info` (the
+        // Yubico Authenticator PIV-tab lag).
+        let mut fs = Fs::new(CountingStorage::new(), TABLE);
+        let mut buf = [0u8; 8];
+        assert_eq!(fs.read(0xD205, &mut buf), None);
+        assert_eq!(fs.size(0xD205), None);
+        assert!(!fs.has_data(0xD205));
+        let st = fs.into_storage();
+        assert_eq!(st.read_calls, 0, "absent read must not probe the backend");
+        assert_eq!(
+            st.size_calls, 0,
+            "absent size/has_data must not probe the backend"
+        );
     }
 
     #[test]
