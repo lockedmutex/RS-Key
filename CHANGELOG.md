@@ -31,6 +31,16 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   `fs.put(key_fid, raw_secret)` no longer compiles (asserted by a `compile_fail`
   doctest). This is the chokepoint whose absence let OATH ship its secrets in
   the clear; every applet's key FIDs were moved onto it.
+- **Resident-credential RP domains are now boxed at rest.** A discoverable
+  credential's `EF_RP` record stored the relying-party id (the site's domain)
+  in cleartext, so a flash dump revealed the *list of sites you hold passkeys
+  for* — a privacy leak, even though the keys themselves were sealed. The domain
+  is now ChaCha20-Poly1305-boxed under the device seed (the same seal the
+  credential body uses), with the rpId **hash** kept in cleartext as the O(1)
+  lookup key. A boot migration re-boxes records enrolled before this release.
+  Honest residual: the rpId hash remains, so a dump can still *dictionary-attack*
+  guessable domains — but the plaintext site list is gone. `bcdDevice` `0x0766`
+  → `0x0767`.
 
 ## [0.2.3] — 2026-06-18
 
