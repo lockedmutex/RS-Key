@@ -24,9 +24,11 @@ Part B (runs only if a FIDO HID device is plugged in):
     one, IGNORING the stateful fields (options.ep / options.clientPin /
     forcePINChange / minPINLength) which depend on PIN/enterprise state.
 
-The statement describes the DEFAULT build profile. `advertise-pqc` adds COSE
--48 to algorithms and `fips-profile` drops -47 and raises minPINLength — if the
-live device is one of those, Part B says so instead of failing blindly.
+The statement describes the DEFAULT build profile. ES256K (-47) and EdDSA (-8)
+are never advertised in any profile (the FIDO conformance tool cannot verify a
+self-attestation over those curves). `advertise-pqc` adds COSE -48 to algorithms
+and `fips-profile` raises minPINLength — if the live device is one of those,
+Part B says so instead of failing blindly.
 """
 import json
 import os

@@ -58,6 +58,7 @@ pub const EV_U2F_AUTH: u8 = 0x10;
 pub const EV_CHECKPOINT: u8 = 0x11;
 pub const EV_ATT_IMPORT: u8 = 0x12;
 pub const EV_ATT_CLEAR: u8 = 0x13;
+pub const EV_CFG_ALWAYS_UV: u8 = 0x14;
 
 /// Entry: `seq(4 LE) ‖ uptime_ms(4 LE) ‖ event(1) ‖ aux(1) ‖ detail(8) ‖ rsvd(2)`.
 pub const ENTRY_LEN: usize = 20;

@@ -24,8 +24,8 @@ use crate::cert;
 use crate::consts::{
     AAGUID, ALG_ED25519, ALG_EDDSA, ALG_ES256, ALG_ES256K, ALG_ES384, ALG_ES512, ALG_ESP256,
     ALG_ESP384, ALG_ESP512, ALG_MLDSA44, CRED_PROT_UV_REQUIRED, CURVE_ED25519, CURVE_MLDSA44,
-    CURVE_P256, CURVE_P256K1, CURVE_P384, CURVE_P521, EF_ATT_CHAIN, EF_EA_ENABLED, EF_EE_DEV,
-    EF_MINPINLEN, EF_PIN, FLAG_AT, FLAG_ED, FLAG_UP, FLAG_UV, MAX_CREDBLOB_LENGTH,
+    CURVE_P256, CURVE_P256K1, CURVE_P384, CURVE_P521, EF_ALWAYS_UV, EF_ATT_CHAIN, EF_EA_ENABLED,
+    EF_EE_DEV, EF_MINPINLEN, EF_PIN, FLAG_AT, FLAG_ED, FLAG_UP, FLAG_UV, MAX_CREDBLOB_LENGTH,
     MAX_RESIDENT_CREDENTIALS, PREFER_PQC,
 };
 use crate::credential::{
@@ -74,7 +74,9 @@ struct Request<'a> {
     exclude: [&'a [u8]; MAX_EXCLUDE],
     exclude_len: usize,
     rk: bool,
-    up_present: bool,
+    /// The `up` option as supplied (absent = implicit true). `up=false` is
+    /// rejected (§6.1.2); `up=true` is accepted as the default.
+    up: Option<bool>,
     uv: bool,
     pin_uv_auth_param: Option<&'a [u8]>,
     pin_uv_auth_protocol: u64,
@@ -104,7 +106,7 @@ fn parse(data: &[u8]) -> Result<Request<'_>, CtapError> {
         exclude: [&[]; MAX_EXCLUDE],
         exclude_len: 0,
         rk: false,
-        up_present: false,
+        up: None,
         uv: false,
         pin_uv_auth_param: None,
         pin_uv_auth_protocol: 0,
@@ -137,6 +139,12 @@ fn parse(data: &[u8]) -> Result<Request<'_>, CtapError> {
                 for _ in 0..m {
                     match cbor(d.str())? {
                         "id" => req.rp_id = cbor(d.str())?,
+                        // rp.name must be a text string when present (conformance
+                        // MakeCredential Req-2 F-2); read-as-text so a non-text
+                        // value surfaces as CBOR_UNEXPECTED_TYPE.
+                        "name" => {
+                            let _: &str = cbor(d.str())?;
+                        }
                         _ => cbor(d.skip())?,
                     }
                 }
@@ -157,19 +165,24 @@ fn parse(data: &[u8]) -> Result<Request<'_>, CtapError> {
                 for _ in 0..a {
                     req.has_pubkey_param = true;
                     let m = def_map(&mut d)?;
-                    let (mut ty, mut alg, mut ty_present) = ("", 0i64, false);
+                    let (mut ty, mut alg, mut ty_present, mut alg_present) =
+                        ("", 0i64, false, false);
                     for _ in 0..m {
                         match cbor(d.str())? {
                             "type" => {
                                 ty = cbor(d.str())?;
                                 ty_present = true;
                             }
-                            "alg" => alg = cbor(d.i64())?,
+                            "alg" => {
+                                alg = cbor(d.i64())?;
+                                alg_present = true;
+                            }
                             _ => cbor(d.skip())?,
                         }
                     }
-                    // Every entry must carry "type".
-                    if !ty_present {
+                    // Every entry is a PublicKeyCredentialParameters and must carry
+                    // both "type" and "alg" (conformance MakeCredential Req-4 F-4).
+                    if !ty_present || !alg_present {
                         return Err(CtapError::InvalidCbor);
                     }
                     // Pick the first supported algorithm offered. Under PREFER_PQC
@@ -236,10 +249,7 @@ fn parse(data: &[u8]) -> Result<Request<'_>, CtapError> {
                 for _ in 0..m {
                     match cbor(d.str())? {
                         "rk" => req.rk = cbor(d.bool())?,
-                        "up" => {
-                            req.up_present = true;
-                            let _ = cbor(d.bool())?;
-                        }
+                        "up" => req.up = Some(cbor(d.bool())?),
                         "uv" => req.uv = cbor(d.bool())?,
                         _ => cbor(d.skip())?,
                     }
@@ -272,8 +282,10 @@ pub fn make_credential<S: Storage, R: Rng>(
     if req.sel_alg == 0 {
         return Err(CtapError::UnsupportedAlgorithm);
     }
-    // makeCredential forbids an explicit "up" and built-in "uv" (5.3/5.6).
-    if req.uv || req.up_present {
+    // makeCredential forbids built-in "uv" (no on-device UV) and an explicit
+    // up=false; up is implicitly true, and an explicit up=true is accepted
+    // (conformance MakeCredential Req-6: P-3 up=true succeeds, F-1 up=false fails).
+    if req.uv || req.up == Some(false) {
         return Err(CtapError::InvalidOption);
     }
     // largeBlobKey may not be requested as false and requires a resident key.
@@ -285,10 +297,9 @@ pub fn make_credential<S: Storage, R: Rng>(
         return Err(CtapError::MissingParameter);
     }
     // Enterprise attestation (§6.1.2): only when enabled via authenticatorConfig,
-    // and only levels 1/2. Without an org-provisioned key, level 1
-    // (vendor-facilitated) produces a normal self-attestation and level 2
-    // (platform-managed) a full device attestation; with one (vendor
-    // ATT_IMPORT), both levels emit the full org attestation below.
+    // and only levels 1/2. Whether it is actually performed (and the `ep` flag set)
+    // is decided later: type 2 for any RP, type 1 only for a vendor-listed RP — see
+    // `rp_eligible_for_vendor_ea` and `full_ea` in `make_credential_inner`.
     if req.enterprise_attestation > 0 {
         if !ctx.fs.has_data(EF_EA_ENABLED) {
             return Err(CtapError::InvalidParameter);
@@ -307,6 +318,20 @@ pub fn make_credential<S: Storage, R: Rng>(
     result
 }
 
+/// Whether `rp_id` is on the built-in vendor-facilitated (type 1) enterprise
+/// attestation list. Shipping firmware carries an EMPTY list — no RP qualifies,
+/// so type-1 EA never fires by default. The `ea-conformance-rpid` feature adds the
+/// FIDO Conformance Tool's fixed test RPID so its Enterprise-Attestation type-1
+/// case can be exercised; it is never enabled in a shipped image.
+fn rp_eligible_for_vendor_ea(rp_id: &str) -> bool {
+    let _ = rp_id;
+    #[cfg(feature = "ea-conformance-rpid")]
+    if rp_id == "enterprisetest.certinfra.fidoalliance.org" {
+        return true;
+    }
+    false
+}
+
 /// CTAP2.1 PIN/UV enforcement (§8.1/§11.1): verifies a `pinUvAuthParam`
 /// against the token and reports whether to set the `uv` flag.
 fn enforce_pin<S: Storage, R: Rng>(
@@ -319,9 +344,7 @@ fn enforce_pin<S: Storage, R: Rng>(
         // Zero-length probe: a selection gesture — wait for a touch, then report
         // the PIN state. With no button configured this confirms instantly.
         Some(&[]) => {
-            if !ctx.check_user_presence() {
-                return Err(CtapError::OperationDenied);
-            }
+            ctx.require_presence()?;
             Err(if pin_set {
                 CtapError::PinAuthInvalid
             } else {
@@ -346,8 +369,9 @@ fn enforce_pin<S: Storage, R: Rng>(
             }
             Ok(true)
         }
-        // §8.1: a configured PIN must be exercised.
-        None if pin_set => Err(CtapError::PuatRequired),
+        // §8.1: a configured PIN must be exercised. alwaysUv additionally forces
+        // user verification even when no PIN is set (CTAP 2.1 alwaysUv).
+        None if pin_set || ctx.fs.has_data(EF_ALWAYS_UV) => Err(CtapError::PuatRequired),
         None => Ok(false),
     }
 }
@@ -425,10 +449,9 @@ fn make_credential_inner<S: Storage, R: Rng>(
     // credential — matching getAssertion — even on the no-PIN path (e.g. an SSH
     // `ed25519-sk` enrollment with no FIDO PIN set). The zero-length
     // pinUvAuthParam probe already took its own touch in `enforce_pin` and
-    // returned early, so it never reaches here. No button → instant.
-    if !ctx.check_user_presence() {
-        return Err(CtapError::OperationDenied);
-    }
+    // returned early, so it never reaches here. No button → instant. A
+    // CTAPHID_CANCEL during the wait surfaces as KEEPALIVE_CANCEL.
+    ctx.require_presence()?;
 
     // authData = rpIdHash | flags | counter | aaguid | credIdLen | credId | COSEpubkey | ext
     // Sized for the ML-DSA-44 worst case: 55 header + a non-resident box (≤640)
@@ -472,19 +495,28 @@ fn make_credential_inner<S: Storage, R: Rng>(
     // attestation signed by the device key, carrying its x5c cert and the `ep`
     // response flag.
     ad[ad_len..ad_len + 32].copy_from_slice(req.client_data_hash);
-    // An org-provisioned attestation key (vendor ATT_IMPORT) upgrades *both*
-    // EA levels to a full attestation under the org chain; without one,
-    // level 2 falls back to the device key (the seed scalar) and its
-    // self-signed EF_EE_DEV cert — the same pair U2F register uses.
-    let org_key = if req.enterprise_attestation > 0 {
+    // Any enterpriseAttestation request (type 1/2, with EA enabled) yields a
+    // basic_full (x5c) attestation; a request WITHOUT it keeps the default
+    // self-attestation. `ea_performed` — platform-managed (type 2), or
+    // vendor-facilitated (type 1) for an RP on the built-in enterprise list (empty
+    // in shipping firmware) — presents the org/EP cert and sets the `ep` flag. A
+    // type-1 request for a non-listed RP is NOT enterprise: it presents the device's
+    // own cert with no `ep` (a normal, non-enterprise attestation — CTAP2.1 §6.1.3,
+    // conformance Enterprise-Attestation F-6). The EP/org cert comes from an
+    // org-provisioned key (vendor ATT_IMPORT); the non-enterprise / no-org-key path
+    // signs with the device key (the seed scalar) + its self-signed EF_EE_DEV cert
+    // (the pair U2F register uses).
+    let ea_performed = req.enterprise_attestation == 2
+        || (req.enterprise_attestation == 1 && rp_eligible_for_vendor_ea(req.rp_id));
+    let full_attestation = req.enterprise_attestation > 0;
+    let org_key = if ea_performed {
         load_att_key(&ctx.dev, ctx.fs)
     } else {
         None
     };
-    let full_ea = req.enterprise_attestation == 2 || org_key.is_some();
     let mut sig = [0u8; MAX_SIG_LEN];
     let mut chain = [0u8; cert::ATT_CHAIN_MAX + 1 + 2 * cert::ATT_CHAIN_MAX_CERTS];
-    let (att_alg, sig_len, chain_len, certs) = if full_ea {
+    let (att_alg, sig_len, chain_len, certs) = if full_attestation {
         if let Some(mut scalar) = org_key {
             let k = P256Key::from_scalar(&scalar);
             scalar.zeroize();
@@ -525,17 +557,18 @@ fn make_credential_inner<S: Storage, R: Rng>(
     };
 
     // Response: { 1: "packed", 2: authData, 3: attStmt [, 4: ep] [, 5: largeBlobKey] }.
-    // attStmt = { alg, sig } for self-attestation, + x5c for enterprise level 2.
+    // attStmt = { alg, sig } for self-attestation, + x5c for any basic_full /
+    // enterprise attestation. `ep` (field 4) only when EA was actually performed.
     let resp_len = {
         let mut enc = Encoder::new(Cursor::new(&mut *out));
-        enc.map(3 + u64::from(full_ea) + u64::from(large_blob_key.is_some()))
+        enc.map(3 + u64::from(ea_performed) + u64::from(large_blob_key.is_some()))
             .and_then(|e| e.u8(1)?.str("packed"))
             .and_then(|e| e.u8(2)?.bytes(&ad[..ad_len]))
-            .and_then(|e| e.u8(3)?.map(2 + u64::from(full_ea)))
+            .and_then(|e| e.u8(3)?.map(2 + u64::from(full_attestation)))
             .and_then(|e| e.str("alg")?.i64(att_alg))
             .and_then(|e| e.str("sig")?.bytes(&sig[..sig_len]))
             .map_err(|_| CtapError::Other)?;
-        if full_ea {
+        if full_attestation {
             enc.str("x5c")
                 .and_then(|e| e.array(u64::from(certs)))
                 .map_err(|_| CtapError::Other)?;
@@ -543,6 +576,8 @@ fn make_credential_inner<S: Storage, R: Rng>(
                 let c = cert::att_chain_cert(&chain[..chain_len], i).ok_or(CtapError::Other)?;
                 enc.bytes(c).map_err(|_| CtapError::Other)?;
             }
+        }
+        if ea_performed {
             enc.u8(4)
                 .and_then(|e| e.bool(true)) // ep: enterprise attestation used
                 .map_err(|_| CtapError::Other)?;
@@ -901,6 +936,89 @@ mod tests {
             e.str("id").unwrap().bytes(&[1, 2, 3, 4]).unwrap();
         });
         assert_eq!(run_err(&req), CtapError::CborUnexpectedType);
+
+        // pubKeyCredParams entry missing "alg" → INVALID_CBOR (Req-4 F-4).
+        let req = mc_build(4, |e| {
+            e.u8(4).unwrap().array(1).unwrap().map(1).unwrap();
+            e.str("type").unwrap().str("public-key").unwrap();
+        });
+        assert_eq!(run_err(&req), CtapError::InvalidCbor);
+    }
+
+    #[test]
+    fn rp_name_must_be_text() {
+        // rp.name as a non-text value → CBOR_UNEXPECTED_TYPE (Req-2 F-2). Built
+        // inline because mc_build emits rp = {id} only.
+        let mut buf = [0u8; 256];
+        let n = {
+            let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+            e.map(4).unwrap();
+            e.u8(1).unwrap().bytes(&[0xCDu8; 32]).unwrap();
+            e.u8(2).unwrap().map(2).unwrap();
+            e.str("id").unwrap().str("example.com").unwrap();
+            e.str("name").unwrap().u8(7).unwrap(); // name as an integer
+            e.u8(3).unwrap().map(1).unwrap();
+            e.str("id").unwrap().bytes(&[1, 2, 3, 4]).unwrap();
+            good_params(&mut e);
+            e.writer().position()
+        };
+        assert_eq!(run_err(&buf[..n]), CtapError::CborUnexpectedType);
+    }
+
+    #[test]
+    fn makecred_up_option() {
+        // up=true is accepted (the default); up=false is rejected with
+        // INVALID_OPTION (conformance MakeCredential Req-6 P-3 / F-1).
+        let up_true = mc_build(5, |e| {
+            good_params(e);
+            e.u8(7).unwrap().map(1).unwrap();
+            e.str("up").unwrap().bool(true).unwrap();
+        });
+        let (resp, _) = run(&up_true);
+        assert!(!resp.is_empty());
+
+        let up_false = mc_build(5, |e| {
+            good_params(e);
+            e.u8(7).unwrap().map(1).unwrap();
+            e.str("up").unwrap().bool(false).unwrap();
+        });
+        assert_eq!(run_err(&up_false), CtapError::InvalidOption);
+    }
+
+    #[test]
+    fn makecred_cancel_maps_keepalive_cancel() {
+        // A CTAPHID_CANCEL during the user-presence wait makes makeCredential
+        // answer CTAP2_ERR_KEEPALIVE_CANCEL (conformance HID-1 P-10).
+        struct Cancel;
+        impl crate::UserPresence for Cancel {
+            fn request(&mut self) -> crate::Presence {
+                crate::Presence::Cancelled
+            }
+        }
+        let req = mc_build(4, good_params);
+        let mut fs = Fs::new(RamStorage::new(), &[]);
+        let dev = Device {
+            serial_hash: &[0xAB; 32],
+            serial_id: &[1, 2, 3, 4, 5, 6, 7, 8],
+            otp_key: None,
+        };
+        let mut rng = SeqRng(1);
+        ensure_seed(&dev, &mut fs, &mut rng).unwrap();
+        let mut out = [0u8; 1024];
+        let mut state = crate::FidoState::new();
+        let mut presence = Cancel;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev,
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 1000,
+        };
+        assert_eq!(
+            make_credential(&mut ctx, &req, &mut out),
+            Err(CtapError::KeepAliveCancel)
+        );
     }
 
     // Parse the response, pull out authData + sig, and check the attestation
@@ -1502,6 +1620,32 @@ mod tests {
     }
 
     #[test]
+    fn always_uv_requires_user_verification_without_pin() {
+        let mut fs = Fs::new(RamStorage::new(), &[]);
+        let mut rng = SeqRng(1);
+        ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
+        let mut state = crate::FidoState::new();
+        // No PIN, but alwaysUv is on → makeCredential still demands UV (a verified
+        // pinUvAuthToken) and rejects an up-only request. Without the EF_ALWAYS_UV
+        // guard this same request succeeds, so the assert is mutation-proof.
+        fs.put(EF_ALWAYS_UV, &[1]).unwrap();
+        let mut out = [0u8; 256];
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 0,
+        };
+        assert_eq!(
+            make_credential(&mut ctx, &build_request(false), &mut out),
+            Err(CtapError::PuatRequired)
+        );
+    }
+
+    #[test]
     fn make_credential_bad_pin_auth_rejected() {
         let mut fs = Fs::new(RamStorage::new(), &[]);
         let mut rng = SeqRng(1);
@@ -1713,13 +1857,113 @@ mod tests {
     }
 
     #[test]
-    fn enterprise_attestation_level1_stays_self() {
-        // Level 1 (vendor-facilitated) is accepted but still produces a plain
-        // self-attestation: 3-field response, no `ep`, 2-entry attStmt
-        // verifying under the credential key.
+    fn enterprise_type1_non_listed_rp_is_basic_full_no_ep() {
+        // A vendor-facilitated (type-1) request for an RP NOT on the enterprise list
+        // returns a NORMAL, non-enterprise attestation: basic_full (x5c present) with
+        // NO `ep` flag (CTAP2.1 §6.1.3, conformance Enterprise-Attestation F-6, which
+        // asserts attStmt.x5c is an array). No org key here → the device's own cert.
         let (resp, _fs) = run_ea(&build_request_ea(1), true).unwrap();
         let mut d = Decoder::new(&resp);
-        assert_eq!(d.map().unwrap().unwrap(), 3); // no field 4 (ep)
-        verify_response(&resp, &[0xCD; 32]);
+        assert_eq!(
+            d.map().unwrap().unwrap(),
+            3,
+            "no `ep` field for a non-enterprise attestation"
+        );
+        assert_eq!(d.u8().unwrap(), 1);
+        assert_eq!(d.str().unwrap(), "packed");
+        assert_eq!(d.u8().unwrap(), 2);
+        d.bytes().unwrap(); // authData
+        assert_eq!(d.u8().unwrap(), 3);
+        // attStmt = { alg, sig, x5c } — basic_full (self would be 2 entries, no x5c).
+        assert_eq!(
+            d.map().unwrap().unwrap(),
+            3,
+            "basic_full attStmt carries x5c, not self"
+        );
+        assert_eq!(d.str().unwrap(), "alg");
+        d.i64().unwrap();
+        assert_eq!(d.str().unwrap(), "sig");
+        d.bytes().unwrap();
+        assert_eq!(d.str().unwrap(), "x5c");
+        assert_eq!(d.array().unwrap().unwrap(), 1, "one cert");
+        assert!(
+            !d.bytes().unwrap().is_empty(),
+            "x5c carries the device cert"
+        );
+    }
+
+    #[test]
+    fn enterprise_type1_non_eligible_ignores_org_key() {
+        // Regression for conformance Enterprise-Attestation F-6: even with an org/EP
+        // attestation key provisioned and EA enabled, a vendor-facilitated (type 1)
+        // request for an RP NOT on the enterprise list must NOT use the org/EP cert.
+        // It returns a normal basic_full attestation with the DEVICE's own cert and
+        // no `ep` — never the enterprise batch cert.
+        let mut fs = Fs::new(RamStorage::new(), &[]);
+        let mut rng = SeqRng(1);
+        ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
+        crate::seed::store_att_key(&dev(), &mut fs, &[0x21u8; 32]).unwrap();
+        let c1 = [0x30u8, 0x03, 1, 2, 3];
+        let mut packed = [0u8; 64];
+        let plen = crate::cert::att_chain_pack(&c1, &mut packed).unwrap();
+        fs.put(EF_ATT_CHAIN, &packed[..plen]).unwrap();
+        fs.put(EF_EA_ENABLED, &[1]).unwrap();
+
+        let req = build_request_ea(1); // rp_id "example.com" — not enterprise-eligible
+        let mut out = [0u8; 1024];
+        let mut state = crate::FidoState::new();
+        let resp = {
+            let mut presence = crate::AlwaysConfirm;
+            let mut ctx = Ctx {
+                presence: &mut presence,
+                dev: dev(),
+                fs: &mut fs,
+                rng: &mut rng,
+                state: &mut state,
+                now_ms: 1000,
+            };
+            let len = make_credential(&mut ctx, &req, &mut out).unwrap();
+            out[..len].to_vec()
+        };
+        let mut d = Decoder::new(&resp);
+        // No `ep` (3 top-level fields), basic_full attStmt (x5c), and the x5c is NOT
+        // the provisioned org/EP cert (`c1`) — the device's own cert instead.
+        assert_eq!(
+            d.map().unwrap().unwrap(),
+            3,
+            "type-1 non-eligible must not add ep"
+        );
+        assert_eq!(d.u8().unwrap(), 1);
+        assert_eq!(d.str().unwrap(), "packed");
+        assert_eq!(d.u8().unwrap(), 2);
+        d.bytes().unwrap();
+        assert_eq!(d.u8().unwrap(), 3);
+        assert_eq!(
+            d.map().unwrap().unwrap(),
+            3,
+            "basic_full attStmt (x5c), not self"
+        );
+        assert_eq!(d.str().unwrap(), "alg");
+        d.i64().unwrap();
+        assert_eq!(d.str().unwrap(), "sig");
+        d.bytes().unwrap();
+        assert_eq!(d.str().unwrap(), "x5c");
+        assert_eq!(d.array().unwrap().unwrap(), 1);
+        assert_ne!(
+            d.bytes().unwrap(),
+            &c1,
+            "non-eligible type-1 must NOT present the org/EP cert"
+        );
+    }
+
+    #[test]
+    fn vendor_ea_eligibility() {
+        // No RP qualifies for vendor-facilitated EA by default; the FIDO conformance
+        // test RPID qualifies only under the `ea-conformance-rpid` feature.
+        assert!(!rp_eligible_for_vendor_ea("example.com"));
+        assert_eq!(
+            rp_eligible_for_vendor_ea("enterprisetest.certinfra.fidoalliance.org"),
+            cfg!(feature = "ea-conformance-rpid")
+        );
     }
 }

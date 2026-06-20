@@ -21,11 +21,11 @@ use crate::cbordec::{cbor, def_arr, def_map};
 use crate::consts::{
     CM_DELETE_CREDENTIAL, CM_ENUMERATE_CREDS_BEGIN, CM_ENUMERATE_CREDS_NEXT,
     CM_ENUMERATE_RPS_BEGIN, CM_ENUMERATE_RPS_NEXT, CM_GET_CREDS_METADATA, CM_UPDATE_USER_INFO,
-    EF_CRED, EF_RP, MAX_RESIDENT_CREDENTIALS,
+    CRED_PROT_UV_OPTIONAL, EF_CRED, EF_RP, MAX_RESIDENT_CREDENTIALS,
 };
 use crate::credential::{
     CRED_RESIDENT_LEN, CredInput, RECORD_PREFIX, RP_PREFIX, credential_create, credential_load,
-    credential_store, derive_large_blob_key, slot_map, unseal_rp_id,
+    derive_large_blob_key, slot_map, unseal_rp_id,
 };
 use crate::ec::CredKey;
 use crate::error::{CtapError, CtapResult};
@@ -425,16 +425,24 @@ fn enumerate_creds_response(
         + u64::from(!cred.user_name.is_empty())
         + u64::from(!cred.user_display_name.is_empty());
 
-    // Extension response fields: 0x0A credProtect (when set), 0x0B largeBlobKey
-    // (derived, when the credential opted in), 0x0C thirdPartyPayment (always).
+    // Extension response fields: 0x0A credProtect (always — defaults to level 1),
+    // 0x0B largeBlobKey (derived, when the credential opted in), 0x0C
+    // thirdPartyPayment (always).
     let large_blob_key = if cred.ext.large_blob_key {
         Some(derive_large_blob_key(seed, cred_box))
     } else {
         None
     };
+    // A credential with no explicit credProtect is level 1 (userVerificationOptional);
+    // the response always carries it (conformance CredMgmt-EnumerateCredentials P-1).
+    let cred_protect = if cred.ext.cred_protect == 0 {
+        CRED_PROT_UV_OPTIONAL
+    } else {
+        cred.ext.cred_protect
+    };
     let fields = 3
         + u64::from(begin)
-        + u64::from(cred.ext.cred_protect > 0)
+        + 1 // 0x0A credProtect (always)
         + u64::from(large_blob_key.is_some())
         + 1; // 0x0C thirdPartyPayment
 
@@ -478,11 +486,9 @@ fn enumerate_creds_response(
     }
 
     // 0x0A credProtect, 0x0B largeBlobKey, 0x0C thirdPartyPayment.
-    if cred.ext.cred_protect > 0 {
-        enc.u8(0x0A)
-            .and_then(|e| e.u64(cred.ext.cred_protect))
-            .map_err(|_| CtapError::Other)?;
-    }
+    enc.u8(0x0A)
+        .and_then(|e| e.u64(cred_protect))
+        .map_err(|_| CtapError::Other)?;
     if let Some(k) = large_blob_key {
         enc.u8(0x0B)
             .and_then(|e| e.bytes(&k))
@@ -581,13 +587,11 @@ fn update_user<S: Storage, R: Rng>(
         };
         let n = n.min(buf.len());
         if n >= RECORD_PREFIX && buf[32..RECORD_PREFIX] == *cred_id {
-            let mut rp_id_hash = [0u8; 32];
-            rp_id_hash.copy_from_slice(&buf[..32]);
             let mut seed = ctx.load_keydev().ok_or(CtapError::NotAllowed)?;
             let r = reseal_user(
                 ctx,
-                &buf[RECORD_PREFIX..n],
-                &rp_id_hash,
+                i,
+                &buf[..n],
                 user_id,
                 user_name,
                 user_display_name,
@@ -600,19 +604,38 @@ fn update_user<S: Storage, R: Rng>(
     Err(CtapError::NoCredentials)
 }
 
+/// Reseal a resident credential with new user name / display name, PRESERVING
+/// its stored resident id. Per CTAP2.1 §6.8.5 the credentialId the platform holds
+/// must stay stable across updateUserInformation; resealing draws a fresh IV
+/// (nonce reuse is forbidden — see `credential::seal_rp_id`), so the box, and any
+/// id re-derived from it, necessarily change. The stored 42-byte resident id is
+/// the credential's stable identity, so we rewrite the same slot keeping that
+/// prefix and only swapping the box. Without this, `deleteCredential` with the
+/// platform's recorded id misses the (rotated) stored id → NO_CREDENTIALS
+/// (conformance CredMgmt-UpdateAndDelete P-2).
+///
+/// Known limitation: the signing key, hmac-secret and largeBlobKey are all
+/// derived from the (now changed) box, so they DO rotate on an update. Keeping
+/// them stable too needs a per-credential nonce decoupled from the IV — a
+/// deferred, box-format-changing refactor — and is not required for conformance.
 #[allow(clippy::too_many_arguments)]
 fn reseal_user<S: Storage, R: Rng>(
     ctx: &mut Ctx<S, R>,
-    cred_box: &[u8],
-    rp_id_hash: &[u8; 32],
+    slot: u16,
+    record: &[u8],
     user_id: &[u8],
     user_name: &str,
     user_display_name: &str,
     seed: &[u8; 32],
 ) -> CtapResult {
+    let mut rp_id_hash = [0u8; 32];
+    rp_id_hash.copy_from_slice(&record[..32]);
+    let resident_id = &record[32..RECORD_PREFIX];
+    let cred_box = &record[RECORD_PREFIX..];
+
     let mut scratch = [0u8; 1024];
     let cred =
-        credential_load(seed, cred_box, rp_id_hash, &mut scratch).ok_or(CtapError::NotAllowed)?;
+        credential_load(seed, cred_box, &rp_id_hash, &mut scratch).ok_or(CtapError::NotAllowed)?;
     // The supplied user id must match the credential's (MIN-length compare).
     let cmp = user_id.len().min(cred.user_id.len());
     if user_id[..cmp] != cred.user_id[..cmp] {
@@ -634,19 +657,21 @@ fn reseal_user<S: Storage, R: Rng>(
         ext: cred.ext,
     };
     let mut new_box = [0u8; 512];
-    let len = credential_create(seed, &ctx.dev, &input, rp_id_hash, &iv, &mut new_box)
+    let len = credential_create(seed, &ctx.dev, &input, &rp_id_hash, &iv, &mut new_box)
         .map_err(|_| CtapError::NotAllowed)?;
-    // Same (rp, user id) → credential_store overwrites the existing slot.
-    credential_store(
-        seed,
-        &ctx.dev,
-        ctx.fs,
-        &new_box[..len],
-        rp_id_hash,
-        cred.rp_id,
-        cred.user_id,
-    )
-    .map_err(|_| CtapError::NotAllowed)?;
+
+    // Rewrite the slot: rp_id_hash ‖ (preserved) resident_id ‖ new box.
+    let total = RECORD_PREFIX + len;
+    let mut rec = [0u8; 1024];
+    if total > rec.len() {
+        return Err(CtapError::KeyStoreFull);
+    }
+    rec[..32].copy_from_slice(&rp_id_hash);
+    rec[32..RECORD_PREFIX].copy_from_slice(resident_id);
+    rec[RECORD_PREFIX..total].copy_from_slice(&new_box[..len]);
+    ctx.fs
+        .put(EF_CRED + slot, &rec[..total])
+        .map_err(|_| CtapError::NotAllowed)?;
     Ok(0)
 }
 
@@ -993,8 +1018,9 @@ mod tests {
     fn parse_cred(resp: &[u8], begin: bool) -> (std::vec::Vec<u8>, [u8; 32], [u8; 32], Option<u8>) {
         let mut d = Decoder::new(resp);
         let fields = d.map().unwrap().unwrap();
-        // 6/7/8 [+9 on Begin] + 0x0C thirdPartyPayment (always emitted).
-        assert_eq!(fields, if begin { 5 } else { 4 });
+        // 6/7/8 [+9 on Begin] + 0x0A credProtect + 0x0C thirdPartyPayment (both
+        // always emitted; 0x0A defaults to level 1 when the credential has none).
+        assert_eq!(fields, if begin { 6 } else { 5 });
         // 0x06 user
         assert_eq!(d.u8().unwrap(), 6);
         let um = d.map().unwrap().unwrap();
@@ -1117,6 +1143,37 @@ mod tests {
         let seed = crate::seed::load_keydev(&dev(), &mut fs).unwrap();
         let expected = derive_large_blob_key(&seed, &rec[RECORD_PREFIX..m]);
         assert_eq!(lbk.as_deref(), Some(&expected[..]));
+    }
+
+    #[test]
+    fn enumerate_defaults_cred_protect_to_level_one() {
+        // A credential created without a credProtect extension still reports
+        // credProtect = 1 (userVerificationOptional) — the field is always
+        // present (conformance CredMgmt-EnumerateCredentials P-1).
+        let (mut fs, mut rng) = setup();
+        register(&mut fs, &mut rng, "example.com", &[5, 5], "dave");
+        let rp_hash = sha256(b"example.com");
+        let mut state = armed(PERM_CM);
+        let mut out = [0u8; 512];
+        let n = run(
+            &mut fs,
+            &mut state,
+            &cm_request(0x04, Some(&subpara_rpidhash(&rp_hash)), &TOKEN),
+            &mut out,
+        )
+        .unwrap();
+        let mut d = Decoder::new(&out[..n]);
+        let fields = d.map().unwrap().unwrap();
+        let mut cp = None;
+        for _ in 0..fields {
+            match d.u8().unwrap() {
+                0x0A => cp = Some(d.u64().unwrap()),
+                _ => {
+                    d.skip().unwrap();
+                }
+            }
+        }
+        assert_eq!(cp, Some(1), "default credProtect is level 1");
     }
 
     #[test]
@@ -1258,6 +1315,82 @@ mod tests {
             ),
             Err(CtapError::InvalidParameter)
         );
+    }
+
+    #[test]
+    fn update_preserves_credential_id_then_deletes() {
+        // CTAP2.1 §6.8.5: updateUserInformation must NOT change the credentialId.
+        // Regression for conformance CredMgmt-UpdateAndDelete P-2 — the reseal used
+        // to rotate the stored resident id, so a later deleteCredential with the
+        // platform's (original) id returned NO_CREDENTIALS.
+        let (mut fs, mut rng) = setup();
+        let (id, ..) = register(&mut fs, &mut rng, "example.com", &[1, 1], "alice");
+        let mut state = armed(PERM_CM);
+        let mut out = [0u8; 512];
+        let rp_hash = sha256(b"example.com");
+
+        // Update the user info (same user id, new name + displayName).
+        run(
+            &mut fs,
+            &mut state,
+            &cm_request(
+                0x07,
+                Some(&subpara_update(&id, &[1, 1], "alice2", "Alice Two")),
+                &TOKEN,
+            ),
+            &mut out,
+        )
+        .unwrap();
+
+        // enumerateCredentials still reports the SAME credentialId (and new name).
+        let n = run(
+            &mut fs,
+            &mut state,
+            &cm_request(0x04, Some(&subpara_rpidhash(&rp_hash)), &TOKEN),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(
+            enumerated_cred_id(&out[..n]),
+            id,
+            "credentialId must be stable across update"
+        );
+        assert_eq!(cred_user_name(&out[..n]), "alice2");
+
+        // deleteCredential with the ORIGINAL id now succeeds (was NO_CREDENTIALS).
+        let n = run(
+            &mut fs,
+            &mut state,
+            &cm_request(0x06, Some(&subpara_cred(&id)), &TOKEN),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(metadata_count(&mut fs, &mut state), 0);
+    }
+
+    // The credentialId (response field 0x07 "id") from an enumerateCredentials
+    // response, read order-independently.
+    fn enumerated_cred_id(resp: &[u8]) -> std::vec::Vec<u8> {
+        let mut d = Decoder::new(resp);
+        let fields = d.map().unwrap().unwrap();
+        let mut id = std::vec::Vec::new();
+        for _ in 0..fields {
+            if d.u8().unwrap() == 7 {
+                let m = d.map().unwrap().unwrap();
+                for _ in 0..m {
+                    match d.str().unwrap() {
+                        "id" => id = d.bytes().unwrap().to_vec(),
+                        _ => {
+                            d.skip().unwrap();
+                        }
+                    }
+                }
+            } else {
+                d.skip().unwrap();
+            }
+        }
+        id
     }
 
     fn cred_user_name(resp: &[u8]) -> std::string::String {

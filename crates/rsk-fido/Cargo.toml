@@ -38,3 +38,9 @@ advertise-pqc = []
 # rises to 6 and the vendor seed export is refused. A build profile, not a
 # FIPS validation — see docs/guides/fips.md.
 fips-profile = []
+# Add the FIDO Conformance Tool's fixed enterprise-attestation test RPID
+# (enterprisetest.certinfra.fidoalliance.org) to the vendor-facilitated (type 1)
+# EA eligibility list, so the tool's Enterprise-Attestation type-1 case can run.
+# Conformance self-validation ONLY — never ship it (it would grant enterprise
+# attestation to a FIDO test domain). Shipping firmware's type-1 list is empty.
+ea-conformance-rpid = []

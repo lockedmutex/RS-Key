@@ -21,10 +21,24 @@ use embassy_time::{Duration, Instant, block_for};
 /// to report `UPNEEDED` (0x02) instead of `PROCESSING` (0x01).
 static UP_PENDING: AtomicBool = AtomicBool::new(false);
 
+/// Set by the CTAPHID transport (high-priority executor) when a `CTAPHID_CANCEL`
+/// arrives for the request the worker is processing. The button wait — running on
+/// the worker executor — polls it each iteration and abandons with `Cancelled`, so
+/// the in-flight CTAP2 command answers `CTAP2_ERR_KEEPALIVE_CANCEL`. Cross-executor
+/// (transport sets, worker reads), mirroring `UP_PENDING` in the other direction.
+static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
+
 /// The CTAPHID keepalive hook passed to `CtapHid::new`: is a touch being awaited?
 /// Always `false` when built without `up-button`, so the status stays `PROCESSING`.
 pub fn up_pending() -> bool {
     UP_PENDING.load(Ordering::Relaxed)
+}
+
+/// The CTAPHID cancel hook passed to `CtapHid::new`: request that an in-flight
+/// touch wait be abandoned. Just sets the flag the wait polls (a no-op on the
+/// no-button build, where `request` confirms instantly and never waits).
+pub fn request_cancel() {
+    CANCEL_REQUESTED.store(true, Ordering::Relaxed);
 }
 
 // Poll cadence and the press timeout. `block_for` keeps interrupts enabled, so the
@@ -35,13 +49,15 @@ const POLL_MS: u64 = 16;
 #[cfg(feature = "up-button")]
 const TIMEOUT_MS: u64 = 30_000;
 
-/// Neutral wait result, mapped to each applet's own `Presence` enum. The sync poll
-/// has no cancel path, so it never produces a "declined".
+/// Neutral wait result, mapped to each applet's own `Presence` enum. The button
+/// has no "declined" gesture; `Cancelled` comes from a `CTAPHID_CANCEL` (FIDO
+/// only) observed via [`CANCEL_REQUESTED`].
 #[cfg(feature = "up-button")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Outcome {
     Confirmed,
     Timeout,
+    Cancelled,
 }
 
 /// User presence via the BOOTSEL button.
@@ -74,12 +90,19 @@ impl BootselPresence {
         // Save the LED status, show the touch status for the wait, restore after.
         let saved = crate::led::status();
         crate::led::set_status(crate::led::STATUS_TOUCH);
+        // Drop any cancel left from an earlier (already-finished) request so this
+        // wait starts clean.
+        CANCEL_REQUESTED.store(false, Ordering::Relaxed);
         UP_PENDING.store(true, Ordering::Relaxed);
         let start = Instant::now();
-        // Wait for a press; with none in TIMEOUT_MS, return a timeout.
+        // Wait for a press; a CTAPHID_CANCEL aborts it, and with neither in
+        // TIMEOUT_MS it times out.
         let result = loop {
             if is_bootsel_pressed(self.bootsel.reborrow()) {
                 break Outcome::Confirmed;
+            }
+            if CANCEL_REQUESTED.load(Ordering::Relaxed) {
+                break Outcome::Cancelled;
             }
             if start.elapsed() >= Duration::from_millis(TIMEOUT_MS) {
                 break Outcome::Timeout;
@@ -98,6 +121,9 @@ impl BootselPresence {
             }
         }
         UP_PENDING.store(false, Ordering::Relaxed);
+        // Clear any cancel that raced in (e.g. just after a confirm) so it can't
+        // leak into the next request's wait.
+        CANCEL_REQUESTED.store(false, Ordering::Relaxed);
         crate::led::set_status(saved);
         result
     }
@@ -110,6 +136,7 @@ impl rsk_fido::UserPresence for BootselPresence {
             match self.wait() {
                 Outcome::Confirmed => rsk_fido::Presence::Confirmed,
                 Outcome::Timeout => rsk_fido::Presence::Timeout,
+                Outcome::Cancelled => rsk_fido::Presence::Cancelled,
             }
         }
         #[cfg(not(feature = "up-button"))]
@@ -125,7 +152,9 @@ impl rsk_openpgp::UserPresence for BootselPresence {
         {
             match self.wait() {
                 Outcome::Confirmed => rsk_openpgp::Presence::Confirmed,
-                Outcome::Timeout => rsk_openpgp::Presence::Timeout,
+                // OpenPGP UIF runs over CCID, which carries no CTAPHID_CANCEL, so
+                // Cancelled is unreachable here; treat it as a non-confirmation.
+                Outcome::Timeout | Outcome::Cancelled => rsk_openpgp::Presence::Timeout,
             }
         }
         #[cfg(not(feature = "up-button"))]
@@ -141,7 +170,8 @@ impl rsk_otp::UserPresence for BootselPresence {
         {
             match self.wait() {
                 Outcome::Confirmed => rsk_otp::Presence::Confirmed,
-                Outcome::Timeout => rsk_otp::Presence::Timeout,
+                // CCID-only applet: no CTAPHID_CANCEL reaches it.
+                Outcome::Timeout | Outcome::Cancelled => rsk_otp::Presence::Timeout,
             }
         }
         #[cfg(not(feature = "up-button"))]
@@ -157,7 +187,8 @@ impl rsk_oath::UserPresence for BootselPresence {
         {
             match self.wait() {
                 Outcome::Confirmed => rsk_oath::Presence::Confirmed,
-                Outcome::Timeout => rsk_oath::Presence::Timeout,
+                // CCID-only applet: no CTAPHID_CANCEL reaches it.
+                Outcome::Timeout | Outcome::Cancelled => rsk_oath::Presence::Timeout,
             }
         }
         #[cfg(not(feature = "up-button"))]

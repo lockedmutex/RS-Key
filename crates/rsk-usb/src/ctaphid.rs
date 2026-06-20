@@ -12,7 +12,7 @@
 
 use core::future::Future;
 
-use embassy_futures::select::{Either, select};
+use embassy_futures::select::{Either, Either3, select, select3};
 use embassy_time::Timer;
 use embassy_usb::class::hid::{HidReader, HidWriter};
 use embassy_usb::driver::Driver;
@@ -46,8 +46,6 @@ const ERR_INVALID_SEQ: u8 = 0x04;
 const ERR_MSG_TIMEOUT: u8 = 0x05;
 const ERR_CHANNEL_BUSY: u8 = 0x06;
 const ERR_INVALID_CHANNEL: u8 = 0x0b;
-// CTAP2_ERR_KEEPALIVE_CANCEL
-const ERR_KEEPALIVE_CANCEL: u8 = 0x2d;
 
 // KEEPALIVE status byte: the authenticator is still processing the request.
 const STATUS_PROCESSING: u8 = 0x01;
@@ -57,6 +55,33 @@ const STATUS_UPNEEDED: u8 = 0x02;
 // Stream a KEEPALIVE this often while the worker runs a long synchronous op
 // (slow P-521, flash GC) — well under any host CTAP timeout.
 const KEEPALIVE_MS: u64 = 100;
+
+/// Which keepalive status to stream while a request is in flight, or `None` to
+/// stay silent. U2F (MSG) is fast apart from the touch wait, and U2FHID hosts —
+/// including the FIDO conformance tool — mishandle a `PROCESSING` keepalive sent
+/// before a quick MSG response (check-only, unknown handle): they read it as the
+/// response's first frame and desync ("sequence out of order"). So for MSG only
+/// ever signal UP-needed; CBOR (CTAP2) keeps `PROCESSING` for its genuinely slow
+/// operations (P-521, resident makeCredential, flash GC).
+fn keepalive_status(is_cbor: bool, up_pending: bool) -> Option<u8> {
+    if up_pending {
+        Some(STATUS_UPNEEDED)
+    } else if is_cbor {
+        Some(STATUS_PROCESSING)
+    } else {
+        None
+    }
+}
+
+/// Whether a report read while a request is in flight is a `CTAPHID_CANCEL` for
+/// the active channel `cid` — the signal to abort the worker's user-presence
+/// wait. `n` is the number of bytes read. The transport reads frames
+/// concurrently with the worker only to catch this; everything else is ignored.
+fn is_cancel_frame(frame: &[u8; HID_RPT_SIZE], n: usize, cid: u32) -> bool {
+    n >= 5
+        && frame[4] == CTAPHID_CANCEL
+        && u32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]]) == cid
+}
 // Abort an in-progress reassembly if the next frame is this late.
 const RX_TIMEOUT_MS: u64 = 500;
 // Abandon a response if the host stops draining the IN endpoint for this long.
@@ -233,20 +258,27 @@ impl Reassembler {
 
         if is_init {
             let cmd = type_byte;
+            // Mid-transaction, an init-type frame that is not CTAPHID_INIT is a
+            // protocol violation — judged BEFORE the bcnt field, which is
+            // meaningless in such a frame. A continuation frame whose seq byte has
+            // the INIT bit set lands here (FIDO conformance HID-1 F-4 corrupts the
+            // last frame's seq to CTAPHID_PING+1 = 0x82); its "bcnt" is then random
+            // payload bytes, so validating length first wrongly returned
+            // ERR_INVALID_LEN whenever those bytes exceeded the max (~88% of runs).
+            if self.in_tx && cmd != CTAPHID_INIT {
+                if self.cid != cid {
+                    // A different channel cannot interrupt — busy; the owning
+                    // channel's in-progress transaction is left intact.
+                    return Outcome::Error(cid, ERR_CHANNEL_BUSY);
+                }
+                // Same channel: an init-type frame where a continuation was
+                // expected is out of sequence; abort the transaction.
+                self.in_tx = false;
+                return Outcome::Error(cid, ERR_INVALID_SEQ);
+            }
             let bcnt = ((f[5] as usize) << 8) | f[6] as usize;
             if bcnt > CTAP_MAX_MESSAGE {
                 return Outcome::Error(cid, ERR_INVALID_LEN);
-            }
-            // Mid-transaction on a different channel → busy.
-            if self.in_tx && self.cid != cid && cmd != CTAPHID_INIT {
-                return Outcome::Error(cid, ERR_CHANNEL_BUSY);
-            }
-            // Same channel, mid-transaction: only CTAPHID_INIT may resync; any
-            // other init-type frame where a continuation was expected is a
-            // sequence error.
-            if self.in_tx && self.cid == cid && cmd != CTAPHID_INIT {
-                self.in_tx = false;
-                return Outcome::Error(cid, ERR_INVALID_SEQ);
             }
             self.cid = cid;
             self.cmd = cmd;
@@ -357,6 +389,11 @@ pub struct CtapHid<'d, D: Driver<'d>, H: MsgHandler> {
     /// selects the `KEEPALIVE` status byte (`UPNEEDED` vs `PROCESSING`). The firmware
     /// reads its worker flag; a `|| false` stand-in keeps the status at `PROCESSING`.
     up_pending: fn() -> bool,
+    /// Signal the worker (on its own executor) to abort an in-flight touch wait,
+    /// invoked when a `CTAPHID_CANCEL` arrives for the channel being processed.
+    /// The aborted command returns `CTAP2_ERR_KEEPALIVE_CANCEL`. A `|| {}` stand-in
+    /// (no button → instant confirmation) makes it a no-op.
+    request_cancel: fn(),
 }
 
 impl<'d, D: Driver<'d>, H: MsgHandler> CtapHid<'d, D, H> {
@@ -365,6 +402,7 @@ impl<'d, D: Driver<'d>, H: MsgHandler> CtapHid<'d, D, H> {
         writer: HidWriter<'d, D, HID_RPT_SIZE>,
         handler: H,
         up_pending: fn() -> bool,
+        request_cancel: fn(),
     ) -> Self {
         Self {
             reader,
@@ -373,6 +411,7 @@ impl<'d, D: Driver<'d>, H: MsgHandler> CtapHid<'d, D, H> {
             asm: Reassembler::new(),
             scratch: [0; CTAP_MAX_MESSAGE],
             up_pending,
+            request_cancel,
         }
     }
 
@@ -460,13 +499,11 @@ impl<'d, D: Driver<'d>, H: MsgHandler> CtapHid<'d, D, H> {
                 write_message(&mut self.writer, cid, CTAPHID_UUID, &DEVICE_UUID).await;
             }
             CTAPHID_CANCEL => {
-                write_message(
-                    &mut self.writer,
-                    cid,
-                    CTAPHID_ERROR,
-                    &[ERR_KEEPALIVE_CANCEL],
-                )
-                .await;
+                // A CANCEL is never acknowledged (CTAPHID spec). With no
+                // transaction in flight it is simply ignored; one that arrives
+                // mid-transaction is observed inside `run_with_keepalive`, which
+                // aborts the worker's touch wait so the in-flight CBOR/MSG
+                // command answers CTAP2_ERR_KEEPALIVE_CANCEL itself.
             }
             CTAPHID_MSG => {
                 self.run_with_keepalive(cid, false).await;
@@ -497,15 +534,21 @@ impl<'d, D: Driver<'d>, H: MsgHandler> CtapHid<'d, D, H> {
     /// worker blocks on slow crypto / flash GC.
     async fn run_with_keepalive(&mut self, cid: u32, is_cbor: bool) {
         let Self {
+            reader,
             handler,
             writer,
             asm,
             scratch,
             up_pending,
-            ..
+            request_cancel,
         } = self;
         let up_pending = *up_pending;
+        let request_cancel = *request_cancel;
         let data = asm.message();
+        // Frames read while the worker runs are inspected only for CTAPHID_CANCEL,
+        // never reassembled (the message buffer is in use), so a scratch buffer
+        // disjoint from `asm` is enough.
+        let mut watch = [0u8; HID_RPT_SIZE];
         let n = {
             let mut fut = core::pin::pin!(async {
                 if is_cbor {
@@ -515,15 +558,45 @@ impl<'d, D: Driver<'d>, H: MsgHandler> CtapHid<'d, D, H> {
                 }
             });
             loop {
-                match select(fut.as_mut(), Timer::after_millis(KEEPALIVE_MS)).await {
-                    Either::First(n) => break n,
-                    Either::Second(_) => {
-                        let status = if up_pending() {
-                            STATUS_UPNEEDED
-                        } else {
-                            STATUS_PROCESSING
-                        };
-                        write_message(writer, cid, CTAPHID_KEEPALIVE, &[status]).await;
+                // Only watch the reader for CTAPHID_CANCEL while a touch is
+                // pending. That is the only window the platform sends CANCEL, and
+                // the only time it is not pipelining the next request. Reading
+                // frames during fast/crypto processing would consume — and then
+                // drop — a pipelined next command (e.g. the rapid getPinToken loop
+                // in conformance ClientPin-GetRetries), wedging the transport. So
+                // off the touch wait we race only the worker and the keepalive,
+                // exactly like before the CANCEL support was added.
+                if up_pending() {
+                    match select3(
+                        fut.as_mut(),
+                        Timer::after_millis(KEEPALIVE_MS),
+                        reader.read(&mut watch),
+                    )
+                    .await
+                    {
+                        Either3::First(n) => break n,
+                        Either3::Second(_) => {
+                            if let Some(status) = keepalive_status(is_cbor, up_pending()) {
+                                write_message(writer, cid, CTAPHID_KEEPALIVE, &[status]).await;
+                            }
+                        }
+                        // A CTAPHID_CANCEL on the active channel aborts the worker's
+                        // touch wait; the command then returns KEEPALIVE_CANCEL
+                        // itself. Any other mid-flight frame is ignored.
+                        Either3::Third(read) => {
+                            if matches!(read, Ok(k) if is_cancel_frame(&watch, k, cid)) {
+                                request_cancel();
+                            }
+                        }
+                    }
+                } else {
+                    match select(fut.as_mut(), Timer::after_millis(KEEPALIVE_MS)).await {
+                        Either::First(n) => break n,
+                        Either::Second(_) => {
+                            if let Some(status) = keepalive_status(is_cbor, up_pending()) {
+                                write_message(writer, cid, CTAPHID_KEEPALIVE, &[status]).await;
+                            }
+                        }
                     }
                 }
             }
@@ -790,6 +863,59 @@ mod tests {
             asm.feed(&init_frame(cid, CTAPHID_INIT, 8, &[1u8; 8])),
             Outcome::Message(cid, CTAPHID_INIT)
         );
+    }
+
+    #[test]
+    fn midtx_init_type_frame_with_oversized_bcnt_is_seq_error() {
+        // FIDO conformance HID-1 F-4: the tool corrupts the LAST continuation
+        // frame's seq byte to CTAPHID_PING+1 (0x82) — an init-type frame mid-
+        // transaction. Its "bcnt" is then random payload bytes; when they exceed
+        // CTAP_MAX_MESSAGE (most runs) a length-first order wrongly answered
+        // ERR_INVALID_LEN. The out-of-sequence error must win over the bcnt check.
+        let mut asm = Reassembler::new();
+        let cid = 0x0100_0000;
+        let payload = [0xABu8; INIT_DATA];
+        assert_eq!(
+            asm.feed(&init_frame(cid, CTAPHID_PING, 1024, &payload)),
+            Outcome::None
+        );
+        // 0x82 = CTAPHID_PING + 1 (INIT bit set); bcnt = 0xFFFF, well over the max.
+        assert_eq!(
+            asm.feed(&init_frame(cid, CTAPHID_PING + 1, 0xFFFF, &[])),
+            Outcome::Error(cid, ERR_INVALID_SEQ)
+        );
+        assert!(!asm.in_progress());
+    }
+
+    #[test]
+    fn keepalive_status_suppresses_processing_for_u2f_msg() {
+        // FIDO conformance U2F-Authenticate P-3 / F-2: a PROCESSING keepalive
+        // before a fast U2F MSG response desyncs the host, so MSG stays silent
+        // unless a touch is pending. CBOR keeps PROCESSING for slow CTAP2 ops.
+        assert_eq!(keepalive_status(false, false), None); // U2F fast op — stay silent
+        assert_eq!(keepalive_status(false, true), Some(STATUS_UPNEEDED)); // U2F touch wait
+        assert_eq!(keepalive_status(true, false), Some(STATUS_PROCESSING)); // CBOR slow op
+        assert_eq!(keepalive_status(true, true), Some(STATUS_UPNEEDED)); // CBOR touch wait
+    }
+
+    #[test]
+    fn cancel_frame_detected_only_for_active_channel() {
+        // FIDO conformance HID-1 P-10/P-15: a CTAPHID_CANCEL on the channel whose
+        // request is in flight aborts the worker's touch wait. Anything else read
+        // mid-request is ignored.
+        let cid = 0x0100_0000;
+        let cancel = init_frame(cid, CTAPHID_CANCEL, 0, &[]);
+        assert!(is_cancel_frame(&cancel, HID_RPT_SIZE, cid));
+        // A CANCEL for a different channel is not ours to act on.
+        assert!(!is_cancel_frame(&cancel, HID_RPT_SIZE, 0x0200_0000));
+        // A different command on the active channel is not a cancel.
+        assert!(!is_cancel_frame(
+            &init_frame(cid, CTAPHID_PING, 0, &[]),
+            HID_RPT_SIZE,
+            cid
+        ));
+        // A short read (< 5 bytes) carries no command byte → ignored.
+        assert!(!is_cancel_frame(&cancel, 4, cid));
     }
 
     #[test]

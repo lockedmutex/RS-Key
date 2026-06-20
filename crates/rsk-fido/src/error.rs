@@ -27,6 +27,7 @@ pub enum CtapError {
     KeyStoreFull = 0x28,           // CTAP2_ERR_KEY_STORE_FULL
     UnsupportedOption = 0x2b,      // CTAP2_ERR_UNSUPPORTED_OPTION
     InvalidOption = 0x2c,          // CTAP2_ERR_INVALID_OPTION
+    KeepAliveCancel = 0x2d,        // CTAP2_ERR_KEEPALIVE_CANCEL (CTAPHID_CANCEL)
     NoCredentials = 0x2e,          // CTAP2_ERR_NO_CREDENTIALS
     UserActionTimeout = 0x2f,      // CTAP2_ERR_USER_ACTION_TIMEOUT (button wait)
     NotAllowed = 0x30,             // CTAP2_ERR_NOT_ALLOWED

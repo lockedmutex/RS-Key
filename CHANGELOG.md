@@ -13,9 +13,129 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
-## [0.2.4] — 2026-06-19
+### Fixed
+
+- **CTAPHID: an init-type frame received mid-transaction is rejected as
+  `ERR_INVALID_SEQ` regardless of its length field.** The `bcnt > maxMsgSize`
+  check ran first, so a continuation frame whose sequence byte had the INIT bit
+  set — the FIDO Conformance Tools' `HID-1 F-4` corrupts the last frame's seq to
+  `CTAPHID_PING + 1` (0x82), leaving random payload bytes as the "bcnt" — usually
+  tripped the length guard and returned `ERR_INVALID_LEN` (0x03) instead of the
+  required `ERR_INVALID_SEQ` (0x04). The out-of-sequence check now precedes the
+  length check. `bcdDevice` `0x0767` → `0x0768`.
+- **U2F authenticate resolves the key handle before requesting a touch.** An
+  unknown handle (wrong AppID / not minted by us) and a check-only (`P1=0x07`)
+  request must be answered immediately — `0x6A80` and `0x6985` respectively —
+  without user presence; we prompted for a touch first on `P1=0x03`, so a
+  conformance negative test (`U2F-Authenticate F-2`) hung on the button and the
+  stream of `UPNEEDED` keepalives desynced the tool's response reader (seen as
+  "sequence out of order"). Shares the `0x0768` bump.
+- **No `PROCESSING` keepalive before a fast U2F response.** U2F (CTAPHID_MSG) is
+  quick apart from the touch wait, but the worker runs on a lower-priority
+  executor, so the 100 ms keepalive timer could fire once before a near-instant
+  reply (check-only, unknown handle) — and U2FHID hosts, including the FIDO
+  Conformance Tool, read that stray `PROCESSING` frame as the response's first
+  frame and desync (`U2F-Authenticate P-3`/`F-2`: "sequence out of order"). MSG
+  now stays silent unless a touch is pending (`UPNEEDED`); CBOR keeps
+  `PROCESSING` for its genuinely slow operations. `bcdDevice` `0x0768` →
+  `0x0769`.
+- **`CTAPHID_CANCEL` aborts an in-flight request's user-presence wait.** While
+  the worker blocked on the touch wait the transport never read further frames,
+  so a `CANCEL` sat unread until the (up to 30 s) wait ended — the FIDO
+  Conformance Tool's `HID-1 P-10` (cancel during `makeCredential`) and `P-15`
+  (cancel during `authenticatorSelection`) timed out. The transport now watches
+  for a `CANCEL` on the active channel concurrently with the worker and signals a
+  cross-executor abort; the cancelled command returns `CTAP2_ERR_KEEPALIVE_CANCEL`
+  (0x2D). A `CANCEL` is also no longer acknowledged with its own frame (per the
+  CTAPHID spec).
+- **`authenticatorMakeCredential` input validation.** A non-text `rp.name`
+  (`Req-2 F-2`) and a `pubKeyCredParams` entry missing its `alg` (`Req-4 F-4`)
+  are now rejected instead of accepted.
+- **`authenticatorMakeCredential` accepts `options.up=true`.** An explicit
+  `up=true` is the default and now succeeds (`Req-6 P-3`); only `up=false`
+  remains an `INVALID_OPTION` (`F-1`).
+- **getAssertion withholds user name/displayName without user verification.** On
+  a multi-credential discovery the response `user` map now carries only `id`
+  unless `uv` is set (CTAP §6.2.2 privacy rule, `Discoverable P-2`); the full
+  identity is returned once the user is verified. Applies to
+  `authenticatorGetNextAssertion` too.
+- **credentialManagement enumerateCredentials always reports `credProtect`.** The
+  `0x0A` field was emitted only when a non-default level was set; it now always
+  appears, defaulting to level 1 (`userVerificationOptional`)
+  (`CredMgmt-EnumerateCredentials P-1`).
+- **largeBlobs accepts `get=0`.** A read of zero bytes is valid and returns an
+  empty fragment instead of `CTAP2_ERR_INVALID_PARAMETER` (`LargeBlobs-1 P-2`).
+- **credentialManagement updateUserInformation keeps the credentialId stable.**
+  Resealing a credential draws a fresh IV (nonce reuse is forbidden), so the box —
+  and the resident id previously re-derived from it — changed, staling the
+  platform's stored credentialId; a later `deleteCredential` with that id then
+  returned `CTAP2_ERR_NO_CREDENTIALS` (`CredMgmt-UpdateAndDelete P-2`). The update
+  now rewrites the credential in place, preserving its stored 42-byte resident id,
+  and `getAssertion` returns that stored id instead of re-deriving it (CTAP2.1
+  §6.8.5). The signing key / hmac-secret / largeBlobKey are still box-derived, so
+  they rotate on an update — full stability needs a per-credential nonce and is
+  deferred. `bcdDevice` `0x076F` → `0x0770`.
+- **A `pinUvAuthToken` request while a forced PIN change is pending now returns the
+  correct per-subcommand error.** With `forcePINChange` set (via `setMinPINLength`
+  subcommand param `0x03`), both `getPinToken` (0x05) and
+  `getPinUvAuthTokenUsingPinWithPermissions` (0x09) refuse to issue a token until the
+  PIN is changed. The FIDO conformance ClientPin forcePINChange tests assert a
+  *different* code for each: legacy `getPinToken` (0x05) → `CTAP2_ERR_PIN_INVALID`
+  (0x31) (`ClientPin1-NewPin F-1`, `ClientPin2-GetPinToken F-5`); the
+  permissions-based `getPinUvAuthTokenUsingPinWithPermissions` (0x09) →
+  `CTAP2_ERR_PIN_POLICY_VIOLATION` (0x37)
+  (`ClientPin2-GetPinUvAuthTokenUsingPinWithPermissions F-1`). Previously both
+  returned `PIN_POLICY_VIOLATION`. The PIN verify itself still succeeds first, so the
+  retry counter is untouched. `bcdDevice` `0x0773` → `0x0774` (0x05 fix); the 0x09
+  branch followed at `0x0776`.
+
+### Changed
+
+- **Enterprise attestation: `ep` advertised + reflects state, type-1 eligibility
+  enforced.** `getInfo` and the metadata statement carry the `ep` option (`false`
+  until `authenticatorConfig` enableEnterpriseAttestation flips it `true`), so
+  platforms and the conformance tool exercise the enterprise profile. EA is now
+  performed only when warranted — platform-managed (type 2) for any RP,
+  vendor-facilitated (type 1) only for an RP on a built-in list (empty in shipping
+  firmware). Any enterpriseAttestation request now yields a basic_full (x5c)
+  attestation: the org/EP cert + `epAtt` when EA is performed, or a non-enterprise
+  basic_full with the device's own cert and no `epAtt` for a non-listed type-1 RP
+  (CTAP2.1 §6.1.3, conformance Enterprise-Attestation F-6, which requires x5c). A
+  request without enterpriseAttestation keeps the default self-attestation. The FIDO
+  conformance test RPID is added to the type-1 list **only** under the
+  conformance-only `ea-conformance-rpid` build feature, never in a shipped image.
+  The metadata `upv` gains `{1,2}` and `{1,3}` and drops the non-MDS3
+  `legalHeader`. `bcdDevice` `0x0770` → `0x0772`.
+- **EdDSA (-8) and ES256K (-47) are no longer advertised in `getInfo.algorithms`
+  or the metadata.** The FIDO conformance tool's shared `verifySignatureCOSE` maps
+  only `-7`/`-35`/`-36` for elliptic curves, so it throws "hashFunction missing"
+  verifying a packed self-attestation over an EdDSA or secp256k1 credential
+  (`MakeCred-Resp P-06`). Both stay fully implemented — makeCredential negotiates
+  `-8`/`-47` from a request's `pubKeyCredParams` — only the advertisement is dropped
+  (the same approach as ML-DSA-44), leaving the advertised set at the
+  tool-verifiable NIST curves ES256/ES384/ES512. getInfo, `authenticationAlgorithms`
+  and `authenticatorGetInfo.algorithms` kept in sync (`tests/62`). `bcdDevice`
+  `0x0772` → `0x0773`.
+- **`getInfo` advertises the `authenticatorConfigCommands` member (`0x1F`).** It
+  lists the supported `authenticatorConfig` (0x0D) subcommands —
+  `enableEnterpriseAttestation` (0x01), `toggleAlwaysUv` (0x02) and `setMinPINLength`
+  (0x03). The FIDO conformance AuthenticatorConfig suite requires it (the
+  enable-enterprise-attestation test asserts the array contains `0x01`, the
+  "featureful" CTAP2.3 profile requires `0x02`, and the suite's `before` hook reads
+  it). Mirrored in the metadata statement. Shares the `0x0774` bump (`0x02` arrived
+  with alwaysUv at `0x0775`, below).
 
 ### Added
+
+- **`alwaysUv` (always require user verification) is supported.** `getInfo`
+  advertises the `options.alwaysUv` flag (reflecting its state, `false` at reset)
+  and the `toggleAlwaysUv` (`0x02`) `authenticatorConfig` subcommand. While enabled
+  (flipped via `authenticatorConfig` toggleAlwaysUv, gated on a pinUvAuthToken with
+  the `acfg` permission), every `makeCredential` / `getAssertion` requires a verified
+  pinUvAuthToken — an up-only (touch) request is refused with
+  `CTAP2_ERR_PUAT_REQUIRED`, even when no PIN is configured. The state persists until
+  `authenticatorReset`, which clears it. Completes the FIDO conformance "featureful"
+  CTAP2.3 profile's authenticatorConfig requirement. `bcdDevice` `0x0774` → `0x0775`.
 
 - **The `rsk` CLI can run without Nix.** A `tools/pyproject.toml` packages the
   CLI so it installs from any Python ≥ 3.9 toolchain —

@@ -171,17 +171,19 @@ fn cmd_authenticate<S: Storage, R: Rng>(
     if kh_len < KEY_HANDLE_LEN || 65 + kh_len > apdu.nc {
         return (Sw::INCORRECT_PARAMS, 0);
     }
-    // "Enforce user presence" (P1=0x03) requires a touch; check-only (0x07) and
-    // don't-enforce (0x08) do not. No button → instant.
-    if apdu.p1 == U2F_AUTH_ENFORCE && !ctx.check_user_presence() {
-        return (Sw::CONDITIONS_NOT_SATISFIED, 0);
-    }
     let key_handle = &apdu.data[65..65 + kh_len];
 
     let mut seed = match ctx.load_keydev() {
         Some(s) => s,
         None => return (Sw::EXEC_ERROR, 0),
     };
+    // Resolve the key handle FIRST — before any user-presence prompt. U2F requires
+    // an unknown handle (wrong AppId / not minted by us) to be rejected with
+    // WRONG_DATA (0x6A80), and check-only to report status, neither gated on a
+    // touch. Prompting before this check makes a negative test hang on the button,
+    // and the stream of UPNEEDED keepalives desyncs a conformance tool's response
+    // reader (seen as "sequence out of order").
+    //
     // credential_load resolves both a CTAP2 box and a U2F key handle, flagging the
     // latter via `u2f`: a box signs with fido_load_key, a handle with its path-as-is
     // scalar (verify_key, which fido_load_key would clobber by rewriting path[0]).
@@ -204,11 +206,19 @@ fn cmd_authenticate<S: Storage, R: Rng>(
     seed.zeroize();
     let mut scalar = match scalar {
         Some(s) => s,
-        None => return (Sw::INCORRECT_PARAMS, 0),
+        None => return (Sw::INCORRECT_PARAMS, 0), // 0x6A80 WRONG_DATA — handle not ours
     };
 
-    // check-only: a valid handle reports "would require user presence".
+    // check-only (P1=0x07): a valid handle reports "would require user presence".
+    // No touch.
     if apdu.p1 == U2F_AUTH_CHECK_ONLY {
+        scalar.zeroize();
+        return (Sw::CONDITIONS_NOT_SATISFIED, 0);
+    }
+
+    // Enforce-user-presence (P1=0x03) requires a touch, now that the handle is
+    // known valid; don't-enforce (0x08) signs without one. No button → instant.
+    if apdu.p1 == U2F_AUTH_ENFORCE && !ctx.check_user_presence() {
         scalar.zeroize();
         return (Sw::CONDITIONS_NOT_SATISFIED, 0);
     }
@@ -299,6 +309,19 @@ mod tests {
     impl crate::UserPresence for Fixed {
         fn request(&mut self) -> crate::Presence {
             self.0
+        }
+    }
+
+    /// Presence mock that counts how many times a touch was requested — lets a
+    /// test prove a path returns *without* prompting the user.
+    struct CountingPresence {
+        verdict: crate::Presence,
+        calls: usize,
+    }
+    impl crate::UserPresence for CountingPresence {
+        fn request(&mut self) -> crate::Presence {
+            self.calls += 1;
+            self.verdict
         }
     }
 
@@ -484,6 +507,49 @@ mod tests {
         let bad_bytes = ext_apdu(CTAP_AUTHENTICATE, U2F_AUTH_ENFORCE, &bad);
         let badc = Apdu::parse(&bad_bytes).unwrap();
         assert_eq!(process_u2f(&mut ctx, &badc, &mut o).0, Sw::INCORRECT_PARAMS);
+    }
+
+    #[test]
+    fn enforce_auth_rejects_unknown_handle_without_touch() {
+        // U2F conformance (U2F-Authenticate F-2): an unknown handle MUST be
+        // rejected with WRONG_DATA (0x6A80) *before* any user-presence prompt.
+        // With a presence that never confirms, the old order (touch first) returned
+        // CONDITIONS_NOT_SATISFIED (0x6985) after a timed-out touch and streamed
+        // keepalives that desynced the host. The handle check must win, and the
+        // touch must not even be requested.
+        let mut fs = Fs::new(RamStorage::new(), &[]);
+        let mut rng = SeqRng(7);
+        ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
+
+        let mut ad = std::vec::Vec::new();
+        ad.extend_from_slice(&CHAL);
+        ad.extend_from_slice(&APP);
+        ad.push(KEY_HANDLE_LEN as u8);
+        ad.extend_from_slice(&[0xEE; KEY_HANDLE_LEN]); // garbage handle — not ours
+        let bytes = ext_apdu(CTAP_AUTHENTICATE, U2F_AUTH_ENFORCE, &ad);
+        let apdu = Apdu::parse(&bytes).unwrap();
+        let mut o = [0u8; 256];
+
+        let mut state = crate::FidoState::new();
+        let mut presence = CountingPresence {
+            verdict: crate::Presence::Timeout,
+            calls: 0,
+        };
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 0,
+        };
+        let (sw, n) = process_u2f(&mut ctx, &apdu, &mut o);
+        assert_eq!(sw, Sw::INCORRECT_PARAMS); // 0x6A80 WRONG_DATA, not 0x6985
+        assert_eq!(n, 0);
+        assert_eq!(
+            presence.calls, 0,
+            "an unknown handle must be rejected without requesting a touch"
+        );
     }
 
     #[test]

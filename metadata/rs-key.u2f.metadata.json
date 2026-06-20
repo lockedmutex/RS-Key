@@ -1,0 +1,40 @@
+{
+  "legalHeader": "RS-Key is AGPL-3.0-only firmware; this Metadata Statement is self-published by the RS-Key project and is NOT a FIDO Alliance MDS listing. See metadata/README.md and docs/guides/aaguid-metadata.md.",
+  "description": "RS-Key U2F Authenticator",
+  "protocolFamily": "u2f",
+  "schema": 3,
+  "authenticatorVersion": 2,
+  "upv": [
+    { "major": 1, "minor": 2 }
+  ],
+  "authenticationAlgorithms": [
+    "secp256r1_ecdsa_sha256_raw"
+  ],
+  "publicKeyAlgAndEncodings": [
+    "ecc_x962_raw"
+  ],
+  "attestationTypes": [
+    "basic_full"
+  ],
+  "attestationCertificateKeyIdentifiers": [
+    "90cab47e3ed39dc43ab16451f6e8267353093820"
+  ],
+  "userVerificationDetails": [
+    [ { "userVerificationMethod": "presence_internal" } ]
+  ],
+  "keyProtection": [
+    "hardware"
+  ],
+  "matcherProtection": [
+    "on_chip"
+  ],
+  "cryptoStrength": 128,
+  "attachmentHint": [
+    "external",
+    "wired"
+  ],
+  "tcDisplay": [],
+  "attestationRootCertificates": [
+    "MIIB1TCCAXugAwIBAgIUP2driKlCVVrwolp87vq0mauW/EIwCgYIKoZIzj0EAwIwRzELMAkGA1UEBhMCWloxDzANBgNVBAoMBlJTLUtleTEnMCUGA1UEAwweUlMtS2V5IFUyRiBBdHRlc3RhdGlvbiBSb290IENBMB4XDTI2MDEwMTAwMDAwMFoXDTQ2MDEwMTAwMDAwMFowRzELMAkGA1UEBhMCWloxDzANBgNVBAoMBlJTLUtleTEnMCUGA1UEAwweUlMtS2V5IFUyRiBBdHRlc3RhdGlvbiBSb290IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEiJUxdOdflH0WiwqYevNwB9c92KlMt5WWXwld6akLoflud+Uxex6kzp0i56w3YmIR4Ow/phNDPrtKNcLV+cvHQqNFMEMwEgYDVR0TAQH/BAgwBgEB/wIBADAOBgNVHQ8BAf8EBAMCAQYwHQYDVR0OBBYEFKmE4l8NGzo0qY2gr1xx+uxoOXiSMAoGCCqGSM49BAMCA0gAMEUCIDlXTCcoBOs0nQGb+Zd/vDU9dD29ohnNbVjK3inVrv9ZAiEAxbZGk3QZa3zFCUreDGZCIrwcsvOHpM663qE2vgeAm+Q="
+  ]
+}
