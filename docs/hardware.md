@@ -40,6 +40,13 @@ env FLASH_SIZE=8M LED_KIND=gpio LED_PIN=25 cargo build --release -p firmware
 env FLASH_SIZE=16M LED_PIN=22 LED_ORDER=grb cargo build --release -p firmware
 ```
 
+The three LED knobs (`LED_PIN` / `LED_KIND` / `LED_ORDER`) set only the *boot
+defaults*: a non-`none` build compiles all three backends, so the pin, driver,
+and wire order are also changeable at **runtime** — no reflash — with `rsk hw`
+or PicoForge, which write them to the device's `phy` record
+([guides/led.md](guides/led.md)). The build knobs still matter for picking a
+lean `none` build and for the out-of-the-box default.
+
 So most RP2350A boards work with at most a one-line change. Everything else
 (USB descriptors, applets, flash layout) is board-independent.
 

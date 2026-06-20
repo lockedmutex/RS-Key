@@ -15,6 +15,21 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Added
 
+- **Runtime LED hardware config — pin, driver, and wire order are now set at
+  runtime via the `phy` record (`rsk hw` / PicoForge), no reflash.** The
+  `LED_KIND` / `LED_PIN` / `LED_ORDER` build knobs (below) become *boot
+  defaults*: a non-`none` build now compiles all three backends and, at boot,
+  applies the data pin (`led_gpio`), driver (`led_driver` — 1=gpio / 2=pimoroni /
+  3=ws2812, matching pico-fido / PicoForge), and an RS-Key vendor wire-order tag
+  (`led_order`, `0x0D`) from `EF_PHY` — the same record that already drives the
+  USB identity. The pin reaches the PIO state machine through a `match` over GPIO
+  `0..=29` (embassy has no `PioPin for AnyPin`, but doesn't need one); the wire
+  order is a runtime red/green swap, so one binary serves both RGB- and GRB-wired
+  parts. New **`rsk hw`** command (`--led-pin` / `--led-driver` / `--led-order` /
+  `--get`) does a read-modify-write of only the LED fields (any USB identity is
+  preserved) and warm-reboots to apply. A `none` build stays headless and ignores
+  the phy LED fields. `bcdDevice` `0x077A` → `0x077B`.
+
 - **Selectable LED backend (`LED_KIND` build knob) — the indicator is no longer
   WS2812-only.** The status engine (boot/processing/touch/idle blink + the
   runtime-configurable colour/brightness in `EF_LED_CONF`) was already

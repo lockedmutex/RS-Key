@@ -58,16 +58,12 @@ fn main() {
     );
     println!("cargo:rerun-if-env-changed=XOSC_DELAY_MULT");
 
-    // WS2812 data pin (default GPIO16, the Waveshare RP2350-One). Chosen at
-    // compile time because embassy's `PioPin` is implemented per concrete pin
-    // (no `AnyPin`), so a runtime pin can't reach the PIO state machine.
+    // WS2812/gpio data pin (`LED_PIN`, default GPIO16). The pin is chosen at
+    // RUNTIME from the phy record — `main` selects the concrete embassy pin via a
+    // `match` over GPIO 0..=29 — so this is only the BOOT DEFAULT used when the phy
+    // record carries no `led_gpio`. Baked as an env the firmware reads with `env!`.
     let led_pin = resolve_led_pin();
-    println!("cargo:rustc-cfg=led_pin=\"{led_pin}\"");
-    let values = (0..=29u8)
-        .map(|n| format!("\"{n}\""))
-        .collect::<Vec<_>>()
-        .join(", ");
-    println!("cargo:rustc-check-cfg=cfg(led_pin, values({values}))");
+    println!("cargo:rustc-env=PK_LED_PIN={led_pin}");
     println!("cargo:rerun-if-env-changed=LED_PIN");
 
     // LED backend (default `ws2812`, the Waveshare RP2350-One). Selected at
