@@ -24,9 +24,11 @@ Part B (runs only if a FIDO HID device is plugged in):
     one, IGNORING the stateful fields (options.ep / options.clientPin /
     forcePINChange / minPINLength) which depend on PIN/enterprise state.
 
-The statement describes the DEFAULT build profile. `advertise-pqc` adds COSE
--48 to algorithms and `fips-profile` drops -47 and raises minPINLength — if the
-live device is one of those, Part B says so instead of failing blindly.
+The statement describes the DEFAULT build profile. ES256K (-47) and EdDSA (-8)
+are never advertised in any profile (the FIDO conformance tool cannot verify a
+self-attestation over those curves). `advertise-pqc` adds COSE -48 to algorithms
+and `fips-profile` raises minPINLength — if the live device is one of those,
+Part B says so instead of failing blindly.
 """
 import json
 import os
@@ -54,7 +56,7 @@ REQUIRED = [
     "attestationRootCertificates", "authenticatorGetInfo",
 ]
 # Fields whose value tracks device state, not model identity.
-STATEFUL = {"forcePINChange", "minPINLength"}
+STATEFUL = {"forcePINChange", "minPINLength", "remainingDiscoverableCredentials"}
 STATEFUL_OPTIONS = {"ep", "clientPin"}
 
 
@@ -162,6 +164,12 @@ def part_b(stmt):
         "minPINLength": m[0x0D],
         "firmwareVersion": m[0x0E],
         "maxCredBlobLength": m[0x0F],
+        "transports": m[0x09],
+        "maxRPIDsForSetMinPINLength": m[0x10],
+        "remainingDiscoverableCredentials": m[0x14],
+        "attestationFormats": m[0x16],
+        "maxPINLength": m[0x1D],
+        "authenticatorConfigCommands": m[0x1F],
     }
     if COSE_MLDSA44 in {a["alg"] for a in live["algorithms"]}:
         print("NOTE: live device is an advertise-pqc build (COSE -48 present); "

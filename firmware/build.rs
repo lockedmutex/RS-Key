@@ -58,17 +58,32 @@ fn main() {
     );
     println!("cargo:rerun-if-env-changed=XOSC_DELAY_MULT");
 
-    // WS2812 data pin (default GPIO16, the Waveshare RP2350-One). Chosen at
-    // compile time because embassy's `PioPin` is implemented per concrete pin
-    // (no `AnyPin`), so a runtime pin can't reach the PIO state machine.
+    // WS2812/gpio data pin (`LED_PIN`, default GPIO16). The pin is chosen at
+    // RUNTIME from the phy record — `main` selects the concrete embassy pin via a
+    // `match` over GPIO 0..=29 — so this is only the BOOT DEFAULT used when the phy
+    // record carries no `led_gpio`. Baked as an env the firmware reads with `env!`.
     let led_pin = resolve_led_pin();
-    println!("cargo:rustc-cfg=led_pin=\"{led_pin}\"");
-    let values = (0..=29u8)
-        .map(|n| format!("\"{n}\""))
-        .collect::<Vec<_>>()
-        .join(", ");
-    println!("cargo:rustc-check-cfg=cfg(led_pin, values({values}))");
+    println!("cargo:rustc-env=PK_LED_PIN={led_pin}");
     println!("cargo:rerun-if-env-changed=LED_PIN");
+
+    // LED backend (default `ws2812`, the Waveshare RP2350-One). Selected at
+    // compile time so only the chosen driver — and its dependencies (PIO, PWM) —
+    // is built. `gpio` = a plain on/off indicator, `pimoroni` = a 3-pin PWM RGB
+    // (Pimoroni Tiny 2350), `none` = headless.
+    let led_kind = resolve_led_kind();
+    println!("cargo:rustc-cfg=led_kind=\"{led_kind}\"");
+    println!(
+        "cargo:rustc-check-cfg=cfg(led_kind, values(\"ws2812\", \"gpio\", \"pimoroni\", \"none\"))"
+    );
+    println!("cargo:rerun-if-env-changed=LED_KIND");
+
+    // WS2812 wire byte order (the `ws2812` backend only): `rgb` (default — the
+    // Waveshare RP2350-One is unusually RGB) or `grb` (the WS2812B standard, e.g.
+    // the TenStar RP2350-USB). The wrong order swaps red↔green (blue is fine).
+    let led_order = resolve_led_order();
+    println!("cargo:rustc-cfg=led_order=\"{led_order}\"");
+    println!("cargo:rustc-check-cfg=cfg(led_order, values(\"rgb\", \"grb\"))");
+    println!("cargo:rerun-if-env-changed=LED_ORDER");
 
     // Bake fake OTP keys into the image instead of reading the fuses — exercises
     // the kbase migration + boot path without an irreversible OTP write.
@@ -164,6 +179,33 @@ fn resolve_led_pin() -> u8 {
         .unwrap_or_else(|_| panic!("LED_PIN={raw:?} must be a GPIO number 0..=29"));
     assert!(v <= 29, "LED_PIN={v} out of range 0..=29 (RP2350A GPIOs)");
     v
+}
+
+/// Resolve `LED_KIND` (the LED driver backend) to a known value; defaults to
+/// `ws2812`. One of: `ws2812` (addressable RGB on `LED_PIN`), `gpio` (a plain
+/// on/off LED on `LED_PIN`), `pimoroni` (3-pin PWM RGB, Pimoroni Tiny 2350), or
+/// `none` (no indicator).
+fn resolve_led_kind() -> String {
+    let raw = env::var("LED_KIND").unwrap_or_default();
+    let v = raw.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "" | "ws2812" => "ws2812".into(), // unset / empty → the default backend
+        "gpio" | "pimoroni" | "none" => v,
+        _ => panic!("LED_KIND={raw:?} must be one of: ws2812, gpio, pimoroni, none"),
+    }
+}
+
+/// Resolve `LED_ORDER` (the WS2812 wire byte order) to `rgb` or `grb`; defaults
+/// to `rgb` (the Waveshare RP2350-One). `grb` is the WS2812B standard — pick it
+/// on boards whose red/green come out swapped (e.g. the TenStar RP2350-USB).
+fn resolve_led_order() -> String {
+    let raw = env::var("LED_ORDER").unwrap_or_default();
+    let v = raw.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "" | "rgb" => "rgb".into(), // unset / empty → the Waveshare default
+        "grb" => v,
+        _ => panic!("LED_ORDER={raw:?} must be rgb or grb"),
+    }
 }
 
 /// Validate a fake-OTP-key env var: exactly 64 hex chars (32 bytes), returned

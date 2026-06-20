@@ -18,12 +18,12 @@ use rsk_fs::Storage;
 
 use crate::cbordec::{cbor, def_arr, def_map};
 use crate::consts::{
-    CRED_PROT_UV_OPTIONAL_WITH_LIST, CRED_PROT_UV_REQUIRED, CURVE_P256, EF_CRED, EF_PIN, FLAG_ED,
-    FLAG_UP, FLAG_UV, MAX_RESIDENT_CREDENTIALS,
+    CRED_PROT_UV_OPTIONAL_WITH_LIST, CRED_PROT_UV_REQUIRED, CURVE_P256, EF_ALWAYS_UV, EF_CRED,
+    EF_PIN, FLAG_ED, FLAG_UP, FLAG_UV, MAX_RESIDENT_CREDENTIALS,
 };
 use crate::credential::{
     CRED_RESIDENT_LEN, Credential, RECORD_PREFIX, credential_load, derive_large_blob_key,
-    derive_resident, is_resident, slot_map,
+    is_resident, slot_map,
 };
 use crate::ec::{CredKey, MAX_SIG_LEN};
 use crate::error::{CtapError, CtapResult};
@@ -154,6 +154,10 @@ struct Best {
     len: usize,
     created: u64,
     resident: bool,
+    /// For a resident credential, its STORED 42-byte resident id — the stable
+    /// credentialId returned to the platform. Kept verbatim rather than
+    /// re-derived from the box so it survives an updateUserInformation reseal.
+    resident_id: [u8; CRED_RESIDENT_LEN],
     user: [u8; MAX_USER_ID],
     user_len: usize,
     // name / displayName, returned only on a multi-credential resident discovery.
@@ -172,6 +176,7 @@ impl Best {
             len: 0,
             created: 0,
             resident: false,
+            resident_id: [0; CRED_RESIDENT_LEN],
             user: [0; MAX_USER_ID],
             user_len: 0,
             name: [0; MAX_USER_NAME],
@@ -193,7 +198,7 @@ impl Best {
         seed: &[u8; 32],
         rp_id_hash: &[u8; 32],
         cand: &[u8],
-        resident: bool,
+        resident_id: Option<&[u8]>,
         uv: bool,
         has_allow: bool,
         scratch: &mut [u8],
@@ -214,7 +219,13 @@ impl Best {
         if !self.any || c.created >= self.created {
             self.any = true;
             self.created = c.created;
-            self.resident = resident;
+            // A resident candidate carries its stored 42-byte id; a non-resident
+            // (allowList box) carries none.
+            self.resident = resident_id.is_some();
+            if let Some(rid) = resident_id {
+                let m = rid.len().min(CRED_RESIDENT_LEN);
+                self.resident_id[..m].copy_from_slice(&rid[..m]);
+            }
             self.len = cand.len();
             self.id[..cand.len()].copy_from_slice(cand);
             self.user_len = c.user_id.len().min(MAX_USER_ID);
@@ -280,9 +291,7 @@ fn enforce_pin<S: Storage, R: Rng>(
         // Zero-length probe (selection gesture): touch, then report PIN state.
         // With no button configured this confirms instantly.
         Some(&[]) => {
-            if !ctx.check_user_presence() {
-                return Err(CtapError::OperationDenied);
-            }
+            ctx.require_presence()?;
             Err(if ctx.fs.has_data(EF_PIN) {
                 CtapError::PinAuthInvalid
             } else {
@@ -303,6 +312,9 @@ fn enforce_pin<S: Storage, R: Rng>(
             }
             Ok(true)
         }
+        // alwaysUv forces user verification (CTAP 2.1 alwaysUv); otherwise an
+        // absent param simply yields an assertion without the uv flag.
+        None if ctx.fs.has_data(EF_ALWAYS_UV) => Err(CtapError::PuatRequired),
         None => Ok(false),
     }
 }
@@ -344,7 +356,7 @@ fn get_assertion_inner<S: Storage, R: Rng>(
                             seed,
                             rp_id_hash,
                             &rec[RECORD_PREFIX..n],
-                            true,
+                            Some(&rec[32..RECORD_PREFIX]),
                             uv,
                             true,
                             &mut scratch,
@@ -353,7 +365,7 @@ fn get_assertion_inner<S: Storage, R: Rng>(
                     }
                 }
             } else {
-                best.consider(seed, rp_id_hash, id, false, uv, true, &mut scratch);
+                best.consider(seed, rp_id_hash, id, None, uv, true, &mut scratch);
             }
         }
     } else {
@@ -375,7 +387,7 @@ fn get_assertion_inner<S: Storage, R: Rng>(
                     seed,
                     rp_id_hash,
                     &rec[RECORD_PREFIX..n],
-                    true,
+                    Some(&rec[32..RECORD_PREFIX]),
                     uv,
                     false,
                     &mut scratch,
@@ -489,10 +501,8 @@ fn get_assertion_inner<S: Storage, R: Rng>(
     // §9.1 user presence: obtain a touch before returning an assertion (up defaults
     // to true; we don't honor up:false, so a configured button is always polled on
     // the primary assertion — getNextAssertion reuses this presence). No button →
-    // instant.
-    if !ctx.check_user_presence() {
-        return Err(CtapError::OperationDenied);
-    }
+    // instant. A CTAPHID_CANCEL during the wait surfaces as KEEPALIVE_CANCEL.
+    ctx.require_presence()?;
 
     // authData = rpIdHash | flags(UP[,UV][,ED]) | counter [| ext] — no attestedCredentialData.
     let ctr = get_sign_counter(ctx.fs);
@@ -507,9 +517,10 @@ fn get_assertion_inner<S: Storage, R: Rng>(
     let sig_len = key.sign(&ad[..ad_len + 32], ctx.rng, &mut sig);
 
     // Response: { 1: {id,type}, 2: authData, 3: sig [, 4: user] [, 5: count] [, 7: largeBlobKey] }.
-    let resident_id = derive_resident(&best.id[..best.len], &ctx.dev);
+    // A resident credential's id is its STORED 42-byte resident id (stable across
+    // updateUserInformation); a non-resident's is the box itself.
     let cred_id: &[u8] = if best.resident {
-        &resident_id
+        &best.resident_id
     } else {
         &best.id[..best.len]
     };
@@ -537,9 +548,11 @@ fn get_assertion_inner<S: Storage, R: Rng>(
         .and_then(|e| e.u8(3)?.bytes(&sig[..sig_len]))
         .map_err(|_| CtapError::Other)?;
     if best.resident {
-        // name / displayName are returned only on a multi-credential discovery.
-        let with_name = multi && best.name_len > 0;
-        let with_display = multi && best.display_len > 0;
+        // name / displayName are user-identifiable info: returned only on a
+        // multi-credential discovery AND only when the user is verified (§6.2.2
+        // privacy rule / conformance Discoverable P-2). Without uv → id only.
+        let with_name = multi && uv && best.name_len > 0;
+        let with_display = multi && uv && best.display_len > 0;
         let entries = 1 + u64::from(with_name) + u64::from(with_display);
         enc.u8(4)
             .and_then(|e| e.map(entries))
@@ -683,8 +696,9 @@ fn next_assertion_response<S: Storage, R: Rng>(
         .ok_or(CtapError::NoCredentials)?;
     let curve = cred.curve;
 
-    // Full user identity: getNextAssertion only ever walks a multi-credential
-    // resident discovery, so id + name + displayName are all returned.
+    // getNextAssertion only ever walks a multi-credential resident discovery;
+    // name / displayName are user-identifiable and returned only when the user
+    // is verified (§6.3 privacy rule), otherwise id only.
     let mut user = [0u8; MAX_USER_ID];
     let user_len = cred.user_id.len().min(MAX_USER_ID);
     user[..user_len].copy_from_slice(&cred.user_id[..user_len]);
@@ -746,8 +760,8 @@ fn next_assertion_response<S: Storage, R: Rng>(
     let sig_len = key.sign(&signed[..ad_len + 32], ctx.rng, &mut sig);
 
     // Response: { 1: {id,type}, 2: authData, 3: sig, 4: {id[,name,displayName]} } (no count).
-    let with_name = name_len > 0;
-    let with_display = display_len > 0;
+    let with_name = uv && name_len > 0;
+    let with_display = uv && display_len > 0;
     let entries = 1 + u64::from(with_name) + u64::from(with_display);
     let mut enc = Encoder::new(Cursor::new(&mut *out));
     enc.map(4)
@@ -1051,6 +1065,31 @@ mod tests {
     }
 
     #[test]
+    fn always_uv_requires_user_verification() {
+        let (mut fs, mut rng) = setup();
+        // alwaysUv on → getAssertion demands UV; an up-only request is refused with
+        // PUAT_REQUIRED before any credential lookup. Without the EF_ALWAYS_UV guard
+        // the same request proceeds and returns NO_CREDENTIALS, so this is
+        // mutation-proof for the guard.
+        fs.put(EF_ALWAYS_UV, &[1]).unwrap();
+        let mut out = [0u8; 256];
+        let mut state = crate::FidoState::new();
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 0,
+        };
+        assert_eq!(
+            get_assertion(&mut ctx, &ga_request(None), &mut out),
+            Err(CtapError::PuatRequired)
+        );
+    }
+
+    #[test]
     fn u2f_handle_usable_via_ctap2_allowlist() {
         use crate::keyderiv::derive_new;
         use rsk_crypto::pinproto::public_xy;
@@ -1132,6 +1171,58 @@ mod tests {
         assert_eq!(d.map().unwrap().unwrap(), 1);
         assert_eq!(d.str().unwrap(), "id");
         assert_eq!(d.bytes().unwrap(), &[9, 8, 7, 6]);
+    }
+
+    #[test]
+    fn discovery_returns_stored_resident_id() {
+        // get_assertion (resident discovery) must echo the credential's STORED
+        // 42-byte resident id — not one re-derived from the box — so the id stays
+        // stable after an updateUserInformation reseal (CTAP2.1 §6.8.5). Proven by
+        // overwriting the stored prefix: a re-derived id would not equal it.
+        let (mut fs, mut rng) = setup();
+        let mut out = [0u8; 1024];
+        {
+            let mut state = crate::FidoState::new();
+            let mut presence = crate::AlwaysConfirm;
+            let mut ctx = Ctx {
+                presence: &mut presence,
+                dev: dev(),
+                fs: &mut fs,
+                rng: &mut rng,
+                state: &mut state,
+                now_ms: 10,
+            };
+            make_credential(&mut ctx, &mc_request(true), &mut out).unwrap();
+        }
+
+        // Overwrite the stored resident-id prefix with a sentinel; the box is left
+        // intact, so a re-derived id would differ from this.
+        let mut rec = [0u8; 1024];
+        let n = fs.read(EF_CRED, &mut rec).unwrap();
+        let mut sentinel = [0u8; CRED_RESIDENT_LEN];
+        for (i, b) in sentinel.iter_mut().enumerate() {
+            *b = 0xC0 ^ i as u8;
+        }
+        rec[32..RECORD_PREFIX].copy_from_slice(&sentinel);
+        fs.put(EF_CRED, &rec[..n]).unwrap();
+
+        // Discovery (no allowList) returns the stored sentinel as the credentialId.
+        let mut out2 = [0u8; 1024];
+        let ga = {
+            let mut state = crate::FidoState::new();
+            let mut presence = crate::AlwaysConfirm;
+            let mut ctx = Ctx {
+                presence: &mut presence,
+                dev: dev(),
+                fs: &mut fs,
+                rng: &mut rng,
+                state: &mut state,
+                now_ms: 20,
+            };
+            let m = get_assertion(&mut ctx, &ga_request(None), &mut out2).unwrap();
+            out2[..m].to_vec()
+        };
+        assert_eq!(cred_id_of(&ga), sentinel.to_vec());
     }
 
     #[test]
@@ -1427,8 +1518,9 @@ mod tests {
         let (u1, count1) = user_and_count(&o1[..n1]);
         assert_eq!(count1, Some(2));
         assert_eq!(u1, &[1, 1, 1, 1]); // newest (created 20)
-        // A multi-credential discovery returns the full user identity.
-        assert_eq!(user_name_of(&o1[..n1]), "user");
+        // Without user verification the user map is id-only — name/displayName are
+        // user-identifiable info, withheld unless uv (§6.2.2 privacy rule).
+        assert_eq!(user_name_of(&o1[..n1]), "");
 
         // getNextAssertion → the older credential, no numberOfCredentials field.
         let mut o2 = [0u8; 1024];
@@ -1447,8 +1539,8 @@ mod tests {
         let (u2, count2) = user_and_count(&o2[..n2]);
         assert_eq!(count2, None);
         assert_eq!(u2, &[9, 8, 7, 6]); // older (created 10)
-        // getNextAssertion also carries the full user identity.
-        assert_eq!(user_name_of(&o2[..n2]), "user");
+        // getNextAssertion likewise withholds name/displayName without uv.
+        assert_eq!(user_name_of(&o2[..n2]), "");
 
         // The list is exhausted → NOT_ALLOWED, and stays that way.
         let mut o3 = [0u8; 256];
@@ -1465,6 +1557,63 @@ mod tests {
             get_next_assertion(&mut ctx, &mut o3),
             Err(CtapError::NotAllowed)
         );
+    }
+
+    #[test]
+    fn multi_cred_user_identity_returned_with_uv() {
+        // The uv side of the §6.2.2 privacy rule: with user verification a
+        // multi-credential discovery returns the full user identity (id + name).
+        let (mut fs, mut rng) = setup();
+        let mut state = crate::FidoState::new();
+        for (uid, t) in [(&[9u8, 8, 7, 6][..], 10u64), (&[1u8, 1, 1, 1][..], 20u64)] {
+            let mut out = [0u8; 1024];
+            let mut presence = crate::AlwaysConfirm;
+            let mut ctx = Ctx {
+                presence: &mut presence,
+                dev: dev(),
+                fs: &mut fs,
+                rng: &mut rng,
+                state: &mut state,
+                now_ms: t,
+            };
+            make_credential(&mut ctx, &mc_request_user(uid), &mut out).unwrap();
+        }
+
+        // Arm a PIN + token and present a valid pinUvAuthParam, no allowList
+        // (so the discovery returns multiple credentials) → uv is set.
+        let token = arm_pin(&mut fs, &mut state);
+        let mut param = [0u8; 32];
+        let plen =
+            rsk_crypto::pinproto::authenticate(PinProto::Two, &token, &CDH, &mut param).unwrap();
+        let req = {
+            let mut buf = [0u8; 256];
+            let n = {
+                let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+                e.map(4).unwrap();
+                e.u8(1).unwrap().str("example.com").unwrap();
+                e.u8(2).unwrap().bytes(&CDH).unwrap();
+                e.u8(6).unwrap().bytes(&param[..plen]).unwrap();
+                e.u8(7).unwrap().u64(2).unwrap();
+                e.writer().position()
+            };
+            buf[..n].to_vec()
+        };
+        let mut o = [0u8; 1024];
+        let n = {
+            let mut presence = crate::AlwaysConfirm;
+            let mut ctx = Ctx {
+                presence: &mut presence,
+                dev: dev(),
+                fs: &mut fs,
+                rng: &mut rng,
+                state: &mut state,
+                now_ms: 30,
+            };
+            get_assertion(&mut ctx, &req, &mut o).unwrap()
+        };
+        let (_u, count) = user_and_count(&o[..n]);
+        assert_eq!(count, Some(2));
+        assert_eq!(user_name_of(&o[..n]), "user");
     }
 
     // A resident makeCredential request carrying a credProtect level.

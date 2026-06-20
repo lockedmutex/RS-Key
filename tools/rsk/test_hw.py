@@ -1,0 +1,63 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 RS-Key contributors
+
+"""Unit tests for the pure logic in rsk.hw (no device).
+
+Run from tools/:  python -m pytest rsk/test_hw.py
+The phy read-modify-write is the brick-risk: it must preserve every existing tag
+(USB identity, options) while changing only the LED fields, and serialize a record
+the firmware parser accepts. Pin that here.
+"""
+from rsk import hw
+
+
+def test_tlv_roundtrip():
+    tlvs = [(hw.TAG_LED_GPIO, b"\x16"), (0x06, b"\x00\x08"), (hw.TAG_LED_ORDER, b"\x01")]
+    assert hw._parse_tlv(hw._serialize_tlv(tlvs)) == tlvs
+
+
+def test_parse_truncated_tail_is_dropped():
+    # A final TLV whose length runs past the buffer ends the parse (no overread),
+    # mirroring the firmware parser.
+    assert hw._parse_tlv(bytes([0x06, 2, 0x00, 0x00, hw.TAG_LED_GPIO, 4, 1, 2])) == [
+        (0x06, b"\x00\x00")
+    ]
+
+
+def test_upsert_replaces_in_place_preserving_others():
+    # A record PicoForge might leave: VIDPID + product + zero OPTS, plus an old pin.
+    tlvs = [
+        (0x00, bytes([0x10, 0x50, 0x04, 0x07])),       # VIDPID
+        (0x09, b"YubiKey RSK\x00"),                    # USB_PRODUCT
+        (0x06, b"\x00\x00"),                           # OPTS
+        (hw.TAG_LED_GPIO, b"\x10"),                    # existing pin 16
+    ]
+    hw._upsert(tlvs, hw.TAG_LED_GPIO, 22)
+    hw._upsert(tlvs, hw.TAG_LED_DRIVER, hw.DRIVERS["ws2812"])
+    hw._upsert(tlvs, hw.TAG_LED_ORDER, hw.ORDERS["grb"])
+    by = dict(tlvs)
+    # LED fields set / replaced...
+    assert by[hw.TAG_LED_GPIO] == b"\x16"
+    assert by[hw.TAG_LED_DRIVER] == bytes([3])
+    assert by[hw.TAG_LED_ORDER] == bytes([1])
+    # ...and the unrelated identity/options tags are untouched.
+    assert by[0x00] == bytes([0x10, 0x50, 0x04, 0x07])
+    assert by[0x09] == b"YubiKey RSK\x00"
+    assert by[0x06] == b"\x00\x00"
+    # The existing pin TLV was replaced in place, not duplicated.
+    assert sum(1 for t, _ in tlvs if t == hw.TAG_LED_GPIO) == 1
+    # New tags appended after the originals (order preserved).
+    assert [t for t, _ in tlvs] == [0x00, 0x09, 0x06, hw.TAG_LED_GPIO,
+                                    hw.TAG_LED_DRIVER, hw.TAG_LED_ORDER]
+
+
+def test_upsert_appends_when_absent():
+    tlvs = [(0x06, b"\x00\x00")]
+    hw._upsert(tlvs, hw.TAG_LED_DRIVER, hw.DRIVERS["gpio"])
+    assert tlvs == [(0x06, b"\x00\x00"), (hw.TAG_LED_DRIVER, b"\x01")]
+
+
+def test_driver_and_order_maps_match_firmware():
+    # pico-fido / PicoForge LedDriverType numbering, and the RS-Key order values.
+    assert hw.DRIVERS == {"gpio": 1, "pimoroni": 2, "ws2812": 3}
+    assert hw.ORDERS == {"rgb": 0, "grb": 1}

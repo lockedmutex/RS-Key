@@ -193,10 +193,22 @@ impl<S: Storage> Fs<S> {
     }
 
     /// Delete a file: drop its contents, metadata, and any dynamic entry.
+    ///
+    /// An absent FID skips the backend `remove` (a full-partition scan, and a
+    /// tombstone write) and the meta read — the present-cache answers in O(1),
+    /// matching [`read`](Self::read) / [`has_data`](Self::has_data). Without
+    /// this guard a blind delete sweep over many absent slots is
+    /// O(slots·partition): the FIDO `authenticatorReset` audit-ring scrub
+    /// (128 slots) measured ~12 s on hardware, overrunning host reset timeouts
+    /// (the FIDO conformance tool gives a reset 10 s) and wedging the suite. The
+    /// dynamic-set cleanup still runs unconditionally so a `new_file` that was
+    /// never `put` is dropped.
     pub fn delete(&mut self, fid: u16) -> Result<()> {
-        let _ = self.meta_delete(fid);
-        self.storage.remove(fid)?;
-        self.mark_absent(fid);
+        if self.present_bit(fid) {
+            let _ = self.meta_delete(fid);
+            self.storage.remove(fid)?;
+            self.mark_absent(fid);
+        }
         self.dynamic.retain(|&f| f != fid);
         Ok(())
     }
@@ -428,6 +440,7 @@ mod tests {
         inner: RamStorage,
         read_calls: u32,
         size_calls: u32,
+        remove_calls: u32,
     }
     impl CountingStorage {
         fn new() -> Self {
@@ -435,6 +448,7 @@ mod tests {
                 inner: RamStorage::new(),
                 read_calls: 0,
                 size_calls: 0,
+                remove_calls: 0,
             }
         }
     }
@@ -447,6 +461,7 @@ mod tests {
             self.inner.write(fid, data)
         }
         fn remove(&mut self, fid: u16) -> Result<()> {
+            self.remove_calls += 1;
             self.inner.remove(fid)
         }
         fn size(&mut self, fid: u16) -> Option<usize> {
@@ -556,6 +571,31 @@ mod tests {
         assert_eq!(
             st.size_calls, 0,
             "absent size/has_data must not probe the backend"
+        );
+    }
+
+    #[test]
+    fn absent_delete_never_touches_the_backend() {
+        // A backend `remove` of an absent FID scans the whole flash partition
+        // (and writes a tombstone) on sequential-storage. The present-cache MUST
+        // short-circuit it, exactly like read/size/has_data. A blind delete sweep
+        // over absent slots is otherwise O(slots·partition): the FIDO reset
+        // audit-ring scrub deletes AUDIT_RING_SLOTS(128) slots and measured ~12 s
+        // on hardware, overrunning the conformance tool's 10 s reset timeout.
+        let mut fs = Fs::new(CountingStorage::new(), TABLE);
+        for fid in 0xC110u16..0xC110 + 128 {
+            fs.delete(fid).unwrap(); // all absent
+        }
+        // A present FID still takes the real delete path (proves the guard isn't
+        // a blanket skip that would leak data on reset).
+        fs.put(0xC110, b"entry").unwrap();
+        fs.delete(0xC110).unwrap();
+        assert!(!fs.has_data(0xC110));
+        let st = fs.into_storage();
+        assert_eq!(
+            st.remove_calls, 1,
+            "only the one present FID may reach the backend remove; \
+             absent deletes must be answered by the present-cache"
         );
     }
 

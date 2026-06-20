@@ -3,7 +3,10 @@
 
 //! The `phy` device-configuration blob: a TLV record in `EF_PHY` holding USB
 //! identity (VID/PID, product string), LED wiring and options. The rescue applet
-//! reads/writes it verbatim; at boot the firmware applies VID/PID and the product string.
+//! reads/writes it verbatim; at boot the firmware applies the USB identity AND the
+//! LED hardware — pin (`led_gpio`), driver (`led_driver`), brightness/steady, and
+//! the WS2812 wire order (`led_order`). The pico-fido tags below match PicoForge;
+//! `led_order` (tag `0x0D`) is an RS-Key extension PicoForge skips as unknown.
 
 use rsk_fs::{Fs, Storage};
 
@@ -22,6 +25,13 @@ const TAG_USB_PRODUCT: u8 = 0x9;
 const TAG_ENABLED_CURVES: u8 = 0xA;
 const TAG_ENABLED_USB_ITF: u8 = 0xB;
 const TAG_LED_DRIVER: u8 = 0xC;
+// RS-Key vendor tag (not in pico-fido / PicoForge): WS2812 wire byte order —
+// 0 = rgb (passthrough), 1 = grb (red/green swapped). PicoForge skips it as
+// unknown and drops it on a read-modify-write; RS-Key's own tools preserve it.
+const TAG_LED_ORDER: u8 = 0xD;
+
+/// `led_order` wire value: a standard WS2812B (GRB) part, red↔green swapped.
+pub const LED_ORDER_GRB: u8 = 1;
 
 pub const OPT_WCID: u16 = 0x1;
 pub const OPT_DIMM: u16 = 0x2;
@@ -51,9 +61,18 @@ pub fn effective_usb_itf(phy: &PhyData) -> u8 {
     }
 }
 
-/// Largest serialized record (every TLV present, 32-byte product).
-pub const PHY_MAX_SIZE: usize =
-    (2 + 4) + (2 + 1) + (2 + 1) + (2 + 2) + (2 + 1) + (2 + 33) + (2 + 4) + (2 + 1) + (2 + 1);
+/// Largest serialized record (every TLV present, 32-byte product). The trailing
+/// `(2 + 1)` is the RS-Key `led_order` tag.
+pub const PHY_MAX_SIZE: usize = (2 + 4)
+    + (2 + 1)
+    + (2 + 1)
+    + (2 + 2)
+    + (2 + 1)
+    + (2 + 33)
+    + (2 + 4)
+    + (2 + 1)
+    + (2 + 1)
+    + (2 + 1);
 
 const PRODUCT_CAP: usize = 32;
 
@@ -99,6 +118,8 @@ pub struct PhyData {
     pub enabled_curves: Option<u32>,
     pub enabled_usb_itf: Option<u8>,
     pub led_driver: Option<u8>,
+    /// RS-Key WS2812 wire order (tag `0x0D`): `0` = rgb, `1` = grb.
+    pub led_order: Option<u8>,
 }
 
 impl PhyData {
@@ -137,6 +158,7 @@ impl PhyData {
                 }
                 (TAG_ENABLED_USB_ITF, 1) => phy.enabled_usb_itf = Some(v[0]),
                 (TAG_LED_DRIVER, 1) => phy.led_driver = Some(v[0]),
+                (TAG_LED_ORDER, 1) => phy.led_order = Some(v[0]),
                 _ => {}
             }
             p = &p[tlen..];
@@ -181,6 +203,9 @@ impl PhyData {
         }
         if let Some(d) = self.led_driver {
             w.tlv(TAG_LED_DRIVER, &[d])?;
+        }
+        if let Some(o) = self.led_order {
+            w.tlv(TAG_LED_ORDER, &[o])?;
         }
         Some(w.len)
     }
@@ -260,7 +285,7 @@ mod proofs {
     /// buffer's — ~5× the solve time for a property that is an artifact of
     /// construction, not part of the wire spec.
     #[kani::proof]
-    #[kani::unwind(12)]
+    #[kani::unwind(13)]
     fn serialize_parse_roundtrip() {
         const W: usize = 4;
         let mut phy = PhyData::default();
@@ -298,6 +323,9 @@ mod proofs {
         if kani::any() {
             phy.led_driver = Some(kani::any());
         }
+        if kani::any() {
+            phy.led_order = Some(kani::any());
+        }
 
         let mut buf = [0u8; PHY_MAX_SIZE];
         let n = phy.serialize(&mut buf).unwrap();
@@ -319,6 +347,7 @@ mod proofs {
             phy.enabled_usb_itf.or(Some(USB_ITF_ALL))
         );
         assert_eq!(got.led_driver, phy.led_driver);
+        assert_eq!(got.led_order, phy.led_order);
     }
 }
 
@@ -338,6 +367,7 @@ mod tests {
             enabled_curves: Some(0x3FF),
             enabled_usb_itf: Some(USB_ITF_CCID | USB_ITF_HID),
             led_driver: Some(3),
+            led_order: Some(LED_ORDER_GRB),
         };
         let mut buf = [0u8; PHY_MAX_SIZE];
         let n = phy.serialize(&mut buf).unwrap();

@@ -29,11 +29,23 @@ cover it:
 |---|---|---|
 | `FLASH_SIZE` | `4M` | A board with a different QSPI flash chip (e.g. `8M`). `build.rs` regenerates `memory.x` from it. Must be ≥ ~2 MB and ≤ 16 MB. |
 | `LED_PIN` | `16` | A board that uses GPIO16 for something else, or wires its addressable LED elsewhere (RP2350A: GPIO `0..=29`). |
+| `LED_KIND` | `ws2812` | A board with a different indicator: `gpio` (a plain on/off LED on `LED_PIN`), `pimoroni` (3-pin PWM RGB, Pimoroni Tiny 2350), or `none`. Default `ws2812` is the Waveshare addressable RGB. |
+| `LED_ORDER` | `rgb` | A `ws2812` board whose red and green come out swapped (blue fine): set `grb` (the WS2812B standard). The Waveshare RP2350-One is `rgb`; most other parts are `grb`. |
 
 ```sh
-# example: an 8 MB board with its LED on GPIO25
-env FLASH_SIZE=8M LED_PIN=25 cargo build --release -p firmware
+# example: an 8 MB board with a plain LED on GPIO25
+env FLASH_SIZE=8M LED_KIND=gpio LED_PIN=25 cargo build --release -p firmware
+
+# example: a 16 MB TenStar RP2350-USB — WS2812 on GP22, standard GRB order
+env FLASH_SIZE=16M LED_PIN=22 LED_ORDER=grb cargo build --release -p firmware
 ```
+
+The three LED knobs (`LED_PIN` / `LED_KIND` / `LED_ORDER`) set only the *boot
+defaults*: a non-`none` build compiles all three backends, so the pin, driver,
+and wire order are also changeable at **runtime** — no reflash — with `rsk hw`
+or PicoForge, which write them to the device's `phy` record
+([guides/led.md](guides/led.md)). The build knobs still matter for picking a
+lean `none` build and for the out-of-the-box default.
 
 So most RP2350A boards work with at most a one-line change. Everything else
 (USB descriptors, applets, flash layout) is board-independent.

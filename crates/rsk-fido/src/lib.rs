@@ -51,8 +51,12 @@ pub enum Presence {
     Confirmed,
     /// No touch within the timeout.
     Timeout,
-    /// The wait was cancelled (`CTAPHID_CANCEL`).
+    /// The user actively declined (no decline path on the BOOTSEL button today,
+    /// but tests and other front-ends can produce it → `OPERATION_DENIED`).
     Declined,
+    /// The platform sent `CTAPHID_CANCEL` while the touch was awaited; the
+    /// in-flight CTAP2 command must answer `CTAP2_ERR_KEEPALIVE_CANCEL`.
+    Cancelled,
 }
 
 /// Obtains physical user presence. The firmware polls the BOOTSEL button; with
@@ -88,11 +92,22 @@ pub struct Ctx<'a, S: Storage, R: Rng> {
 }
 
 impl<S: Storage, R: Rng> Ctx<'_, S, R> {
-    /// Request a touch, mapping any non-confirmation (timeout or cancel) to
-    /// `false`. Callers that need to tell timeout from cancel call
-    /// `self.presence.request()` directly.
+    /// Request a touch, mapping any non-confirmation (timeout, decline or
+    /// cancel) to `false`. Callers that must distinguish a `CTAPHID_CANCEL`
+    /// (→ `KEEPALIVE_CANCEL`) use [`require_presence`](Self::require_presence).
     pub fn check_user_presence(&mut self) -> bool {
         self.presence.request() == Presence::Confirmed
+    }
+
+    /// Obtain user presence for a CTAP2 command, mapping the outcome to its
+    /// status code: a `CTAPHID_CANCEL` aborts with `KEEPALIVE_CANCEL`, any
+    /// other non-confirmation (timeout, decline) with `OPERATION_DENIED`.
+    pub fn require_presence(&mut self) -> Result<(), CtapError> {
+        match self.presence.request() {
+            Presence::Confirmed => Ok(()),
+            Presence::Cancelled => Err(CtapError::KeepAliveCancel),
+            Presence::Timeout | Presence::Declined => Err(CtapError::OperationDenied),
+        }
     }
 
     /// The device seed for FIDO operations: the RAM copy a vendor `UNLOCK` left
@@ -127,12 +142,14 @@ pub fn process_cbor<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, data: &[u8], out: &
                 Some(n) if n >= 1 => (mp[0], n >= 2 && mp[1] == 1),
                 _ => (consts::MIN_PIN_LENGTH, false),
             };
+            let remaining_rk = credential::remaining_discoverable(ctx.fs);
             getinfo::get_info(
                 ctx.fs.has_data(consts::EF_PIN),
                 min_pin,
                 force,
-                // enableEnterpriseAttestation persists until reset (flash flag).
                 ctx.fs.has_data(consts::EF_EA_ENABLED),
+                ctx.fs.has_data(consts::EF_ALWAYS_UV),
+                remaining_rk,
                 &mut out[1..],
             )
         }
@@ -204,8 +221,8 @@ mod tests {
         let n = dispatch(&[consts::CTAP_GET_INFO], &mut out);
         assert!(n > 1);
         assert_eq!(out[0], CTAP2_OK);
-        // The payload is the getInfo map (CBOR map header 0xAE = map(14)).
-        assert_eq!(out[1], 0xAE);
+        // The payload is the getInfo map (CBOR map header 0xB4 = map(20)).
+        assert_eq!(out[1], 0xB4);
     }
 
     #[test]

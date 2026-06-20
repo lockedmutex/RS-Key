@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 RS-Key contributors
 
-//! `authenticatorConfig`: enableEnterpriseAttestation (0x01), setMinPINLength
-//! (0x03) and the vendor arm (0xFF) carrying the soft-lock pair AUT_ENABLE /
-//! AUT_DISABLE — all gated on a `pinUvAuthParam` with the `acfg` permission;
-//! the soft-lock pair additionally requires a physical touch.
+//! `authenticatorConfig`: enableEnterpriseAttestation (0x01), toggleAlwaysUv
+//! (0x02), setMinPINLength (0x03) and the vendor arm (0xFF) carrying the soft-lock
+//! pair AUT_ENABLE / AUT_DISABLE — all gated on a `pinUvAuthParam` with the `acfg`
+//! permission; the soft-lock pair additionally requires a physical touch.
 
 use minicbor::Decoder;
 use rsk_fs::{Sealed, Storage};
@@ -15,8 +15,9 @@ use rsk_crypto::sha256;
 
 use crate::cbordec::{cbor, def_arr, def_map};
 use crate::consts::{
-    CONFIG_AUT_DISABLE, CONFIG_AUT_ENABLE, CONFIG_ENABLE_EA, CONFIG_SET_MIN_PIN, CONFIG_VENDOR,
-    CTAP_CONFIG, EF_EA_ENABLED, EF_KEY_DEV, EF_KEY_DEV_ENC, EF_MINPINLEN, EF_PIN, MIN_PIN_LENGTH,
+    CONFIG_AUT_DISABLE, CONFIG_AUT_ENABLE, CONFIG_ENABLE_EA, CONFIG_SET_MIN_PIN,
+    CONFIG_TOGGLE_ALWAYS_UV, CONFIG_VENDOR, CTAP_CONFIG, EF_ALWAYS_UV, EF_EA_ENABLED, EF_KEY_DEV,
+    EF_KEY_DEV_ENC, EF_MINPINLEN, EF_PIN, MAX_MIN_PIN_RPIDS, MIN_PIN_LENGTH,
 };
 use crate::error::{CtapError, CtapResult};
 use crate::journal;
@@ -26,9 +27,6 @@ use crate::vendor::open_channel_key;
 use crate::{Ctx, Rng};
 
 const MAX_RAW_SUBPARA: usize = 256;
-/// Max RP ids the setMinPINLength `minPinLengthRPIDs` list keeps; the
-/// raw-subpara MAC payload caps the practical count anyway.
-const MAX_MIN_PIN_RPIDS: usize = 8;
 
 struct Req<'a> {
     subcommand: u64,
@@ -157,6 +155,7 @@ pub fn authenticator_config<S: Storage, R: Rng>(
             journal::append(ctx, journal::EV_CFG_EA, 0, &[]);
             Ok(0)
         }
+        CONFIG_TOGGLE_ALWAYS_UV => toggle_always_uv(ctx),
         CONFIG_SET_MIN_PIN => set_min_pin_length(
             ctx,
             req.new_min_pin,
@@ -170,6 +169,24 @@ pub fn authenticator_config<S: Storage, R: Rng>(
         },
         _ => Err(CtapError::UnsupportedOption),
     }
+}
+
+/// `toggleAlwaysUv` (CTAP 2.1 §6.11): flip the alwaysUv state. While enabled,
+/// every makeCredential / getAssertion requires user verification (a verified
+/// pinUvAuthToken), not merely user presence — enforced in those commands'
+/// `enforce_pin`. Disabling is supported, so the conformance toggle test
+/// (AuthenticatorConfig P-2) observes the opposite value. State is the presence of
+/// `EF_ALWAYS_UV`; it persists until authenticatorReset (flash, CTAP 2.1).
+fn toggle_always_uv<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>) -> CtapResult {
+    if ctx.fs.has_data(EF_ALWAYS_UV) {
+        ctx.fs.delete(EF_ALWAYS_UV).map_err(|_| CtapError::Other)?;
+    } else {
+        ctx.fs
+            .put(EF_ALWAYS_UV, &[1])
+            .map_err(|_| CtapError::Other)?;
+    }
+    journal::append(ctx, journal::EV_CFG_ALWAYS_UV, 0, &[]);
+    Ok(0)
 }
 
 /// `AUT_ENABLE`: engage the soft lock. The host sends a 32-byte lock key over
@@ -413,6 +430,33 @@ mod tests {
         let mut buf = [0u8; 2];
         assert_eq!(fs.read(EF_MINPINLEN, &mut buf), Some(2));
         assert_eq!(buf, [6, 0]); // minPINLength 6, no forced change
+    }
+
+    #[test]
+    fn toggle_always_uv_flips_state() {
+        let mut fs = Fs::new(RamStorage::new(), &[]);
+        let mut state = armed(PERM_ACFG);
+        let req = config_request(CONFIG_TOGGLE_ALWAYS_UV as u8, &[], &TOKEN);
+        // Off by default; first toggle enables, second disables.
+        assert!(!fs.has_data(EF_ALWAYS_UV));
+        assert_eq!(run_fs(&mut fs, &mut state, &req), Ok(0));
+        assert!(fs.has_data(EF_ALWAYS_UV));
+        assert_eq!(run_fs(&mut fs, &mut state, &req), Ok(0));
+        assert!(!fs.has_data(EF_ALWAYS_UV));
+    }
+
+    #[test]
+    fn toggle_always_uv_requires_acfg_permission() {
+        // The shared token check rejects a token lacking the acfg permission, so
+        // alwaysUv cannot be flipped without it.
+        let mut fs = Fs::new(RamStorage::new(), &[]);
+        let mut state = armed(0);
+        let req = config_request(CONFIG_TOGGLE_ALWAYS_UV as u8, &[], &TOKEN);
+        assert_eq!(
+            run_fs(&mut fs, &mut state, &req),
+            Err(CtapError::PinAuthInvalid)
+        );
+        assert!(!fs.has_data(EF_ALWAYS_UV));
     }
 
     // setMinPINLength subCommandParams `{1: new_min, 2: [rpIds…]}`.

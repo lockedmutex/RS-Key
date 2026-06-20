@@ -5,18 +5,41 @@
 //! timing plus a runtime-configurable color/brightness persisted in `EF_LED_CONF`.
 //! The blink task runs on the high-priority interrupt executor, so the LED keeps
 //! animating while the worker blocks in a touch wait or long synchronous crypto.
+//!
+//! The status engine is backend-agnostic — it keeps a colour/brightness per
+//! status in atomics. The render half is chosen at build time by `LED_KIND`:
+//! [`Blinker::tick`] computes the colour to show each tick, and one of the
+//! `*_task`s drives the hardware — `ws2812` (addressable RGB), `gpio` (a plain
+//! on/off LED, colour collapsed to lit/unlit), `pimoroni` (3-pin PWM RGB), or
+//! `none` (no indicator).
 
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
-use embassy_rp::peripherals::PIO0;
-// The Waveshare RP2350-One's WS2812 takes the RGB wire byte order, not the
-// WS2812B-standard GRB embassy defaults to — the default swaps red and green on
-// this board (blue is unaffected). Drive it in `Rgb` order to match.
-use embassy_rp::pio_programs::ws2812::{PioWs2812, Rgb};
+#[cfg(not(led_kind = "none"))]
 use embassy_time::{Duration, Instant, Timer};
+#[cfg(not(led_kind = "none"))]
 use smart_leds::RGB8;
 
-/// The Waveshare RP2350-One has a single on-board WS2812 (GPIO16).
+// Every non-`none` build compiles all three hardware backends — the driver and
+// pin are chosen at runtime from the phy record (see `main`). The embassy color
+// order is fixed at `Rgb` (raw passthrough); the WS2812 wire byte order is instead
+// a runtime software r/g swap (`LED_RG_SWAP`), so a board whose red/green come out
+// swapped (standard WS2812B = GRB, e.g. the TenStar RP2350-USB; the Waveshare
+// RP2350-One is unusually RGB) is corrected without reflashing. `LED_ORDER` only
+// seeds the swap's boot default.
+#[cfg(not(led_kind = "none"))]
+use embassy_rp::peripherals::PIO0;
+#[cfg(not(led_kind = "none"))]
+use embassy_rp::pio_programs::ws2812::{PioWs2812, Rgb as Ws2812Order};
+
+#[cfg(not(led_kind = "none"))]
+use embassy_rp::gpio::{Level, Output};
+
+#[cfg(not(led_kind = "none"))]
+use embassy_rp::pwm::{Config as PwmConfig, Pwm};
+
+/// A single on-board addressable LED.
+#[cfg(not(led_kind = "none"))]
 pub const NUM_LEDS: usize = 1;
 
 /// Status indices — also the index into [`TIMING`]/[`DEFAULT_COLOR`], the
@@ -38,6 +61,7 @@ const COLOR_YELLOW: u8 = 4;
 
 /// Fixed blink timing per status `(on_ms, off_ms)` — only color and brightness
 /// are configurable. Indexed by the `STATUS_*` constants.
+#[cfg(not(led_kind = "none"))]
 const TIMING: [(u64, u64); N_STATUS] = [
     (500, 500),  // Idle
     (50, 50),    // Processing
@@ -69,6 +93,12 @@ static STATUS_BRIGHTNESS: [AtomicU8; N_STATUS] = [
     AtomicU8::new(DEFAULT_BRIGHTNESS),
     AtomicU8::new(DEFAULT_BRIGHTNESS),
 ];
+/// WS2812 wire r/g swap, read live by the addressable render task. Seeds from the
+/// `LED_ORDER` build flag (`grb` → swap red↔green, `rgb` → passthrough) and is
+/// overridden at boot by the phy record's order tag via [`set_rg_swap`]. embassy's
+/// color order stays `Rgb`, so this software swap is the single runtime knob.
+#[cfg(not(led_kind = "none"))]
+static LED_RG_SWAP: AtomicBool = AtomicBool::new(cfg!(led_order = "grb"));
 
 /// Set the active status (the worker on dispatch start/end, `presence` for a
 /// touch wait). Out-of-range indices are clamped by the render loop.
@@ -93,6 +123,23 @@ pub fn set_status_config(idx: u8, color: u8, brightness: u8) {
 /// Toggle the global no-blink (solid) mode.
 pub fn set_steady(on: bool) {
     LED_STEADY.store(on, Ordering::Relaxed);
+}
+
+/// Set the WS2812 wire r/g swap (the boot-applied phy order tag). `true` = the LED
+/// is GRB-wired (standard WS2812B) and red/green are swapped before writing; the
+/// addressable task reads this live.
+#[cfg(not(led_kind = "none"))]
+pub fn set_rg_swap(on: bool) {
+    LED_RG_SWAP.store(on, Ordering::Relaxed);
+}
+
+/// Set every status's brightness at once — the phy record's boot-default channel
+/// max (PicoForge's global brightness), applied before `EF_LED_CONF` can override.
+#[cfg(not(led_kind = "none"))]
+pub fn set_all_brightness(b: u8) {
+    for slot in &STATUS_BRIGHTNESS {
+        slot.store(b, Ordering::Relaxed);
+    }
 }
 
 /// The full config as the persisted/`GET LED` block `[steady, (color, br) × N]`.
@@ -127,6 +174,8 @@ pub fn load_block(b: &[u8]) {
     }
 }
 
+/// Map a status colour code (0–7) at channel max `b` to an RGB triple.
+#[cfg(not(led_kind = "none"))]
 fn color_rgb(color: u8, b: u8) -> RGB8 {
     let (r, g, bl) = match color {
         COLOR_RED => (b, 0, 0),
@@ -141,35 +190,113 @@ fn color_rgb(color: u8, b: u8) -> RGB8 {
     RGB8 { r, g, b: bl }
 }
 
-/// The blink loop: alternate on/off phases of the current
-/// status, re-reading it every tick so a mid-phase switch (touch wait,
-/// processing) recolors immediately. A phase already underway keeps its length;
-/// in steady mode the phase timing still advances (so toggling back to blinking
-/// resumes cleanly) but the color stays lit the whole time.
-#[embassy_executor::task]
-pub async fn led_task(mut ws2812: PioWs2812<'static, PIO0, 0, NUM_LEDS, Rgb>) {
-    let mut on_phase = false;
-    let mut phase_end = Instant::now();
-    loop {
+/// Tracks the blink phase and yields the colour to show each tick — shared by
+/// every render backend. The status, colour and brightness are re-read every
+/// tick so a mid-phase switch (touch wait, processing) recolors immediately. A
+/// phase already underway keeps its length; in steady mode the timing still
+/// advances (so toggling back to blinking resumes cleanly) but the colour stays
+/// lit the whole phase.
+#[cfg(not(led_kind = "none"))]
+struct Blinker {
+    on_phase: bool,
+    phase_end: Instant,
+}
+
+#[cfg(not(led_kind = "none"))]
+impl Blinker {
+    fn new() -> Self {
+        Self {
+            on_phase: false,
+            phase_end: Instant::now(),
+        }
+    }
+
+    fn tick(&mut self) -> RGB8 {
         let s = (LED_STATUS.load(Ordering::Relaxed) as usize).min(N_STATUS - 1);
         let (on_ms, off_ms) = TIMING[s];
         let now = Instant::now();
-        if now >= phase_end {
-            on_phase = !on_phase;
-            phase_end = now + Duration::from_millis(if on_phase { on_ms } else { off_ms });
+        if now >= self.phase_end {
+            self.on_phase = !self.on_phase;
+            self.phase_end =
+                now + Duration::from_millis(if self.on_phase { on_ms } else { off_ms });
         }
-        let lit = on_phase || LED_STEADY.load(Ordering::Relaxed);
-        let color = if lit {
+        if self.on_phase || LED_STEADY.load(Ordering::Relaxed) {
             color_rgb(
                 STATUS_COLOR[s].load(Ordering::Relaxed),
                 STATUS_BRIGHTNESS[s].load(Ordering::Relaxed),
             )
         } else {
             RGB8::default()
-        };
-        ws2812.write(&[color; NUM_LEDS]).await;
+        }
+    }
+}
+
+/// `ws2812` backend: drive the single addressable LED with the blink colour,
+/// applying the runtime r/g wire-order swap (see [`LED_RG_SWAP`]) so one binary
+/// serves both RGB- and GRB-wired parts.
+#[cfg(not(led_kind = "none"))]
+#[embassy_executor::task]
+pub async fn ws2812_task(mut ws2812: PioWs2812<'static, PIO0, 0, NUM_LEDS, Ws2812Order>) {
+    let mut blinker = Blinker::new();
+    loop {
+        let mut c = blinker.tick();
+        if LED_RG_SWAP.load(Ordering::Relaxed) {
+            core::mem::swap(&mut c.r, &mut c.g);
+        }
+        ws2812.write(&[c; NUM_LEDS]).await;
         Timer::after_millis(5).await;
     }
+}
+
+/// `gpio` backend: a plain on/off LED (active-high). Hue and brightness collapse
+/// to lit/unlit — only the blink *pattern* distinguishes statuses.
+#[cfg(not(led_kind = "none"))]
+#[embassy_executor::task]
+pub async fn gpio_task(mut led: Output<'static>) {
+    let mut blinker = Blinker::new();
+    loop {
+        let c = blinker.tick();
+        led.set_level(if (c.r | c.g | c.b) != 0 {
+            Level::High
+        } else {
+            Level::Low
+        });
+        Timer::after_millis(5).await;
+    }
+}
+
+/// `pimoroni` backend: a 3-pin PWM RGB LED (Pimoroni Tiny 2350 — R=GPIO18,
+/// G=GPIO19, B=GPIO20; common-anode, so the channels are inverted). `rg` drives
+/// R (channel A) + G (channel B) on one slice, `b` drives B (channel A) on
+/// another; `top` = 255 so a colour byte maps straight onto a compare value.
+#[cfg(not(led_kind = "none"))]
+#[embassy_executor::task]
+pub async fn pimoroni_task(mut rg: Pwm<'static>, mut b: Pwm<'static>) {
+    let mut blinker = Blinker::new();
+    loop {
+        let c = blinker.tick();
+        let mut cfg = pimoroni_cfg();
+        cfg.compare_a = u16::from(c.r);
+        cfg.compare_b = u16::from(c.g);
+        rg.set_config(&cfg);
+        let mut cfg_b = pimoroni_cfg();
+        cfg_b.compare_a = u16::from(c.b);
+        b.set_config(&cfg_b);
+        Timer::after_millis(5).await;
+    }
+}
+
+/// Base PWM config for the Pimoroni common-anode RGB: an 8-bit `top`, both
+/// channels inverted (the LED lights when the pin is driven low / sinks current).
+/// Shared by the task and `main`'s `Pwm` construction so the polarity matches.
+#[cfg(not(led_kind = "none"))]
+pub fn pimoroni_cfg() -> PwmConfig {
+    // `PwmConfig` is `#[non_exhaustive]`, so build from Default and set fields.
+    let mut cfg = PwmConfig::default();
+    cfg.top = 255;
+    cfg.invert_a = true;
+    cfg.invert_b = true;
+    cfg
 }
 
 /// USB device-event handler: flip the boot status to idle the moment the host

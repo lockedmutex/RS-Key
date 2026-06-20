@@ -9,6 +9,12 @@
 # Cargo dependencies are intentionally NOT managed here — they are covered by
 # cargo-audit (advisories), cargo-deny (advisories + licenses) and cargo-vet
 # (provenance-of-review) in the merge gate.
+#
+# The Python host tooling (tools/) IS watched here via the native `uv` ecosystem
+# (Dependabot reads pyproject.toml + uv.lock directly; GA 2025-03, security
+# updates 2025-12) — so a future cryptography/fido2/pyscard/pytest CVE lands as a
+# PR instead of just a quiet alert, the way the 2026-06 cryptography/pytest CVEs
+# did. One grouped PR per week.
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -20,4 +26,15 @@ updates:
         patterns: ["*"]
     commit-message:
       prefix: ci
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: uv
+    directory: "/tools"
+    schedule:
+      interval: weekly
+    groups:
+      python:
+        patterns: ["*"]
+    commit-message:
+      prefix: deps
     open-pull-requests-limit: 5

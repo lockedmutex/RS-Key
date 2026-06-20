@@ -51,6 +51,7 @@ pub const VENDOR_ATT_STATE: u64 = 0x0B; // {present, chain hash} — ungated
 
 // authenticatorConfig subcommands.
 pub const CONFIG_ENABLE_EA: u64 = 0x01; // enableEnterpriseAttestation
+pub const CONFIG_TOGGLE_ALWAYS_UV: u64 = 0x02; // toggleAlwaysUv
 pub const CONFIG_SET_MIN_PIN: u64 = 0x03; // setMinPINLength
 pub const CONFIG_VENDOR: u64 = 0xFF; // vendor subcommands, selected by a u64 id
 
@@ -161,6 +162,9 @@ pub const LARGEBLOB_INITIAL: [u8; 17] = [
 
 /// Max resident credentials / relying parties.
 pub const MAX_RESIDENT_CREDENTIALS: u16 = 256;
+/// Max RP-id hashes the setMinPINLength `minPinLengthRPIDs` list keeps (getInfo
+/// `maxRPIDsForSetMinPINLength`, 0x10).
+pub const MAX_MIN_PIN_RPIDS: usize = 8;
 
 // FIDO flash file ids (device-local; fids never cross the wire).
 // Audit journal (journal.rs) — deliberately outside every reset range: FIDO's
@@ -180,6 +184,8 @@ pub const EF_ATT_KEY: KeyFid = KeyFid::new(0xCE10); // org attestation P-256 sca
 pub const EF_ATT_CHAIN: u16 = 0xCE11; // packed DER chain: count ‖ (len LE ‖ der)*
 /// `enableEnterpriseAttestation` — persists until reset (CTAP 2.1), hence flash.
 pub const EF_EA_ENABLED: u16 = 0xCE12;
+/// `alwaysUv` state — present = enabled. Persists until reset (CTAP 2.1), flash.
+pub const EF_ALWAYS_UV: u16 = 0xCE13;
 pub const EF_COUNTER: u16 = 0xC000; // global signature counter
 pub const EF_CRED: u16 = 0xCF00; // resident credentials, 0xCF00..0xCFFF
 pub const EF_RP: u16 = 0xD000; // relying-party metadata, 0xD000..0xD0FF

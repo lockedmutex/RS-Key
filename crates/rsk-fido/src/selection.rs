@@ -16,6 +16,8 @@ pub fn selection<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>) -> CtapResult {
         Presence::Confirmed => Ok(0),
         Presence::Timeout => Err(CtapError::UserActionTimeout),
         Presence::Declined => Err(CtapError::OperationDenied),
+        // CTAPHID_CANCEL during the touch wait (FIDO conformance HID-1 P-15).
+        Presence::Cancelled => Err(CtapError::KeepAliveCancel),
     }
 }
 
@@ -83,6 +85,15 @@ mod tests {
         assert_eq!(
             run(&mut Fixed(Presence::Declined)),
             Err(CtapError::OperationDenied)
+        );
+    }
+
+    #[test]
+    fn selection_cancelled_maps_keepalive_cancel() {
+        // A CTAPHID_CANCEL during the touch wait → CTAP2_ERR_KEEPALIVE_CANCEL.
+        assert_eq!(
+            run(&mut Fixed(Presence::Cancelled)),
+            Err(CtapError::KeepAliveCancel)
         );
     }
 }

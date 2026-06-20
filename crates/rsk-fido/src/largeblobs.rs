@@ -22,7 +22,8 @@ use crate::state::PERM_LBW;
 use crate::{Ctx, Rng};
 
 struct Req<'a> {
-    get: u64,                            // 0x01 — bytes to read (0 = absent)
+    get: u64,                            // 0x01 — bytes to read (valid when get_present)
+    get_present: bool,                   // whether 0x01 was supplied (get=0 reads nothing)
     set: Option<&'a [u8]>,               // 0x02 — fragment to write
     offset: u64,                         // 0x03 — UINT64_MAX sentinel = absent
     length: u64,                         // 0x04 — total array length (first fragment)
@@ -34,6 +35,7 @@ fn parse(data: &[u8]) -> Result<Req<'_>, CtapError> {
     let mut d = Decoder::new(data);
     let mut req = Req {
         get: 0,
+        get_present: false,
         set: None,
         offset: u64::MAX,
         length: 0,
@@ -53,7 +55,10 @@ fn parse(data: &[u8]) -> Result<Req<'_>, CtapError> {
         // anywhere near it); reject rather than wrap the ascending watermark.
         expected = key.checked_add(1).ok_or(CtapError::InvalidCbor)?;
         match key {
-            0x01 => req.get = cbor(d.u64())?,
+            0x01 => {
+                req.get = cbor(d.u64())?;
+                req.get_present = true;
+            }
             0x02 => req.set = Some(cbor(d.bytes())?),
             0x03 => req.offset = cbor(d.u64())?,
             0x04 => req.length = cbor(d.u64())?,
@@ -74,14 +79,16 @@ pub fn large_blobs<S: Storage, R: Rng>(
     let req = parse(data)?;
 
     // offset (0x03) is mandatory; exactly one of get / set must be present.
+    // get=0 is a valid read of zero bytes (conformance LargeBlobs-1 P-2), so the
+    // get/set choice keys off whether 0x01 was *supplied*, not its value.
     if req.offset == u64::MAX {
         return Err(CtapError::InvalidParameter);
     }
-    if (req.get == 0) == req.set.is_none() {
+    if req.get_present == req.set.is_some() {
         return Err(CtapError::InvalidParameter);
     }
 
-    if req.get > 0 {
+    if req.get_present {
         read_fragment(ctx, &req, out)
     } else {
         write_fragment(ctx, &req, out)
@@ -309,6 +316,17 @@ mod tests {
         // A fresh device returns the 17-byte CTAP2.1 default array.
         let n = run(&mut fs, &mut state, &get_request(1000, 0), &mut out).unwrap();
         assert_eq!(get_bytes(&out, n), LARGEBLOB_INITIAL.to_vec());
+    }
+
+    #[test]
+    fn get_zero_bytes_returns_empty_fragment() {
+        // get=0 is a valid read of zero bytes (conformance LargeBlobs-1 P-2):
+        // success with an empty fragment, not INVALID_PARAMETER.
+        let mut fs = seeded_fs();
+        let mut state = FidoState::new();
+        let mut out = [0u8; 64];
+        let n = run(&mut fs, &mut state, &get_request(0, 0), &mut out).unwrap();
+        assert!(get_bytes(&out, n).is_empty());
     }
 
     #[test]

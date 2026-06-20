@@ -1,19 +1,19 @@
 {
-  "legalHeader": "RS-Key is AGPL-3.0-only firmware; this Metadata Statement is self-published by the RS-Key project and is NOT a FIDO Alliance MDS listing. See metadata/README.md and docs/aaguid-metadata.md.",
   "description": "RS-Key FIDO2 Authenticator",
   "aaguid": "2479c7bf-6b30-5683-9ec8-0e8171a918b7",
   "protocolFamily": "fido2",
   "schema": 3,
   "authenticatorVersion": 329476,
   "upv": [
-    { "major": 1, "minor": 0 }
+    { "major": 1, "minor": 0 },
+    { "major": 1, "minor": 1 },
+    { "major": 1, "minor": 2 },
+    { "major": 1, "minor": 3 }
   ],
   "authenticationAlgorithms": [
     "secp256r1_ecdsa_sha256_raw",
-    "ed25519_eddsa_sha512_raw",
     "secp384r1_ecdsa_sha384_raw",
-    "secp521r1_ecdsa_sha512_raw",
-    "secp256k1_ecdsa_sha256_raw"
+    "secp521r1_ecdsa_sha512_raw"
   ],
   "publicKeyAlgAndEncodings": [
     "cose"
@@ -38,10 +38,14 @@
   ],
   "tcDisplay": [],
   "attestationRootCertificates": [],
+  "icon": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAo0lEQVR42u3awQ2AIBAEwGvACuzAwuzXijBWoA+BA+axBewEEjiIbT/KygkAAAAAAAAAAAAAAAAA6JFynWsBPIXfMiXAl+I9ICJr+VYIkbl8C4TIXr42AoARytdEAAAAwBjlayFYAQAAAHASBOA2aB5gIpQJYdqhKICVATLufwAAAAAAkPkoDAAAAADLP48DAOCbHAAAAAAAAAAAAAAAAAD8nhsn0WdECq7vpQAAAABJRU5ErkJggg==",
   "authenticatorGetInfo": {
     "versions": [
       "U2F_V2",
-      "FIDO_2_0"
+      "FIDO_2_0",
+      "FIDO_2_1",
+      "FIDO_2_2",
+      "FIDO_2_3"
     ],
     "extensions": [
       "credBlob",
@@ -57,6 +61,7 @@
       "ep": false,
       "rk": true,
       "up": true,
+      "alwaysUv": false,
       "credMgmt": true,
       "authnrCfg": true,
       "clientPin": false,
@@ -73,15 +78,19 @@
     "maxCredentialIdLength": 1024,
     "algorithms": [
       { "alg": -7, "type": "public-key" },
-      { "alg": -8, "type": "public-key" },
       { "alg": -35, "type": "public-key" },
-      { "alg": -36, "type": "public-key" },
-      { "alg": -47, "type": "public-key" }
+      { "alg": -36, "type": "public-key" }
     ],
     "maxSerializedLargeBlobArray": 2048,
     "forcePINChange": false,
     "minPINLength": 4,
     "firmwareVersion": 329476,
-    "maxCredBlobLength": 128
+    "maxCredBlobLength": 128,
+    "transports": ["usb"],
+    "maxRPIDsForSetMinPINLength": 8,
+    "remainingDiscoverableCredentials": 256,
+    "attestationFormats": ["packed"],
+    "maxPINLength": 63,
+    "authenticatorConfigCommands": [1, 2, 3]
   }
 }

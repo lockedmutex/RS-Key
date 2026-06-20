@@ -11,7 +11,9 @@
 name = "rsk"
 description = "RS-Key device CLI — status, seed backup, secure boot, OTP, FIDO, OpenPGP, audit."
 readme = "README.md"
-requires-python = ">=3.9"
+# 3.10 floor: Python 3.9 is EOL (2025-10), and the security-patched cryptography
+# / pytest pins (CVE fixes) require >=3.10 — keeping 3.9 would pin vulnerable deps.
+requires-python = ">=3.10"
 license = "AGPL-3.0-only"
 authors = [{ name = "RS-Key contributors" }]
 keywords = ["fido2", "webauthn", "rp2350", "security-key", "openpgp", "piv"]
@@ -21,7 +23,7 @@ dynamic = ["version"]
 # test-only extras like pytest/dilithium live under [optional-dependencies]).
 dependencies = [
   "hidapi>=0.14",         # CTAPHID transport (`import hid`)
-  "cryptography>=42",     # P-256 ECDH / AES / HMAC — clientPIN + MSE seed backup
+  "cryptography>=42",     # P-256 ECDH/AES/HMAC (clientPIN + MSE); >=46 adds hybrid ML-KEM-768
   "pyscard>=2.0",         # PC/SC for the CCID applets (PIV / OATH / rescue)
   "fido2>=1.1",           # `rsk fido` set-pin / list-passkeys
   "mnemonic>=0.21",       # BIP-39 seed rendering

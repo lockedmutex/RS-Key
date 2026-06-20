@@ -80,6 +80,10 @@ fips-profile = ["rsk-fido/fips-profile", "rsk-piv/fips-profile"]
 # Keygen microbenchmark vendor command (INS 0x13). Debug/measurement only —
 # never ship it: it exposes a timing oracle over the primality primitives.
 keygen-bench = []
+# Add the FIDO Conformance Tool's enterprise-attestation test RPID to the
+# vendor-facilitated (type 1) EA list (see rsk-fido's feature docs). Build
+# `--features ea-conformance-rpid` ONLY for FIDO Conformance EA testing; never ship.
+ea-conformance-rpid = ["rsk-fido/ea-conformance-rpid"]
 
 [[bin]]
 name = "firmware"

@@ -19,7 +19,15 @@ use embassy_rp::flash::{Blocking, Flash};
 use embassy_rp::interrupt;
 use embassy_rp::interrupt::{InterruptExt, Priority};
 use embassy_rp::peripherals::{DMA_CH0, PIO0, TRNG, USB};
-use embassy_rp::pio::{InterruptHandler as PioIrq, Pio};
+use embassy_rp::pio::InterruptHandler as PioIrq;
+// The `ws2812` LED backend drives the addressable LED over the PIO. Any non-`none`
+// build compiles all three hardware backends so the driver is runtime-selectable
+// from the phy record (PicoForge); a `none` build pulls in none of them. DMA_CH0
+// and the PIO0/DMA IRQs stay bound unconditionally (the type is used by
+// `bind_interrupts!` below — harmless when no backend uses it).
+#[cfg(not(led_kind = "none"))]
+use embassy_rp::pio::Pio;
+#[cfg(not(led_kind = "none"))]
 use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program};
 use embassy_rp::trng::{Config as TrngConfig, InterruptHandler as TrngIrq, Trng};
 use embassy_rp::usb::{Driver as UsbDriver, InterruptHandler as UsbIrq};
@@ -99,6 +107,21 @@ const fn env_u32(s: &str) -> u32 {
     acc
 }
 const XOSC_DELAY_MULT: u32 = env_u32(env!("PK_XOSC_DELAY_MULT"));
+
+// Build-time LED defaults. The runtime `EF_PHY` record (PicoForge / `rsk hw`)
+// overrides each at boot; absent that, the LED behaves exactly as the build
+// flags say. Only a non-`none` build renders an LED, so these exist only there.
+// The wire-order default lives in `led` (the `LED_RG_SWAP` atomic seeds from the
+// `led_order` cfg). `BUILD_DRIVER` maps the build LED_KIND onto the phy driver
+// numbering (1=gpio, 2=pimoroni, 3=ws2812).
+#[cfg(not(led_kind = "none"))]
+const BUILD_LED_PIN: u8 = env_u16(env!("PK_LED_PIN")) as u8;
+#[cfg(led_kind = "ws2812")]
+const BUILD_DRIVER: u8 = 3;
+#[cfg(led_kind = "gpio")]
+const BUILD_DRIVER: u8 = 1;
+#[cfg(led_kind = "pimoroni")]
+const BUILD_DRIVER: u8 = 2;
 
 type Drv = UsbDriver<'static, USB>;
 
@@ -191,7 +214,10 @@ async fn main(_spawner: Spawner) {
     let mut usb_pid = USB_PID;
     let mut usb_product = USB_PRODUCT;
     let mut usb_itf = rsk_rescue::phy::USB_ITF_ALL;
-    if let Some(phy) = rsk_rescue::phy::load(&mut fs) {
+    // The phy record drives USB identity (here) and the LED hardware (pin/driver/
+    // wire order, applied at the spawn site below) — keep it in scope for both.
+    let phy = rsk_rescue::phy::load(&mut fs);
+    if let Some(phy) = &phy {
         if let Some((vid, pid)) = phy.vid_pid {
             (usb_vid, usb_pid) = (vid, pid);
         }
@@ -202,7 +228,7 @@ async fn main(_spawner: Spawner) {
                 usb_product = stored;
             }
         }
-        usb_itf = rsk_rescue::phy::effective_usb_itf(&phy);
+        usb_itf = rsk_rescue::phy::effective_usb_itf(phy);
     }
 
     // Provision/recover all persistent state BEFORE attaching to USB. `builder.build()`
@@ -237,6 +263,20 @@ async fn main(_spawner: Spawner) {
     rsk_fido::credential::migrate_rp_seal(&dev, &mut fs);
     let _ = rsk_fido::seed::ensure_seed(&dev, &mut fs, &mut rng);
     let _ = rsk_openpgp::scan_files(&dev, &mut fs, &mut rng);
+    // PHY carries the boot-default LED brightness + steady (PicoForge's global LED
+    // knobs) and the RS-Key wire-order tag. Apply them BEFORE `load_led_config` so
+    // a per-status `EF_LED_CONF` (set via `rsk led`) overrides brightness/steady;
+    // the wire order is not in EF_LED_CONF, so it stands.
+    #[cfg(not(led_kind = "none"))]
+    if let Some(phy) = &phy {
+        if let Some(b) = phy.led_brightness {
+            led::set_all_brightness(b);
+        }
+        led::set_steady(phy.opts & rsk_rescue::phy::OPT_LED_STEADY != 0);
+        if let Some(order) = phy.led_order {
+            led::set_rg_swap(order != 0);
+        }
+    }
     vendor::load_led_config(&mut fs);
     rsk_otp::power_up_bump(&mut fs);
 
@@ -252,7 +292,7 @@ async fn main(_spawner: Spawner) {
     config.serial_number = Some("rs-key-0001");
     config.max_power = 100;
     config.max_packet_size_0 = 64;
-    config.device_release = 0x0767; // bcdDevice: our build counter
+    config.device_release = 0x077B; // bcdDevice: our build counter
 
     let mut builder = Builder::new(
         driver,
@@ -306,7 +346,13 @@ async fn main(_spawner: Spawner) {
     let usb = builder.build();
     let ctap = hid.map(|h| {
         let (reader, writer) = h.split();
-        CtapHid::new(reader, writer, ClientCtap, presence::up_pending)
+        CtapHid::new(
+            reader,
+            writer,
+            ClientCtap,
+            presence::up_pending,
+            presence::request_cancel,
+        )
     });
 
     interrupt::SWI_IRQ_1.set_priority(Priority::P2);
@@ -322,25 +368,139 @@ async fn main(_spawner: Spawner) {
         hp.spawn(otp_kbd::kbd_task(kbd).unwrap());
     }
 
-    let Pio {
-        mut common, sm0, ..
-    } = Pio::new(p.PIO0, Irqs);
-    let program = PioWs2812Program::new(&mut common);
-    macro_rules! led_pin {
-        ($($n:literal => $pin:expr),* $(,)?) => {{
-            $( #[cfg(led_pin = $n)] { $pin } )*
-        }};
+    // LED backend, selected at runtime from the phy record (PicoForge-compatible),
+    // defaulting to the build LED_KIND / LED_PIN. A non-`none` build compiles all
+    // three hardware backends so the driver + pin can change without reflashing; a
+    // `none` build is headless (the status engine still runs — vendor SET/GET LED
+    // keep working — but nothing renders it). The runtime pin reaches the PIO state
+    // machine via a `match` that moves the shared `sm0`/`DMA_CH0` across its
+    // mutually-exclusive arms (every `PioWs2812` erases the pin type, so all arms
+    // share one type) — embassy has no `PioPin for AnyPin`, but it doesn't need one.
+    #[cfg(not(led_kind = "none"))]
+    {
+        use embassy_rp::gpio::{Level, Output};
+        use embassy_rp::pwm::Pwm;
+
+        // PHY led_gpio overrides the build LED_PIN; an out-of-range pin is ignored.
+        let led_gpio = phy
+            .as_ref()
+            .and_then(|p| p.led_gpio)
+            .filter(|&g| g <= 29)
+            .unwrap_or(BUILD_LED_PIN);
+        // PHY led_driver (1=gpio, 2=pimoroni, 3=ws2812) overrides the build kind;
+        // anything else (unset, or the N/A esp32 value) keeps the build default.
+        let led_driver = match phy.as_ref().and_then(|p| p.led_driver) {
+            Some(d @ 1..=3) => d,
+            _ => BUILD_DRIVER,
+        };
+
+        match led_driver {
+            1 => {
+                // `gpio`: a plain on/off LED on `led_gpio`. `Output<'static>` erases
+                // the pin, so every arm is the same type.
+                macro_rules! gpio_pin {
+                    ($pin:expr) => {
+                        Output::new($pin, Level::Low)
+                    };
+                }
+                let led = match led_gpio {
+                    0 => gpio_pin!(p.PIN_0),
+                    1 => gpio_pin!(p.PIN_1),
+                    2 => gpio_pin!(p.PIN_2),
+                    3 => gpio_pin!(p.PIN_3),
+                    4 => gpio_pin!(p.PIN_4),
+                    5 => gpio_pin!(p.PIN_5),
+                    6 => gpio_pin!(p.PIN_6),
+                    7 => gpio_pin!(p.PIN_7),
+                    8 => gpio_pin!(p.PIN_8),
+                    9 => gpio_pin!(p.PIN_9),
+                    10 => gpio_pin!(p.PIN_10),
+                    11 => gpio_pin!(p.PIN_11),
+                    12 => gpio_pin!(p.PIN_12),
+                    13 => gpio_pin!(p.PIN_13),
+                    14 => gpio_pin!(p.PIN_14),
+                    15 => gpio_pin!(p.PIN_15),
+                    16 => gpio_pin!(p.PIN_16),
+                    17 => gpio_pin!(p.PIN_17),
+                    18 => gpio_pin!(p.PIN_18),
+                    19 => gpio_pin!(p.PIN_19),
+                    20 => gpio_pin!(p.PIN_20),
+                    21 => gpio_pin!(p.PIN_21),
+                    22 => gpio_pin!(p.PIN_22),
+                    23 => gpio_pin!(p.PIN_23),
+                    24 => gpio_pin!(p.PIN_24),
+                    25 => gpio_pin!(p.PIN_25),
+                    26 => gpio_pin!(p.PIN_26),
+                    27 => gpio_pin!(p.PIN_27),
+                    28 => gpio_pin!(p.PIN_28),
+                    _ => gpio_pin!(p.PIN_29),
+                };
+                hp.spawn(led::gpio_task(led).unwrap());
+            }
+            2 => {
+                // `pimoroni`: a 3-pin PWM RGB on fixed pins (Pimoroni Tiny 2350) —
+                // R=GPIO18 (slice1·A), G=GPIO19 (slice1·B), B=GPIO20 (slice2·A);
+                // common-anode polarity is in `led::pimoroni_cfg`. led_gpio is N/A.
+                let rg = Pwm::new_output_ab(p.PWM_SLICE1, p.PIN_18, p.PIN_19, led::pimoroni_cfg());
+                let b = Pwm::new_output_a(p.PWM_SLICE2, p.PIN_20, led::pimoroni_cfg());
+                hp.spawn(led::pimoroni_task(rg, b).unwrap());
+            }
+            _ => {
+                // `ws2812` (driver 3, and the safe fallback): the single addressable
+                // RGB LED on `led_gpio`. Wire order is a software r/g swap in the
+                // task (`led::set_rg_swap`), so embassy's color order stays `Rgb`.
+                let Pio {
+                    mut common, sm0, ..
+                } = Pio::new(p.PIO0, Irqs);
+                let program = PioWs2812Program::new(&mut common);
+                macro_rules! ws2812_pin {
+                    ($pin:expr) => {
+                        PioWs2812::with_color_order(
+                            &mut common,
+                            sm0,
+                            p.DMA_CH0,
+                            Irqs,
+                            $pin,
+                            &program,
+                        )
+                    };
+                }
+                let ws2812 = match led_gpio {
+                    0 => ws2812_pin!(p.PIN_0),
+                    1 => ws2812_pin!(p.PIN_1),
+                    2 => ws2812_pin!(p.PIN_2),
+                    3 => ws2812_pin!(p.PIN_3),
+                    4 => ws2812_pin!(p.PIN_4),
+                    5 => ws2812_pin!(p.PIN_5),
+                    6 => ws2812_pin!(p.PIN_6),
+                    7 => ws2812_pin!(p.PIN_7),
+                    8 => ws2812_pin!(p.PIN_8),
+                    9 => ws2812_pin!(p.PIN_9),
+                    10 => ws2812_pin!(p.PIN_10),
+                    11 => ws2812_pin!(p.PIN_11),
+                    12 => ws2812_pin!(p.PIN_12),
+                    13 => ws2812_pin!(p.PIN_13),
+                    14 => ws2812_pin!(p.PIN_14),
+                    15 => ws2812_pin!(p.PIN_15),
+                    16 => ws2812_pin!(p.PIN_16),
+                    17 => ws2812_pin!(p.PIN_17),
+                    18 => ws2812_pin!(p.PIN_18),
+                    19 => ws2812_pin!(p.PIN_19),
+                    20 => ws2812_pin!(p.PIN_20),
+                    21 => ws2812_pin!(p.PIN_21),
+                    22 => ws2812_pin!(p.PIN_22),
+                    23 => ws2812_pin!(p.PIN_23),
+                    24 => ws2812_pin!(p.PIN_24),
+                    25 => ws2812_pin!(p.PIN_25),
+                    26 => ws2812_pin!(p.PIN_26),
+                    27 => ws2812_pin!(p.PIN_27),
+                    28 => ws2812_pin!(p.PIN_28),
+                    _ => ws2812_pin!(p.PIN_29),
+                };
+                hp.spawn(led::ws2812_task(ws2812).unwrap());
+            }
+        }
     }
-    let led_data = led_pin!(
-        "0" => p.PIN_0, "1" => p.PIN_1, "2" => p.PIN_2, "3" => p.PIN_3, "4" => p.PIN_4,
-        "5" => p.PIN_5, "6" => p.PIN_6, "7" => p.PIN_7, "8" => p.PIN_8, "9" => p.PIN_9,
-        "10" => p.PIN_10, "11" => p.PIN_11, "12" => p.PIN_12, "13" => p.PIN_13, "14" => p.PIN_14,
-        "15" => p.PIN_15, "16" => p.PIN_16, "17" => p.PIN_17, "18" => p.PIN_18, "19" => p.PIN_19,
-        "20" => p.PIN_20, "21" => p.PIN_21, "22" => p.PIN_22, "23" => p.PIN_23, "24" => p.PIN_24,
-        "25" => p.PIN_25, "26" => p.PIN_26, "27" => p.PIN_27, "28" => p.PIN_28, "29" => p.PIN_29,
-    );
-    let ws2812 = PioWs2812::with_color_order(&mut common, sm0, p.DMA_CH0, Irqs, led_data, &program);
-    hp.spawn(led::led_task(ws2812).unwrap());
 
     core1::spawn(p.CORE1);
 

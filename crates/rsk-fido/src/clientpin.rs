@@ -157,7 +157,15 @@ fn set_pin<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [u8]) -
         return Err(CtapError::NotAllowed);
     }
     let new_pin_enc = req.new_pin_enc.unwrap();
-    if new_pin_enc.len() != 64 + proto.iv_overhead() {
+    let want = 64 + proto.iv_overhead();
+    // A padded new PIN longer than 64 bytes means the PIN exceeds the 63-byte
+    // maximum → a policy violation, not a malformed request (conformance
+    // ClientPin*-Policy F-2; protocol 2's 16-byte IV made this hit the strict
+    // length guard and wrongly return INVALID_PARAMETER).
+    if new_pin_enc.len() > want {
+        return Err(CtapError::PinPolicyViolation);
+    }
+    if new_pin_enc.len() != want {
         return Err(CtapError::InvalidParameter);
     }
     let mut shared = [0u8; 64];
@@ -187,6 +195,10 @@ fn change_pin<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [u8]
     let pin_hash_enc = req.pin_hash_enc.unwrap();
     let new_pin_enc = req.new_pin_enc.unwrap();
     pin_set_and_unblocked(ctx)?;
+    // An over-long padded new PIN is a policy violation (see `set_pin`).
+    if new_pin_enc.len() > 64 + proto.iv_overhead() {
+        return Err(CtapError::PinPolicyViolation);
+    }
     if new_pin_enc.len() != 64 + proto.iv_overhead()
         || pin_hash_enc.len() != 16 + proto.iv_overhead()
     {
@@ -288,10 +300,20 @@ fn get_pin_token<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [
 
     pin_hash.zeroize();
 
-    // CTAP 2.1 forced PIN change: while EF_MINPINLEN[1] is set, a successful
-    // PIN check still refuses the token — only changePIN lifts the flag.
+    // CTAP 2.1 forced PIN change: while EF_MINPINLEN[1] is set, a successful PIN
+    // check still refuses the token until changePIN lifts the flag. The FIDO
+    // conformance ClientPin forcePINChange tests assert a DIFFERENT code per
+    // subcommand: legacy getPinToken (0x05) → CTAP2_ERR_PIN_INVALID (0x31)
+    // (ClientPin1-NewPin F-1 / ClientPin2-GetPinToken F-5); the permissions-based
+    // getPinUvAuthTokenUsingPinWithPermissions (0x09) → CTAP2_ERR_PIN_POLICY_VIOLATION
+    // (0x37) (ClientPin2-GetPinUvAuthTokenUsingPinWithPermissions F-1). The PIN
+    // verify above already succeeded, so the retry counter is untouched either way.
     if force_change_pending(ctx) {
-        return Err(CtapError::PinPolicyViolation);
+        return Err(if req.subcommand == 0x5 {
+            CtapError::PinInvalid
+        } else {
+            CtapError::PinPolicyViolation
+        });
     }
 
     // Build the token and return it encrypted under the shared secret.
@@ -715,6 +737,19 @@ mod tests {
             ])
         }
 
+        // getPinUvAuthTokenUsingPinWithPermissions (subCommand 9) with `perms`.
+        fn get_token_perms_req(&self, pin: &[u8], perms: u64) -> std::vec::Vec<u8> {
+            let h = sha256(pin);
+            let phe = self.enc(&h[..16]);
+            build(&[
+                (1, V::U(self.wire)),
+                (2, V::U(9)),
+                (3, V::Cose(&self.x, &self.y)),
+                (6, V::B(&phe)),
+                (9, V::U(perms)),
+            ])
+        }
+
         fn change_pin_req(&self, old: &[u8], new: &[u8]) -> std::vec::Vec<u8> {
             let mut padded = [0u8; 64];
             padded[..new.len()].copy_from_slice(new);
@@ -789,6 +824,33 @@ mod tests {
         set_and_get_token(PinProto::One, 1);
     }
 
+    #[test]
+    fn set_pin_over_max_length_is_policy_violation() {
+        // A new PIN longer than 63 bytes (padded > 64) must be a
+        // PIN_POLICY_VIOLATION, not INVALID_PARAMETER — conformance
+        // ClientPin2-Policy F-2. Protocol 2's 16-byte IV pushed the 96-byte
+        // ciphertext past the strict `== 80` guard, wrongly yielding 0x02.
+        let (mut fs, mut rng) = setup();
+        let mut state = FidoState::new();
+        let plat = key_agreement(&mut fs, &mut rng, &mut state, PinProto::Two, 2);
+        // 80-byte padded block → an over-length PIN; encrypts to 96 bytes (> 80).
+        let padded = [0x31u8; 80];
+        let npe = plat.enc(&padded);
+        let puap = plat.mac(&npe);
+        let req = build(&[
+            (1, V::U(plat.wire)),
+            (2, V::U(3)),
+            (3, V::Cose(&plat.x, &plat.y)),
+            (4, V::B(&puap)),
+            (5, V::B(&npe)),
+        ]);
+        let mut out = [0u8; 64];
+        assert_eq!(
+            run(&mut fs, &mut rng, &mut state, &req, &mut out),
+            Err(CtapError::PinPolicyViolation)
+        );
+    }
+
     #[cfg(feature = "fips-profile")]
     #[test]
     fn fips_min_pin_floor_is_six() {
@@ -841,8 +903,11 @@ mod tests {
         mp[2..].copy_from_slice(&sha256(b"example.com"));
         fs.put(EF_MINPINLEN, &mp).unwrap();
 
-        // The *correct* PIN is refused while the flag is up — and the refusal
-        // is a policy error, not a failed verify: retries stay full.
+        // The *correct* PIN is refused while the flag is up. Via the legacy
+        // getPinToken (0x05) the code is PIN_INVALID (the conformance tool's
+        // ClientPin2-GetPinToken F-5; 0x09 instead uses POLICY_VIOLATION — see
+        // `forced_pin_change_0x09_is_policy_violation`). The verify already
+        // succeeded, so this is not a failed verify and the retry counter stays full.
         assert_eq!(
             run(
                 &mut fs,
@@ -851,7 +916,7 @@ mod tests {
                 &plat.get_token_req(b"1234"),
                 &mut out
             ),
-            Err(CtapError::PinPolicyViolation)
+            Err(CtapError::PinInvalid)
         );
         let mut pf = [0u8; PIN_FILE_LEN];
         assert_eq!(fs.read(EF_PIN, &mut pf), Some(PIN_FILE_LEN));
@@ -881,6 +946,42 @@ mod tests {
             &mut out,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn forced_pin_change_0x09_is_policy_violation() {
+        // getPinUvAuthTokenUsingPinWithPermissions (0x09) reports a pending forced
+        // PIN change as PIN_POLICY_VIOLATION (0x37) — unlike the legacy getPinToken
+        // (0x05) above, which reports PIN_INVALID. The FIDO conformance
+        // ClientPin2-GetPinUvAuthTokenUsingPinWithPermissions F-1 asserts
+        // POLICY_VIOLATION, so a single shared code can satisfy only one of the two.
+        let (mut fs, mut rng) = setup();
+        let mut state = FidoState::new();
+        let plat = key_agreement(&mut fs, &mut rng, &mut state, PinProto::Two, 2);
+        let mut out = [0u8; 256];
+        run(
+            &mut fs,
+            &mut rng,
+            &mut state,
+            &plat.set_pin_req(b"1234"),
+            &mut out,
+        )
+        .unwrap();
+        let mut mp = [0u8; 2 + 32];
+        mp[0] = 4;
+        mp[1] = 1;
+        mp[2..].copy_from_slice(&sha256(b"example.com"));
+        fs.put(EF_MINPINLEN, &mp).unwrap();
+        assert_eq!(
+            run(
+                &mut fs,
+                &mut rng,
+                &mut state,
+                &plat.get_token_perms_req(b"1234", PERM_MC as u64),
+                &mut out
+            ),
+            Err(CtapError::PinPolicyViolation)
+        );
     }
 
     #[test]
