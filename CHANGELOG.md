@@ -13,7 +13,31 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+## [0.2.6] — 2026-06-21
+
 ### Fixed
+
+- **ML-DSA-44 (COSE `-48`) FIDO `getAssertion` hard-wedged the device — the
+  post-quantum credential key is now heap-boxed off the worker stack.** The
+  optional ML-DSA-44 signature scheme (negotiable from a request's
+  `pubKeyCredParams`, unadvertised by default) held fips204's ~16.6 KiB of
+  NTT-form keys *inline* on the worker stack, directly below the stack-heavy
+  rejection-sampling `sign`. A `.bss` growth since v0.2.5 (the power-cut
+  tri-state present-cache + the hybrid ML-KEM-768 seed-backup) had lowered the
+  RP2350 worker-stack ceiling from ~238 KiB to ~222 KiB, so an ML-DSA-44
+  `getAssertion` overflowed it → memory corruption → `panic-halt`, leaving FIDO
+  dark until a USB replug. Reachable as a denial of service: an explicit `-48`
+  `makeCredential` followed by `getAssertion` wedges the authenticator even
+  though `-48` is unadvertised. `makeCredential` survived because key generation
+  is a shallower frame than signing. The keypair is now `Box`-ed onto the
+  firmware heap — idle during a FIDO request, since applet keys are reconstructed
+  per-operation — freeing ~16.6 KiB at signing depth and restoring a measured
+  32–64 KiB of stack margin (verified on hardware by flashing deliberately
+  stack-starved builds: passes at −32 KiB, wedges at −64 KiB). The heap stays
+  128 KiB, so there is no RSA impact, and a `size_of::<CredKey>()` guard fails
+  the build if the key ever regresses back inline. HW-verified on RP2350
+  (`tests/60` raw CTAPHID + `tests/61` python-fido2/OpenSSL, ML-DSA-44
+  register+login). `bcdDevice` `0x077D` → `0x077E`.
 
 - **`ssh-keygen -t ed25519-sk` (and any Ed25519 FIDO2 credential) failed on
   Windows — EdDSA is now advertised in `authenticatorGetInfo`.** The device has
