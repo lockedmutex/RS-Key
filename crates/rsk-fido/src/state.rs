@@ -33,6 +33,10 @@ pub struct AssertionState {
     pub rp_id_hash: [u8; 32],
     pub client_data_hash: [u8; 32],
     pub uv: bool,
+    /// The originating request's user-presence decision (honoring `up:false`
+    /// unless the `strict-up` build forces it true) — getNextAssertion reuses it
+    /// so a silent discovery stays silent across the whole walk.
+    pub up: bool,
     pub slots: [u16; MAX_ASSERTION_CREDS],
     pub total: u8,
     pub counter: u8,
@@ -59,6 +63,7 @@ impl AssertionState {
             rp_id_hash: [0; 32],
             client_data_hash: [0; 32],
             uv: false,
+            up: true,
             slots: [0; MAX_ASSERTION_CREDS],
             total: 0,
             counter: 0,

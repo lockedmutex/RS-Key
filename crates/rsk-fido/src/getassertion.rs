@@ -46,6 +46,11 @@ struct Request<'a> {
     allow_len: usize,
     rk_option: bool,
     uv: bool,
+    /// The `up` option (default true). `up:false` is the platform's silent
+    /// pre-flight probe; honoring it (no touch, UP flag 0) is what keeps a
+    /// WebAuthn login to a single touch. See the presence check in
+    /// `get_assertion_inner` and the `strict-up` feature.
+    up: bool,
     pin_uv_auth_param: Option<&'a [u8]>,
     pin_uv_auth_protocol: u64,
     ext_cred_blob: bool,
@@ -63,6 +68,7 @@ fn parse(data: &[u8]) -> Result<Request<'_>, CtapError> {
         allow_len: 0,
         rk_option: false,
         uv: false,
+        up: true,
         pin_uv_auth_param: None,
         pin_uv_auth_protocol: 0,
         ext_cred_blob: false,
@@ -121,6 +127,7 @@ fn parse(data: &[u8]) -> Result<Request<'_>, CtapError> {
                     match cbor(d.str())? {
                         "rk" => req.rk_option = cbor(d.bool())?,
                         "uv" => req.uv = cbor(d.bool())?,
+                        "up" => req.up = cbor(d.bool())?,
                         _ => cbor(d.skip())?,
                     }
                 }
@@ -327,6 +334,10 @@ fn get_assertion_inner<S: Storage, R: Rng>(
     uv: bool,
     out: &mut [u8],
 ) -> CtapResult {
+    // User-presence decision for the whole call: honor `up:false` (the platform's
+    // silent pre-flight) unless the `strict-up` build forces a touch on every
+    // assertion. getNextAssertion reuses it via `gna.up`.
+    let want_up = cfg!(feature = "strict-up") || req.up;
     let mut best = Best::new();
     let mut scratch = [0u8; 1024];
     let mut rec = [0u8; 1024];
@@ -406,6 +417,7 @@ fn get_assertion_inner<S: Storage, R: Rng>(
             gna.rp_id_hash = *rp_id_hash;
             gna.client_data_hash.copy_from_slice(req.client_data_hash);
             gna.uv = uv;
+            gna.up = want_up;
             gna.total = ncand as u8;
             gna.counter = 1;
             gna.started_ms = ctx.now_ms;
@@ -498,17 +510,24 @@ fn get_assertion_inner<S: Storage, R: Rng>(
         key
     };
 
-    // §9.1 user presence: obtain a touch before returning an assertion (up defaults
-    // to true; we don't honor up:false, so a configured button is always polled on
-    // the primary assertion — getNextAssertion reuses this presence). No button →
-    // instant. A CTAPHID_CANCEL during the wait surfaces as KEEPALIVE_CANCEL.
-    ctx.require_presence()?;
+    // §6.2 user presence. `up` defaults to true; the platform sets up:false for
+    // its silent pre-flight (credential discovery), which a spec-compliant key
+    // answers with NO touch and the UP flag clear — that is what keeps a WebAuthn
+    // login to one touch. The `strict-up` build opts out: it polls the button on
+    // every assertion, so an allowList login asks for two touches (one for the
+    // pre-flight probe, one for the real assertion). No button configured → the
+    // poll confirms instantly. A CTAPHID_CANCEL during the wait surfaces as
+    // KEEPALIVE_CANCEL.
+    if want_up {
+        ctx.require_presence()?;
+    }
 
-    // authData = rpIdHash | flags(UP[,UV][,ED]) | counter [| ext] — no attestedCredentialData.
+    // authData = rpIdHash | flags([UP][,UV][,ED]) | counter [| ext] — no attestedCredentialData.
     let ctr = get_sign_counter(ctx.fs);
     let mut ad = [0u8; 37 + 320 + 32];
     ad[..32].copy_from_slice(rp_id_hash);
-    ad[32] = FLAG_UP | ed | if uv { FLAG_UV } else { 0 };
+    let up_flag = if want_up { FLAG_UP } else { 0 };
+    ad[32] = up_flag | ed | if uv { FLAG_UV } else { 0 };
     ad[33..37].copy_from_slice(&ctr.to_be_bytes());
     ad[37..37 + ext_len].copy_from_slice(&ext[..ext_len]);
     let ad_len = 37 + ext_len;
@@ -642,6 +661,7 @@ pub fn get_next_assertion<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, out: &mut [u8
     let rp_id_hash = ctx.state.gna.rp_id_hash;
     let client_data_hash = ctx.state.gna.client_data_hash;
     let uv = ctx.state.gna.uv;
+    let up = ctx.state.gna.up;
 
     // Re-read the credential record; the resident id is its stored 42-byte prefix.
     let mut rec = [0u8; 1024];
@@ -667,6 +687,7 @@ pub fn get_next_assertion<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, out: &mut [u8
         &rp_id_hash,
         &client_data_hash,
         uv,
+        up,
         &seed,
         out,
     );
@@ -688,6 +709,7 @@ fn next_assertion_response<S: Storage, R: Rng>(
     rp_id_hash: &[u8; 32],
     client_data_hash: &[u8; 32],
     uv: bool,
+    up: bool,
     seed: &[u8; 32],
     out: &mut [u8],
 ) -> CtapResult {
@@ -749,7 +771,8 @@ fn next_assertion_response<S: Storage, R: Rng>(
     let ctr = get_sign_counter(ctx.fs);
     let mut ad = [0u8; 37 + 320];
     ad[..32].copy_from_slice(rp_id_hash);
-    ad[32] = FLAG_UP | ed | if uv { FLAG_UV } else { 0 };
+    let up_flag = if up { FLAG_UP } else { 0 };
+    ad[32] = up_flag | ed | if uv { FLAG_UV } else { 0 };
     ad[33..37].copy_from_slice(&ctr.to_be_bytes());
     ad[37..37 + ext_len].copy_from_slice(&ext[..ext_len]);
     let ad_len = 37 + ext_len;
@@ -1021,6 +1044,130 @@ mod tests {
         let mut rng = SeqRng(1);
         ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
         (fs, rng)
+    }
+
+    /// A presence source that always declines — `require_presence` then returns
+    /// `OperationDenied`, so it proves whether a touch was actually polled.
+    struct Decline;
+    impl crate::UserPresence for Decline {
+        fn request(&mut self) -> crate::Presence {
+            crate::Presence::Declined
+        }
+    }
+
+    /// A getAssertion for `allow` carrying the options map `{ "up": up }`.
+    fn ga_request_up(allow: &[u8], up: bool) -> std::vec::Vec<u8> {
+        let mut buf = [0u8; 512];
+        let n = {
+            let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+            e.map(4).unwrap();
+            e.u8(1).unwrap().str("example.com").unwrap();
+            e.u8(2).unwrap().bytes(&CDH).unwrap();
+            e.u8(3).unwrap().array(1).unwrap().map(2).unwrap();
+            e.str("type").unwrap().str("public-key").unwrap();
+            e.str("id").unwrap().bytes(allow).unwrap();
+            e.u8(5)
+                .unwrap()
+                .map(1)
+                .unwrap()
+                .str("up")
+                .unwrap()
+                .bool(up)
+                .unwrap();
+            e.writer().position()
+        };
+        buf[..n].to_vec()
+    }
+
+    fn register_non_resident(fs: &mut Fs<RamStorage>, rng: &mut SeqRng) -> std::vec::Vec<u8> {
+        let mut out = [0u8; 1024];
+        let mut state = crate::FidoState::new();
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs,
+            rng,
+            state: &mut state,
+            now_ms: 10,
+        };
+        let n = make_credential(&mut ctx, &mc_request(false), &mut out).unwrap();
+        let (cred_id, _x, _y) = parse_mc(&out[..n]);
+        cred_id
+    }
+
+    // Default build: the platform's silent pre-flight (up:false) must return an
+    // assertion WITHOUT polling the button and with the UP flag clear — that is
+    // what keeps a WebAuthn login to a single touch. Mutation-proof: a Decline
+    // presence would deny the operation if the touch were polled, and the same
+    // credential with up:true IS denied.
+    #[cfg(not(feature = "strict-up"))]
+    #[test]
+    fn up_false_preflight_is_silent_and_clears_up_flag() {
+        let (mut fs, mut rng) = setup();
+        let cred_id = register_non_resident(&mut fs, &mut rng);
+
+        let mut out = [0u8; 1024];
+        let n = {
+            let mut state = crate::FidoState::new();
+            let mut presence = Decline;
+            let mut ctx = Ctx {
+                presence: &mut presence,
+                dev: dev(),
+                fs: &mut fs,
+                rng: &mut rng,
+                state: &mut state,
+                now_ms: 20,
+            };
+            get_assertion(&mut ctx, &ga_request_up(&cred_id, false), &mut out)
+                .expect("up:false returns an assertion without a touch")
+        };
+        let ad = assertion_auth_data(&out[..n]);
+        assert_eq!(ad[32] & 0x01, 0x00, "up:false → UP flag clear");
+
+        // up:true with the same declined button IS refused — the touch is normally
+        // required, so this guards against the gate becoming a no-op.
+        let mut out2 = [0u8; 1024];
+        let mut state = crate::FidoState::new();
+        let mut presence = Decline;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 30,
+        };
+        assert_eq!(
+            get_assertion(&mut ctx, &ga_request_up(&cred_id, true), &mut out2),
+            Err(CtapError::OperationDenied),
+            "up:true with a declined touch must be denied",
+        );
+    }
+
+    // strict-up build: even up:false polls the button, so a declined touch denies
+    // the assertion (the opt-in two-touch behavior).
+    #[cfg(feature = "strict-up")]
+    #[test]
+    fn strict_up_polls_button_even_on_up_false() {
+        let (mut fs, mut rng) = setup();
+        let cred_id = register_non_resident(&mut fs, &mut rng);
+        let mut out = [0u8; 1024];
+        let mut state = crate::FidoState::new();
+        let mut presence = Decline;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 20,
+        };
+        assert_eq!(
+            get_assertion(&mut ctx, &ga_request_up(&cred_id, false), &mut out),
+            Err(CtapError::OperationDenied),
+            "strict-up: up:false still requires a touch",
+        );
     }
 
     #[test]
