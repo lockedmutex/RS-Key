@@ -52,6 +52,7 @@
 # Internals
 
 - [Architecture](architecture.md)
+- [Host protocol](protocol.md)
 - [Testing](testing.md)
 - [Interop matrix](interop.md)
 - [Versions](versioning.md)
