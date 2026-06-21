@@ -80,9 +80,15 @@ fips-profile = ["rsk-fido/fips-profile", "rsk-piv/fips-profile"]
 # Keygen microbenchmark vendor command (INS 0x13). Debug/measurement only —
 # never ship it: it exposes a timing oracle over the primality primitives.
 keygen-bench = []
+# FIDO Conformance Tool build profile (see rsk-fido's feature docs): suppresses
+# the EdDSA (-8) advertisement so the tool can verify every advertised algorithm.
+# The shipping build advertises -8 (Windows WebAuthn / `ed25519-sk`). Build
+# `--features fido-conformance` ONLY for the FIDO Conformance run; never ship.
+fido-conformance = ["rsk-fido/fido-conformance"]
 # Add the FIDO Conformance Tool's enterprise-attestation test RPID to the
-# vendor-facilitated (type 1) EA list (see rsk-fido's feature docs). Build
-# `--features ea-conformance-rpid` ONLY for FIDO Conformance EA testing; never ship.
+# vendor-facilitated (type 1) EA list (see rsk-fido's feature docs). Pulls in
+# `fido-conformance` transitively. Build `--features ea-conformance-rpid` ONLY for
+# FIDO Conformance EA testing; never ship.
 ea-conformance-rpid = ["rsk-fido/ea-conformance-rpid"]
 
 [[bin]]

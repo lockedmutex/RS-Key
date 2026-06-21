@@ -38,9 +38,19 @@ advertise-pqc = []
 # rises to 6 and the vendor seed export is refused. A build profile, not a
 # FIPS validation — see docs/guides/fips.md.
 fips-profile = []
+# FIDO Conformance Tool build profile, OFF by default. Suppresses the EdDSA (-8)
+# advertisement in getInfo `algorithms` (0x0A): the tool's shared
+# verifySignatureCOSE maps only -7/-35/-36, so it cannot verify a packed EdDSA
+# self-attestation (MakeCred-Resp P-06). The shipping build ADVERTISES -8 — the
+# Windows WebAuthn API drops unadvertised algorithms, breaking `ed25519-sk`. The
+# EdDSA capability itself is unchanged; only the advertisement is suppressed. Pair
+# with `metadata/rs-key.conformance.metadata.json`. Conformance ONLY — never ship.
+fido-conformance = []
 # Add the FIDO Conformance Tool's fixed enterprise-attestation test RPID
 # (enterprisetest.certinfra.fidoalliance.org) to the vendor-facilitated (type 1)
 # EA eligibility list, so the tool's Enterprise-Attestation type-1 case can run.
-# Conformance self-validation ONLY — never ship it (it would grant enterprise
-# attestation to a FIDO test domain). Shipping firmware's type-1 list is empty.
-ea-conformance-rpid = []
+# Implies `fido-conformance` (an EA conformance build is a conformance build, so
+# it must also suppress EdDSA). Conformance self-validation ONLY — never ship it
+# (it would grant enterprise attestation to a FIDO test domain). Shipping
+# firmware's type-1 list is empty.
+ea-conformance-rpid = ["fido-conformance"]

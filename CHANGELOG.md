@@ -13,6 +13,75 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+## [0.2.6] — 2026-06-21
+
+### Fixed
+
+- **ML-DSA-44 (COSE `-48`) FIDO `getAssertion` hard-wedged the device — the
+  post-quantum credential key is now heap-boxed off the worker stack.** The
+  optional ML-DSA-44 signature scheme (negotiable from a request's
+  `pubKeyCredParams`, unadvertised by default) held fips204's ~16.6 KiB of
+  NTT-form keys *inline* on the worker stack, directly below the stack-heavy
+  rejection-sampling `sign`. A `.bss` growth since v0.2.5 (the power-cut
+  tri-state present-cache + the hybrid ML-KEM-768 seed-backup) had lowered the
+  RP2350 worker-stack ceiling from ~238 KiB to ~222 KiB, so an ML-DSA-44
+  `getAssertion` overflowed it → memory corruption → `panic-halt`, leaving FIDO
+  dark until a USB replug. Reachable as a denial of service: an explicit `-48`
+  `makeCredential` followed by `getAssertion` wedges the authenticator even
+  though `-48` is unadvertised. `makeCredential` survived because key generation
+  is a shallower frame than signing. The keypair is now `Box`-ed onto the
+  firmware heap — idle during a FIDO request, since applet keys are reconstructed
+  per-operation — freeing ~16.6 KiB at signing depth and restoring a measured
+  32–64 KiB of stack margin (verified on hardware by flashing deliberately
+  stack-starved builds: passes at −32 KiB, wedges at −64 KiB). The heap stays
+  128 KiB, so there is no RSA impact, and a `size_of::<CredKey>()` guard fails
+  the build if the key ever regresses back inline. HW-verified on RP2350
+  (`tests/60` raw CTAPHID + `tests/61` python-fido2/OpenSSL, ML-DSA-44
+  register+login). `bcdDevice` `0x077D` → `0x077E`.
+
+- **`ssh-keygen -t ed25519-sk` (and any Ed25519 FIDO2 credential) failed on
+  Windows — EdDSA is now advertised in `authenticatorGetInfo`.** The device has
+  always *supported* EdDSA (COSE `-8`): `makeCredential` negotiates it from a
+  request's `pubKeyCredParams` and signs with Ed25519. But `-8` was omitted from
+  the advertised `algorithms` (0x0A) list, kept out alongside ES256K (`-47`) so
+  the FIDO Conformance tool — whose `verifySignatureCOSE` only maps `-7/-35/-36` —
+  wouldn't fail trying to verify an EdDSA self-attestation. The Windows WebAuthn
+  API (the path Windows OpenSSH takes) **intersects the requested algorithms with
+  the advertised list**, so it silently dropped `-8` and the credential create
+  failed; macOS/Linux OpenSSH go through libfido2, which sends `-8` directly, so
+  it worked there. The shipping/default build now advertises `-8`. The capability
+  is unchanged — only the advertisement was added. ES256K (`-47`) stays
+  unadvertised (still negotiable from a request). For the conformance run, the new
+  `fido-conformance` build feature suppresses `-8` again and
+  `metadata/rs-key.conformance.metadata.json` is the matching EdDSA-free Metadata
+  Statement (verified by `tests/62` to be the shipping statement minus EdDSA).
+  `bcdDevice` `0x077C` → `0x077D`.
+
+- **Two power-cut data-durability bugs in the flash file system, both surfaced by
+  the `power_cut` / `fs_ops` fuzz targets (deep-checks) and latent since the
+  present-cache landed in v0.2.3.** Neither affects the shipped, verified v0.2.5
+  artifacts — both are power-cut-edge, not artifact-integrity.
+  - **`delete` orphaned metadata.** `Fs::delete` dropped a file's `EF_META`
+    record only when the file's *own* data was present, so a file given metadata
+    (`meta_add`) but never written (`put`) kept its metadata after deletion — the
+    record read back alive across a reboot, diverging the live key set from the
+    model. `delete` now drops metadata unconditionally (O(1) when there is none),
+    and `meta_delete` skips the `EF_META` rewrite when the FID had no record, so
+    the absent-slot reset sweep stays write-free.
+  - **The present-cache could go false-absent after a torn migration.** The boot
+    `scan` seeds its negative cache from a bulk `for_each_key`, which can silently
+    under-count a key when a power-cut interrupts a `sequential-storage` page
+    migration — while the per-key `fetch_item` still recovers it. A clear cache
+    bit was trusted as "absent", so committed data/metadata read back lost, and a
+    `meta_add` over a false-absent `EF_META` wiped every existing record. The
+    cache is now tri-state (`present` + a `decided` authority bit): a clear bit is
+    trusted only once a backend probe confirms it, otherwise the reliable
+    `fetch_item` decides and the answer is memoised — a false-absent is now
+    impossible. Cost: a one-time-per-boot first probe per absent FID (the PIV-tab
+    lag returns once after a plug-in, then stays O(1)). `fetch_item` durability is
+    pinned by a new `kv_durability` fuzz target (the storage layer in isolation);
+    `power_cut` and `fs_ops` now run clean. `bcdDevice` `0x077B` → `0x077C`.
+
 ## [0.2.5] — 2026-06-20
 
 ### Added
