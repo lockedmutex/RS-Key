@@ -15,6 +15,24 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Fixed
 
+- **`ssh-keygen -t ed25519-sk` (and any Ed25519 FIDO2 credential) failed on
+  Windows — EdDSA is now advertised in `authenticatorGetInfo`.** The device has
+  always *supported* EdDSA (COSE `-8`): `makeCredential` negotiates it from a
+  request's `pubKeyCredParams` and signs with Ed25519. But `-8` was omitted from
+  the advertised `algorithms` (0x0A) list, kept out alongside ES256K (`-47`) so
+  the FIDO Conformance tool — whose `verifySignatureCOSE` only maps `-7/-35/-36` —
+  wouldn't fail trying to verify an EdDSA self-attestation. The Windows WebAuthn
+  API (the path Windows OpenSSH takes) **intersects the requested algorithms with
+  the advertised list**, so it silently dropped `-8` and the credential create
+  failed; macOS/Linux OpenSSH go through libfido2, which sends `-8` directly, so
+  it worked there. The shipping/default build now advertises `-8`. The capability
+  is unchanged — only the advertisement was added. ES256K (`-47`) stays
+  unadvertised (still negotiable from a request). For the conformance run, the new
+  `fido-conformance` build feature suppresses `-8` again and
+  `metadata/rs-key.conformance.metadata.json` is the matching EdDSA-free Metadata
+  Statement (verified by `tests/62` to be the shipping statement minus EdDSA).
+  `bcdDevice` `0x077C` → `0x077D`.
+
 - **Two power-cut data-durability bugs in the flash file system, both surfaced by
   the `power_cut` / `fs_ops` fuzz targets (deep-checks) and latent since the
   present-cache landed in v0.2.3.** Neither affects the shipped, verified v0.2.5

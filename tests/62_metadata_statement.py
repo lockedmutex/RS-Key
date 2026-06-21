@@ -24,11 +24,15 @@ Part B (runs only if a FIDO HID device is plugged in):
     one, IGNORING the stateful fields (options.ep / options.clientPin /
     forcePINChange / minPINLength) which depend on PIN/enterprise state.
 
-The statement describes the DEFAULT build profile. ES256K (-47) and EdDSA (-8)
-are never advertised in any profile (the FIDO conformance tool cannot verify a
-self-attestation over those curves). `advertise-pqc` adds COSE -48 to algorithms
-and `fips-profile` raises minPINLength — if the live device is one of those,
-Part B says so instead of failing blindly.
+The statement describes the DEFAULT (shipping) build profile, which advertises
+EdDSA (-8): the Windows WebAuthn API drops unadvertised algorithms, breaking
+`ssh-keygen -t ed25519-sk`. ES256K (-47) is never advertised (the FIDO
+conformance tool cannot verify a secp256k1 self-attestation). The
+`fido-conformance` build suppresses -8 too; its EdDSA-free metadata variant
+`metadata/rs-key.conformance.metadata.json` is checked here to be exactly the
+shipping statement minus EdDSA. `advertise-pqc` adds COSE -48 to algorithms and
+`fips-profile` raises minPINLength — if the live device is one of those, Part B
+says so instead of failing blindly.
 """
 import json
 import os
@@ -37,6 +41,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 META = os.path.join(ROOT, "metadata", "rs-key.metadata.json")
+CONF_META = os.path.join(ROOT, "metadata", "rs-key.conformance.metadata.json")
 CONSTS = os.path.join(ROOT, "crates", "rsk-fido", "src", "consts.rs")
 
 # FIDO Registry (v2.2) sign-algorithm string <-> COSE alg id, classic set only.
@@ -117,6 +122,41 @@ def part_a(stmt):
     print(f"Part A OK — aaguid {dashed}, algs {sorted(want)}, fw {gi.get('firmwareVersion')}")
 
 
+def check_conformance_variant(stmt):
+    """The conformance metadata must equal the shipping statement minus EdDSA.
+
+    The `fido-conformance` build drops EdDSA (-8) from getInfo (the conformance
+    tool cannot verify an EdDSA self-attestation), so the operator feeds the tool
+    `rs-key.conformance.metadata.json`. Deriving it as "shipping minus EdDSA"
+    guarantees the two never disagree on anything else.
+    """
+    if not os.path.exists(CONF_META):
+        print("conformance variant: absent (skipped)")
+        return
+    conf = json.load(open(CONF_META))
+    expected = json.loads(json.dumps(stmt))  # deep copy
+    expected["authenticationAlgorithms"] = [
+        a for a in expected["authenticationAlgorithms"]
+        if a != "ed25519_eddsa_sha512_raw"
+    ]
+    expected["authenticatorGetInfo"]["algorithms"] = [
+        a for a in expected["authenticatorGetInfo"]["algorithms"] if a["alg"] != -8
+    ]
+    gi = conf.get("authenticatorGetInfo", {})
+    fails = []
+    if "ed25519_eddsa_sha512_raw" in conf.get("authenticationAlgorithms", []):
+        fails.append("conformance variant must not list ed25519_eddsa_sha512_raw")
+    if any(a["alg"] == -8 for a in gi.get("algorithms", [])):
+        fails.append("conformance variant must not advertise COSE -8")
+    if conf != expected:
+        fails.append("conformance variant must equal the shipping statement minus EdDSA (-8)")
+    if fails:
+        for f in fails:
+            print(f"  FAIL: {f}")
+        sys.exit(f"conformance variant: {len(fails)} failure(s)")
+    print("conformance variant OK — shipping statement minus EdDSA (-8)")
+
+
 def _norm(gi):
     """Drop stateful fields so the static surface can be compared."""
     out = {k: v for k, v in gi.items() if k not in STATEFUL}
@@ -171,12 +211,22 @@ def part_b(stmt):
         "maxPINLength": m[0x1D],
         "authenticatorConfigCommands": m[0x1F],
     }
-    if COSE_MLDSA44 in {a["alg"] for a in live["algorithms"]}:
+    live_algs = {a["alg"] for a in live["algorithms"]}
+    if COSE_MLDSA44 in live_algs:
         print("NOTE: live device is an advertise-pqc build (COSE -48 present); "
               "the statement targets the DEFAULT profile — comparison skipped.")
         return
 
-    want = _norm(stmt["authenticatorGetInfo"])
+    # Pick the metadata profile matching the live device: the default build
+    # advertises EdDSA (-8); the fido-conformance build drops it (and pairs with
+    # the EdDSA-free variant).
+    ref = stmt
+    if -8 not in live_algs and os.path.exists(CONF_META):
+        ref = json.load(open(CONF_META))
+        print("NOTE: live device is a fido-conformance build (no EdDSA -8); "
+              "comparing against the conformance variant.")
+
+    want = _norm(ref["authenticatorGetInfo"])
     got = _norm(live)
     if want != got:
         for k in sorted(set(want) | set(got)):
@@ -190,6 +240,7 @@ def part_b(stmt):
 def main():
     stmt = json.load(open(META))
     part_a(stmt)
+    check_conformance_variant(stmt)
     part_b(stmt)
 
 

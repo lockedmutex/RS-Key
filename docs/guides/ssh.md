@@ -25,6 +25,13 @@ both key types it can use:
 - **Linux:** OpenSSH links `libfido2` almost everywhere; you only need the FIDO
   udev rules — see [linux.md](../linux.md). FIDO is local to wherever `ssh`
   runs, so logging in *to* a remote box needs nothing special there.
+- **Windows:** OpenSSH for Windows routes `-sk` keys through the Windows WebAuthn
+  API (`webauthn.dll`), which only offers algorithms the device *advertises* in
+  its FIDO `getInfo`. `ed25519-sk` therefore needs firmware that advertises EdDSA
+  — RS-Key `bcdDevice 0x077D` or newer (see `rsk status`). On older firmware
+  `ed25519-sk` fails at create with a generic error while `ecdsa-sk` still works,
+  so either reflash or use `ecdsa-sk`. macOS and Linux talk to `libfido2`
+  directly and send the algorithm regardless, so they are unaffected.
 
 ## Enroll
 

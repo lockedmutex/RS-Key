@@ -37,6 +37,9 @@ run "fmt (fuzz)"               cargo fmt --manifest-path fuzz/Cargo.toml --check
 run "test (host)"              cargo test -p rsk-sdk -p rsk-fs -p rsk-usb -p rsk-crypto -p rsk-fido -p rsk-openpgp -p rsk-rsa-asm -p rsk-mgmt -p rsk-oath -p rsk-otp -p rsk-piv -p rsk-rescue --target "$HOST"
 # The PQC-advertisement opt-in changes the getInfo shape — test both forms.
 run "test (advertise-pqc)"     cargo test -p rsk-fido --features advertise-pqc --target "$HOST" getinfo
+# fido-conformance suppresses the default EdDSA (-8) advertisement — verify that
+# path too (the shipping/default build advertises -8; this drops it for the tool).
+run "test (fido-conformance)"  cargo test -p rsk-fido --features fido-conformance --target "$HOST" getinfo
 # The FIPS-style profile changes algorithm menus / PIN floor / export policy;
 # run its tests (name-filtered: the regular fixtures assume the 4-char PIN
 # floor) and type-check the locked firmware image.

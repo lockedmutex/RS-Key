@@ -7,14 +7,22 @@
 //! 2026-06-02) hard-fail the whole getInfo parse on an unknown COSE id, while
 //! makeCredential still negotiates -48 from the request's `pubKeyCredParams`;
 //! the `advertise-pqc` feature opts back into the advertisement.
+//!
+//! EdDSA (-8), by contrast, IS advertised by default: the Windows WebAuthn API
+//! (the path OpenSSH `ssh-keygen -t ed25519-sk` takes) intersects a request's
+//! `pubKeyCredParams` with the advertised set and silently drops -8 when it is
+//! unadvertised, so credential creation fails on Windows (it works on
+//! macOS/Linux libfido2, which sends -8 directly). The `fido-conformance` feature
+//! suppresses it for the FIDO conformance run (its verifySignatureCOSE can only
+//! verify -7/-35/-36 self-attestations).
 
 use minicbor::Encoder;
 use minicbor::encode::{Error, Write};
 
 use crate::consts::{
-    AAGUID, ALG_ES256, ALG_ES384, ALG_ES512, ALG_MLDSA44, FIRMWARE_VERSION, MAX_CRED_ID_LENGTH,
-    MAX_CREDBLOB_LENGTH, MAX_CREDENTIAL_COUNT_IN_LIST, MAX_LARGE_BLOB_SIZE, MAX_MIN_PIN_RPIDS,
-    MAX_MSG_SIZE,
+    AAGUID, ALG_EDDSA, ALG_ES256, ALG_ES384, ALG_ES512, ALG_MLDSA44, FIRMWARE_VERSION,
+    MAX_CRED_ID_LENGTH, MAX_CREDBLOB_LENGTH, MAX_CREDENTIAL_COUNT_IN_LIST, MAX_LARGE_BLOB_SIZE,
+    MAX_MIN_PIN_RPIDS, MAX_MSG_SIZE,
 };
 use crate::cose::cose_public_key;
 use crate::error::{CtapError, CtapResult};
@@ -139,25 +147,39 @@ fn write_info<W: Write>(
     // HID, so the FIDO transport list is just "usb".)
     enc.u8(0x09)?.array(1)?.str("usb")?;
 
-    // 0x0A algorithms — ES256 (-7), ES384 (-35), ES512 (-36); `advertise-pqc`
-    // prepends ML-DSA-44 (off by default: shipped Firefoxes reject the whole
-    // getInfo on an unknown COSE id). EdDSA (-8) and ES256K (-47) are implemented
-    // but deliberately NOT advertised: the FIDO conformance tool's shared
-    // verifySignatureCOSE maps only -7/-35/-36 for elliptic curves (no -8, no -47),
-    // so it throws "hashFunction missing" trying to verify a packed self-attestation
-    // over an EdDSA or secp256k1 credential (MakeCred-Resp P-06). makeCredential
-    // still negotiates -8/-47 from a request's pubKeyCredParams — only the
-    // advertisement is suppressed (like ML-DSA-44). Keep this set in sync with the
-    // metadata (`authenticationAlgorithms` + `authenticatorGetInfo.algorithms`) —
-    // `tests/62` enforces it.
+    // 0x0A algorithms — ES256 (-7), ES384 (-35), ES512 (-36), then EdDSA (-8).
+    // `advertise-pqc` prepends ML-DSA-44 (off by default: shipped Firefoxes reject
+    // the whole getInfo on an unknown COSE id).
+    //
+    // EdDSA (-8) is advertised by DEFAULT. Platforms that intersect a credential
+    // request's `pubKeyCredParams` with the advertised set — notably the Windows
+    // WebAuthn API (`webauthn.dll`), the path OpenSSH `ssh-keygen -t ed25519-sk`
+    // takes — silently drop -8 when it is unadvertised, so the create fails
+    // (macOS/Linux libfido2 sends -8 directly, so it works there). The
+    // `fido-conformance` feature suppresses it: the FIDO conformance tool's shared
+    // verifySignatureCOSE maps only -7/-35/-36 for elliptic curves, so it throws
+    // "hashFunction missing" verifying a packed EdDSA self-attestation
+    // (MakeCred-Resp P-06).
+    //
+    // ES256K (-47) stays unadvertised in EVERY profile for the same P-06 reason.
+    // Both -8 and -47 remain fully implemented — makeCredential negotiates them
+    // from a request regardless of advertisement (like ML-DSA-44). Keep the
+    // advertised set in sync with the metadata (`authenticationAlgorithms` +
+    // `authenticatorGetInfo.algorithms`); `tests/62` enforces it, and
+    // `metadata/rs-key.conformance.metadata.json` is the EdDSA-free variant for
+    // the `fido-conformance` build.
     let pqc = cfg!(feature = "advertise-pqc");
-    enc.u8(0x0A)?.array(3 + u64::from(pqc))?;
+    let eddsa = cfg!(not(feature = "fido-conformance"));
+    enc.u8(0x0A)?.array(3 + u64::from(pqc) + u64::from(eddsa))?;
     if pqc {
         cose_public_key(enc, ALG_MLDSA44)?;
     }
     cose_public_key(enc, ALG_ES256)?;
     cose_public_key(enc, ALG_ES384)?;
     cose_public_key(enc, ALG_ES512)?;
+    if eddsa {
+        cose_public_key(enc, ALG_EDDSA)?;
+    }
 
     // 0x0B maxSerializedLargeBlobArray
     enc.u8(0x0B)?.u64(MAX_LARGE_BLOB_SIZE as u64)?;
@@ -207,18 +229,11 @@ fn write_info<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consts::{ALG_EDDSA, ALG_ES256K};
+    use crate::consts::ALG_ES256K;
     use minicbor::Decoder;
 
-    /// Conformance regression guard (MakeCred-Resp P-06): the advertised
-    /// `algorithms` (0x0A) must NEVER include EdDSA (-8) or ES256K (-47). The FIDO
-    /// conformance tool's shared `verifySignatureCOSE` maps only -7/-35/-36 for
-    /// elliptic curves and throws "hashFunction missing" on a self-attestation over
-    /// any other curve. Both stay fully implemented (makeCredential negotiates them
-    /// from a request) — only the advertisement is suppressed, so the advertised EC
-    /// set is exactly the tool-verifiable NIST curves.
-    #[test]
-    fn algorithms_never_advertise_eddsa_or_es256k() {
+    /// Decode the advertised `algorithms` (0x0A) COSE ids from a getInfo response.
+    fn advertised_algs() -> std::vec::Vec<i64> {
         let mut out = [0u8; 1024];
         let n = get_info(false, 6, false, false, false, 256, &mut out).unwrap();
         let mut d = Decoder::new(&out[..n]);
@@ -239,16 +254,42 @@ mod tests {
                 d.skip().unwrap();
             }
         }
-        assert!(
-            !algs.contains(&ALG_EDDSA),
-            "EdDSA (-8) must not be advertised"
-        );
+        algs
+    }
+
+    /// Algorithm-advertisement policy (0x0A).
+    ///
+    /// EdDSA (-8) is advertised by DEFAULT — the Windows WebAuthn API filters a
+    /// request's `pubKeyCredParams` by the advertised set, so an unadvertised -8
+    /// breaks `ssh-keygen -t ed25519-sk`. The `fido-conformance` feature suppresses
+    /// it (the conformance tool's shared `verifySignatureCOSE` cannot verify an
+    /// EdDSA self-attestation — MakeCred-Resp P-06). ES256K (-47) is never
+    /// advertised (same P-06 limitation). Both stay implemented: makeCredential
+    /// still negotiates them from a request's `pubKeyCredParams`.
+    #[test]
+    fn algorithms_advertisement_policy() {
+        let algs = advertised_algs();
+        // The NIST ECDSA curves are always advertised.
+        assert!(algs.contains(&ALG_ES256));
+        assert!(algs.contains(&ALG_ES384));
+        assert!(algs.contains(&ALG_ES512));
+        // ES256K is never advertised (FIDO conformance MakeCred-Resp P-06).
         assert!(
             !algs.contains(&ALG_ES256K),
             "ES256K (-47) must not be advertised"
         );
-        // The `ends_with` tolerates an advertise-pqc ML-DSA-44 prefix.
-        assert!(algs.ends_with(&[ALG_ES256, ALG_ES384, ALG_ES512]));
+        // EdDSA is advertised by default, suppressed only under `fido-conformance`.
+        if cfg!(feature = "fido-conformance") {
+            assert!(
+                !algs.contains(&ALG_EDDSA),
+                "EdDSA (-8) must not be advertised in the conformance profile"
+            );
+        } else {
+            assert!(
+                algs.contains(&ALG_EDDSA),
+                "EdDSA (-8) must be advertised by default (Windows WebAuthn / ed25519-sk)"
+            );
+        }
     }
 
     #[test]
@@ -335,17 +376,25 @@ mod tests {
         assert_eq!(d.array().unwrap().unwrap(), 1);
         assert_eq!(d.str().unwrap(), "usb");
 
-        // 0x0A algorithms: [{alg, type:"public-key"} …] — classic ids; the
-        // `advertise-pqc` feature prepends ML-DSA-44 (default stays without it:
-        // Firefox authenticator-rs strict parse).
+        // 0x0A algorithms: [{alg, type:"public-key"} …] — the NIST ECDSA curves,
+        // then EdDSA (-8) unless `fido-conformance` suppresses it; `advertise-pqc`
+        // prepends ML-DSA-44 (default stays without it: Firefox authenticator-rs
+        // strict parse).
         assert_eq!(d.u8().unwrap(), 0x0A);
         let pqc = cfg!(feature = "advertise-pqc");
-        assert_eq!(d.array().unwrap().unwrap(), 3 + u64::from(pqc));
+        let eddsa = cfg!(not(feature = "fido-conformance"));
+        assert_eq!(
+            d.array().unwrap().unwrap(),
+            3 + u64::from(pqc) + u64::from(eddsa)
+        );
         let mut algs = vec![];
         if pqc {
             algs.push(ALG_MLDSA44);
         }
         algs.extend([ALG_ES256, ALG_ES384, ALG_ES512]);
+        if eddsa {
+            algs.push(ALG_EDDSA);
+        }
         for alg in algs {
             assert_eq!(d.map().unwrap().unwrap(), 2);
             assert_eq!(d.str().unwrap(), "alg");

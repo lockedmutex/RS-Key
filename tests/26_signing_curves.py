@@ -8,10 +8,15 @@
 
 For each of EdDSA (Ed25519), ES256K (secp256k1), ES384 (P-384) and ES512 (P-521),
 in roughly fastest-to-slowest order:
-  1. getInfo                  -> the algorithm is advertised in 0x0A
-  2. makeCredential(alg)      -> a credential with the matching COSE public key
-  3. getAssertion(credId)     -> sign authData ‖ clientDataHash
-  4. verify the signature under the credential public key (host `cryptography`)
+  1. makeCredential(alg)      -> a credential with the matching COSE public key
+  2. getAssertion(credId)     -> sign authData ‖ clientDataHash
+  3. verify the signature under the credential public key (host `cryptography`)
+
+getInfo's advertised set (0x0A) is checked once up front: ES256/ES384/ES512 and
+EdDSA (-8) are advertised (EdDSA so the Windows WebAuthn API offers `ed25519-sk`);
+ES256K (-47) is implemented but intentionally NOT advertised (the FIDO conformance
+tool cannot verify a secp256k1 self-attestation). makeCredential still negotiates
+ES256K from a request, so the per-curve loop exercises it all the same.
 
 A no-PIN device is assumed (resets at the start). Needs `cryptography`. Uses a
 generous response timeout because the pure-Rust P-384/P-521 arithmetic is slow
@@ -122,7 +127,11 @@ def main():
         assert rst[0] == 0x00, f"reset status {rst[0]:#x}"
         gi = decode(send_cbor_t(dev, cid, bytes([0x04]))[1:])
         algs = {a["alg"] for a in gi[0x0A]}
-        assert {-7, -8, -35, -36, -47} <= algs, f"getInfo algorithms = {sorted(algs)}"
+        # ES256/384/512 and EdDSA (-8) are advertised; ES256K (-47) is implemented
+        # but intentionally unadvertised (FIDO conformance MakeCred-Resp P-06) —
+        # makeCredential still negotiates it, so the loop below still tests it.
+        assert {-7, -8, -35, -36} <= algs, f"getInfo algorithms = {sorted(algs)}"
+        assert -47 not in algs, f"ES256K (-47) must not be advertised: {sorted(algs)}"
         print(f"getInfo: algorithms {sorted(algs, reverse=True)}")
 
         passed = []
