@@ -48,7 +48,7 @@ run "test (fips: rsk-piv)"     cargo test -p rsk-piv --features fips-profile --t
 run "clippy (fips firmware)"   cargo clippy -p firmware --features fips-profile -- -D warnings
 run "build firmware (release)" cargo build --release -p firmware
 # The test build: no BOOTSEL presence, so the automated suites don't hang on a touch.
-run "build firmware (test, --no-default-features)" cargo build --release -p firmware --no-default-features
+run "build firmware (test, --features no-touch)" cargo build --release -p firmware --features no-touch
 run "build rsk-wipe (release)" cargo build --release -p rsk-wipe
 run "flake.lock in sync"       lock_in_sync
 # RUSTSEC-2023-0071: rsa Marvin timing side-channel — no fixed release; it is the

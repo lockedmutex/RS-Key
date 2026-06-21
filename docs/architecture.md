@@ -116,7 +116,7 @@ reader name.
 One BOOTSEL button, shared by all applets through a `UserPresence` trait the
 firmware implements once: FIDO operations, OpenPGP UIF, PIV touch policies,
 OATH touch accounts, and OTP slot typing (1–4 presses select the slot) all
-gate on it. The no-touch build (`--no-default-features`) auto-confirms — for
+gate on it. The no-touch build (`--features no-touch`) auto-confirms — for
 test rigs, not for daily use.
 
 ## Provenance

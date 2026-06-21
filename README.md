@@ -21,7 +21,7 @@ replacement for an audited commercial key.
 ## Project status
 
 A working, single-maintainer hobby project under active development. The latest
-tagged release is **v0.2.7**; day to day the supported version is the tip of
+tagged release is **v0.2.8**; day to day the supported version is the tip of
 `main`, and every behavior change bumps the USB `bcdDevice` build counter so a
 build can be named precisely. Most of the protocol surface works against real host software; what
 has actually been checked on hardware (with dates) is in
@@ -110,7 +110,7 @@ cp firmware.uf2 /Volumes/RP2350/  # macOS; on Linux, the mounted RP2350 mass-sto
 
 Re-plug the board and it enumerates as a composite USB authenticator. The default
 build requires a **physical touch** (the BOOTSEL button) for FIDO operations;
-build with `--no-default-features` for a no-touch build (the automated test
+build with `--features no-touch` for a no-touch build (the automated test
 suites need it). Full walkthrough: [docs/quickstart.md](docs/quickstart.md).
 On Linux, the CCID half needs a little host setup: [docs/linux.md](docs/linux.md).
 

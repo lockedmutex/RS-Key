@@ -6,7 +6,7 @@ at runtime (except where noted for the phy record).
 
 ```sh
 # the general shape
-nix develop -c env KNOB=value cargo build --release -p firmware [--features ...] [--no-default-features]
+nix develop -c env KNOB=value cargo build --release -p firmware [--features ...]
 picotool uf2 convert target/thumbv8m.main-none-eabihf/release/firmware -t elf firmware.uf2
 ```
 
@@ -26,9 +26,10 @@ flowchart TD
 
 | Feature | Default | Effect |
 |---|---|---|
-| `up-button` | **on** | FIDO operations (makeCredential, getAssertion, U2F, reset, selection) and OpenPGP UIF data objects require a press of the BOOTSEL button. Build with `--no-default-features` to get the **no-touch test build** — the automated suites (`tests/`, python-fido2, OpenPGP card tests) cannot press a button and will hang on a touch build. |
+| `no-touch` | off | Auto-confirm user presence — FIDO operations (makeCredential, getAssertion, U2F, reset, selection) and OpenPGP UIF data objects no longer require a press of the BOOTSEL button. **Requiring a touch is the default and is not a feature**; `--features no-touch` is the explicit escape hatch for the automated suites (`tests/`, python-fido2, OpenPGP card tests), which cannot press a button and would hang on the (default) touch build. **Never ship a no-touch build.** |
 | `advertise-pqc` | off | Prepends ML-DSA-44 (COSE −48) to the getInfo `algorithms` list. Off by default because released Firefox versions abort the *entire* getInfo parse on an unknown COSE id and report the authenticator broken. **PQC capability is on regardless of this flag** — makeCredential negotiates −48 from the request's `pubKeyCredParams`; the flag only controls advertising. |
 | `fips-profile` | off | Bakes a locked FIPS-style policy into the image: ES256K (secp256k1) leaves the FIDO menu, the minimum PIN rises to 6, the vendor seed *export* is refused, and PIV refuses new 3DES management keys and RSA-1024. The default build is unchanged; with secure boot the policy is sealed by your signature. A profile, **not** a FIPS validation — details and rationale: [guides/fips.md](guides/fips.md). |
+| `strict-up` | off | Require a touch on **every** `getAssertion`. By default RS-Key honors the platform's silent pre-flight probe (`up:false`): it returns the discovery assertion with no touch and the UP flag clear, so a WebAuthn login with an `allowCredentials` (non-resident) credential is a **single** touch — matching the CTAP2 spec and YubiKey. With `strict-up` the button is polled even for that probe, so such a login asks for **two** touches (one for the probe, one for the real assertion). A deliberately stricter "every assertion needs an explicit gesture" stance for those who want it; it is **not** spec-conformant for `up:false`. Resident-credential / passkey logins are a single touch either way. `fido-conformance` enables this implicitly (the conformance pass was validated with it). |
 
 ## Environment variables
 
@@ -74,7 +75,7 @@ cargo build --release -p firmware
 env VIDPID=Yubikey5 cargo build --release -p firmware
 
 # no-touch test build (for the automated suites)
-cargo build --release -p firmware --no-default-features
+cargo build --release -p firmware --features no-touch
 
 # Nitrokey FIDO2 identity with its own version number
 env VIDPID=NitroFIDO2 FW_VERSION=1.4.0 cargo build --release -p firmware
@@ -114,7 +115,7 @@ check the seal with `picotool`. The flavors mirror the
 | Attribute | Image |
 |---|---|
 | `.#firmware` (default) | touch build, RS-Key identity (`0x1209:0x0001`), fw 5.7.4 |
-| `.#firmware-no-touch` | `--no-default-features` (the test build) |
+| `.#firmware-no-touch` | `--features no-touch` (the test build) |
 | `.#firmware-fips` | `--features fips-profile` |
 | `.#firmware-pqc` | `--features advertise-pqc` |
 

@@ -50,10 +50,10 @@ A few honest details:
 - **No dedicated error color.** The firmware does not light a distinct "error"
   state; a failed operation just drops back to idle. Read the host tool's exit
   code, not the LED, for success or failure.
-- **The touch state needs the touch build.** It is only ever shown on a build
-  with the `up-button` feature (the default touch build). A no-touch build
-  never enters it. The processing state still flashes during the operation
-  either way ([build.md](../build.md)).
+- **The touch state needs the touch build.** It is only ever shown on the
+  default touch build; a no-touch build (`--features no-touch`) never enters it.
+  The processing state still flashes during the operation either way
+  ([build.md](../build.md)).
 - **Default brightness is gentle** — 16 of 255 per channel, so the indicator
   is visible without being a flashlight. Turn it up if you want.
 - **Boot is brief.** You normally see it only for the moment between power-up

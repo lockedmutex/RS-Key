@@ -8,7 +8,7 @@ which builds every artifact reproducibly, hashes it, and signs the manifest.
 ## What a release contains
 
 - **Eight firmware images** — `rs-key-<tag>-<flavor>.uf2`, the cross product of
-  the build flags (`up-button` × `advertise-pqc` × `fips-profile`):
+  the build flags (`no-touch` × `advertise-pqc` × `fips-profile`):
 
   | flavor | flags | use |
   |---|---|---|

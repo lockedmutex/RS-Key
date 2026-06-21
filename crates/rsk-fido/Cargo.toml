@@ -45,7 +45,17 @@ fips-profile = []
 # Windows WebAuthn API drops unadvertised algorithms, breaking `ed25519-sk`. The
 # EdDSA capability itself is unchanged; only the advertisement is suppressed. Pair
 # with `metadata/rs-key.conformance.metadata.json`. Conformance ONLY — never ship.
-fido-conformance = []
+# Implies `strict-up`: the conformance pass was validated with a touch on every
+# assertion, so the conformance image keeps that exact behavior.
+fido-conformance = ["strict-up"]
+# Require user presence on EVERY getAssertion, OFF by default. The default build
+# honors `up:false` — the platform's silent pre-flight probe returns with no
+# touch and the UP flag clear, so a WebAuthn login (allowList credential) is a
+# SINGLE touch, matching the spec and YubiKey. With `strict-up` the button is
+# polled on every assertion including that probe, so such a login asks for TWO
+# touches (one for the probe, one for the real assertion) — a deliberately
+# stricter "every assertion needs an explicit gesture" stance. See docs/build.md.
+strict-up = []
 # Add the FIDO Conformance Tool's fixed enterprise-attestation test RPID
 # (enterprisetest.certinfra.fidoalliance.org) to the vendor-facilitated (type 1)
 # EA eligibility list, so the tool's Enterprise-Attestation type-1 case can run.

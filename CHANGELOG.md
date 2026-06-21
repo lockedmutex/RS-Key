@@ -13,6 +13,32 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+## [0.2.8] — 2026-06-21
+
+### Changed
+
+- **A WebAuthn login is a single touch by default.** RS-Key now honors the
+  platform's silent pre-flight probe — a `getAssertion` with the `up` option set
+  to `false` — by returning the credential-discovery assertion **without**
+  polling the button and with the UP flag clear, as the CTAP2 spec and YubiKey
+  do. Previously the `up` option was ignored and every assertion polled the
+  button, so an `allowCredentials` (non-resident) login — the common security-key
+  second-factor flow — cost **two** touches: one for the browser's silent
+  pre-flight, one for the real assertion. Resident-credential / passkey logins
+  were, and remain, a single touch. A new `strict-up` cargo feature (off by
+  default) restores the touch-on-every-assertion behavior for anyone who wants an
+  explicit gesture per assertion; `fido-conformance` enables it implicitly so the
+  conformance image keeps its validated behavior. See
+  [build.md](https://github.com/TheMaxMur/RS-Key/blob/main/docs/build.md).
+  bcdDevice 0x077F → 0x0780.
+- **Requiring a touch is the unconditional default, not a cargo feature.** The
+  `up-button` feature (which was on by default) is gone — the shipped image
+  demands a BOOTSEL touch for FIDO / OpenPGP-UIF operations with no flag. The
+  no-touch test image, for the automated suites that cannot press a button, is
+  now the explicit opt-in **`--features no-touch`** (previously
+  `--no-default-features`). The secure default no longer depends on a feature
+  being left enabled; the default firmware binary is unchanged.
+
 ## [0.2.7] — 2026-06-21
 
 ### Security
