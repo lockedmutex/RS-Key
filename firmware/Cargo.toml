@@ -60,13 +60,13 @@ embassy-embedded-hal = { workspace = true }
 embedded-storage-async = "0.4"
 
 [features]
-# Physical BOOTSEL touch for user presence:
-# ON BY DEFAULT — the shipped firmware requires a touch for makeCredential /
-# getAssertion / selection / reset / U2F and the OpenPGP UIF DOs. The automated test
-# suites (python-fido2, Gnuk, the raw m* tools) can't press the button, so build
-# those WITHOUT presence: `cargo build --release -p firmware --no-default-features`.
-default = ["up-button"]
-up-button = []
+# Physical BOOTSEL touch for user presence is REQUIRED BY DEFAULT and is NOT a
+# feature: the shipped firmware demands a touch for makeCredential / getAssertion
+# / selection / reset / U2F and the OpenPGP UIF DOs with no flag needed. The
+# automated test suites (python-fido2, Gnuk, the raw m* tools) can't press the
+# button, so build the no-touch test image with `--features no-touch`, which
+# auto-confirms presence. Never ship a no-touch build.
+no-touch = []
 # Advertise ML-DSA-44 in getInfo `algorithms` — OFF by default because shipped
 # Firefoxes reject the whole getInfo on an unknown COSE id (see rsk-fido). The
 # PQC capability works either way; this only changes the advertisement:

@@ -47,7 +47,7 @@ pub const NUM_LEDS: usize = 1;
 pub const STATUS_IDLE: u8 = 0;
 pub const STATUS_PROCESSING: u8 = 1;
 /// Only set from the (gated) touch-wait path.
-#[cfg_attr(not(feature = "up-button"), allow(dead_code))]
+#[cfg_attr(feature = "no-touch", allow(dead_code))]
 pub const STATUS_TOUCH: u8 = 2;
 pub const STATUS_BOOT: u8 = 3;
 const N_STATUS: usize = 4;
@@ -107,7 +107,7 @@ pub fn set_status(idx: u8) {
 }
 
 /// The active status index — saved/restored around a touch wait by `presence`.
-#[cfg_attr(not(feature = "up-button"), allow(dead_code))]
+#[cfg_attr(feature = "no-touch", allow(dead_code))]
 pub fn status() -> u8 {
     LED_STATUS.load(Ordering::Relaxed)
 }

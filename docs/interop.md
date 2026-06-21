@@ -72,7 +72,7 @@ re-verified end-to-end. See
 
 The CLI suites cannot press the BOOTSEL button, so anything touch-gated either
 needs the **no-touch test build** (`cargo build -p firmware
---no-default-features`, see [build.md](build.md)) or a human. The matrix splits
+--features no-touch`, see [build.md](build.md)) or a human. The matrix splits
 accordingly:
 
 - **CLI sweep** — run on the **no-touch** build; fully automatable

@@ -194,7 +194,7 @@ nix develop -c python tests/80_piv.py
 nix develop -c python tests/75_seed_backup.py --pin <your PIN>
 ```
 
-- Most need the **no-touch build** (`--no-default-features`) — they cannot
+- Most need the **no-touch build** (`--features no-touch`) — they cannot
   press the button. If the board runs secure boot, sign the test build too.
 - Numbering: `0x` transport smoke, `1x` FIDO basics, `2x` FIDO full,
   `3x/4x/5x` OpenPGP, `6x` PQC, `7x` management/OATH/OTP/backup/lock,

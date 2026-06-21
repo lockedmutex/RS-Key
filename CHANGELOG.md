@@ -29,6 +29,13 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   conformance image keeps its validated behavior. See
   [build.md](https://github.com/TheMaxMur/RS-Key/blob/main/docs/build.md).
   bcdDevice 0x077F → 0x0780.
+- **Requiring a touch is the unconditional default, not a cargo feature.** The
+  `up-button` feature (which was on by default) is gone — the shipped image
+  demands a BOOTSEL touch for FIDO / OpenPGP-UIF operations with no flag. The
+  no-touch test image, for the automated suites that cannot press a button, is
+  now the explicit opt-in **`--features no-touch`** (previously
+  `--no-default-features`). The secure default no longer depends on a feature
+  being left enabled; the default firmware binary is unchanged.
 
 ## [0.2.7] — 2026-06-21
 

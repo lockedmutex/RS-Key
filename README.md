@@ -110,7 +110,7 @@ cp firmware.uf2 /Volumes/RP2350/  # macOS; on Linux, the mounted RP2350 mass-sto
 
 Re-plug the board and it enumerates as a composite USB authenticator. The default
 build requires a **physical touch** (the BOOTSEL button) for FIDO operations;
-build with `--no-default-features` for a no-touch build (the automated test
+build with `--features no-touch` for a no-touch build (the automated test
 suites need it). Full walkthrough: [docs/quickstart.md](docs/quickstart.md).
 On Linux, the CCID half needs a little host setup: [docs/linux.md](docs/linux.md).
 

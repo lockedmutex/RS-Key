@@ -4,17 +4,18 @@
 //! Physical user presence over the BOOTSEL button, sampled via the
 //! QSPI-CS-to-Hi-Z trick in a RAM function. The wait blocks the worker while the
 //! high-priority transports stream keepalives reporting `UPNEEDED` ([`up_pending`]).
-//! One [`BootselPresence`] serves every applet's `UserPresence` trait; without the
-//! `up-button` feature `request` confirms instantly (for the automated suites).
+//! One [`BootselPresence`] serves every applet's `UserPresence` trait; a touch is
+//! required by default, and the opt-in `no-touch` feature makes `request` confirm
+//! instantly (for the automated suites, which cannot press a button).
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use embassy_rp::Peri;
 use embassy_rp::peripherals::BOOTSEL;
 
-#[cfg(feature = "up-button")]
+#[cfg(not(feature = "no-touch"))]
 use embassy_rp::bootsel::is_bootsel_pressed;
-#[cfg(feature = "up-button")]
+#[cfg(not(feature = "no-touch"))]
 use embassy_time::{Duration, Instant, block_for};
 
 /// Set while the worker is blocked in a button wait — read by the CTAPHID keepalive
@@ -29,7 +30,7 @@ static UP_PENDING: AtomicBool = AtomicBool::new(false);
 static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// The CTAPHID keepalive hook passed to `CtapHid::new`: is a touch being awaited?
-/// Always `false` when built without `up-button`, so the status stays `PROCESSING`.
+/// Always `false` on the `no-touch` build, so the status stays `PROCESSING`.
 pub fn up_pending() -> bool {
     UP_PENDING.load(Ordering::Relaxed)
 }
@@ -44,15 +45,15 @@ pub fn request_cancel() {
 // Poll cadence and the press timeout. `block_for` keeps interrupts enabled, so the
 // high-priority executor (USB + keepalives) runs between polls; only the ~4000-cycle
 // `is_bootsel_pressed` read briefly masks interrupts.
-#[cfg(feature = "up-button")]
+#[cfg(not(feature = "no-touch"))]
 const POLL_MS: u64 = 16;
-#[cfg(feature = "up-button")]
+#[cfg(not(feature = "no-touch"))]
 const TIMEOUT_MS: u64 = 30_000;
 
 /// Neutral wait result, mapped to each applet's own `Presence` enum. The button
 /// has no "declined" gesture; `Cancelled` comes from a `CTAPHID_CANCEL` (FIDO
 /// only) observed via [`CANCEL_REQUESTED`].
-#[cfg(feature = "up-button")]
+#[cfg(not(feature = "no-touch"))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Outcome {
     Confirmed,
@@ -62,7 +63,7 @@ enum Outcome {
 
 /// User presence via the BOOTSEL button.
 pub struct BootselPresence {
-    #[cfg_attr(not(feature = "up-button"), allow(dead_code))]
+    #[cfg_attr(feature = "no-touch", allow(dead_code))]
     bootsel: Peri<'static, BOOTSEL>,
 }
 
@@ -72,20 +73,20 @@ impl BootselPresence {
     }
 
     /// One non-blocking sample of the BOOTSEL level, for the typed-ticket button
-    /// watcher. Gated by `up-button`: the no-touch test build never sees a press
-    /// and does no QSPI-CS polling.
+    /// watcher. On the `no-touch` build it never samples — the test build sees no
+    /// press and does no QSPI-CS polling.
     pub fn poll_pressed(&mut self) -> bool {
-        #[cfg(feature = "up-button")]
+        #[cfg(not(feature = "no-touch"))]
         {
             is_bootsel_pressed(self.bootsel.reborrow())
         }
-        #[cfg(not(feature = "up-button"))]
+        #[cfg(feature = "no-touch")]
         {
             false
         }
     }
 
-    #[cfg(feature = "up-button")]
+    #[cfg(not(feature = "no-touch"))]
     fn wait(&mut self) -> Outcome {
         // Save the LED status, show the touch status for the wait, restore after.
         let saved = crate::led::status();
@@ -131,7 +132,7 @@ impl BootselPresence {
 
 impl rsk_fido::UserPresence for BootselPresence {
     fn request(&mut self) -> rsk_fido::Presence {
-        #[cfg(feature = "up-button")]
+        #[cfg(not(feature = "no-touch"))]
         {
             match self.wait() {
                 Outcome::Confirmed => rsk_fido::Presence::Confirmed,
@@ -139,7 +140,7 @@ impl rsk_fido::UserPresence for BootselPresence {
                 Outcome::Cancelled => rsk_fido::Presence::Cancelled,
             }
         }
-        #[cfg(not(feature = "up-button"))]
+        #[cfg(feature = "no-touch")]
         {
             rsk_fido::Presence::Confirmed
         }
@@ -148,7 +149,7 @@ impl rsk_fido::UserPresence for BootselPresence {
 
 impl rsk_openpgp::UserPresence for BootselPresence {
     fn request(&mut self) -> rsk_openpgp::Presence {
-        #[cfg(feature = "up-button")]
+        #[cfg(not(feature = "no-touch"))]
         {
             match self.wait() {
                 Outcome::Confirmed => rsk_openpgp::Presence::Confirmed,
@@ -157,7 +158,7 @@ impl rsk_openpgp::UserPresence for BootselPresence {
                 Outcome::Timeout | Outcome::Cancelled => rsk_openpgp::Presence::Timeout,
             }
         }
-        #[cfg(not(feature = "up-button"))]
+        #[cfg(feature = "no-touch")]
         {
             rsk_openpgp::Presence::Confirmed
         }
@@ -166,7 +167,7 @@ impl rsk_openpgp::UserPresence for BootselPresence {
 
 impl rsk_otp::UserPresence for BootselPresence {
     fn request(&mut self) -> rsk_otp::Presence {
-        #[cfg(feature = "up-button")]
+        #[cfg(not(feature = "no-touch"))]
         {
             match self.wait() {
                 Outcome::Confirmed => rsk_otp::Presence::Confirmed,
@@ -174,7 +175,7 @@ impl rsk_otp::UserPresence for BootselPresence {
                 Outcome::Timeout | Outcome::Cancelled => rsk_otp::Presence::Timeout,
             }
         }
-        #[cfg(not(feature = "up-button"))]
+        #[cfg(feature = "no-touch")]
         {
             rsk_otp::Presence::Confirmed
         }
@@ -183,7 +184,7 @@ impl rsk_otp::UserPresence for BootselPresence {
 
 impl rsk_oath::UserPresence for BootselPresence {
     fn request(&mut self) -> rsk_oath::Presence {
-        #[cfg(feature = "up-button")]
+        #[cfg(not(feature = "no-touch"))]
         {
             match self.wait() {
                 Outcome::Confirmed => rsk_oath::Presence::Confirmed,
@@ -191,7 +192,7 @@ impl rsk_oath::UserPresence for BootselPresence {
                 Outcome::Timeout | Outcome::Cancelled => rsk_oath::Presence::Timeout,
             }
         }
-        #[cfg(not(feature = "up-button"))]
+        #[cfg(feature = "no-touch")]
         {
             rsk_oath::Presence::Confirmed
         }

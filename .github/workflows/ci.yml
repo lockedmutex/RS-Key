@@ -5,7 +5,7 @@
 #   check   — the merge gate, the same single source of truth as local work:
 #             `nix develop -c ./scripts/check.sh` (docs/testing.md, "CI parity").
 #             Green locally means green here; no CI-only logic to drift.
-#   flavors — every feature combination of the firmware (up-button ×
+#   flavors — every feature combination of the firmware (no-touch ×
 #             advertise-pqc × fips-profile), each packaged as a downloadable
 #             firmware-<flavor>.uf2 artifact.
 #   knobs   — build smokes for the compile-time env knobs (docs/build.md):
@@ -72,13 +72,13 @@ jobs:
           - name: fips-pqc
             args: "--features fips-profile,advertise-pqc"
           - name: no-touch
-            args: "--no-default-features"
+            args: "--features no-touch"
           - name: no-touch-pqc
-            args: "--no-default-features --features advertise-pqc"
+            args: "--features no-touch,advertise-pqc"
           - name: no-touch-fips
-            args: "--no-default-features --features fips-profile"
+            args: "--features no-touch,fips-profile"
           - name: no-touch-fips-pqc
-            args: "--no-default-features --features fips-profile,advertise-pqc"
+            args: "--features no-touch,fips-profile,advertise-pqc"
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
