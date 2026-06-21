@@ -94,10 +94,16 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 
 #[test]
 fn churn_lap_physically_scrubs_superseded_secret() {
+    // Last arg = MockFlash's source-pointer `alignment_check`. It is OFF here: the
+    // stack `[u8; N]` buffers are align-1 and happen to land 4-aligned on a real
+    // machine but not under miri (which runs this test in deep-checks), and the
+    // RP2350 QSPI write does not require source alignment anyway. This test proves
+    // the scrub, not flash alignment strictness — which the libfuzzer flash
+    // targets (kv_durability / power_cut) already exercise with the check ON.
     let flash = Rc::new(RefCell::new(Mock::new(
         WriteCountCheck::Disabled,
         None,
-        true,
+        false,
     )));
     let mut map = Store::new(
         SharedMock(flash.clone()),
