@@ -88,8 +88,8 @@ fn main() {
     // Maximum number of addressable LEDs the binary can drive. The PIO state
     // machine and frame buffers are sized to this ceiling; the actual number
     // of connected LEDs is set at **runtime** via the phy record (`rsk hw
-    // --led-num`), which must be ≤ MAX_LEDS. Default 8 covers the common
-    // 1-8 range; boards with more (up to 64) override via `MAX_LEDS=<n>`.
+    // --led-num`), which must be ≤ MAX_LEDS. Default 1 (a single onboard
+    // LED); a board with a chain of N addressable LEDs builds `MAX_LEDS=N` (≤64).
     let max_leds = resolve_max_leds();
     println!("cargo:rustc-env=PK_MAX_LEDS={max_leds}");
     println!("cargo:rerun-if-env-changed=MAX_LEDS");
@@ -205,10 +205,10 @@ fn resolve_led_kind() -> String {
 }
 
 /// Resolve `MAX_LEDS` (the PIO/array ceiling for addressable LEDs) to a
-/// positive integer; defaults to 8. The runtime count (`rsk hw --led-num`)
-/// must be ≤ this value.
+/// positive integer; defaults to 1 (a single onboard LED). The runtime count
+/// (`rsk hw --led-num`) must be ≤ this value.
 fn resolve_max_leds() -> u32 {
-    let raw = env::var("MAX_LEDS").unwrap_or_else(|_| "8".into());
+    let raw = env::var("MAX_LEDS").unwrap_or_else(|_| "1".into());
     let v = raw
         .trim()
         .parse::<u32>()

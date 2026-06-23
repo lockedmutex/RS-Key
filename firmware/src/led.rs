@@ -39,7 +39,7 @@ use embassy_rp::gpio::{Level, Output};
 use embassy_rp::pwm::{Config as PwmConfig, Pwm};
 
 /// Maximum number of addressable LEDs the PIO buffer and frame arrays are
-/// sized to. Baked at compile time via the `MAX_LEDS` build flag (default 8);
+/// sized to. Baked at compile time via the `MAX_LEDS` build flag (default 1);
 /// the actual connected count is set at runtime via `rsk hw --led-num` and
 /// must be ≤ this value.
 #[cfg(not(led_kind = "none"))]

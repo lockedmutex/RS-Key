@@ -22,13 +22,14 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   --effect/--speed`. The number of connected LEDs is a **runtime** setting in the
   phy record (`rsk hw --led-num <n>`, new PicoForge-compatible TLV tag `0x0E`),
   bounded by a compile-time `MAX_LEDS` buffer ceiling (`MAX_LEDS` build flag,
-  default 8). A phy count above that ceiling is **saturated, not asserted**, so a
+  default 1 — a single onboard LED; a chain sets `MAX_LEDS=N`). A phy count above
+  that ceiling is **saturated, not asserted**, so a
   stray value can never panic the boot path (the phy record survives factory
   resets, so a boot panic there would be an unrecoverable loop). `EF_LED_CONF`
   grows to 17 bytes — `steady, (effect, color, brightness, speed) × 4` — and
   older 13/9/2-byte blocks still load forward-compatibly. Single-LED boards are
   unaffected (effects reduce to a static color or the legacy blink). Thanks to
-  @Curious-r for the contribution. bcdDevice 0x0780 → 0x0782.
+  @Curious-r for the contribution. bcdDevice 0x0780 → 0x0783.
 
 ## [0.2.8] — 2026-06-21
 
