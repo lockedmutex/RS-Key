@@ -59,7 +59,7 @@ def register(sub):
         "--led-num",
         type=int,
         metavar="1-255",
-        help="number of addressable LEDs connected (runtime, overrides MAX_LEDS)",
+        help="number of addressable LEDs connected at runtime (firmware caps it at the build's MAX_LEDS)",
     )
     p.add_argument(
         "--get", action="store_true", help="read the current phy LED config and exit"

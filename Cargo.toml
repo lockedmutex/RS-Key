@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["firmware", "rsk-wipe", "crates/rsk-sdk", "crates/rsk-fs", "crates/rsk-usb", "crates/rsk-crypto", "crates/rsk-fido", "crates/rsk-openpgp", "crates/rsk-rsa-asm", "crates/rsk-mgmt", "crates/rsk-oath", "crates/rsk-otp", "crates/rsk-piv", "crates/rsk-rescue"]
+members = ["firmware", "rsk-wipe", "crates/rsk-sdk", "crates/rsk-fs", "crates/rsk-usb", "crates/rsk-crypto", "crates/rsk-fido", "crates/rsk-openpgp", "crates/rsk-rsa-asm", "crates/rsk-mgmt", "crates/rsk-oath", "crates/rsk-otp", "crates/rsk-piv", "crates/rsk-rescue", "crates/rsk-led"]
 
 # Embassy crates are versioned together; pin them all to the same git source so
 # they stay mutually compatible. We track `branch = "main"`, not a crates.io
@@ -34,6 +34,7 @@ rsk-oath = { path = "crates/rsk-oath" }
 rsk-otp = { path = "crates/rsk-otp" }
 rsk-piv = { path = "crates/rsk-piv" }
 rsk-rescue = { path = "crates/rsk-rescue" }
+rsk-led = { path = "crates/rsk-led" }
 minicbor = { version = "2.2", default-features = false }
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic", "ecdh"] }
 # Additional FIDO2 signing curves; same 0.13 RustCrypto ecosystem as p256.

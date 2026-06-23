@@ -29,6 +29,7 @@ rsk-oath = { workspace = true }
 rsk-otp = { workspace = true }
 rsk-piv = { workspace = true }
 rsk-rescue = { workspace = true }
+rsk-led = { workspace = true }
 rp-pac = { workspace = true }
 rsk-crypto = { workspace = true }
 # core1's prime search owns an IncrementalSieve per core, and the keygen-bench

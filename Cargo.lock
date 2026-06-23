@@ -1021,6 +1021,7 @@ dependencies = [
  "rsk-crypto",
  "rsk-fido",
  "rsk-fs",
+ "rsk-led",
  "rsk-mgmt",
  "rsk-oath",
  "rsk-openpgp",
@@ -2032,6 +2033,10 @@ dependencies = [
  "heapless 0.8.0",
  "rsk-sdk",
 ]
+
+[[package]]
+name = "rsk-led"
+version = "0.1.0"
 
 [[package]]
 name = "rsk-mgmt"

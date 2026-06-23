@@ -96,12 +96,14 @@ impl<S: Storage> Applet<Fs<S>> for VendorApplet {
                 let status = (apdu.p2 >> 4) & 0x3;
                 crate::led::set_status_config(status, apdu.p2 & 0x7, apdu.p1);
                 crate::led::set_steady(apdu.p2 & P2_STEADY != 0);
+                // Optional data bytes: data[0] = effect, data[1] = speed. They
+                // are independent, so an effect-only update (one data byte)
+                // keeps the status's current speed rather than resetting it.
                 if apdu.nc >= 1 {
-                    crate::led::set_status_effect(
-                        status,
-                        apdu.data[0],
-                        apdu.data.get(1).copied().unwrap_or(0),
-                    );
+                    crate::led::set_status_effect(status, apdu.data[0]);
+                }
+                if apdu.nc >= 2 {
+                    crate::led::set_status_speed(status, apdu.data[1]);
                 }
                 if fs.put(EF_LED_CONF, &crate::led::config_block()).is_err() {
                     return Sw::MEMORY_FAILURE;
