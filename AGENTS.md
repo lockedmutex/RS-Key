@@ -116,6 +116,15 @@ flash layout, and device identity.
   the upgrade — say how, and load older record layouts forward-compatibly.
 - **User-visible behaviour** → the matching `docs/guides/*.md` and a CHANGELOG
   `[Unreleased]` entry.
+- **A `tools/rsk` (Python CLI) or `tools/tui` (Rust TUI) change** → bump that
+  package's version (`tools/rsk/__init__.py` `__version__` /
+  `tools/tui/Cargo.toml` `version`). It's the host-tool analog of the bcdDevice
+  bump: `pipx` / `pip` / a published `uvx` install key off the version, so an
+  unbumped change leaves those users on a **stale build** (e.g. an old `rsk led`
+  silently mis-parsing a new device's config). For local dev, run current source
+  with `uv run --project tools rsk …` (or `nix develop` → `rsk`) — NOT
+  `uvx --from tools/`, which caches the built env regardless of the version
+  (`uv cache clean` busts it if you must).
 - **A new `unsafe` site** → [docs/unsafe.md](docs/unsafe.md).
 - **Anything protocol-visible** → a test at the level it's visible: a host test
   if the logic is host-testable, a `tests/*.py` script if only the USB stack

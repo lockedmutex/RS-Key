@@ -106,7 +106,14 @@ Any change to device behavior bumps `config.device_release` in
 `firmware/src/main.rs` by one (hex). It's the build counter: `rsk inventory
 list` reports it, fleet records key on it, and "which build is this key
 actually running" stops being archaeology. Host-only changes (CLI, docs, CI)
-don't bump it.
+don't bump it — but a user-facing change to `tools/rsk` (the Python CLI) or
+`tools/tui` (the Rust TUI) **does** bump that package's own version
+(`tools/rsk/__init__.py`'s `__version__` / `tools/tui/Cargo.toml`'s `version`):
+`pipx` / `pip` / a published `uvx` install key off it, so an unbumped tool change
+leaves those users on a stale build — e.g. an old `rsk led` silently mis-parsing
+a new device's config block. (For local dev, run current source with `uv run
+--project tools rsk …` or `nix develop` → `rsk`; `uvx --from tools/` caches the
+built env regardless of version — `uv cache clean` busts it.)
 
 Don't confuse it with the **anti-rollback epoch** — a separate, much coarser
 number that is *not* in `main.rs`. The epoch is a `picotool seal --rollback N`
