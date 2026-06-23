@@ -344,7 +344,7 @@ fn enforce_pin<S: Storage, R: Rng>(
         // Zero-length probe: a selection gesture — wait for a touch, then report
         // the PIN state. With no button configured this confirms instantly.
         Some(&[]) => {
-            ctx.require_presence()?;
+            ctx.require_presence(crate::Confirm::titled("Use this key?"))?;
             Err(if pin_set {
                 CtapError::PinAuthInvalid
             } else {
@@ -451,7 +451,12 @@ fn make_credential_inner<S: Storage, R: Rng>(
     // pinUvAuthParam probe already took its own touch in `enforce_pin` and
     // returned early, so it never reaches here. No button → instant. A
     // CTAPHID_CANCEL during the wait surfaces as KEEPALIVE_CANCEL.
-    ctx.require_presence()?;
+    // The trusted screen (display build) names the relying party being registered.
+    ctx.require_presence(crate::Confirm::new(
+        "Register key?",
+        req.rp_id.as_bytes(),
+        req.user_name.as_bytes(),
+    ))?;
 
     // authData = rpIdHash | flags | counter | aaguid | credIdLen | credId | COSEpubkey | ext
     // Sized for the ML-DSA-44 worst case: 55 header + a non-resident box (≤640)
@@ -831,7 +836,7 @@ mod tests {
     // A presence that never confirms — a button left untouched.
     struct Decline;
     impl crate::UserPresence for Decline {
-        fn request(&mut self) -> crate::Presence {
+        fn request(&mut self, _confirm: crate::Confirm<'_>) -> crate::Presence {
             crate::Presence::Timeout
         }
     }
@@ -991,7 +996,7 @@ mod tests {
         // answer CTAP2_ERR_KEEPALIVE_CANCEL (conformance HID-1 P-10).
         struct Cancel;
         impl crate::UserPresence for Cancel {
-            fn request(&mut self) -> crate::Presence {
+            fn request(&mut self, _confirm: crate::Confirm<'_>) -> crate::Presence {
                 crate::Presence::Cancelled
             }
         }

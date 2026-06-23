@@ -31,6 +31,7 @@ use core::cell::RefCell;
 
 use rsk_crypto::Device;
 use rsk_fs::{Fs, KeyFid, Storage};
+pub use rsk_sdk::Confirm;
 use rsk_sdk::{Apdu, Applet, ResBuf, Sw};
 
 pub use init::{Error, scan_files};
@@ -55,7 +56,9 @@ pub enum Presence {
 /// [`AlwaysConfirm`] (which tests use). Shared with the FIDO applet — the firmware
 /// type implements both `rsk_fido::UserPresence` and this.
 pub trait UserPresence {
-    fn request(&mut self) -> Presence;
+    /// Ask for presence. `confirm` names the pending operation for a trusted
+    /// on-screen Approve/Deny prompt; the BOOTSEL-button backend ignores it.
+    fn request(&mut self, confirm: Confirm<'_>) -> Presence;
 }
 
 /// A [`UserPresence`] that confirms instantly — the no-button default and the
@@ -63,7 +66,7 @@ pub trait UserPresence {
 pub struct AlwaysConfirm;
 
 impl UserPresence for AlwaysConfirm {
-    fn request(&mut self) -> Presence {
+    fn request(&mut self, _confirm: Confirm<'_>) -> Presence {
         Presence::Confirmed
     }
 }
@@ -78,8 +81,18 @@ pub(crate) fn check_uif<S: Storage>(
 ) -> Result<(), Sw> {
     let mut buf = [0u8; 2];
     let on = matches!(fs.read(fid, &mut buf), Some(n) if n >= 1 && buf[0] > 0);
-    if on && presence.request() != Presence::Confirmed {
-        return Err(Sw::SECURE_MESSAGE_EXEC_ERROR);
+    if on {
+        // The trusted screen names which key operation the UIF is gating (the
+        // OpenPGP UIF DOs: 0xD6 signature, 0xD7 decryption, 0xD8 authentication).
+        let title = match fid {
+            0xD6 => "Sign data?",
+            0xD7 => "Decrypt data?",
+            0xD8 => "Authenticate?",
+            _ => "Confirm?",
+        };
+        if presence.request(Confirm::titled(title)) != Presence::Confirmed {
+            return Err(Sw::SECURE_MESSAGE_EXEC_ERROR);
+        }
     }
     Ok(())
 }
@@ -729,7 +742,7 @@ mod tests {
 
     struct Fixed(crate::Presence);
     impl crate::UserPresence for Fixed {
-        fn request(&mut self) -> crate::Presence {
+        fn request(&mut self, _confirm: crate::Confirm<'_>) -> crate::Presence {
             self.0
         }
     }

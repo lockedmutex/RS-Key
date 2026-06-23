@@ -12,7 +12,10 @@ use crate::{Ctx, Presence, Rng};
 
 /// `authenticatorSelection`: wait for a touch, then reply with only the status byte.
 pub fn selection<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>) -> CtapResult {
-    match ctx.presence.request() {
+    match ctx
+        .presence
+        .request(crate::Confirm::titled("Use this key?"))
+    {
         Presence::Confirmed => Ok(0),
         Presence::Timeout => Err(CtapError::UserActionTimeout),
         Presence::Declined => Err(CtapError::OperationDenied),
@@ -42,7 +45,7 @@ mod tests {
     /// A `UserPresence` returning a fixed outcome.
     struct Fixed(Presence);
     impl crate::UserPresence for Fixed {
-        fn request(&mut self) -> Presence {
+        fn request(&mut self, _confirm: crate::Confirm<'_>) -> Presence {
             self.0
         }
     }

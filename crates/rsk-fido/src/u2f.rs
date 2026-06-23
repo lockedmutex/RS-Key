@@ -53,7 +53,7 @@ fn cmd_register<S: Storage, R: Rng>(
         return (Sw::WRONG_LENGTH, 0);
     }
     // U2F register requires a physical touch; no button → instant.
-    if !ctx.check_user_presence() {
+    if !ctx.check_user_presence(crate::Confirm::titled("Register key?")) {
         return (Sw::CONDITIONS_NOT_SATISFIED, 0);
     }
     // U2F register request is challenge(32) ‖ application(32). The key handle
@@ -218,7 +218,7 @@ fn cmd_authenticate<S: Storage, R: Rng>(
 
     // Enforce-user-presence (P1=0x03) requires a touch, now that the handle is
     // known valid; don't-enforce (0x08) signs without one. No button → instant.
-    if apdu.p1 == U2F_AUTH_ENFORCE && !ctx.check_user_presence() {
+    if apdu.p1 == U2F_AUTH_ENFORCE && !ctx.check_user_presence(crate::Confirm::titled("Sign in?")) {
         scalar.zeroize();
         return (Sw::CONDITIONS_NOT_SATISFIED, 0);
     }
@@ -307,7 +307,7 @@ mod tests {
 
     struct Fixed(crate::Presence);
     impl crate::UserPresence for Fixed {
-        fn request(&mut self) -> crate::Presence {
+        fn request(&mut self, _confirm: crate::Confirm<'_>) -> crate::Presence {
             self.0
         }
     }
@@ -319,7 +319,7 @@ mod tests {
         calls: usize,
     }
     impl crate::UserPresence for CountingPresence {
-        fn request(&mut self) -> crate::Presence {
+        fn request(&mut self, _confirm: crate::Confirm<'_>) -> crate::Presence {
             self.calls += 1;
             self.verdict
         }

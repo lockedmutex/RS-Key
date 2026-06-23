@@ -65,56 +65,6 @@ impl Rect {
     }
 }
 
-/// The operation a confirmation prompt is gating — the *what am I approving* the
-/// BOOTSEL button could never convey. The firmware maps each applet call site
-/// (FIDO makeCredential/getAssertion/U2F, OpenPGP signing, …) to one of these so
-/// the screen can name the action in trusted, device-controlled text.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Operation {
-    /// FIDO2 `authenticatorMakeCredential` — registering a new credential.
-    MakeCredential,
-    /// FIDO2 `authenticatorGetAssertion` — signing in with an existing credential.
-    GetAssertion,
-    /// U2F/CTAP1 register.
-    U2fRegister,
-    /// U2F/CTAP1 authenticate.
-    U2fAuthenticate,
-    /// `authenticatorSelection` — the platform asking which key to use.
-    Selection,
-    /// `authenticatorReset` — wiping all credentials.
-    Reset,
-    /// OpenPGP signature (UIF-gated).
-    OpenPgpSign,
-    /// OpenPGP decryption (UIF-gated).
-    OpenPgpDecrypt,
-    /// OpenPGP authentication (UIF-gated).
-    OpenPgpAuthenticate,
-    /// Seed backup / restore over the vendor channel.
-    SeedBackup,
-    /// Any other presence-gated action with no richer context.
-    Generic,
-}
-
-impl Operation {
-    /// A short, fixed, device-controlled title for the prompt header. Never
-    /// relying-party text — that goes in the [`Label`]s, sanitized.
-    pub const fn title(self) -> &'static str {
-        match self {
-            Operation::MakeCredential => "Register key?",
-            Operation::GetAssertion => "Sign in?",
-            Operation::U2fRegister => "Register key?",
-            Operation::U2fAuthenticate => "Sign in?",
-            Operation::Selection => "Use this key?",
-            Operation::Reset => "Erase everything?",
-            Operation::OpenPgpSign => "Sign data?",
-            Operation::OpenPgpDecrypt => "Decrypt data?",
-            Operation::OpenPgpAuthenticate => "Authenticate?",
-            Operation::SeedBackup => "Export seed?",
-            Operation::Generic => "Confirm?",
-        }
-    }
-}
-
 /// Maximum sanitized label length (bytes == printable-ASCII chars) kept for a
 /// relying-party id or account name. Sized so the renderer can wrap it across at
 /// most a couple of lines on the 240px-wide panel; anything longer is truncated
@@ -183,7 +133,10 @@ impl Label {
 /// title plus up to two sanitized relying-party fields (e.g. rp id and account).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ConfirmPrompt {
-    pub operation: Operation,
+    /// Trusted, device-controlled prompt header (e.g. `"Sign in?"`), supplied by
+    /// the firmware applet via `rsk_sdk::Confirm`. Never relying-party text — that
+    /// goes in the sanitized [`Label`]s below.
+    pub title: &'static str,
     /// Primary subject — the relying-party id for FIDO, or a key label.
     pub primary: Label,
     /// Secondary subject — the account / user name, when the request carries one.
@@ -191,11 +144,11 @@ pub struct ConfirmPrompt {
 }
 
 impl ConfirmPrompt {
-    /// Build a prompt, sanitizing both untrusted fields. Pass empty slices for
-    /// fields the request doesn't carry.
-    pub fn new(operation: Operation, primary: &[u8], secondary: &[u8]) -> Self {
+    /// Build a prompt from a trusted title, sanitizing both untrusted fields. Pass
+    /// empty slices for fields the request doesn't carry.
+    pub fn new(title: &'static str, primary: &[u8], secondary: &[u8]) -> Self {
         Self {
-            operation,
+            title,
             primary: Label::clamp(primary),
             secondary: Label::clamp(secondary),
         }
@@ -209,19 +162,36 @@ pub enum Button {
     Deny,
 }
 
-/// Bottom band reserved for the Allow/Deny buttons; the prompt text fills the
-/// space above it. The two buttons split the band so a tap is unambiguous and the
-/// targets are large (≈120×80) — a security key must be hard to *mis*-tap.
-pub const BTN_BAND_TOP: u16 = PANEL_H - 80;
-/// Deny on the left (the safe default), Allow on the right.
-pub const DENY_RECT: Rect = Rect::new(0, BTN_BAND_TOP, PANEL_W / 2, PANEL_H - BTN_BAND_TOP);
-/// Allow on the right.
-pub const ALLOW_RECT: Rect = Rect::new(
-    PANEL_W / 2,
-    BTN_BAND_TOP,
-    PANEL_W / 2,
-    PANEL_H - BTN_BAND_TOP,
-);
+/// Floating-button geometry: the two large Allow/Deny targets sit inset from the
+/// panel edges with a gap between them, rather than filling the screen edge-to-
+/// edge. The dead space this leaves is deliberate security margin — a tap in a
+/// margin or in the centre gap selects *nothing* ([`hit_confirm`] returns `None`),
+/// so a careless edge tap can't approve. The buttons are still large (96×64) so a
+/// deliberate press is easy.
+pub const BTN_W: u16 = 96;
+/// Button height.
+pub const BTN_H: u16 = 64;
+/// Inset from the left/right panel edges.
+const BTN_SIDE: u16 = 16;
+/// Gap between the Deny and Allow buttons.
+const BTN_GAP: u16 = 16;
+/// Float above the bottom panel edge.
+const BTN_BOTTOM: u16 = 28;
+/// Top of the button row; the prompt text fills the space above it.
+pub const BTN_BAND_TOP: u16 = PANEL_H - BTN_H - BTN_BOTTOM;
+/// Deny on the left (the safe default), floating.
+pub const DENY_RECT: Rect = Rect::new(BTN_SIDE, BTN_BAND_TOP, BTN_W, BTN_H);
+/// Allow on the right, floating; a full [`BTN_GAP`] separates it from Deny.
+pub const ALLOW_RECT: Rect = Rect::new(BTN_SIDE + BTN_W + BTN_GAP, BTN_BAND_TOP, BTN_W, BTN_H);
+
+// Compile-time layout invariants (paint and hit-test share these rects): the two
+// floating buttons are disjoint with a real gap between them, and both sit fully
+// inside the panel below the prompt area. A bad edit to the geometry fails the build.
+const _: () = {
+    assert!(DENY_RECT.x + DENY_RECT.w < ALLOW_RECT.x);
+    assert!(DENY_RECT.x > 0 && ALLOW_RECT.x + ALLOW_RECT.w < PANEL_W);
+    assert!(DENY_RECT.y > BTN_BAND_TOP - 1 && ALLOW_RECT.y + ALLOW_RECT.h < PANEL_H);
+};
 
 /// Which button, if any, a tap at `p` selects on the confirm screen. A tap in the
 /// prompt area above the button band returns `None` (no accidental approval from a
@@ -357,38 +327,33 @@ mod tests {
 
     #[test]
     fn confirm_prompt_sanitizes_both_fields() {
-        let p = ConfirmPrompt::new(Operation::GetAssertion, b"login.example\x00", b"al\x1bice");
+        let p = ConfirmPrompt::new("Sign in?", b"login.example\x00", b"al\x1bice");
         assert_eq!(p.primary.as_str(), "login.example?");
         assert_eq!(p.secondary.as_str(), "al?ice");
-        assert_eq!(p.operation.title(), "Sign in?");
+        assert_eq!(p.title, "Sign in?");
     }
 
     #[test]
-    fn hit_allow_and_deny_regions() {
-        // Center of each button.
-        assert_eq!(
-            hit_confirm(Point::new(60, BTN_BAND_TOP + 40)),
-            Some(Button::Deny)
-        );
-        assert_eq!(
-            hit_confirm(Point::new(180, BTN_BAND_TOP + 40)),
-            Some(Button::Allow)
-        );
+    fn hit_centres_of_each_button() {
+        let deny_c = Point::new(DENY_RECT.x + BTN_W / 2, DENY_RECT.y + BTN_H / 2);
+        let allow_c = Point::new(ALLOW_RECT.x + BTN_W / 2, ALLOW_RECT.y + BTN_H / 2);
+        assert_eq!(hit_confirm(deny_c), Some(Button::Deny));
+        assert_eq!(hit_confirm(allow_c), Some(Button::Allow));
     }
 
     #[test]
-    fn hit_above_band_is_none() {
-        // A tap in the prompt area must not approve or deny anything.
-        assert_eq!(hit_confirm(Point::new(120, BTN_BAND_TOP - 1)), None);
+    fn taps_off_the_floating_buttons_select_nothing() {
+        let mid_h = BTN_BAND_TOP + BTN_H / 2;
+        // Above the button row (the prompt area).
+        assert_eq!(hit_confirm(Point::new(PANEL_W / 2, BTN_BAND_TOP - 1)), None);
         assert_eq!(hit_confirm(Point::new(0, 0)), None);
-    }
-
-    #[test]
-    fn allow_deny_rects_are_disjoint_and_cover_the_band() {
-        // Shared seam: x == PANEL_W/2 belongs to Allow (left-inclusive), not Deny.
-        let seam = Point::new(PANEL_W / 2, BTN_BAND_TOP + 1);
-        assert!(ALLOW_RECT.contains(seam));
-        assert!(!DENY_RECT.contains(seam));
+        // The centre gap between the two floating buttons.
+        assert_eq!(hit_confirm(Point::new(PANEL_W / 2, mid_h)), None);
+        // The left and right side margins, at button height.
+        assert_eq!(hit_confirm(Point::new(2, mid_h)), None);
+        assert_eq!(hit_confirm(Point::new(PANEL_W - 2, mid_h)), None);
+        // Below the floating buttons (the bottom margin).
+        assert_eq!(hit_confirm(Point::new(PANEL_W / 2, PANEL_H - 1)), None);
     }
 
     #[test]
@@ -398,24 +363,5 @@ mod tests {
         assert!(!r.contains(Point::new(40, 20))); // right exclusive (10+30)
         assert!(!r.contains(Point::new(10, 60))); // bottom exclusive (20+40)
         assert!(r.contains(Point::new(39, 59)));
-    }
-
-    #[test]
-    fn every_operation_has_a_title() {
-        for op in [
-            Operation::MakeCredential,
-            Operation::GetAssertion,
-            Operation::U2fRegister,
-            Operation::U2fAuthenticate,
-            Operation::Selection,
-            Operation::Reset,
-            Operation::OpenPgpSign,
-            Operation::OpenPgpDecrypt,
-            Operation::OpenPgpAuthenticate,
-            Operation::SeedBackup,
-            Operation::Generic,
-        ] {
-            assert!(!op.title().is_empty());
-        }
     }
 }

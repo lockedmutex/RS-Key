@@ -46,6 +46,24 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   `dep:`-gated and the gate asserts it is absent from the default firmware
   dependency tree, so there is no size cost; only the shared `bcdDevice` build
   counter advances. bcdDevice 0x0784 → 0x0785.
+- **Trusted-display variant — on-screen Approve/Deny (experimental, opt-in).** On
+  the `display` build the panel now gates user presence: when an applet asks for a
+  touch, the screen shows a trusted Approve/Deny prompt that names the operation
+  ("Sign in?", "Register key?", …) and, for FIDO make/getAssertion, the **real**
+  relying-party id and account. A tap on **Allow** confirms; a tap on **Deny** is a
+  genuine refusal (`CTAP2_ERR_OPERATION_DENIED`). This is the anti-phishing payoff:
+  even driven over WebUSB, a signature can't be produced without a physical tap on
+  a screen showing the true rp ("what you see is what you sign"). The Allow/Deny
+  buttons are rounded floating targets with muted (not vivid) colors, inset from
+  the edges with a centre gap — a tap in a margin or the gap approves nothing.
+  Relying-party text is sanitized to bounded printable ASCII before it can reach
+  the framebuffer (terminal-escape / homoglyph / overlong tricks can't survive).
+  The confirmation context is threaded through every applet's `UserPresence` via a
+  new dependency-free `rsk_sdk::Confirm`; the standard (button) key ignores it and
+  is byte-for-byte unchanged. CTAPHID_CANCEL and the configurable touch timeout are
+  honored during the wait, and USB keepalives keep flowing (the on-screen wait is a
+  busy-wait on the thread executor, preempted by USB on the interrupt executor).
+  bcdDevice 0x0785 → 0x0786.
 
 ### Changed
 

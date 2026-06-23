@@ -38,7 +38,7 @@ enum Dir {
 /// pass through.
 fn check_touch(policy: u8, presence: &mut dyn UserPresence) -> Result<(), Sw> {
     if matches!(policy, TOUCHPOLICY_ALWAYS | TOUCHPOLICY_CACHED) {
-        match presence.request() {
+        match presence.request(rsk_sdk::Confirm::titled("Use PIV key?")) {
             Presence::Confirmed => Ok(()),
             _ => Err(Sw::SECURITY_STATUS_NOT_SATISFIED),
         }

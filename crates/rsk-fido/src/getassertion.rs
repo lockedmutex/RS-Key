@@ -298,7 +298,7 @@ fn enforce_pin<S: Storage, R: Rng>(
         // Zero-length probe (selection gesture): touch, then report PIN state.
         // With no button configured this confirms instantly.
         Some(&[]) => {
-            ctx.require_presence()?;
+            ctx.require_presence(crate::Confirm::titled("Use this key?"))?;
             Err(if ctx.fs.has_data(EF_PIN) {
                 CtapError::PinAuthInvalid
             } else {
@@ -519,7 +519,16 @@ fn get_assertion_inner<S: Storage, R: Rng>(
     // poll confirms instantly. A CTAPHID_CANCEL during the wait surfaces as
     // KEEPALIVE_CANCEL.
     if want_up {
-        ctx.require_presence()?;
+        // The trusted screen (display build) names the relying party AND the
+        // account of the credential being used — the anti-phishing payload: a tap
+        // can't approve a hidden rp, and the user sees which stored credential
+        // signs in. Empty for a credential with no stored user name (older / U2F).
+        let account = sel.as_ref().map(|c| c.user_name.as_bytes()).unwrap_or(&[]);
+        ctx.require_presence(crate::Confirm::new(
+            "Sign in?",
+            req.rp_id.as_bytes(),
+            account,
+        ))?;
     }
 
     // authData = rpIdHash | flags([UP][,UV][,ED]) | counter [| ext] — no attestedCredentialData.
@@ -1050,7 +1059,7 @@ mod tests {
     /// `OperationDenied`, so it proves whether a touch was actually polled.
     struct Decline;
     impl crate::UserPresence for Decline {
-        fn request(&mut self) -> crate::Presence {
+        fn request(&mut self, _confirm: crate::Confirm<'_>) -> crate::Presence {
             crate::Presence::Declined
         }
     }

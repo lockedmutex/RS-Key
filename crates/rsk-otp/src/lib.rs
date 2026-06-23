@@ -11,6 +11,7 @@ use core::cell::RefCell;
 
 use rsk_crypto::{aes128_encrypt_block, ct_eq, hmac_sha1};
 use rsk_fs::{Fs, Storage};
+pub use rsk_sdk::Confirm;
 use rsk_sdk::{Apdu, Applet, ResBuf, Sw};
 
 pub mod hid;
@@ -37,14 +38,16 @@ pub enum Presence {
 /// Physical user presence; the firmware backs this with the BOOTSEL button
 /// (same shape as `rsk_openpgp::UserPresence`).
 pub trait UserPresence {
-    fn request(&mut self) -> Presence;
+    /// Ask for presence. `confirm` names the operation for a trusted on-screen
+    /// Approve/Deny prompt; the BOOTSEL-button backend ignores it.
+    fn request(&mut self, confirm: Confirm<'_>) -> Presence;
 }
 
 /// Test/no-button stand-in: confirms instantly.
 pub struct AlwaysConfirm;
 
 impl UserPresence for AlwaysConfirm {
-    fn request(&mut self) -> Presence {
+    fn request(&mut self, _confirm: Confirm<'_>) -> Presence {
         Presence::Confirmed
     }
 }
@@ -432,7 +435,11 @@ impl<'a> OtpApplet<'a> {
             return SW_WRONG_DATA;
         }
         if cfg & CFG_CHAL_BTN_TRIG != 0
-            && self.presence.borrow_mut().request() != Presence::Confirmed
+            && self
+                .presence
+                .borrow_mut()
+                .request(Confirm::titled("Challenge-response?"))
+                != Presence::Confirmed
         {
             return Sw::CONDITIONS_NOT_SATISFIED;
         }
@@ -590,7 +597,7 @@ mod tests {
     /// Presence stub the tests can flip to Declined.
     struct TestPresence(Presence);
     impl UserPresence for TestPresence {
-        fn request(&mut self) -> Presence {
+        fn request(&mut self, _confirm: Confirm<'_>) -> Presence {
             self.0
         }
     }

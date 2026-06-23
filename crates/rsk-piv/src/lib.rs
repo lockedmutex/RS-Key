@@ -1070,7 +1070,7 @@ mod tests {
         confirm: bool,
     }
     impl UserPresence for Scripted {
-        fn request(&mut self) -> Presence {
+        fn request(&mut self, _confirm: rsk_sdk::Confirm<'_>) -> Presence {
             if self.confirm {
                 Presence::Confirmed
             } else {

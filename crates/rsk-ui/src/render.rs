@@ -20,7 +20,7 @@ use embedded_graphics::{
     },
     pixelcolor::Rgb565,
     prelude::{RgbColor, WebColors},
-    primitives::{Circle, Primitive, PrimitiveStyle, Rectangle},
+    primitives::{Circle, Primitive, PrimitiveStyle, Rectangle, RoundedRectangle},
     text::{Alignment, Baseline, Text, TextStyle, TextStyleBuilder},
 };
 
@@ -29,10 +29,13 @@ use crate::{ALLOW_RECT, ConfirmPrompt, DENY_RECT, PANEL_W, Rect, Screen, StatusK
 const BG: Rgb565 = Rgb565::BLACK;
 const FG: Rgb565 = Rgb565::WHITE;
 const MUTED: Rgb565 = Rgb565::CSS_SLATE_GRAY;
-/// Allow on the right is green, Deny on the left is red — the colors back up the
-/// fixed left/right geometry so the *meaning* of a tap is doubly unambiguous.
-const ALLOW_FILL: Rgb565 = Rgb565::CSS_DARK_GREEN;
-const DENY_FILL: Rgb565 = Rgb565::CSS_DARK_RED;
+/// Allow on the right is green, Deny on the left is red — muted, not vivid, so the
+/// colors read as calm confirmation rather than alarm while still backing up the
+/// fixed left/right geometry, making the *meaning* of a tap doubly unambiguous.
+const ALLOW_FILL: Rgb565 = Rgb565::CSS_SEA_GREEN;
+const DENY_FILL: Rgb565 = Rgb565::CSS_INDIAN_RED;
+/// Corner radius for the floating buttons — enough to read as rounded cards.
+const BTN_RADIUS: u32 = 12;
 
 /// Center the screen horizontally on a half-pixel-free integer midline.
 const MIDX: i32 = PANEL_W as i32 / 2;
@@ -72,13 +75,7 @@ fn status<D: DrawTarget<Color = Rgb565>>(t: &mut D, kind: StatusKind) -> Result<
 }
 
 fn confirm<D: DrawTarget<Color = Rgb565>>(t: &mut D, p: &ConfirmPrompt) -> Result<(), D::Error> {
-    text(
-        t,
-        p.operation.title(),
-        EgPoint::new(MIDX, 40),
-        &FONT_9X15_BOLD,
-        FG,
-    )?;
+    text(t, p.title, EgPoint::new(MIDX, 40), &FONT_9X15_BOLD, FG)?;
     // The relying-party fields, already sanitized to short printable ASCII by
     // `Label::clamp`. Phase 2 wraps a long rp id across lines + marks truncation;
     // for now one centered line each, clipped at the panel edge by the target.
@@ -104,15 +101,17 @@ fn confirm<D: DrawTarget<Color = Rgb565>>(t: &mut D, p: &ConfirmPrompt) -> Resul
     button(t, ALLOW_RECT, "Allow", ALLOW_FILL)
 }
 
-/// Fill a button rect and center its caption — the fill and the caption share the
-/// one [`Rect`] the hit-test uses, so paint and hit-test can never disagree.
+/// Fill a rounded floating button and center its caption — the fill and the
+/// caption share the one [`Rect`] the hit-test uses, so paint and hit-test can
+/// never disagree. The rounded card never extends past `r`, so it stays within the
+/// exact region [`crate::hit_confirm`] approves.
 fn button<D: DrawTarget<Color = Rgb565>>(
     t: &mut D,
     r: Rect,
     label: &str,
     fill: Rgb565,
 ) -> Result<(), D::Error> {
-    eg_rect(r)
+    RoundedRectangle::with_equal_corners(eg_rect(r), Size::new(BTN_RADIUS, BTN_RADIUS))
         .into_styled(PrimitiveStyle::with_fill(fill))
         .draw(t)?;
     text(t, label, center(r), &FONT_9X15_BOLD, FG)
@@ -160,7 +159,7 @@ fn eg_rect(r: Rect) -> Rectangle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Operation, PANEL_H};
+    use crate::{BTN_W, PANEL_H};
     use embedded_graphics::{Pixel, geometry::OriginDimensions};
 
     /// A `DrawTarget` that records into a 240×320 buffer and, like a real panel,
@@ -245,26 +244,29 @@ mod tests {
     /// each in its own color, with the operation title above the button band.
     #[test]
     fn confirm_paints_allow_and_deny_in_their_hit_rects() {
-        let p = ConfirmPrompt::new(Operation::GetAssertion, b"github.com", b"alice");
+        let p = ConfirmPrompt::new("Sign in?", b"github.com", b"alice");
         let mut d = Rec::new();
         render(&mut d, &Screen::Confirm(p)).unwrap();
         assert!(!d.oob, "confirm drew outside the panel");
 
-        // Each button region carries its fill (sampled at a corner, away from the
-        // centered caption) and some non-background content overall.
-        assert_eq!(d.at(ALLOW_RECT.x + 2, ALLOW_RECT.y + 2), ALLOW_FILL);
-        assert_eq!(d.at(DENY_RECT.x + 2, DENY_RECT.y + 2), DENY_FILL);
+        // Each floating button carries its fill, sampled near the top edge — on the
+        // flat span between the rounded corners and above the centered caption.
+        assert_eq!(d.at(ALLOW_RECT.x + BTN_W / 2, ALLOW_RECT.y + 4), ALLOW_FILL);
+        assert_eq!(d.at(DENY_RECT.x + BTN_W / 2, DENY_RECT.y + 4), DENY_FILL);
         assert!(d.any_non_bg_in(ALLOW_RECT));
         assert!(d.any_non_bg_in(DENY_RECT));
         // The title sits in the prompt area above the button band, in foreground.
         assert!((0..crate::BTN_BAND_TOP).any(|y| (0..PANEL_W).any(|x| d.at(x, y) == FG)));
+        // Rounded corners: the very corner pixel is background, not button fill.
+        assert_eq!(d.at(ALLOW_RECT.x, ALLOW_RECT.y), BG);
+        assert_eq!(d.at(DENY_RECT.x, DENY_RECT.y), BG);
     }
 
     #[test]
     fn confirm_button_band_does_not_intrude_on_the_prompt_area() {
         // Nothing of the (filled) buttons is painted above the reserved band, so a
         // stray prompt-area tap can never land on button paint.
-        let p = ConfirmPrompt::new(Operation::MakeCredential, b"example.org", b"");
+        let p = ConfirmPrompt::new("Register key?", b"example.org", b"");
         let mut d = Rec::new();
         render(&mut d, &Screen::Confirm(p)).unwrap();
         let row = crate::BTN_BAND_TOP - 1;

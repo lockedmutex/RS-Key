@@ -24,7 +24,7 @@ use crate::{Ctx, Rng};
 pub fn reset<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>) -> CtapResult {
     // A factory reset requires a physical touch; both a timeout and a cancel
     // abort it before anything is wiped.
-    if !ctx.check_user_presence() {
+    if !ctx.check_user_presence(crate::Confirm::titled("Erase everything?")) {
         return Err(CtapError::UserActionTimeout);
     }
     // Drop every FIDO file, then regenerate the seed. The flash `Fs` is shared
@@ -164,7 +164,7 @@ mod tests {
 
     struct Fixed(crate::Presence);
     impl crate::UserPresence for Fixed {
-        fn request(&mut self) -> crate::Presence {
+        fn request(&mut self, _confirm: crate::Confirm<'_>) -> crate::Presence {
             self.0
         }
     }

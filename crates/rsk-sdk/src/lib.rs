@@ -9,12 +9,14 @@
 
 pub mod apdu;
 pub mod applet;
+pub mod confirm;
 pub mod error;
 pub mod sw;
 pub mod tlv;
 
 pub use apdu::Apdu;
 pub use applet::{Applet, Dispatcher, ResBuf};
+pub use confirm::Confirm;
 pub use error::{Error, Result};
 pub use sw::Sw;
 

@@ -202,7 +202,7 @@ fn aut_enable<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, param: &[u8]) -> CtapResu
         return Err(CtapError::NotAllowed);
     }
     let mut lock_key = open_channel_key(ctx, param)?;
-    if !ctx.check_user_presence() {
+    if !ctx.check_user_presence(crate::Confirm::titled("Lock device?")) {
         lock_key.zeroize();
         return Err(CtapError::OperationDenied);
     }
@@ -234,7 +234,7 @@ fn aut_disable<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>) -> CtapResult {
     if ctx.state.keydev_dec.is_none() {
         return Err(CtapError::PinAuthInvalid);
     }
-    if !ctx.check_user_presence() {
+    if !ctx.check_user_presence(crate::Confirm::titled("Unlock device?")) {
         return Err(CtapError::OperationDenied);
     }
     let mut seed = ctx.state.keydev_dec.unwrap();

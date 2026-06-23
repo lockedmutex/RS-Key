@@ -41,6 +41,7 @@ pub use error::{CTAP2_OK, CtapError, CtapResult};
 
 use rsk_crypto::Device;
 use rsk_fs::{Fs, Storage};
+pub use rsk_sdk::Confirm;
 
 pub use state::FidoState;
 
@@ -69,7 +70,9 @@ pub enum Presence {
 /// no button configured it confirms immediately, which is also what host tests
 /// use via [`AlwaysConfirm`].
 pub trait UserPresence {
-    fn request(&mut self) -> Presence;
+    /// Ask for presence. `confirm` describes the pending operation for a trusted
+    /// on-screen Approve/Deny prompt; the BOOTSEL-button backend ignores it.
+    fn request(&mut self, confirm: Confirm<'_>) -> Presence;
 }
 
 /// A [`UserPresence`] that confirms instantly — the no-button default and the
@@ -77,7 +80,7 @@ pub trait UserPresence {
 pub struct AlwaysConfirm;
 
 impl UserPresence for AlwaysConfirm {
-    fn request(&mut self) -> Presence {
+    fn request(&mut self, _confirm: Confirm<'_>) -> Presence {
         Presence::Confirmed
     }
 }
@@ -101,15 +104,15 @@ impl<S: Storage, R: Rng> Ctx<'_, S, R> {
     /// Request a touch, mapping any non-confirmation (timeout, decline or
     /// cancel) to `false`. Callers that must distinguish a `CTAPHID_CANCEL`
     /// (→ `KEEPALIVE_CANCEL`) use [`require_presence`](Self::require_presence).
-    pub fn check_user_presence(&mut self) -> bool {
-        self.presence.request() == Presence::Confirmed
+    pub fn check_user_presence(&mut self, confirm: Confirm<'_>) -> bool {
+        self.presence.request(confirm) == Presence::Confirmed
     }
 
     /// Obtain user presence for a CTAP2 command, mapping the outcome to its
     /// status code: a `CTAPHID_CANCEL` aborts with `KEEPALIVE_CANCEL`, any
     /// other non-confirmation (timeout, decline) with `OPERATION_DENIED`.
-    pub fn require_presence(&mut self) -> Result<(), CtapError> {
-        match self.presence.request() {
+    pub fn require_presence(&mut self, confirm: Confirm<'_>) -> Result<(), CtapError> {
+        match self.presence.request(confirm) {
             Presence::Confirmed => Ok(()),
             Presence::Cancelled => Err(CtapError::KeepAliveCancel),
             Presence::Timeout | Presence::Declined => Err(CtapError::OperationDenied),

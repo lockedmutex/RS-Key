@@ -13,6 +13,7 @@ use core::cell::RefCell;
 
 use rsk_crypto::{Device, hmac_sha1, hmac_sha256, hmac_sha512};
 use rsk_fs::{Fs, KeyFid, Storage};
+pub use rsk_sdk::Confirm;
 use rsk_sdk::tlv::{find_tag, format_len};
 use rsk_sdk::{Apdu, Applet, ResBuf, Sw};
 use zeroize::Zeroize;
@@ -42,14 +43,16 @@ pub enum Presence {
 /// Physical user presence; the firmware backs this with the BOOTSEL button
 /// (same shape as `rsk_openpgp::UserPresence`).
 pub trait UserPresence {
-    fn request(&mut self) -> Presence;
+    /// Ask for presence. `confirm` names the operation for a trusted on-screen
+    /// Approve/Deny prompt; the BOOTSEL-button backend ignores it.
+    fn request(&mut self, confirm: Confirm<'_>) -> Presence;
 }
 
 /// Test/no-button stand-in: confirms instantly.
 pub struct AlwaysConfirm;
 
 impl UserPresence for AlwaysConfirm {
-    fn request(&mut self) -> Presence {
+    fn request(&mut self, _confirm: Confirm<'_>) -> Presence {
         Presence::Confirmed
     }
 }
@@ -447,7 +450,11 @@ impl<'a> OathApplet<'a> {
         if find_tag(blob, TAG_PROPERTY as u16)
             .and_then(|v| v.first())
             .is_some_and(|p| p & PROP_TOUCH != 0)
-            && self.presence.borrow_mut().request() != Presence::Confirmed
+            && self
+                .presence
+                .borrow_mut()
+                .request(Confirm::titled("Show OATH code?"))
+                != Presence::Confirmed
         {
             return Sw::SECURITY_STATUS_NOT_SATISFIED;
         }
@@ -1082,7 +1089,7 @@ mod tests {
     /// Answers every touch request with a fixed outcome and counts the asks.
     struct StubPresence(Presence, u32);
     impl UserPresence for StubPresence {
-        fn request(&mut self) -> Presence {
+        fn request(&mut self, _confirm: Confirm<'_>) -> Presence {
             self.1 += 1;
             self.0
         }

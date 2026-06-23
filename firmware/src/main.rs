@@ -71,6 +71,7 @@ compile_error!(
 
 use flash_storage::{FLASH_SIZE, FlashStorage};
 use handler::{FidoRng, Store};
+#[cfg(not(feature = "display"))]
 use presence::BootselPresence;
 use worker::{ClientCcid, ClientCtap, Worker};
 
@@ -165,6 +166,10 @@ static PHY_PRODUCT: StaticCell<[u8; 32]> = StaticCell::new();
 const DISPLAY_BUF_LEN: usize = 4096;
 #[cfg(feature = "display")]
 static DISPLAY_BUF: StaticCell<[u8; DISPLAY_BUF_LEN]> = StaticCell::new();
+/// The trusted-display panel + touch, shared by `status_task` (ambient status) and
+/// the `TouchPresence` backend (the confirm prompt) on the thread executor.
+#[cfg(feature = "display")]
+static UI: StaticCell<RefCell<display::Ui>> = StaticCell::new();
 
 struct SendUsb(UsbDevice<'static, Drv>);
 unsafe impl Send for SendUsb {}
@@ -331,7 +336,7 @@ async fn main(spawner: Spawner) {
     config.serial_number = Some("rs-key-0001");
     config.max_power = 100;
     config.max_packet_size_0 = 64;
-    config.device_release = 0x0785; // bcdDevice: our build counter
+    config.device_release = 0x0786; // bcdDevice: our build counter
 
     let mut builder = Builder::new(
         driver,
@@ -542,12 +547,14 @@ async fn main(spawner: Spawner) {
     }
 
     // Trusted display (the `display` build — always `LED_KIND=none` per the guard
-    // above, so the LED block compiled out and SPI1/I2C1/GPIO16 are free). Driven on
-    // the THREAD executor: a blocking SPI repaint there stalls only the worker, while
-    // USB on the interrupt executor preempts it — the panel must never delay USB. The
-    // panel is built + reset inside the task so its init runs after USB attach.
+    // above, so the LED block compiled out and SPI1/I2C1/GPIO16 are free). Build the
+    // panel + touch here, after the USB task is spawned, so its ~200 ms reset runs
+    // while the interrupt executor enumerates — never delaying it. `status_task`
+    // mirrors the device status; the `TouchPresence` backend (the `presence::Presence`
+    // below) paints the confirm prompt. Both share the panel via the `UI` cell on the
+    // thread executor.
     #[cfg(feature = "display")]
-    {
+    let display_ui = {
         use embassy_rp::gpio::{Level, Output};
         use embassy_rp::i2c::{Config as I2cConfig, I2c};
         use embassy_rp::spi::{Config as SpiConfig, Spi};
@@ -576,8 +583,14 @@ async fn main(spawner: Spawner) {
             buf,
         };
         let touch = display::TouchHw { i2c, rst: tp_rst };
-        spawner.spawn(display::display_task(panel, touch).unwrap());
-    }
+        // Reborrow the `&'static mut` from the cell as a shared `&'static` so both
+        // `status_task` and the `TouchPresence` backend can hold it (a shared
+        // reference is `Copy`; the `RefCell` provides the interior mutability).
+        let ui: &'static RefCell<display::Ui> =
+            UI.init(RefCell::new(display::Ui::build(panel, touch)));
+        spawner.spawn(display::status_task(ui).unwrap());
+        ui
+    };
     // `spawner` is otherwise unused (the standard key spawns on the interrupt
     // executor `hp`); consume it so `-D warnings` passes without the display task.
     #[cfg(not(feature = "display"))]
@@ -585,7 +598,10 @@ async fn main(spawner: Spawner) {
 
     core1::spawn(p.CORE1);
 
+    #[cfg(not(feature = "display"))]
     let presence_ref = PRESENCE.init(RefCell::new(BootselPresence::new(p.BOOTSEL)));
+    #[cfg(feature = "display")]
+    let presence_ref = PRESENCE.init(RefCell::new(display::TouchPresence::new(display_ui)));
     let platform_ref = RESCUE_PLATFORM.init(RefCell::new(rescue_platform::RescuePlatform));
     let (kvm, kvc) = (kvmain_range(), kvcnt_range());
     let kv_total = (kvm.end - kvm.start) + (kvc.end - kvc.start);

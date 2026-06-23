@@ -234,7 +234,7 @@ fn audit_checkpoint<S: Storage, R: Rng>(
     out: &mut [u8],
 ) -> CtapResult {
     pin_gate(ctx, req)?;
-    if !ctx.check_user_presence() {
+    if !ctx.check_user_presence(crate::Confirm::titled("Sign audit log?")) {
         return Err(CtapError::OperationDenied);
     }
     journal::vendor_checkpoint(ctx, req.blob, out)
@@ -417,7 +417,7 @@ fn gate<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req) -> Result<(), CtapEr
         return Err(CtapError::NotAllowed);
     }
     pin_gate(ctx, req)?;
-    if !ctx.check_user_presence() {
+    if !ctx.check_user_presence(crate::Confirm::titled("Vendor config?")) {
         return Err(CtapError::OperationDenied);
     }
     Ok(())
@@ -529,7 +529,7 @@ fn backup_load<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req) -> CtapResult
 
 /// `BACKUP_FINALIZE`: seal the one-time export window (a reset reopens it).
 fn backup_finalize<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>) -> CtapResult {
-    if !ctx.check_user_presence() {
+    if !ctx.check_user_presence(crate::Confirm::titled("Finish backup?")) {
         return Err(CtapError::OperationDenied);
     }
     ctx.fs
@@ -585,7 +585,7 @@ mod tests {
 
     struct Decline;
     impl UserPresence for Decline {
-        fn request(&mut self) -> Presence {
+        fn request(&mut self, _confirm: crate::Confirm<'_>) -> Presence {
             Presence::Timeout
         }
     }
