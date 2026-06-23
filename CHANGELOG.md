@@ -30,6 +30,22 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   older 13/9/2-byte blocks still load forward-compatibly. Single-LED boards are
   unaffected (effects reduce to a static color or the legacy blink). Thanks to
   @Curious-r for the contribution. bcdDevice 0x0780 → 0x0783.
+- **Trusted-display variant — panel bringup (experimental, opt-in).** A screen +
+  touch variant for the Waveshare RP2350-Touch-LCD-2.8, behind the `display` cargo
+  feature / `firmware-display` nix flavor. The panel is now driven: on the display
+  build the ST7789 (over SPI1) shows a boot splash and then mirrors the device
+  status the onboard LED would otherwise show (idle / working / touch), and the
+  CST328 touch controller (over I2C1) is read and each raw touch is marked on
+  screen — the hardware bringup. The *what to draw* and the *touch-report parse*
+  live in `rsk-ui`, a pure host-tested crate (the on-screen UI model + renderer,
+  the untrusted relying-party-string sanitizer, the Allow/Deny button geometry,
+  with Kani proofs and a recording-target render test). Still to come in later
+  phases: the trusted on-screen Approve/Deny showing the relying party, on-device
+  PIN entry, lock, and settings. A standard key **without** a screen compiles
+  **none** of this — the whole stack (`rsk-ui`, `mipidsi`, `embedded-graphics`) is
+  `dep:`-gated and the gate asserts it is absent from the default firmware
+  dependency tree, so there is no size cost; only the shared `bcdDevice` build
+  counter advances. bcdDevice 0x0784 → 0x0785.
 
 ### Changed
 

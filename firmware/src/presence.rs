@@ -81,6 +81,14 @@ pub struct BootselPresence {
     bootsel: Peri<'static, BOOTSEL>,
 }
 
+/// The presence backend the [`crate::worker::Worker`] owns, selected at build
+/// time so the worker wiring stays backend-agnostic. The standard key confirms
+/// with the BOOTSEL button; the `display` build (Phase 2) swaps this alias to a
+/// `TouchPresence` that renders on-screen Approve/Deny and returns a real
+/// `Declined` — every applet's `UserPresence` trait is satisfied by whichever
+/// backend this names, so only this line changes.
+pub type Presence = BootselPresence;
+
 impl BootselPresence {
     pub fn new(bootsel: Peri<'static, BOOTSEL>) -> Self {
         Self { bootsel }

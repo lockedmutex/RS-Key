@@ -86,6 +86,7 @@ let
       xoscDelayMult ? envOr "XOSC_DELAY_MULT" null, # 1..1024 crystal settle
       flashSize ? envOr "FLASH_SIZE" null, # bytes / 0xHEX / <n>K|M (default 4M)
       ledPin ? envOr "LED_PIN" null, # WS2812 data GPIO 0..=29 (default 16)
+      ledKind ? envOr "LED_KIND" null, # ws2812 | gpio | pimoroni | none (default ws2812)
       fakeMkek ? envOr "FAKE_MKEK" null, # 64 hex — TEST builds only
       fakeDevk ? envOr "FAKE_DEVK" null, # 64 hex — TEST builds only
     }:
@@ -100,6 +101,7 @@ let
         XOSC_DELAY_MULT = if xoscDelayMult == null then null else toString xoscDelayMult;
         FLASH_SIZE = if flashSize == null then null else toString flashSize;
         LED_PIN = if ledPin == null then null else toString ledPin;
+        LED_KIND = ledKind;
         FAKE_MKEK = fakeMkek;
         FAKE_DEVK = fakeDevk;
       };
@@ -216,6 +218,19 @@ in
     firmware-pico = mkFirmware {
       name = "firmware-pico";
       vidpid = "Pico";
+    };
+    # Trusted-display flavor for the Waveshare RP2350-Touch-LCD-2.8: 16 MB flash,
+    # and the ST7789 panel is the status indicator instead of an addressable LED
+    # (LED_KIND=none), which also frees GPIO16 for the backlight. Experimental and
+    # off the release matrix until the panel is HW-verified (Phase 1).
+    firmware-display = mkFirmware {
+      name = "firmware-display";
+      flashSize = "16M";
+      ledKind = "none";
+      cargoFlags = [
+        "--features"
+        "display"
+      ];
     };
   };
 

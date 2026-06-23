@@ -23,7 +23,7 @@ lock_in_sync() {
 
 run "fmt"                      cargo fmt --all --check
 run "clippy (embedded)"        cargo clippy --workspace -- -D warnings
-run "clippy (host tests)"      cargo clippy -p rsk-sdk -p rsk-fs -p rsk-usb -p rsk-crypto -p rsk-fido -p rsk-openpgp -p rsk-rsa-asm -p rsk-mgmt -p rsk-oath -p rsk-otp -p rsk-piv -p rsk-rescue -p rsk-led --target "$HOST" --all-targets -- -D warnings
+run "clippy (host tests)"      cargo clippy -p rsk-sdk -p rsk-fs -p rsk-usb -p rsk-crypto -p rsk-fido -p rsk-openpgp -p rsk-rsa-asm -p rsk-mgmt -p rsk-oath -p rsk-otp -p rsk-piv -p rsk-rescue -p rsk-led -p rsk-ui --target "$HOST" --all-targets -- -D warnings
 # tools/tui is its own workspace (host-only), so the --all/--workspace runs
 # above never see it — gate it explicitly. Its lockfile was scanned by nobody
 # until Dependabot flagged a transitive advisory from the GitHub side.
@@ -34,7 +34,7 @@ run "clippy (tui)"             cargo clippy --manifest-path tools/tui/Cargo.toml
 # (deep-checks CI). Format fuzz/ with this same stable rustfmt — not the .#fuzz
 # nightly one, which lays imports out differently.
 run "fmt (fuzz)"               cargo fmt --manifest-path fuzz/Cargo.toml --check
-run "test (host)"              cargo test -p rsk-sdk -p rsk-fs -p rsk-usb -p rsk-crypto -p rsk-fido -p rsk-openpgp -p rsk-rsa-asm -p rsk-mgmt -p rsk-oath -p rsk-otp -p rsk-piv -p rsk-rescue -p rsk-led --target "$HOST"
+run "test (host)"              cargo test -p rsk-sdk -p rsk-fs -p rsk-usb -p rsk-crypto -p rsk-fido -p rsk-openpgp -p rsk-rsa-asm -p rsk-mgmt -p rsk-oath -p rsk-otp -p rsk-piv -p rsk-rescue -p rsk-led -p rsk-ui --target "$HOST"
 # The PQC-advertisement opt-in changes the getInfo shape — test both forms.
 run "test (advertise-pqc)"     cargo test -p rsk-fido --features advertise-pqc --target "$HOST" getinfo
 # fido-conformance suppresses the default EdDSA (-8) advertisement — verify that
@@ -46,7 +46,24 @@ run "test (fido-conformance)"  cargo test -p rsk-fido --features fido-conformanc
 run "test (fips: rsk-fido)"    cargo test -p rsk-fido --features fips-profile --target "$HOST" fips
 run "test (fips: rsk-piv)"     cargo test -p rsk-piv --features fips-profile --target "$HOST" fips
 run "clippy (fips firmware)"   cargo clippy -p firmware --features fips-profile -- -D warnings
+# The display path (panel driver + touch) is `LED_KIND=none`-only, so the default
+# embedded clippy above never lints it — gate it explicitly, like the fips firmware.
+run "clippy (display firmware)" env LED_KIND=none cargo clippy -p firmware --features display -- -D warnings
 run "build firmware (release)" cargo build --release -p firmware
+# The trusted-display flavor must keep building from the same tree. Built
+# `LED_KIND=none` (the panel replaces the addressable LED and its backlight uses
+# GPIO16 — the compile_error guard in main.rs enforces this), and before the
+# no-touch build below, which stays the last `-p firmware` build so target/ keeps
+# the no-touch test image (see docs/build.md).
+run "build firmware (display)" env LED_KIND=none cargo build --release -p firmware --features display
+# Machine-checked "no size cost for keys without a screen": the display UI crate
+# and its driver stack must be absent from the DEFAULT firmware dependency tree, so
+# a standard key can not pull any of the screen code in.
+run "display code absent from default image" sh -c '
+  if ! out=$(cargo tree -p firmware -e normal 2>&1); then echo "$out"; exit 1; fi
+  if printf "%s\n" "$out" | grep -qE "rsk-ui|mipidsi"; then
+    echo "FAIL: display code (rsk-ui/mipidsi) leaked into the default (no-display) firmware image"; exit 1
+  fi'
 # The test build: no BOOTSEL presence, so the automated suites don't hang on a touch.
 run "build firmware (test, --features no-touch)" cargo build --release -p firmware --features no-touch
 run "build rsk-wipe (release)" cargo build --release -p rsk-wipe

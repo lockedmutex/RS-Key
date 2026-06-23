@@ -30,6 +30,7 @@ flowchart TD
 | `advertise-pqc` | off | Prepends ML-DSA-44 (COSE −48) to the getInfo `algorithms` list. Off by default because released Firefox versions abort the *entire* getInfo parse on an unknown COSE id and report the authenticator broken. **PQC capability is on regardless of this flag** — makeCredential negotiates −48 from the request's `pubKeyCredParams`; the flag only controls advertising. |
 | `fips-profile` | off | Bakes a locked FIPS-style policy into the image: ES256K (secp256k1) leaves the FIDO menu, the minimum PIN rises to 6, the vendor seed *export* is refused, and PIV refuses new 3DES management keys and RSA-1024. The default build is unchanged; with secure boot the policy is sealed by your signature. A profile, **not** a FIPS validation — details and rationale: [guides/fips.md](guides/fips.md). |
 | `strict-up` | off | Require a touch on **every** `getAssertion`. By default RS-Key honors the platform's silent pre-flight probe (`up:false`): it returns the discovery assertion with no touch and the UP flag clear, so a WebAuthn login with an `allowCredentials` (non-resident) credential is a **single** touch — matching the CTAP2 spec and YubiKey. With `strict-up` the button is polled even for that probe, so such a login asks for **two** touches (one for the probe, one for the real assertion). A deliberately stricter "every assertion needs an explicit gesture" stance for those who want it; it is **not** spec-conformant for `up:false`. Resident-credential / passkey logins are a single touch either way. `fido-conformance` enables this implicitly (the conformance pass was validated with it). |
+| `display` | off | **Experimental** trusted-display build for a screen + touch board (Waveshare RP2350-Touch-LCD-2.8): on-screen Approve/Deny showing the relying party, on-device PIN entry, lock, and settings. Entirely `dep:`-gated — a standard key without a screen compiles **none** of it, so its image is unaffected (the gate asserts the `rsk-ui` UI crate is absent from the default dependency tree). Build the display flavor with `LED_KIND=none FLASH_SIZE=16M … --features display` (the panel replaces the addressable LED, freeing GPIO16 for the backlight; a compile-time guard enforces `LED_KIND=none`). Phase 1 (bringup) is wired: the ST7789 shows a splash then mirrors the device status, and the CST328 touch is read (each raw touch marked on screen). The trusted Approve/Deny, on-device PIN, lock, and settings land in later phases. |
 
 ## Environment variables
 
@@ -120,6 +121,7 @@ check the seal with `picotool`. The flavors mirror the
 | `.#firmware-no-touch` | `--features no-touch` (the test build) |
 | `.#firmware-fips` | `--features fips-profile` |
 | `.#firmware-pqc` | `--features advertise-pqc` |
+| `.#firmware-display` | `--features display`, `FLASH_SIZE=16M`, `LED_KIND=none` (experimental, Waveshare RP2350-Touch-LCD-2.8) |
 
 Two caveats:
 

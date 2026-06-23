@@ -46,6 +46,8 @@ use rsk_usb::ctaphid::{CtapHid, FIDO_REPORT_DESCRIPTOR};
 
 mod ccid_handler;
 mod core1;
+#[cfg(feature = "display")]
+mod display;
 mod flash_storage;
 mod handler;
 mod led;
@@ -55,6 +57,17 @@ mod presence;
 mod rescue_platform;
 mod vendor;
 mod worker;
+
+// The `display` build turns the ST7789 panel into the status indicator, and its
+// backlight sits on GPIO16 — the default addressable-LED pin. So the panel and the
+// LED can't coexist: the flavor must be built `LED_KIND=none` (which also frees
+// GPIO16). Fail loudly at compile time rather than silently double-claim the pin.
+#[cfg(all(feature = "display", not(led_kind = "none")))]
+compile_error!(
+    "the `display` build requires LED_KIND=none (the ST7789 panel replaces the LED \
+     and its backlight uses GPIO16); build with `LED_KIND=none ... --features \
+     display` — the `firmware-display` nix flavor sets this for you"
+);
 
 use flash_storage::{FLASH_SIZE, FlashStorage};
 use handler::{FidoRng, Store};
@@ -143,9 +156,15 @@ static USB_HANDLER: StaticCell<led::StatusHandler> = StaticCell::new();
 static FS: StaticCell<RefCell<Store>> = StaticCell::new();
 static FLASH_CELL: StaticCell<RefCell<flash_storage::AsyncFlash>> = StaticCell::new();
 static RNG_CELL: StaticCell<RefCell<FidoRng>> = StaticCell::new();
-static PRESENCE: StaticCell<RefCell<BootselPresence>> = StaticCell::new();
+static PRESENCE: StaticCell<RefCell<presence::Presence>> = StaticCell::new();
 static RESCUE_PLATFORM: StaticCell<RefCell<rescue_platform::RescuePlatform>> = StaticCell::new();
 static PHY_PRODUCT: StaticCell<[u8; 32]> = StaticCell::new();
+// The mipidsi SPI pixel-batch buffer for the `display` build: bigger = fewer SPI
+// transactions per fill. 4 KiB ≈ 8 full panel rows per chunk.
+#[cfg(feature = "display")]
+const DISPLAY_BUF_LEN: usize = 4096;
+#[cfg(feature = "display")]
+static DISPLAY_BUF: StaticCell<[u8; DISPLAY_BUF_LEN]> = StaticCell::new();
 
 struct SendUsb(UsbDevice<'static, Drv>);
 unsafe impl Send for SendUsb {}
@@ -185,7 +204,7 @@ fn kvcnt_range() -> core::ops::Range<u32> {
 }
 
 #[embassy_executor::main]
-async fn main(_spawner: Spawner) {
+async fn main(spawner: Spawner) {
     let mut config = embassy_rp::config::Config::default();
     if let Some(xosc) = config.clocks.xosc.as_mut() {
         xosc.delay_multiplier = XOSC_DELAY_MULT;
@@ -312,7 +331,7 @@ async fn main(_spawner: Spawner) {
     config.serial_number = Some("rs-key-0001");
     config.max_power = 100;
     config.max_packet_size_0 = 64;
-    config.device_release = 0x0784; // bcdDevice: our build counter
+    config.device_release = 0x0785; // bcdDevice: our build counter
 
     let mut builder = Builder::new(
         driver,
@@ -521,6 +540,48 @@ async fn main(_spawner: Spawner) {
             }
         }
     }
+
+    // Trusted display (the `display` build — always `LED_KIND=none` per the guard
+    // above, so the LED block compiled out and SPI1/I2C1/GPIO16 are free). Driven on
+    // the THREAD executor: a blocking SPI repaint there stalls only the worker, while
+    // USB on the interrupt executor preempts it — the panel must never delay USB. The
+    // panel is built + reset inside the task so its init runs after USB attach.
+    #[cfg(feature = "display")]
+    {
+        use embassy_rp::gpio::{Level, Output};
+        use embassy_rp::i2c::{Config as I2cConfig, I2c};
+        use embassy_rp::spi::{Config as SpiConfig, Spi};
+
+        let mut spi_cfg = SpiConfig::default();
+        spi_cfg.frequency = 40_000_000; // ST7789 takes ≤62.5 MHz; 40 is a safe bringup start
+        let spi = Spi::new_blocking(p.SPI1, p.PIN_10, p.PIN_11, p.PIN_12, spi_cfg);
+
+        let mut i2c_cfg = I2cConfig::default();
+        i2c_cfg.frequency = 400_000;
+        let i2c = I2c::new_blocking(p.I2C1, p.PIN_7, p.PIN_6, i2c_cfg);
+
+        let cs = Output::new(p.PIN_13, Level::High);
+        let dc = Output::new(p.PIN_14, Level::Low);
+        let rst = Output::new(p.PIN_15, Level::High);
+        let bl = Output::new(p.PIN_16, Level::Low); // off until the panel is initialized
+        let tp_rst = Output::new(p.PIN_17, Level::High);
+
+        let buf = DISPLAY_BUF.init([0u8; DISPLAY_BUF_LEN]);
+        let panel = display::PanelHw {
+            spi,
+            cs,
+            dc,
+            rst,
+            bl,
+            buf,
+        };
+        let touch = display::TouchHw { i2c, rst: tp_rst };
+        spawner.spawn(display::display_task(panel, touch).unwrap());
+    }
+    // `spawner` is otherwise unused (the standard key spawns on the interrupt
+    // executor `hp`); consume it so `-D warnings` passes without the display task.
+    #[cfg(not(feature = "display"))]
+    let _ = spawner;
 
     core1::spawn(p.CORE1);
 

@@ -23,7 +23,7 @@ use rsk_usb::ctaphid::{CTAP_MAX_MESSAGE, MsgHandler};
 use crate::ccid_handler::CcidApplets;
 use crate::handler::{AppletHandler, FidoRng, Store};
 use crate::otp_kbd;
-use crate::presence::BootselPresence;
+use crate::presence::Presence;
 
 /// A worker request carries a full CTAPHID message at most; responses match —
 /// an ML-DSA-44 makeCredential response runs ~4 KB, and getInfo advertises
@@ -171,9 +171,10 @@ pub struct Worker<'a> {
     /// The TRNG/DRBG, kept for the secure-reboot wipe (the DRBG state is the one
     /// long-lived RAM secret outside the applet layer).
     rng: &'a RefCell<FidoRng>,
-    /// The BOOTSEL button, for the typed-ticket press watcher (the same button the
-    /// applets borrow for touch confirmation, behind the shared `RefCell`).
-    presence: &'a RefCell<BootselPresence>,
+    /// The presence backend (BOOTSEL button, or the screen on a `display` build),
+    /// for the typed-ticket press watcher and the same backend the applets borrow
+    /// for touch confirmation, behind the shared `RefCell`.
+    presence: &'a RefCell<Presence>,
     /// Click-counter state: last sampled level, click count, and the
     /// ms of the last release.
     btn_state: bool,
@@ -197,7 +198,7 @@ impl<'a> Worker<'a> {
     pub fn new(
         fs: &'a RefCell<Store>,
         rng: &'a RefCell<FidoRng>,
-        presence: &'a RefCell<BootselPresence>,
+        presence: &'a RefCell<Presence>,
         platform: &'a RefCell<crate::rescue_platform::RescuePlatform>,
         serial_id: [u8; 8],
         serial_hash: [u8; 32],
