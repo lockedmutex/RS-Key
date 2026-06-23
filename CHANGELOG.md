@@ -31,6 +31,16 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   unaffected (effects reduce to a static color or the legacy blink). Thanks to
   @Curious-r for the contribution. bcdDevice 0x0780 → 0x0783.
 
+### Changed
+
+- **Touch timeout is configurable; phy tag `0x08` now follows pico-fido.** RS-Key
+  read tag `0x08` as a user-presence button GPIO, but the button is always BOOTSEL
+  so the field was never used. It now means `PresenceTimeout` — the touch-wait
+  timeout in **seconds** — matching pico-fido / PicoForge, so a PicoForge config
+  (or `rsk hw --touch-timeout <secs>`) sets how long the device waits for a touch.
+  Absent / `0` keeps the built-in 30 s default; existing phy records never carried
+  a meaningful `0x08`, so the realignment is safe. bcdDevice 0x0783 → 0x0784.
+
 ## [0.2.8] — 2026-06-21
 
 ### Changed

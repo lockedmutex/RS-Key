@@ -8,7 +8,7 @@
 //! required by default, and the opt-in `no-touch` feature makes `request` confirm
 //! instantly (for the automated suites, which cannot press a button).
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use embassy_rp::Peri;
 use embassy_rp::peripherals::BOOTSEL;
@@ -42,13 +42,27 @@ pub fn request_cancel() {
     CANCEL_REQUESTED.store(true, Ordering::Relaxed);
 }
 
-// Poll cadence and the press timeout. `block_for` keeps interrupts enabled, so the
+/// Built-in touch-wait timeout (ms) used when the phy record carries none.
+const DEFAULT_TIMEOUT_MS: u32 = 30_000;
+/// Touch-wait timeout in ms, seeded at boot from the phy record's
+/// `PRESENCE_TIMEOUT` tag (pico-fido `0x08`, seconds). Read live by the wait.
+static PRESENCE_TIMEOUT_MS: AtomicU32 = AtomicU32::new(DEFAULT_TIMEOUT_MS);
+
+/// Override the touch-wait timeout from the phy record — value in **seconds**,
+/// matching pico-fido / PicoForge's tag `0x08`. `0` (or an absent tag) keeps the
+/// built-in 30 s default. Call once at boot, before any applet runs.
+pub fn set_timeout_secs(secs: u8) {
+    if secs != 0 {
+        PRESENCE_TIMEOUT_MS.store(secs as u32 * 1000, Ordering::Relaxed);
+    }
+}
+
+// Poll cadence for the press wait. `block_for` keeps interrupts enabled, so the
 // high-priority executor (USB + keepalives) runs between polls; only the ~4000-cycle
-// `is_bootsel_pressed` read briefly masks interrupts.
+// `is_bootsel_pressed` read briefly masks interrupts. The timeout is runtime
+// (`PRESENCE_TIMEOUT_MS`).
 #[cfg(not(feature = "no-touch"))]
 const POLL_MS: u64 = 16;
-#[cfg(not(feature = "no-touch"))]
-const TIMEOUT_MS: u64 = 30_000;
 
 /// Neutral wait result, mapped to each applet's own `Presence` enum. The button
 /// has no "declined" gesture; `Cancelled` comes from a `CTAPHID_CANCEL` (FIDO
@@ -96,8 +110,9 @@ impl BootselPresence {
         CANCEL_REQUESTED.store(false, Ordering::Relaxed);
         UP_PENDING.store(true, Ordering::Relaxed);
         let start = Instant::now();
-        // Wait for a press; a CTAPHID_CANCEL aborts it, and with neither in
-        // TIMEOUT_MS it times out.
+        let timeout = Duration::from_millis(PRESENCE_TIMEOUT_MS.load(Ordering::Relaxed) as u64);
+        // Wait for a press; a CTAPHID_CANCEL aborts it, and with neither before
+        // the timeout it times out.
         let result = loop {
             if is_bootsel_pressed(self.bootsel.reborrow()) {
                 break Outcome::Confirmed;
@@ -105,7 +120,7 @@ impl BootselPresence {
             if CANCEL_REQUESTED.load(Ordering::Relaxed) {
                 break Outcome::Cancelled;
             }
-            if start.elapsed() >= Duration::from_millis(TIMEOUT_MS) {
+            if start.elapsed() >= timeout {
                 break Outcome::Timeout;
             }
             block_for(Duration::from_millis(POLL_MS));
@@ -115,7 +130,7 @@ impl BootselPresence {
         if result == Outcome::Confirmed {
             let release = Instant::now();
             while is_bootsel_pressed(self.bootsel.reborrow()) {
-                if release.elapsed() >= Duration::from_millis(TIMEOUT_MS) {
+                if release.elapsed() >= timeout {
                     break;
                 }
                 block_for(Duration::from_millis(POLL_MS));

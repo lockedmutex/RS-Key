@@ -299,7 +299,7 @@ hardware).
 | `04` | LED_GPIO | 1 | data-pin GPIO `0..=29` |
 | `05` | LED_BRIGHTNESS | 1 | global channel max `0..=255` |
 | `06` | OPTS | 2 | flags (BE16): `WCID 0x1`, `DIMM 0x2`, `DISABLE_POWER_RESET 0x4`, `LED_STEADY 0x8` |
-| `08` | UP_BTN | 1 | user-presence button GPIO |
+| `08` | PRESENCE_TIMEOUT | 1 | touch-wait timeout in **seconds** (`0`/absent ⇒ firmware default 30 s). Matches pico-fido / PicoForge `PresenceTimeout`. |
 | `09` | USB_PRODUCT | 1..33 | product string + trailing `NUL` (length **includes** the NUL) |
 | `0A` | ENABLED_CURVES | 4 | FIDO curve bitmask (BE32) |
 | `0B` | ENABLED_USB_ITF | 1 | interface mask: `CCID 0x1`, `WCID 0x2`, `HID 0x4`, `KB 0x8`, `LWIP 0x10` |
@@ -311,11 +311,12 @@ Notes for a host implementation:
 - **Read-modify-write.** READ the record, change only your tags, WRITE it back —
   this is exactly what `rsk hw` does (`tools/rsk/hw.py`).
   Preserve tags you don't recognize.
-- **Tags `0x0D` (LED_ORDER) and `0x0E` (LED_NUM)** are the RS-Key-specific tags.
-  PicoForge can skip them as unknown; RS-Key's own tools preserve them across a
-  RMW. LED_ORDER corrects a GRB/RGB red/green swap without reflashing; LED_NUM
+- **RS-Key-specific tags** PicoForge skips as unknown: `0x0B` (ENABLED_USB_ITF)
+  and `0x0E` (LED_NUM). RS-Key's own tools preserve them across a RMW; LED_NUM
   sets how many daisy-chained addressable LEDs are lit (the binary carries a
-  compile-time `MAX_LEDS` buffer ceiling and drives the first LED_NUM of it).
+  compile-time `MAX_LEDS` ceiling and drives the first LED_NUM of it). The rest —
+  including `0x08` (PRESENCE_TIMEOUT) and `0x0D` (LED_ORDER) — is shared with
+  pico-fido / PicoForge.
 - **`ENABLED_USB_ITF`**: absent ⇒ ALL. A mask that would disable every interface
   the firmware actually builds (`CCID | HID | KB`) is rejected and falls back to
   ALL — otherwise CCID would vanish and the rescue applet that could fix it would

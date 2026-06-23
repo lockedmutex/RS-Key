@@ -20,7 +20,10 @@ const TAG_VIDPID: u8 = 0x0;
 const TAG_LED_GPIO: u8 = 0x4;
 const TAG_LED_BRIGHTNESS: u8 = 0x5;
 const TAG_OPTS: u8 = 0x6;
-const TAG_UP_BTN: u8 = 0x8;
+// Tag `0x08` matches pico-fido / PicoForge `PresenceTimeout`: the touch-wait
+// timeout in seconds. (RS-Key once read this as a presence-button GPIO, but the
+// button is always BOOTSEL, so that was never used — realigned to pico-fido.)
+const TAG_PRESENCE_TIMEOUT: u8 = 0x8;
 const TAG_USB_PRODUCT: u8 = 0x9;
 const TAG_ENABLED_CURVES: u8 = 0xA;
 const TAG_ENABLED_USB_ITF: u8 = 0xB;
@@ -117,7 +120,9 @@ pub struct PhyData {
     pub led_gpio: Option<u8>,
     pub led_brightness: Option<u8>,
     pub opts: u16,
-    pub up_btn: Option<u8>,
+    /// Touch-wait timeout in seconds (tag `0x08`, pico-fido `PresenceTimeout`);
+    /// `None` / `0` keeps the firmware's built-in 30 s default.
+    pub presence_timeout: Option<u8>,
     pub usb_product: Option<Product>,
     pub enabled_curves: Option<u32>,
     pub enabled_usb_itf: Option<u8>,
@@ -153,7 +158,7 @@ impl PhyData {
                 (TAG_LED_GPIO, 1) => phy.led_gpio = Some(v[0]),
                 (TAG_LED_BRIGHTNESS, 1) => phy.led_brightness = Some(v[0]),
                 (TAG_OPTS, 2) => phy.opts = u16::from_be_bytes([v[0], v[1]]),
-                (TAG_UP_BTN, 1) => phy.up_btn = Some(v[0]),
+                (TAG_PRESENCE_TIMEOUT, 1) => phy.presence_timeout = Some(v[0]),
                 (TAG_USB_PRODUCT, 1..=33) => {
                     // Length includes a trailing NUL; the string also stops at
                     // an embedded NUL.
@@ -194,8 +199,8 @@ impl PhyData {
             w.tlv(TAG_LED_BRIGHTNESS, &[b])?;
         }
         w.tlv(TAG_OPTS, &self.opts.to_be_bytes())?;
-        if let Some(b) = self.up_btn {
-            w.tlv(TAG_UP_BTN, &[b])?;
+        if let Some(t) = self.presence_timeout {
+            w.tlv(TAG_PRESENCE_TIMEOUT, &[t])?;
         }
         if let Some(p) = &self.usb_product {
             let s = p.as_bytes();
@@ -311,7 +316,7 @@ mod proofs {
         }
         phy.opts = kani::any();
         if kani::any() {
-            phy.up_btn = Some(kani::any());
+            phy.presence_timeout = Some(kani::any());
         }
         if kani::any() {
             let raw: [u8; W] = kani::any();
@@ -349,7 +354,7 @@ mod proofs {
         assert_eq!(got.led_gpio, phy.led_gpio);
         assert_eq!(got.led_brightness, phy.led_brightness);
         assert_eq!(got.opts, phy.opts);
-        assert_eq!(got.up_btn, phy.up_btn);
+        assert_eq!(got.presence_timeout, phy.presence_timeout);
         match (&got.usb_product, &phy.usb_product) {
             (Some(g), Some(p)) => assert_eq!(g.as_bytes(), p.as_bytes()),
             (None, None) => {}
@@ -377,7 +382,7 @@ mod tests {
             led_gpio: Some(16),
             led_brightness: Some(200),
             opts: OPT_LED_STEADY | OPT_DIMM,
-            up_btn: Some(1),
+            presence_timeout: Some(20),
             usb_product: Product::new(b"RSK Custom"),
             enabled_curves: Some(0x3FF),
             enabled_usb_itf: Some(USB_ITF_CCID | USB_ITF_HID),

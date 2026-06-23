@@ -229,6 +229,8 @@ async fn main(_spawner: Spawner) {
             }
         }
         usb_itf = rsk_rescue::phy::effective_usb_itf(phy);
+        // Touch-wait timeout (pico-fido phy tag 0x08, seconds; 0/absent = default).
+        presence::set_timeout_secs(phy.presence_timeout.unwrap_or(0));
     }
 
     // Provision/recover all persistent state BEFORE attaching to USB. `builder.build()`
@@ -310,7 +312,7 @@ async fn main(_spawner: Spawner) {
     config.serial_number = Some("rs-key-0001");
     config.max_power = 100;
     config.max_packet_size_0 = 64;
-    config.device_release = 0x0783; // bcdDevice: our build counter
+    config.device_release = 0x0784; // bcdDevice: our build counter
 
     let mut builder = Builder::new(
         driver,

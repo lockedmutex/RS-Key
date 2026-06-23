@@ -27,6 +27,7 @@ TAG_LED_GPIO = 0x04
 TAG_LED_DRIVER = 0x0C
 TAG_LED_ORDER = 0x0D  # RS-Key vendor tag (PicoForge skips it as unknown)
 TAG_LED_NUM = 0x0E  # RS-Key vendor tag: addressable LED count
+TAG_PRESENCE_TIMEOUT = 0x08  # touch-wait timeout (seconds); pico-fido/PicoForge compatible
 
 # Driver numbering follows pico-fido / PicoForge's LedDriverType.
 DRIVERS = {"gpio": 1, "pimoroni": 2, "ws2812": 3}
@@ -37,7 +38,7 @@ ORDER_NAMES = {v: k for k, v in ORDERS.items()}
 
 def register(sub):
     p = sub.add_parser(
-        "hw", help="LED hardware wiring (pin/driver/order) via the phy record"
+        "hw", help="device hardware config (LED wiring + touch timeout) via the phy record"
     )
     p.add_argument(
         "--led-pin",
@@ -62,7 +63,13 @@ def register(sub):
         help="number of addressable LEDs connected at runtime (firmware caps it at the build's MAX_LEDS)",
     )
     p.add_argument(
-        "--get", action="store_true", help="read the current phy LED config and exit"
+        "--touch-timeout",
+        type=int,
+        metavar="1-255",
+        help="touch-wait timeout in seconds (pico-fido/PicoForge compatible; firmware default 30)",
+    )
+    p.add_argument(
+        "--get", action="store_true", help="read the current phy config and exit"
     )
     p.add_argument(
         "--no-reboot",
@@ -115,7 +122,7 @@ def _show(tlvs):
     drv = by.get(TAG_LED_DRIVER)
     order = by.get(TAG_LED_ORDER)
     print(
-        "phy LED config ('(build default)' = field absent, firmware build value used):"
+        "phy config ('(build default)' = field absent, firmware build value used):"
     )
     print(f"  pin     {pin[0] if pin else '(build default)'}")
     print(f"  driver  {DRIVER_NAMES.get(drv[0], drv[0]) if drv else '(build default)'}")
@@ -124,6 +131,8 @@ def _show(tlvs):
     )
     led_num = by.get(TAG_LED_NUM)
     print(f"  num     {led_num[0] if led_num else '(build default)'}")
+    tmo = by.get(TAG_PRESENCE_TIMEOUT)
+    print(f"  touch   {str(tmo[0]) + 's' if tmo else '(build default 30s)'}")
 
 
 def run(args):
@@ -140,6 +149,7 @@ def run(args):
         or args.led_driver is not None
         or args.led_order is not None
         or args.led_num is not None
+        or args.touch_timeout is not None
     )
     if args.get or not setting:
         _show(tlvs)
@@ -157,6 +167,10 @@ def run(args):
         if not 1 <= args.led_num <= 255:
             raise SystemExit("--led-num must be 1–255")
         _upsert(tlvs, TAG_LED_NUM, args.led_num)
+    if args.touch_timeout is not None:
+        if not 1 <= args.touch_timeout <= 255:
+            raise SystemExit("--touch-timeout must be 1–255 (seconds)")
+        _upsert(tlvs, TAG_PRESENCE_TIMEOUT, args.touch_timeout)
 
     blob = _serialize_tlv(tlvs)
     _, s1, s2 = ccid.transmit(
