@@ -305,15 +305,17 @@ hardware).
 | `0B` | ENABLED_USB_ITF | 1 | interface mask: `CCID 0x1`, `WCID 0x2`, `HID 0x4`, `KB 0x8`, `LWIP 0x10` |
 | `0C` | LED_DRIVER | 1 | `1` = gpio, `2` = pimoroni, `3` = ws2812 (follows pico-fido/PicoForge `LedDriverType`) |
 | `0D` | LED_ORDER | 1 | **RS-Key extension** — WS2812 wire order: `0` = rgb, `1` = grb |
+| `0E` | LED_NUM | 1 | **RS-Key extension** — addressable LEDs actually connected (`1..=255`; `0`/absent = the build's `MAX_LEDS`). Firmware saturates a value above its compiled `MAX_LEDS` ceiling. |
 
 Notes for a host implementation:
 - **Read-modify-write.** READ the record, change only your tags, WRITE it back —
   this is exactly what `rsk hw` does (`tools/rsk/hw.py`).
   Preserve tags you don't recognize.
-- **Tag `0x0D` (LED_ORDER)** is the only RS-Key-specific tag. PicoForge can skip
-  it as unknown; RS-Key's own tools preserve it across a RMW. (It exists because
-  some RP2350 boards wire WS2812 as GRB and others as RGB; this corrects the
-  red/green swap without reflashing.)
+- **Tags `0x0D` (LED_ORDER) and `0x0E` (LED_NUM)** are the RS-Key-specific tags.
+  PicoForge can skip them as unknown; RS-Key's own tools preserve them across a
+  RMW. LED_ORDER corrects a GRB/RGB red/green swap without reflashing; LED_NUM
+  sets how many daisy-chained addressable LEDs are lit (the binary carries a
+  compile-time `MAX_LEDS` buffer ceiling and drives the first LED_NUM of it).
 - **`ENABLED_USB_ITF`**: absent ⇒ ALL. A mask that would disable every interface
   the firmware actually builds (`CCID | HID | KB`) is rejected and falls back to
   ALL — otherwise CCID would vanish and the rescue applet that could fix it would
@@ -322,10 +324,10 @@ Notes for a host implementation:
 
 ---
 
-## 8. Vendor / LED applet — per-status LED colors
+## 8. Vendor / LED applet — per-status LED color & effects
 
-**AID `F0 00 00 00 01`. CLA `00`.** Live LED customization (color/brightness per
-device status), persisted in flash and applied immediately. Source:
+**AID `F0 00 00 00 01`. CLA `00`.** Live LED customization (color/brightness/effect
+per device status), persisted in flash and applied immediately. Source:
 `firmware/src/vendor.rs`,
 `firmware/src/led.rs`. Reference client:
 `tools/rsk/led.py`.
@@ -334,8 +336,8 @@ device status), persisted in flash and applied immediately. Source:
 |---|---|---|---|---|---|
 | `01` | — | — | — | counter (BE4) | INCREMENT test counter, return new value |
 | `02` | — | — | — | counter (BE4) | GET test counter |
-| `10` | brightness `0..255` | `color \| steady \| status<<4` | — | — | SET LED for one status |
-| `11` | `00` | `00` | — | 9-byte config block | GET LED config |
+| `10` | brightness `0..255` | `color \| steady \| status<<4` | `[effect[, speed]]` opt. | — | SET LED for one status |
+| `11` | `00` | `00` | — | 17-byte config block | GET LED config |
 | `1F` | `00`/`01` | `00` | — | — | REBOOT (warm / BOOTSEL) |
 
 `INS 12` (CORE1_STATS) and `INS 13` (KEYGEN_BENCH) exist only in debug/bench
@@ -343,12 +345,18 @@ builds and are not part of the stable surface.
 
 **SET LED `0x10` P2 layout:** bits `[2:0]` = color, bit `3` (`0x08`) = steady
 (solid, no blink — a **global** toggle), bits `[5:4]` = status. P1 = per-channel
-brightness.
+brightness. The command data field is optional: `data[0]` sets the status's
+**effect**, `data[1]` its **speed** (`0` = the effect's built-in default). They
+are independent — send no data to leave both unchanged, one byte to set only the
+effect (the current speed is kept), two bytes to set both.
 
-**GET LED `0x11` response** (`config_block`, 9 bytes):
-`steady(1) | (color, brightness) × 4` for statuses **idle, processing, touch, boot**
-in that order. (`block[0]` = steady; status *s* → color `block[1+2s]`,
-brightness `block[2+2s]`.)
+**GET LED `0x11` response** (`config_block`, 17 bytes):
+`steady(1) | (effect, color, brightness, speed) × 4` for statuses **idle,
+processing, touch, boot** in that order. (`block[0]` = steady; status *s* →
+effect `block[1+4s]`, color `block[2+4s]`, brightness `block[3+4s]`, speed
+`block[4+4s]`.) **Read the response length:** older firmware returns a 13-byte
+(`effect, color, brightness`) or 9-byte (`color, brightness`) block — the stride
+is `(len − 1) / 4`.
 
 | Color | Code |  | Status | Code |
 |---|---|---|---|---|
@@ -361,8 +369,21 @@ brightness `block[2+2s]`.)
 | cyan | 6 |  | | |
 | white | 7 |  | | |
 
+**Effects** (the `effect` byte — `ws2812` backend only; `gpio`/`pimoroni` always
+use the classic on/off blink). `legacy` reproduces the original blink; the rest
+animate across the connected LEDs and reduce gracefully on a single LED:
+
+| Effect | Code |  | Effect | Code |
+|---|---|---|---|---|
+| legacy (classic blink) | 0 |  | flow | 3 |
+| vapor (breathing) | 1 |  | sparkle | 4 |
+| bounce | 2 |  | | |
+
 Example — set the **idle** status to solid blue at brightness `0x20`:
 P2 = `color 3 | steady 0x08 | status 0<<4` = `0x0B`, APDU `00 10 20 0B`.
+Example — set **touch** to yellow `bounce` at brightness `0x10`, speed `0x0F`:
+P2 = `color 4 | status 2<<4` = `0x24`, data = `effect 2 ‖ speed 0x0F`,
+APDU `00 10 10 24 02 02 0F`.
 
 ---
 
