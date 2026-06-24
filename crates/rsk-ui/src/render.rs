@@ -166,6 +166,29 @@ fn masked_entry<D: DrawTarget<Color = Rgb565>>(t: &mut D, entered: usize) -> Res
     Ok(())
 }
 
+/// Top and height of the masked-entry band — the strip [`render_pin_dots`] repaints
+/// on its own. Must cover the dot row `masked_entry` draws (y 54, dia 12).
+const PIN_ENTRY_TOP: i32 = 48;
+const PIN_ENTRY_H: u32 = 24;
+
+/// Repaint **only** the masked-entry band (clear the strip, redraw the dots),
+/// leaving the static keys untouched. The pad is painted in full once via
+/// `render(&Screen::Pin(..))`; each keystroke then calls this, so adding or removing
+/// a digit is a tiny partial update with no full-screen clear — and thus no flicker,
+/// unlike repainting the whole 240×320 frame per tap.
+pub fn render_pin_dots<D>(target: &mut D, entered: usize) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    Rectangle::new(
+        EgPoint::new(0, PIN_ENTRY_TOP),
+        Size::new(PANEL_W as u32, PIN_ENTRY_H),
+    )
+    .into_styled(PrimitiveStyle::with_fill(BG))
+    .draw(target)?;
+    masked_entry(target, entered)
+}
+
 /// A static caption for a pad key — no alloc: digits index a fixed table.
 fn key_label(k: PinKey) -> &'static str {
     const DIGITS: [&str; 10] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
@@ -350,5 +373,23 @@ mod tests {
         assert!(d.any_non_bg_in(PIN_CANCEL_RECT));
         // Four entered digits paint masked dots in the band above the grid.
         assert!((40..72).any(|y| (0..PANEL_W).any(|x| d.at(x, y) != BG)));
+    }
+
+    #[test]
+    fn pin_dots_partial_update_leaves_keys_intact() {
+        let mut d = Rec::new();
+        render(&mut d, &Screen::Pin(PinPad::new(2))).unwrap();
+        let ok = pin_key_rect(2, 3);
+        let key_px = d.at(ok.x + crate::PIN_KEY_W / 2, ok.y + 3);
+        // A partial dots update touches only the entry band, never the keys.
+        render_pin_dots(&mut d, 5).unwrap();
+        assert!(!d.oob);
+        assert_eq!(
+            d.at(ok.x + crate::PIN_KEY_W / 2, ok.y + 3),
+            key_px,
+            "the static keys must survive a partial dots update"
+        );
+        // The band still carries dots for the new digit count.
+        assert!((48..72).any(|y| (0..PANEL_W).any(|x| d.at(x, y) != BG)));
     }
 }

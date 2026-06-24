@@ -342,7 +342,10 @@ impl TouchPresence {
                         }
                     };
                     if repaint && done.is_none() {
-                        let _ = rsk_ui::render(&mut u.panel, &Screen::Pin(PinPad::new(entered)));
+                        // Partial update: only the masked-entry row changes per
+                        // keystroke, so repaint just that strip — no full-frame
+                        // clear, no flicker.
+                        let _ = rsk_ui::render_pin_dots(&mut u.panel, entered);
                     }
                     u.touch.wait_release(start, timeout);
                     if let Some(o) = done {

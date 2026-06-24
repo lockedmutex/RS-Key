@@ -18,7 +18,7 @@
 
 pub mod render;
 pub mod touch;
-pub use render::render;
+pub use render::{render, render_pin_dots};
 
 /// Panel geometry (Waveshare RP2350-Touch-LCD-2.8, ST7789T3, portrait).
 pub const PANEL_W: u16 = 240;

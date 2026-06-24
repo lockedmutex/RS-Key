@@ -84,7 +84,9 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   `UnsupportedOption`. The pad geometry + hit-test live in `rsk-ui` (host-tested +
   Kani-proved disjoint). NB the display build's getInfo therefore advertises `uv`,
   a deliberate divergence from the shared metadata statement, which describes the
-  standard (screenless) key. bcdDevice 0x0786 → 0x0787.
+  standard (screenless) key. The pad repaints only its masked-entry row per
+  keystroke — a tiny partial update, not a full-frame redraw — so typing a digit
+  does not flash the whole screen. bcdDevice 0x0786 → 0x0788.
 
 ### Changed
 
