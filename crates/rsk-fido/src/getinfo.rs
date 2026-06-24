@@ -37,13 +37,21 @@ use crate::error::{CtapError, CtapResult};
 /// (`enableEnterpriseAttestation` / `toggleAlwaysUv`). Platforms (and the FIDO
 /// conformance tool) only exercise those paths when the option is present. Keep in
 /// sync with `metadata/rs-key.metadata.json`.
+/// `builtin_uv` advertises `options.uv` (built-in user verification — the
+/// trusted-display PIN pad): present only on a build that can collect a PIN on its
+/// own UI, with the value tracking whether a PIN is configured. Standard (screenless)
+/// keys pass `false` and the key is omitted entirely.
 /// `remaining_rk` is the live free discoverable-credential count (getInfo 0x14).
+// Each argument is a distinct getInfo input the caller already holds; a params
+// struct would only relocate them, not reduce the surface.
+#[allow(clippy::too_many_arguments)]
 pub fn get_info(
     pin_set: bool,
     min_pin_len: u8,
     force_change: bool,
     ea_enabled: bool,
     always_uv: bool,
+    builtin_uv: bool,
     remaining_rk: u16,
     out: &mut [u8],
 ) -> CtapResult {
@@ -55,12 +63,14 @@ pub fn get_info(
         force_change,
         ea_enabled,
         always_uv,
+        builtin_uv,
         remaining_rk,
     )
     .map_err(|_| CtapError::Other)?;
     Ok(enc.writer().position())
 }
 
+#[allow(clippy::too_many_arguments)] // mirrors get_info's distinct inputs (see above)
 fn write_info<W: Write>(
     enc: &mut Encoder<W>,
     pin_set: bool,
@@ -68,6 +78,7 @@ fn write_info<W: Write>(
     force_change: bool,
     ea_enabled: bool,
     always_uv: bool,
+    builtin_uv: bool,
     remaining_rk: u16,
 ) -> Result<(), Error<W::Error>> {
     // Keys are ascending uints → CTAP canonical order (1-byte keys 0x01..0x16
@@ -105,30 +116,26 @@ fn write_info<W: Write>(
     enc.u8(0x03)?.bytes(&AAGUID)?;
 
     // 0x04 options — text keys in canonical order (length, then bytewise). "ep"
-    // (enterprise attestation) sorts first among the 2-char keys; "alwaysUv"
-    // (value = enabled state) sorts first among the 8-char keys (before "credMgmt").
-    enc.u8(0x04)?
-        .map(10)?
-        .str("ep")?
-        .bool(ea_enabled)?
-        .str("rk")?
-        .bool(true)?
-        .str("up")?
-        .bool(true)?
-        .str("alwaysUv")?
-        .bool(always_uv)?
-        .str("credMgmt")?
-        .bool(true)?
-        .str("authnrCfg")?
-        .bool(true)?
-        .str("clientPin")?
-        .bool(pin_set)?
-        .str("largeBlobs")?
-        .bool(true)?
-        .str("pinUvAuthToken")?
-        .bool(true)?
-        .str("setMinPINLength")?
-        .bool(true)?;
+    // (enterprise attestation) sorts first among the 2-char keys; "uv" (built-in
+    // user verification) sorts right after "up" (0x75 0x76 > 0x75 0x70) and is
+    // present only when the build can collect a PIN on its own UI (the trusted
+    // display); "alwaysUv" sorts first among the 8-char keys (before "credMgmt").
+    enc.u8(0x04)?.map(10 + u64::from(builtin_uv))?;
+    enc.str("ep")?.bool(ea_enabled)?;
+    enc.str("rk")?.bool(true)?;
+    enc.str("up")?.bool(true)?;
+    if builtin_uv {
+        // Built-in UV verifies the same EF_PIN as clientPIN, so `true` = a PIN is
+        // configured (ready), `false` = supported but not yet configured.
+        enc.str("uv")?.bool(pin_set)?;
+    }
+    enc.str("alwaysUv")?.bool(always_uv)?;
+    enc.str("credMgmt")?.bool(true)?;
+    enc.str("authnrCfg")?.bool(true)?;
+    enc.str("clientPin")?.bool(pin_set)?;
+    enc.str("largeBlobs")?.bool(true)?;
+    enc.str("pinUvAuthToken")?.bool(true)?;
+    enc.str("setMinPINLength")?.bool(true)?;
 
     // 0x05 maxMsgSize
     enc.u8(0x05)?.u64(MAX_MSG_SIZE)?;
@@ -235,7 +242,7 @@ mod tests {
     /// Decode the advertised `algorithms` (0x0A) COSE ids from a getInfo response.
     fn advertised_algs() -> std::vec::Vec<i64> {
         let mut out = [0u8; 1024];
-        let n = get_info(false, 6, false, false, false, 256, &mut out).unwrap();
+        let n = get_info(false, 6, false, false, false, false, 256, &mut out).unwrap();
         let mut d = Decoder::new(&out[..n]);
         let entries = d.map().unwrap().unwrap();
         let mut algs = std::vec::Vec::new();
@@ -295,7 +302,7 @@ mod tests {
     #[test]
     fn get_info_fields() {
         let mut buf = [0u8; 512];
-        let n = get_info(true, 4, false, false, false, 200, &mut buf).unwrap();
+        let n = get_info(true, 4, false, false, false, false, 200, &mut buf).unwrap();
         let mut d = Decoder::new(&buf[..n]);
 
         let entries = d.map().unwrap().unwrap();
@@ -450,12 +457,51 @@ mod tests {
         assert!(d.datatype().is_err());
     }
 
+    /// Read the `options` (0x04) map as `(key, value)` pairs.
+    fn option_pairs(builtin_uv: bool, pin_set: bool) -> std::vec::Vec<(std::string::String, bool)> {
+        let mut buf = [0u8; 512];
+        let n = get_info(pin_set, 4, false, false, false, builtin_uv, 256, &mut buf).unwrap();
+        let mut d = Decoder::new(&buf[..n]);
+        d.map().unwrap();
+        for k in [0x01u8, 0x02, 0x03] {
+            assert_eq!(d.u8().unwrap(), k);
+            d.skip().unwrap();
+        }
+        assert_eq!(d.u8().unwrap(), 0x04);
+        let m = d.map().unwrap().unwrap();
+        (0..m)
+            .map(|_| (d.str().unwrap().to_string(), d.bool().unwrap()))
+            .collect()
+    }
+
+    /// `options.uv` (built-in user verification) is advertised only on a build that
+    /// can collect a PIN on its own UI, sorts right after `up`, and tracks whether a
+    /// PIN is configured. A screenless key omits it entirely.
+    #[test]
+    fn uv_option_present_only_with_builtin_uv() {
+        // Screenless: no "uv" key, 10 options.
+        let plain = option_pairs(false, true);
+        assert_eq!(plain.len(), 10);
+        assert!(!plain.iter().any(|(k, _)| k == "uv"));
+
+        // Display build, PIN set: "uv" = true, immediately after "up".
+        let ready = option_pairs(true, true);
+        assert_eq!(ready.len(), 11);
+        let up = ready.iter().position(|(k, _)| k == "up").unwrap();
+        assert_eq!(ready[up + 1].0, "uv", "uv must sort right after up");
+        assert!(ready[up + 1].1, "uv = true once a PIN is configured");
+
+        // Display build, no PIN yet: "uv" present but false (supported, unconfigured).
+        let unconfigured = option_pairs(true, false);
+        assert!(!unconfigured.iter().find(|(k, _)| k == "uv").unwrap().1);
+    }
+
     #[test]
     fn client_pin_reflects_pin_state() {
         // options.clientPin is false before a PIN is set, true after.
         let mut buf = [0u8; 512];
         for pin_set in [false, true] {
-            let n = get_info(pin_set, 4, false, false, false, 256, &mut buf).unwrap();
+            let n = get_info(pin_set, 4, false, false, false, false, 256, &mut buf).unwrap();
             let mut d = Decoder::new(&buf[..n]);
             d.map().unwrap();
             // skip to 0x04 options.
@@ -488,7 +534,7 @@ mod tests {
     fn min_pin_policy_reflected() {
         // 0x0D mirrors minPINLength, 0x0C the forceChangePin flag.
         let mut buf = [0u8; 512];
-        let n = get_info(true, 8, true, false, false, 256, &mut buf).unwrap();
+        let n = get_info(true, 8, true, false, false, false, 256, &mut buf).unwrap();
         let mut d = Decoder::new(&buf[..n]);
         d.map().unwrap();
         let (mut force, mut min) = (None, None);
@@ -509,7 +555,7 @@ mod tests {
         // state: false at reset, true once EA has been enabled.
         for ea in [false, true] {
             let mut buf = [0u8; 512];
-            let n = get_info(true, 4, false, ea, false, 256, &mut buf).unwrap();
+            let n = get_info(true, 4, false, ea, false, false, 256, &mut buf).unwrap();
             let mut d = Decoder::new(&buf[..n]);
             d.map().unwrap();
             for _ in 0..3 {
@@ -530,7 +576,7 @@ mod tests {
         // false at reset, true once alwaysUv has been enabled.
         for always_uv in [false, true] {
             let mut buf = [0u8; 512];
-            let n = get_info(true, 4, false, false, always_uv, 256, &mut buf).unwrap();
+            let n = get_info(true, 4, false, false, always_uv, false, 256, &mut buf).unwrap();
             let mut d = Decoder::new(&buf[..n]);
             d.map().unwrap();
             for _ in 0..3 {
@@ -554,7 +600,7 @@ mod tests {
     fn get_info_buffer_too_small() {
         let mut tiny = [0u8; 8];
         assert_eq!(
-            get_info(false, 4, false, false, false, 256, &mut tiny),
+            get_info(false, 4, false, false, false, false, 256, &mut tiny),
             Err(CtapError::Other)
         );
     }

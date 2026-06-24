@@ -64,6 +64,27 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   honored during the wait, and USB keepalives keep flowing (the on-screen wait is a
   busy-wait on the thread executor, preempted by USB on the interrupt executor).
   bcdDevice 0x0785 → 0x0786.
+- **Trusted-display variant — on-device PIN / built-in user verification
+  (experimental, opt-in).** On the `display` build the device can now verify the
+  user with a PIN typed on its **own** screen, so the PIN never crosses the host —
+  defeating a host-side keylogger, the user-verification counterpart to Phase 2's
+  "what you see is what you sign". getInfo advertises `options.uv`, and clientPIN
+  gains the standard built-in-UV subcommands `getPinUvAuthTokenUsingUvWithPermissions`
+  (0x06) and `getUVRetries` (0x07): the platform asks the device to verify, the
+  on-screen numeric pad collects the PIN (masked — only dot-per-digit is drawn,
+  each key debounced to release, OK gated at `minPINLength`), it is checked against
+  the same `EF_PIN` clientPIN already uses, and a `pinUvAuthToken` is minted — so
+  makeCredential / getAssertion are unchanged (a token is a token however it was
+  earned, and the Phase 2 Approve/Deny still names the relying party afterwards).
+  Built-in UV shares the clientPIN retry budget, so a wrong on-screen PIN is
+  `UV_INVALID` and spends one retry; an exhausted budget is `UV_BLOCKED`; tapping
+  Cancel declines without spending one. A standard key **without** a screen compiles
+  none of this and is byte-for-byte unchanged — the new `UserPresence` methods
+  default to "no built-in UV", so getInfo omits `uv` and 0x06/0x07 answer
+  `UnsupportedOption`. The pad geometry + hit-test live in `rsk-ui` (host-tested +
+  Kani-proved disjoint). NB the display build's getInfo therefore advertises `uv`,
+  a deliberate divergence from the shared metadata statement, which describes the
+  standard (screenless) key. bcdDevice 0x0786 → 0x0787.
 
 ### Changed
 

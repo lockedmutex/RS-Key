@@ -24,7 +24,10 @@ use embedded_graphics::{
     text::{Alignment, Baseline, Text, TextStyle, TextStyleBuilder},
 };
 
-use crate::{ALLOW_RECT, ConfirmPrompt, DENY_RECT, PANEL_W, Rect, Screen, StatusKind};
+use crate::{
+    ALLOW_RECT, ConfirmPrompt, DENY_RECT, PANEL_W, PIN_CANCEL_RECT, PIN_COLS, PIN_ROWS, PinKey,
+    PinPad, Rect, Screen, StatusKind, pin_grid_key, pin_key_rect,
+};
 
 const BG: Rgb565 = Rgb565::BLACK;
 const FG: Rgb565 = Rgb565::WHITE;
@@ -36,6 +39,9 @@ const ALLOW_FILL: Rgb565 = Rgb565::CSS_SEA_GREEN;
 const DENY_FILL: Rgb565 = Rgb565::CSS_INDIAN_RED;
 /// Corner radius for the floating buttons — enough to read as rounded cards.
 const BTN_RADIUS: u32 = 12;
+/// Neutral fill for the numeric PIN keys; OK reuses the Allow green, Del the muted
+/// gray, Cancel the Deny red, so the affirmative/destructive keys stand out.
+const KEY_FILL: Rgb565 = Rgb565::CSS_STEEL_BLUE;
 
 /// Center the screen horizontally on a half-pixel-free integer midline.
 const MIDX: i32 = PANEL_W as i32 / 2;
@@ -51,6 +57,7 @@ where
         Screen::Splash => splash(target),
         Screen::Status(kind) => status(target, *kind),
         Screen::Confirm(prompt) => confirm(target, prompt),
+        Screen::Pin(pad) => pin(target, pad),
     }
 }
 
@@ -115,6 +122,59 @@ fn button<D: DrawTarget<Color = Rgb565>>(
         .into_styled(PrimitiveStyle::with_fill(fill))
         .draw(t)?;
     text(t, label, center(r), &FONT_9X15_BOLD, FG)
+}
+
+/// The built-in-UV PIN pad: a header (title + Cancel), the masked entry, then the
+/// 3×4 key grid. Each key is painted in the exact [`pin_key_rect`] that
+/// [`crate::hit_pin`] maps a tap to, and only masked dots — never the digits — are
+/// shown.
+fn pin<D: DrawTarget<Color = Rgb565>>(t: &mut D, pad: &PinPad) -> Result<(), D::Error> {
+    text(t, "Enter PIN", EgPoint::new(MIDX, 22), &FONT_9X15_BOLD, FG)?;
+    button(t, PIN_CANCEL_RECT, "Cancel", DENY_FILL)?;
+    masked_entry(t, pad.entered)?;
+    let mut row = 0;
+    while row < PIN_ROWS {
+        let mut col = 0;
+        while col < PIN_COLS {
+            let key = pin_grid_key(col, row);
+            let fill = match key {
+                PinKey::Ok => ALLOW_FILL,
+                PinKey::Del => MUTED,
+                _ => KEY_FILL,
+            };
+            button(t, pin_key_rect(col, row), key_label(key), fill)?;
+            col += 1;
+        }
+        row += 1;
+    }
+    Ok(())
+}
+
+/// One filled dot per entered digit (capped to a row width), centered — the PIN
+/// itself is never rendered, only its length.
+fn masked_entry<D: DrawTarget<Color = Rgb565>>(t: &mut D, entered: usize) -> Result<(), D::Error> {
+    const MAX_DOTS: usize = 10;
+    const DIA: u32 = 12;
+    const STEP: i32 = 20;
+    let n = entered.min(MAX_DOTS) as i32;
+    let start = MIDX - (n * STEP) / 2 + (STEP - DIA as i32) / 2;
+    for i in 0..n {
+        Circle::new(EgPoint::new(start + i * STEP, 54), DIA)
+            .into_styled(PrimitiveStyle::with_fill(FG))
+            .draw(t)?;
+    }
+    Ok(())
+}
+
+/// A static caption for a pad key — no alloc: digits index a fixed table.
+fn key_label(k: PinKey) -> &'static str {
+    const DIGITS: [&str; 10] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
+    match k {
+        PinKey::Digit(n) => DIGITS[(n % 10) as usize],
+        PinKey::Del => "Del",
+        PinKey::Ok => "OK",
+        PinKey::Cancel => "Cancel",
+    }
 }
 
 fn status_color(kind: StatusKind) -> Rgb565 {
@@ -274,5 +334,21 @@ mod tests {
             let c = d.at(x, row);
             c != ALLOW_FILL && c != DENY_FILL
         }));
+    }
+
+    #[test]
+    fn pin_pad_fits_and_paints_keys_in_their_hit_rects() {
+        let mut d = Rec::new();
+        render(&mut d, &Screen::Pin(PinPad::new(4))).unwrap();
+        assert!(!d.oob, "pin pad drew outside the panel");
+        // The OK key is filled in its own hit rect (the key you see is the key you tap).
+        let ok = pin_key_rect(2, 3);
+        assert_eq!(d.at(ok.x + crate::PIN_KEY_W / 2, ok.y + 3), ALLOW_FILL);
+        assert!(d.any_non_bg_in(ok));
+        // A digit key and the Cancel target carry paint.
+        assert!(d.any_non_bg_in(pin_key_rect(0, 0)));
+        assert!(d.any_non_bg_in(PIN_CANCEL_RECT));
+        // Four entered digits paint masked dots in the band above the grid.
+        assert!((40..72).any(|y| (0..PANEL_W).any(|x| d.at(x, y) != BG)));
     }
 }

@@ -3,7 +3,10 @@
 
 //! `authenticatorClientPIN`: getPINRetries (1), getKeyAgreement (2), setPIN
 //! (3), changePIN (4), getPinToken (5) and
-//! getPinUvAuthTokenUsingPinWithPermissions (9); the PIN/UV-auth state lives in
+//! getPinUvAuthTokenUsingPinWithPermissions (9). The trusted-display build adds
+//! built-in user verification — getPinUvAuthTokenUsingUvWithPermissions (6) and
+//! getUVRetries (7), where the user types the PIN on the device's own pad so it
+//! never reaches the host. The PIN/UV-auth state lives in
 //! [`crate::state::FidoState`]. PIN commands never touch the seed's at-rest
 //! format (UP-only operations must keep working across power cycles); a
 //! successful verify only migrates legacy PIN-wrapped blobs back to plain
@@ -24,7 +27,7 @@ use crate::error::{CtapError, CtapResult};
 use crate::journal;
 use crate::seed::migrate_keydev_pin;
 use crate::state::{PERM_BE, PERM_GA, PERM_MC, PERM_PCMR};
-use crate::{Ctx, Rng};
+use crate::{Ctx, PinEntry, Rng};
 
 const PIN_FILE_LEN: usize = 35; // retries(1) + len(1) + format(1) + verifier(32)
 const PADDED_PIN_LEN: usize = 64;
@@ -113,6 +116,10 @@ pub fn client_pin<S: Storage, R: Rng>(
         0x3 => set_pin(ctx, &req, out),
         0x4 => change_pin(ctx, &req, out),
         0x5 | 0x9 => get_pin_token(ctx, &req, out),
+        // Built-in UV (0x06 token / 0x07 retries) exists only where the firmware can
+        // collect a PIN on its own UI; elsewhere it falls through to UnsupportedOption.
+        0x6 if ctx.presence.uv_available() => get_uv_token(ctx, &req, out),
+        0x7 if ctx.presence.uv_available() => get_uv_retries(ctx, out),
         _ => Err(CtapError::UnsupportedOption),
     }
 }
@@ -262,7 +269,7 @@ fn change_pin<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [u8]
 
 fn get_pin_token<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [u8]) -> CtapResult {
     let proto = require_pin_inputs(req, false, true)?;
-    let mut permissions = req.permissions as u8;
+    let permissions = req.permissions as u8;
     if req.subcommand == 0x5 {
         if req.permissions != 0 || req.rp_id.is_some() {
             return Err(CtapError::InvalidParameter);
@@ -316,18 +323,38 @@ fn get_pin_token<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [
         });
     }
 
-    // Build the token and return it encrypted under the shared secret.
+    // The legacy getPinToken (0x05) grants the fixed mc|ga permission set; the
+    // permissions-based variant (0x09) uses exactly what was requested.
+    let permissions = if req.subcommand == 0x5 {
+        PERM_MC | PERM_GA
+    } else {
+        permissions
+    };
+    let res = issue_token(ctx, proto, secret, permissions, req.rp_id, out);
+    shared.zeroize();
+    res
+}
+
+/// Build the requested pinUvAuthToken, encrypt it under the ECDH `secret`, and
+/// write the clientPIN response. Shared by the PIN (0x05/0x09) and the built-in-UV
+/// (0x06) token paths once verification has already succeeded — the token itself
+/// is identical; only *how* the user verified differs.
+fn issue_token<S: Storage, R: Rng>(
+    ctx: &mut Ctx<S, R>,
+    proto: PinProto,
+    secret: &[u8],
+    permissions: u8,
+    rp_id: Option<&str>,
+    out: &mut [u8],
+) -> CtapResult {
     let pdata = if permissions & PERM_PCMR != 0 {
         ctx.state.ppaut_permissions = PERM_PCMR;
         ctx.state.ppaut_token
     } else {
         ctx.state.reset_pin_uv_auth_token(ctx.rng);
         ctx.state.begin_using_token(false);
-        if req.subcommand == 0x5 {
-            permissions = PERM_MC | PERM_GA;
-        }
         ctx.state.paut.permissions = permissions;
-        match req.rp_id {
+        match rp_id {
             Some(rp) => {
                 ctx.state.paut.rp_id_hash = sha256(rp.as_bytes());
                 ctx.state.paut.has_rp_id = true;
@@ -338,12 +365,101 @@ fn get_pin_token<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [
     };
 
     let mut token_enc = [0u8; 32 + 16];
-    let enc_len = pinproto::encrypt(proto, secret, &[0u8; 16], &pdata, &mut token_enc);
-    shared.zeroize();
-    let enc_len = enc_len.map_err(|_| CtapError::Other)?;
+    let enc_len = pinproto::encrypt(proto, secret, &[0u8; 16], &pdata, &mut token_enc)
+        .map_err(|_| CtapError::Other)?;
     ctx.state.needs_power_cycle = false;
     let len = encode(out, |e| {
         e.map(1)?.u8(2)?.bytes(&token_enc[..enc_len])?;
+        Ok(())
+    })?;
+    Ok(len)
+}
+
+/// `getPinUvAuthTokenUsingUvWithPermissions` (0x06): the built-in-UV counterpart of
+/// the permissions-based PIN token (0x09). Instead of the host sending the PIN, the
+/// user verifies on the device's own UI (the trusted-display PIN pad) — the PIN
+/// never crosses the host — and the same EF_PIN verifier is checked locally. Only
+/// reached on a build that advertises `options.uv` (gated in the dispatch).
+fn get_uv_token<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [u8]) -> CtapResult {
+    let proto = require_pin_inputs(req, false, false)?;
+    let permissions = req.permissions as u8;
+    // WithPermissions: a non-zero permission set is mandatory; bio-enrollment (be)
+    // is unsupported, and pcm-readonly (pcmr) may not be combined with anything else.
+    if req.permissions == 0 {
+        return Err(CtapError::InvalidParameter);
+    }
+    if permissions & PERM_BE != 0 {
+        return Err(CtapError::UnauthorizedPermission);
+    }
+    if permissions & PERM_PCMR != 0 && permissions != PERM_PCMR {
+        return Err(CtapError::UnauthorizedPermission);
+    }
+    // Built-in UV verifies the same EF_PIN as clientPIN and shares its retry budget.
+    pin_set_and_unblocked(ctx)?;
+    if ctx.state.needs_power_cycle {
+        return Err(CtapError::UvBlocked);
+    }
+
+    // The interactive step: collect the PIN on the device and verify it locally. A
+    // short entry (below minPINLength) is refused by the pad without a verify, so it
+    // can't burn a retry; an actual mismatch does, exactly like a host PIN.
+    let min = min_pin_length(ctx) as usize;
+    let mut pin = [0u8; PADDED_PIN_LEN];
+    let entry = ctx.presence.collect_pin(min, &mut pin);
+    let verified = perform_builtin_uv(ctx, entry, &pin);
+    pin.zeroize();
+    verified?;
+
+    // A pending forced PIN change still blocks token issuance (changePIN first).
+    if force_change_pending(ctx) {
+        return Err(CtapError::PinPolicyViolation);
+    }
+
+    let mut shared = [0u8; 64];
+    let slen = derive_shared(ctx, req, proto, &mut shared)?;
+    let res = issue_token(ctx, proto, &shared[..slen], permissions, req.rp_id, out);
+    shared.zeroize();
+    res
+}
+
+/// Verify a PIN entered via built-in UV against EF_PIN, mapping the entry outcome
+/// and translating the host-PIN error dialect of [`verify_pin_hash`] into the
+/// built-in-UV codes a platform expects (UV_INVALID / UV_BLOCKED). A non-entry
+/// (decline / timeout / cancel) returns before the verify, so it never spends a
+/// retry; only a real mismatch does.
+fn perform_builtin_uv<S: Storage, R: Rng>(
+    ctx: &mut Ctx<S, R>,
+    entry: PinEntry,
+    pin: &[u8],
+) -> Result<(), CtapError> {
+    let len = match entry {
+        PinEntry::Entered(len) => len.min(pin.len()),
+        PinEntry::Declined => return Err(CtapError::OperationDenied),
+        PinEntry::Timeout => return Err(CtapError::UserActionTimeout),
+        PinEntry::Cancelled => return Err(CtapError::KeepAliveCancel),
+        PinEntry::Unsupported => return Err(CtapError::UnsupportedOption),
+    };
+    let mut dhash = sha256(&pin[..len]);
+    let res = verify_pin_hash(ctx, &dhash[..16]);
+    dhash.zeroize();
+    res.map_err(|e| match e {
+        CtapError::PinInvalid => CtapError::UvInvalid,
+        CtapError::PinBlocked | CtapError::PinAuthBlocked => CtapError::UvBlocked,
+        other => other,
+    })
+}
+
+/// `getUVRetries` (0x07): the built-in-UV retry budget. Built-in UV verifies the
+/// same EF_PIN as clientPIN and shares its counter, so this mirrors getPINRetries
+/// (response key 0x05 `uvRetries`, plus 0x04 `powerCycleState` while soft-locked).
+fn get_uv_retries<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, out: &mut [u8]) -> CtapResult {
+    let retries = pin_retries(ctx);
+    let pc = ctx.state.needs_power_cycle;
+    let len = encode(out, |e| {
+        e.map(if pc { 2 } else { 1 })?.u8(5)?.u8(retries)?;
+        if pc {
+            e.u8(4)?.bool(true)?;
+        }
         Ok(())
     })?;
     Ok(len)
@@ -606,6 +722,68 @@ mod tests {
         client_pin(&mut ctx, data, out)
     }
 
+    /// A built-in-UV presence backend for the 0x06/0x07 tests: it reports built-in
+    /// UV available and "types" a fixed PIN on the (virtual) pad, honoring the same
+    /// min-length gate the real pad enforces. An explicit `outcome` overrides the
+    /// entry to exercise the decline / timeout / cancel branches.
+    struct UvPad {
+        digits: std::vec::Vec<u8>,
+        outcome: Option<PinEntry>,
+    }
+    impl UvPad {
+        fn typing(pin: &[u8]) -> Self {
+            Self {
+                digits: pin.to_vec(),
+                outcome: None,
+            }
+        }
+        fn ending(outcome: PinEntry) -> Self {
+            Self {
+                digits: std::vec::Vec::new(),
+                outcome: Some(outcome),
+            }
+        }
+    }
+    impl crate::UserPresence for UvPad {
+        fn request(&mut self, _c: crate::Confirm<'_>) -> crate::Presence {
+            crate::Presence::Confirmed
+        }
+        fn uv_available(&self) -> bool {
+            true
+        }
+        fn collect_pin(&mut self, min_len: usize, out: &mut [u8]) -> PinEntry {
+            if let Some(o) = self.outcome {
+                return o;
+            }
+            if self.digits.len() < min_len {
+                return PinEntry::Declined;
+            }
+            let n = self.digits.len().min(out.len());
+            out[..n].copy_from_slice(&self.digits[..n]);
+            PinEntry::Entered(n)
+        }
+    }
+
+    /// `run` with a caller-supplied presence backend (for the built-in-UV pad).
+    fn run_with(
+        presence: &mut dyn crate::UserPresence,
+        fs: &mut Fs<RamStorage>,
+        rng: &mut SeqRng,
+        state: &mut FidoState,
+        data: &[u8],
+        out: &mut [u8],
+    ) -> CtapResult {
+        let mut ctx = Ctx {
+            presence,
+            dev: dev(),
+            fs,
+            rng,
+            state,
+            now_ms: 0,
+        };
+        client_pin(&mut ctx, data, out)
+    }
+
     // A clientPIN request field value.
     enum V<'a> {
         U(u64),
@@ -750,6 +928,17 @@ mod tests {
             ])
         }
 
+        // getPinUvAuthTokenUsingUvWithPermissions (subCommand 6): built-in UV, so no
+        // encrypted PIN on the wire — just keyAgreement + the requested permissions.
+        fn get_uv_token_req(&self, perms: u64) -> std::vec::Vec<u8> {
+            build(&[
+                (1, V::U(self.wire)),
+                (2, V::U(6)),
+                (3, V::Cose(&self.x, &self.y)),
+                (9, V::U(perms)),
+            ])
+        }
+
         fn change_pin_req(&self, old: &[u8], new: &[u8]) -> std::vec::Vec<u8> {
             let mut padded = [0u8; 64];
             padded[..new.len()].copy_from_slice(new);
@@ -849,6 +1038,146 @@ mod tests {
             run(&mut fs, &mut rng, &mut state, &req, &mut out),
             Err(CtapError::PinPolicyViolation)
         );
+    }
+
+    /// Set a PIN host-side, returning everything wired for a built-in-UV test.
+    fn setup_with_pin(pin: &[u8]) -> (Fs<RamStorage>, SeqRng, FidoState, Platform) {
+        let (mut fs, mut rng) = setup();
+        let mut state = FidoState::new();
+        let plat = key_agreement(&mut fs, &mut rng, &mut state, PinProto::Two, 2);
+        let mut out = [0u8; 256];
+        run(
+            &mut fs,
+            &mut rng,
+            &mut state,
+            &plat.set_pin_req(pin),
+            &mut out,
+        )
+        .unwrap();
+        (fs, rng, state, plat)
+    }
+
+    fn ef_pin_retries(fs: &mut Fs<RamStorage>) -> u8 {
+        let mut pf = [0u8; PIN_FILE_LEN];
+        assert_eq!(fs.read(EF_PIN, &mut pf), Some(PIN_FILE_LEN));
+        pf[0]
+    }
+
+    /// Built-in UV: with a PIN set host-side, obtain a pinUvAuthToken via the
+    /// on-device pad (subCommand 6) — the PIN never crosses the wire. The minted
+    /// token carries the requested permissions and counts as user-verified.
+    #[test]
+    fn builtin_uv_token_success() {
+        let (mut fs, mut rng, mut state, plat) = setup_with_pin(b"1234");
+        let mut out = [0u8; 256];
+        let mut pad = UvPad::typing(b"1234");
+        let n = run_with(
+            &mut pad,
+            &mut fs,
+            &mut rng,
+            &mut state,
+            &plat.get_uv_token_req(PERM_GA as u64),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(plat.decrypt_token(&out[..n]), state.paut.token);
+        assert_eq!(state.paut.permissions, PERM_GA);
+        assert!(state.user_verified());
+        // A correct entry restores the full retry budget.
+        assert_eq!(ef_pin_retries(&mut fs), MAX_PIN_RETRIES);
+    }
+
+    /// A wrong on-screen PIN is reported as UV_INVALID (the built-in-UV dialect of
+    /// PIN_INVALID) and spends one of the shared retries.
+    #[test]
+    fn builtin_uv_wrong_pin_is_uv_invalid_and_burns_a_retry() {
+        let (mut fs, mut rng, mut state, plat) = setup_with_pin(b"1234");
+        let mut out = [0u8; 256];
+        let mut pad = UvPad::typing(b"9999");
+        assert_eq!(
+            run_with(
+                &mut pad,
+                &mut fs,
+                &mut rng,
+                &mut state,
+                &plat.get_uv_token_req(PERM_GA as u64),
+                &mut out,
+            ),
+            Err(CtapError::UvInvalid)
+        );
+        assert_eq!(ef_pin_retries(&mut fs), MAX_PIN_RETRIES - 1);
+    }
+
+    /// Tapping Cancel on the pad is a deliberate decline (OPERATION_DENIED) and,
+    /// unlike a wrong PIN, never spends a retry.
+    #[test]
+    fn builtin_uv_decline_denies_without_burning_a_retry() {
+        let (mut fs, mut rng, mut state, plat) = setup_with_pin(b"1234");
+        let mut out = [0u8; 256];
+        let mut pad = UvPad::ending(PinEntry::Declined);
+        assert_eq!(
+            run_with(
+                &mut pad,
+                &mut fs,
+                &mut rng,
+                &mut state,
+                &plat.get_uv_token_req(PERM_GA as u64),
+                &mut out,
+            ),
+            Err(CtapError::OperationDenied)
+        );
+        assert_eq!(ef_pin_retries(&mut fs), MAX_PIN_RETRIES);
+    }
+
+    /// Without an on-device pad (the default backend), the built-in-UV subcommands
+    /// answer UnsupportedOption — exactly as a standard key does.
+    #[test]
+    fn builtin_uv_subcommands_unsupported_without_a_pad() {
+        let (mut fs, mut rng, mut state, plat) = setup_with_pin(b"1234");
+        let mut out = [0u8; 256];
+        assert_eq!(
+            run(
+                &mut fs,
+                &mut rng,
+                &mut state,
+                &plat.get_uv_token_req(PERM_GA as u64),
+                &mut out,
+            ),
+            Err(CtapError::UnsupportedOption)
+        );
+        let uv_retries = build(&[(1, V::U(plat.wire)), (2, V::U(7))]);
+        assert_eq!(
+            run(&mut fs, &mut rng, &mut state, &uv_retries, &mut out),
+            Err(CtapError::UnsupportedOption)
+        );
+    }
+
+    /// getUVRetries (0x07) reports the shared budget that getPINRetries does, under
+    /// response key 0x05.
+    #[test]
+    fn get_uv_retries_mirrors_pin_retries() {
+        let (mut fs, mut rng, mut state, plat) = setup_with_pin(b"1234");
+        let mut out = [0u8; 256];
+        // Burn one retry with a wrong on-screen PIN.
+        let mut pad = UvPad::typing(b"0000");
+        let _ = run_with(
+            &mut pad,
+            &mut fs,
+            &mut rng,
+            &mut state,
+            &plat.get_uv_token_req(PERM_GA as u64),
+            &mut out,
+        );
+        // getUVRetries → { 5: uvRetries }, equal to the now-decremented PIN budget.
+        let mut idle = UvPad::ending(PinEntry::Declined);
+        let req = build(&[(1, V::U(plat.wire)), (2, V::U(7))]);
+        let n = run_with(&mut idle, &mut fs, &mut rng, &mut state, &req, &mut out).unwrap();
+        let mut d = Decoder::new(&out[..n]);
+        assert_eq!(d.map().unwrap().unwrap(), 1);
+        assert_eq!(d.u8().unwrap(), 5);
+        let uv = d.u8().unwrap();
+        assert_eq!(uv, MAX_PIN_RETRIES - 1);
+        assert_eq!(uv, ef_pin_retries(&mut fs));
     }
 
     #[cfg(feature = "fips-profile")]

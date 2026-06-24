@@ -207,6 +207,106 @@ pub fn hit_confirm(p: Point) -> Option<Button> {
     }
 }
 
+// --- PIN pad (built-in user verification) ----------------------------------
+
+/// A key on the on-screen numeric PIN pad (the trusted-display built-in-UV input).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PinKey {
+    /// A digit 0–9.
+    Digit(u8),
+    /// Backspace — drop the last entered digit.
+    Del,
+    /// Commit the entered PIN.
+    Ok,
+    /// Abandon entry — a deliberate decline.
+    Cancel,
+}
+
+/// What the PIN screen shows: how many digits have been entered, rendered as masked
+/// dots — never the digits themselves, which the firmware keeps and never paints.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PinPad {
+    /// Count of digits entered so far (shown masked).
+    pub entered: usize,
+}
+
+impl PinPad {
+    pub const fn new(entered: usize) -> Self {
+        Self { entered }
+    }
+}
+
+/// PIN-pad grid: 3 columns. The bottom row is Del / 0 / OK.
+pub const PIN_COLS: u16 = 3;
+/// PIN-pad grid rows (1–9, then Del / 0 / OK).
+pub const PIN_ROWS: u16 = 4;
+/// Key width.
+pub const PIN_KEY_W: u16 = 64;
+/// Key height.
+pub const PIN_KEY_H: u16 = 48;
+const PIN_GRID_X0: u16 = 12;
+const PIN_GRID_Y0: u16 = 84;
+const PIN_GAP_X: u16 = 12;
+const PIN_GAP_Y: u16 = 8;
+/// Cancel target, in the header above the grid — kept clear of the digit keys so a
+/// digit tap can never abandon entry.
+pub const PIN_CANCEL_RECT: Rect = Rect::new(8, 6, 64, 28);
+
+/// The rectangle of the key at grid position `(col, row)` — the single source of
+/// truth shared by the renderer and [`hit_pin`], so paint and hit-test can never
+/// disagree (the Allow/Deny contract, extended to the pad).
+pub const fn pin_key_rect(col: u16, row: u16) -> Rect {
+    Rect::new(
+        PIN_GRID_X0 + col * (PIN_KEY_W + PIN_GAP_X),
+        PIN_GRID_Y0 + row * (PIN_KEY_H + PIN_GAP_Y),
+        PIN_KEY_W,
+        PIN_KEY_H,
+    )
+}
+
+/// The key at grid position `(col, row)`: rows 0–2 hold digits 1–9 in reading
+/// order; the bottom row is Del / 0 / OK.
+pub const fn pin_grid_key(col: u16, row: u16) -> PinKey {
+    match (col, row) {
+        (0, 3) => PinKey::Del,
+        (1, 3) => PinKey::Digit(0),
+        (2, 3) => PinKey::Ok,
+        _ => PinKey::Digit((row * PIN_COLS + col + 1) as u8),
+    }
+}
+
+// Compile-time layout invariants: positive gaps (rows/columns disjoint), the whole
+// grid fits below the header, and the Cancel target sits entirely above the grid.
+// A bad geometry edit fails the build.
+const _: () = {
+    assert!(PIN_GAP_X > 0 && PIN_GAP_Y > 0);
+    let last = pin_key_rect(PIN_COLS - 1, PIN_ROWS - 1);
+    assert!(last.x + last.w <= PANEL_W && last.y + last.h <= PANEL_H);
+    assert!(PIN_CANCEL_RECT.y + PIN_CANCEL_RECT.h <= PIN_GRID_Y0);
+    assert!(PIN_CANCEL_RECT.x + PIN_CANCEL_RECT.w <= PANEL_W);
+};
+
+/// Which PIN-pad key, if any, a tap at `p` selects. Cancel (header) is tested first,
+/// then the 3×4 grid. The rects are disjoint by construction, so at most one matches;
+/// a tap in a gap or margin selects nothing.
+pub fn hit_pin(p: Point) -> Option<PinKey> {
+    if PIN_CANCEL_RECT.contains(p) {
+        return Some(PinKey::Cancel);
+    }
+    let mut row = 0;
+    while row < PIN_ROWS {
+        let mut col = 0;
+        while col < PIN_COLS {
+            if pin_key_rect(col, row).contains(p) {
+                return Some(pin_grid_key(col, row));
+            }
+            col += 1;
+        }
+        row += 1;
+    }
+    None
+}
+
 /// The device's current status, mirrored from the LED status engine so the panel
 /// can show the same idle/working/touch state the onboard LED would.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -229,9 +329,9 @@ impl StatusKind {
     }
 }
 
-/// Top-level screen the display task renders. Phase 0 covers the boot splash, the
-/// idle/status screen, and the trusted confirm prompt; the PIN pad, settings menu,
-/// and lock screen land in later phases.
+/// Top-level screen the display task renders: the boot splash, the idle/status
+/// screen, the trusted Allow/Deny prompt, and the built-in-UV PIN pad. The settings
+/// menu and lock screen land in later phases.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Screen {
     /// One-time boot splash.
@@ -240,6 +340,8 @@ pub enum Screen {
     Status(StatusKind),
     /// A pending Allow/Deny decision.
     Confirm(ConfirmPrompt),
+    /// The built-in-UV PIN pad, showing how many digits have been entered (masked).
+    Pin(PinPad),
 }
 
 #[cfg(kani)]
@@ -273,6 +375,29 @@ mod proofs {
     fn confirm_buttons_disjoint() {
         let p = Point::new(kani::any(), kani::any());
         assert!(!(ALLOW_RECT.contains(p) && DENY_RECT.contains(p)));
+    }
+
+    /// No tap selects two PIN-pad keys at once: the Cancel target is disjoint from
+    /// every grid key, and any two distinct grid cells are disjoint — so `hit_pin`
+    /// maps a tap to at most one key (a stray touch can't enter a digit *and*
+    /// commit).
+    #[kani::proof]
+    fn pin_keys_disjoint() {
+        let p = Point::new(kani::any(), kani::any());
+        let mut r = 0;
+        while r < PIN_ROWS {
+            let mut c = 0;
+            while c < PIN_COLS {
+                assert!(!(PIN_CANCEL_RECT.contains(p) && pin_key_rect(c, r).contains(p)));
+                c += 1;
+            }
+            r += 1;
+        }
+        let (c1, r1): (u16, u16) = (kani::any(), kani::any());
+        let (c2, r2): (u16, u16) = (kani::any(), kani::any());
+        kani::assume(c1 < PIN_COLS && r1 < PIN_ROWS && c2 < PIN_COLS && r2 < PIN_ROWS);
+        kani::assume((c1, r1) != (c2, r2));
+        assert!(!(pin_key_rect(c1, r1).contains(p) && pin_key_rect(c2, r2).contains(p)));
     }
 }
 
@@ -363,5 +488,37 @@ mod tests {
         assert!(!r.contains(Point::new(40, 20))); // right exclusive (10+30)
         assert!(!r.contains(Point::new(10, 60))); // bottom exclusive (20+40)
         assert!(r.contains(Point::new(39, 59)));
+    }
+
+    #[test]
+    fn pin_key_centers_hit_their_keys() {
+        // Every grid key's center hits exactly that key.
+        for row in 0..PIN_ROWS {
+            for col in 0..PIN_COLS {
+                let r = pin_key_rect(col, row);
+                let c = Point::new(r.x + PIN_KEY_W / 2, r.y + PIN_KEY_H / 2);
+                assert_eq!(hit_pin(c), Some(pin_grid_key(col, row)));
+            }
+        }
+        // Layout: rows 0–2 are digits 1–9 in reading order; the bottom row is Del/0/OK.
+        assert_eq!(pin_grid_key(0, 0), PinKey::Digit(1));
+        assert_eq!(pin_grid_key(2, 2), PinKey::Digit(9));
+        assert_eq!(pin_grid_key(0, 3), PinKey::Del);
+        assert_eq!(pin_grid_key(1, 3), PinKey::Digit(0));
+        assert_eq!(pin_grid_key(2, 3), PinKey::Ok);
+    }
+
+    #[test]
+    fn pin_cancel_hits_and_gaps_select_nothing() {
+        let c = PIN_CANCEL_RECT;
+        assert_eq!(
+            hit_pin(Point::new(c.x + c.w / 2, c.y + c.h / 2)),
+            Some(PinKey::Cancel)
+        );
+        // The gap between column 0 and column 1 selects nothing.
+        let k = pin_key_rect(0, 0);
+        assert_eq!(hit_pin(Point::new(k.x + PIN_KEY_W + 1, k.y + 2)), None);
+        // Below the grid (bottom-left margin) selects nothing.
+        assert_eq!(hit_pin(Point::new(0, PANEL_H - 1)), None);
     }
 }

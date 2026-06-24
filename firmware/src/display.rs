@@ -39,7 +39,7 @@ use mipidsi::models::ST7789;
 use mipidsi::options::ColorInversion;
 use mipidsi::{Builder, Display};
 use rsk_sdk::Confirm;
-use rsk_ui::{Button, ConfirmPrompt, Screen, StatusKind};
+use rsk_ui::{Button, ConfirmPrompt, PinKey, PinPad, Screen, StatusKind};
 
 use crate::led;
 use crate::presence::{CANCEL_REQUESTED, PRESENCE_TIMEOUT_MS, UP_PENDING};
@@ -84,6 +84,18 @@ impl Touch {
         // Clear register 0xD005 (write address + a 0 byte) to ack the report.
         let _ = self.i2c.blocking_write(CST328_ADDR, &[0xD0, 0x05, 0x00]);
         pt
+    }
+
+    /// Block until the finger lifts (bounded by `timeout`), so one tap maps to one
+    /// key press — the CST328 reports continuously while touched. Used by the PIN
+    /// pad, where a held finger must not machine-gun a digit.
+    fn wait_release(&mut self, start: Instant, timeout: Duration) {
+        while self.read().is_some() {
+            if start.elapsed() >= timeout {
+                break;
+            }
+            block_for(Duration::from_millis(TOUCH_POLL_MS));
+        }
     }
 }
 
@@ -283,6 +295,75 @@ impl TouchPresence {
         led::set_status(saved);
         outcome
     }
+
+    /// Run the built-in-UV PIN pad: render the masked keypad, block-poll the CST328,
+    /// and accumulate ASCII digits into `out`. Each key is debounced to release, so
+    /// one tap is one press; OK commits only at/above `min_len` (a too-short entry
+    /// can't reach the verifier and burn a retry), Del backspaces, Cancel declines.
+    /// Honors the same UP_PENDING / CANCEL_REQUESTED / timeout contract as the
+    /// confirm wait. The entered digits are the caller's to zeroize after verifying.
+    fn collect_pin_impl(&mut self, min_len: usize, out: &mut [u8]) -> rsk_fido::PinEntry {
+        let saved = led::status();
+        led::set_status(led::STATUS_TOUCH);
+        CANCEL_REQUESTED.store(false, Ordering::Relaxed);
+        UP_PENDING.store(true, Ordering::Relaxed);
+
+        let start = Instant::now();
+        let timeout = Duration::from_millis(PRESENCE_TIMEOUT_MS.load(Ordering::Relaxed) as u64);
+        let mut entered = 0usize;
+
+        let outcome = {
+            let mut u = self.ui.borrow_mut();
+            let _ = rsk_ui::render(&mut u.panel, &Screen::Pin(PinPad::new(entered)));
+            u.shown = None; // force the status loop to repaint once we release it
+            loop {
+                if let Some(p) = u.touch.read() {
+                    let mut repaint = true;
+                    let done = match rsk_ui::hit_pin(p) {
+                        Some(PinKey::Digit(d)) => {
+                            if entered < out.len() {
+                                out[entered] = b'0' + d;
+                                entered += 1;
+                            }
+                            None
+                        }
+                        Some(PinKey::Del) => {
+                            entered = entered.saturating_sub(1);
+                            None
+                        }
+                        Some(PinKey::Ok) if entered >= min_len => {
+                            Some(rsk_fido::PinEntry::Entered(entered))
+                        }
+                        Some(PinKey::Cancel) => Some(rsk_fido::PinEntry::Declined),
+                        // OK below the minimum, or a tap in a gap: nothing changes.
+                        _ => {
+                            repaint = false;
+                            None
+                        }
+                    };
+                    if repaint && done.is_none() {
+                        let _ = rsk_ui::render(&mut u.panel, &Screen::Pin(PinPad::new(entered)));
+                    }
+                    u.touch.wait_release(start, timeout);
+                    if let Some(o) = done {
+                        break o;
+                    }
+                }
+                if CANCEL_REQUESTED.load(Ordering::Relaxed) {
+                    break rsk_fido::PinEntry::Cancelled;
+                }
+                if start.elapsed() >= timeout {
+                    break rsk_fido::PinEntry::Timeout;
+                }
+                block_for(Duration::from_millis(TOUCH_POLL_MS));
+            }
+        };
+
+        UP_PENDING.store(false, Ordering::Relaxed);
+        CANCEL_REQUESTED.store(false, Ordering::Relaxed);
+        led::set_status(saved);
+        outcome
+    }
 }
 
 impl rsk_fido::UserPresence for TouchPresence {
@@ -293,6 +374,16 @@ impl rsk_fido::UserPresence for TouchPresence {
             Outcome::Timeout => rsk_fido::Presence::Timeout,
             Outcome::Cancelled => rsk_fido::Presence::Cancelled,
         }
+    }
+
+    // The trusted display has an on-screen PIN pad, so built-in UV is available and
+    // getInfo advertises `options.uv` — the PIN is typed here, never on the host.
+    fn uv_available(&self) -> bool {
+        true
+    }
+
+    fn collect_pin(&mut self, min_len: usize, out: &mut [u8]) -> rsk_fido::PinEntry {
+        self.collect_pin_impl(min_len, out)
     }
 }
 

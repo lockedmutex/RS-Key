@@ -66,6 +66,24 @@ pub enum Presence {
     Cancelled,
 }
 
+/// Outcome of collecting a built-in-UV PIN on the device's own UI (the
+/// trusted-display PIN pad). Built-in UV proves *user verification* without the
+/// PIN ever crossing the host — the anti-keylogger counterpart to the on-screen
+/// Approve/Deny that proves *user presence*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinEntry {
+    /// The user committed a PIN of this many ASCII-digit bytes, in `out[..len]`.
+    Entered(usize),
+    /// The user tapped Cancel on the pad — a deliberate decline.
+    Declined,
+    /// No completed entry within the presence timeout.
+    Timeout,
+    /// The platform sent `CTAPHID_CANCEL` while the pad was up.
+    Cancelled,
+    /// The backend has no on-device UI to collect a PIN (the default).
+    Unsupported,
+}
+
 /// Obtains physical user presence. The firmware polls the BOOTSEL button; with
 /// no button configured it confirms immediately, which is also what host tests
 /// use via [`AlwaysConfirm`].
@@ -73,6 +91,24 @@ pub trait UserPresence {
     /// Ask for presence. `confirm` describes the pending operation for a trusted
     /// on-screen Approve/Deny prompt; the BOOTSEL-button backend ignores it.
     fn request(&mut self, confirm: Confirm<'_>) -> Presence;
+
+    /// Whether this backend can collect built-in user verification — a PIN entered
+    /// on the authenticator's own UI, so it never reaches the host. Only the
+    /// trusted-display backend overrides this; the BOOTSEL button and the host-test
+    /// stand-in have no UI to type a PIN, so built-in UV is absent and `options.uv`
+    /// stays unadvertised (and `clientPIN` 0x06/0x07 answer `UnsupportedOption`).
+    fn uv_available(&self) -> bool {
+        false
+    }
+
+    /// Collect a built-in-UV PIN on the device's own UI as ASCII digits into `out`,
+    /// refusing to *commit* below `min_len` characters so a fat-fingered short entry
+    /// can't burn a retry. Returns how the entry ended. The default — no on-device
+    /// UI — reports [`PinEntry::Unsupported`]; this is only reached on a backend
+    /// that also overrides [`uv_available`](Self::uv_available).
+    fn collect_pin(&mut self, _min_len: usize, _out: &mut [u8]) -> PinEntry {
+        PinEntry::Unsupported
+    }
 }
 
 /// A [`UserPresence`] that confirms instantly — the no-button default and the
@@ -158,6 +194,7 @@ pub fn process_cbor<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, data: &[u8], out: &
                 force,
                 ctx.fs.has_data(consts::EF_EA_ENABLED),
                 ctx.fs.has_data(consts::EF_ALWAYS_UV),
+                ctx.presence.uv_available(),
                 remaining_rk,
                 &mut out[1..],
             )

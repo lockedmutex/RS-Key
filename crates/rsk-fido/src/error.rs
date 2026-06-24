@@ -39,6 +39,7 @@ pub enum CtapError {
     PuatRequired = 0x36,           // CTAP2_ERR_PUAT_REQUIRED (PIN required)
     PinPolicyViolation = 0x37,     // CTAP2_ERR_PIN_POLICY_VIOLATION
     RequestTooLarge = 0x39,        // CTAP2_ERR_REQUEST_TOO_LARGE
+    UvBlocked = 0x3c,              // CTAP2_ERR_UV_BLOCKED (built-in UV retries exhausted)
     IntegrityFailure = 0x3d,       // CTAP2_ERR_INTEGRITY_FAILURE (large-blob hash)
     InvalidSubcommand = 0x3e,      // CTAP2_ERR_INVALID_SUBCOMMAND (config vendor id)
     UvInvalid = 0x3f,              // CTAP2_ERR_UV_INVALID
