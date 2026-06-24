@@ -89,6 +89,56 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   does not flash the whole screen; and the ambient status screen is held back
   briefly between the pad and the Approve/Deny prompt so it does not blip the
   idle/working screen in the hand-off. bcdDevice 0x0786 → 0x0789.
+- **Trusted-display variant — on-device settings menu (experimental, opt-in).** On
+  the `display` build the idle screen is now interactive: a **MENU** button (shown
+  only while idle) opens an on-device settings menu — no host involved. It offers
+  **Brightness** (five live backlight levels; GPIO16 is now driven as PWM instead of
+  a plain on/off output), **Touch timeout** (step the presence-wait between
+  10/20/30/60/120 s live), and a read-only **Device info** page (firmware
+  `bcdDevice` + chip serial). The menu is a synchronous on-panel interaction that
+  shares the confirm/PIN modals' executor, so while it is open the worker is parked
+  (a host command waits behind it); it auto-closes after 15 s without a tap so a
+  walked-away user can't wedge the host. These settings are **runtime-only** for now
+  — a reboot re-seeds the touch timeout from the phy record and brightness returns to
+  full; persisting them across boots is a later, deliberate flash-format change. The
+  menu geometry, hit-tests and value steppers live in `rsk-ui` (host-tested +
+  Kani-proved disjoint); a standard key **without** a screen compiles none of it and
+  is byte-for-byte unchanged. bcdDevice 0x0789 → 0x078A.
+- **Trusted-display variant — redesigned UI + hold-to-approve (experimental,
+  opt-in).** The `display` build moves to a consistent on-device design language: a
+  bottom **navigation bar** (Home / Passkeys / Settings) replaces the single corner
+  menu button, a shared list-row / header / card system, vector icon glyphs drawn
+  from primitives (no bitmap assets — and, since the device only knows a relying
+  party's id string, a generic globe + the rpId rather than a brand logo), and a
+  true-black palette with a cyan accent. The Home tab shows the device status; the
+  Approve prompt is restyled with a shield, the relying-party card and a plain
+  "approve only if you started this" caution. Most importantly, **approve is now a
+  deliberate hold, not a tap**: the approve button fills as you hold it (~0.8 s) and
+  an accidental brush — or sliding off — resets it, so a signature needs a sustained,
+  intentional press on the trusted screen. Deny stays a single tap. The Passkeys tab
+  is a stub (the resident-credential list lands in a later wave). The UI model,
+  geometry, hit-tests and glyphs all live in `rsk-ui` (host-tested + Kani-proved
+  disjoint); a standard key without a screen compiles none of it. bcdDevice 0x078A →
+  0x078B.
+- **Trusted-display variant — PIN pad in the new design language (experimental,
+  opt-in).** The on-screen PIN pad — the one screen the redesign hadn't yet reached
+  — now matches the rest of the `display` UI: a lock-marked header, a cyan-accent
+  masked entry, and a 3×4 grid of dark neutral key cards with a subtle edge (the
+  affirmative OK a solid green check glyph, Del a backspace glyph, and the decline a
+  low-emphasis outlined Cancel, mirroring the Approve prompt's Deny). This is a
+  re-skin only — the
+  pad geometry, the masked-dots-only display and the per-keystroke partial repaint
+  are unchanged. The now-unused idle "menu button" hit-test (`MENU_BTN_RECT` /
+  `hit_menu`), superseded by the bottom navigation bar, is removed from `rsk-ui`.
+  bcdDevice 0x078B → 0x078D.
+- **Trusted-display variant — hold-to-approve button: no flicker, no fill artifact
+  (experimental, opt-in).** The Approve screen's hold button now paints a static base
+  once and grows the fill **in place** as you hold, instead of repainting the whole
+  button from a dark base every poll — so the build-up no longer flickers. The
+  progress fill is the button's own rounded shape revealed left-to-right through a
+  clip, so its corners exactly match the card — no square corner pokes past it — and
+  the advancing edge is flat. bcdDevice
+  0x078D → 0x078F.
 
 ### Changed
 

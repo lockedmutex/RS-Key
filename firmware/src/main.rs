@@ -336,7 +336,9 @@ async fn main(spawner: Spawner) {
     config.serial_number = Some("rs-key-0001");
     config.max_power = 100;
     config.max_packet_size_0 = 64;
-    config.device_release = 0x0789; // bcdDevice: our build counter
+    // bcdDevice build counter; also surfaced on the trusted-display Info page.
+    let device_release: u16 = 0x078F;
+    config.device_release = device_release;
 
     let mut builder = Builder::new(
         driver,
@@ -557,6 +559,7 @@ async fn main(spawner: Spawner) {
     let display_ui = {
         use embassy_rp::gpio::{Level, Output};
         use embassy_rp::i2c::{Config as I2cConfig, I2c};
+        use embassy_rp::pwm::Pwm;
         use embassy_rp::spi::{Config as SpiConfig, Spi};
 
         let mut spi_cfg = SpiConfig::default();
@@ -570,7 +573,9 @@ async fn main(spawner: Spawner) {
         let cs = Output::new(p.PIN_13, Level::High);
         let dc = Output::new(p.PIN_14, Level::Low);
         let rst = Output::new(p.PIN_15, Level::High);
-        let bl = Output::new(p.PIN_16, Level::Low); // off until the panel is initialized
+        // Backlight on GPIO16 as PWM (slice 0, channel A) at zero duty — dark until
+        // `Ui::build` raises it to full after the first render (no white flash).
+        let bl = Pwm::new_output_a(p.PWM_SLICE0, p.PIN_16, display::backlight_cfg(0));
         let tp_rst = Output::new(p.PIN_17, Level::High);
 
         let buf = DISPLAY_BUF.init([0u8; DISPLAY_BUF_LEN]);
@@ -583,11 +588,15 @@ async fn main(spawner: Spawner) {
             buf,
         };
         let touch = display::TouchHw { i2c, rst: tp_rst };
+        let info = display::DeviceInfo {
+            version: device_release,
+            chipid: u64::from_le_bytes(serial_id),
+        };
         // Reborrow the `&'static mut` from the cell as a shared `&'static` so both
         // `status_task` and the `TouchPresence` backend can hold it (a shared
         // reference is `Copy`; the `RefCell` provides the interior mutability).
         let ui: &'static RefCell<display::Ui> =
-            UI.init(RefCell::new(display::Ui::build(panel, touch)));
+            UI.init(RefCell::new(display::Ui::build(panel, touch, info)));
         spawner.spawn(display::status_task(ui).unwrap());
         ui
     };

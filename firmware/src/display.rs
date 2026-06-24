@@ -31,6 +31,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use embassy_rp::gpio::Output;
 use embassy_rp::i2c::{Blocking as I2cBlocking, I2c};
 use embassy_rp::peripherals::{I2C1, SPI1};
+use embassy_rp::pwm::{Config as PwmConfig, Pwm};
 use embassy_rp::spi::{Blocking as SpiBlocking, Spi};
 use embassy_time::{Delay, Duration, Instant, Timer, block_for};
 use embedded_hal_bus::spi::ExclusiveDevice;
@@ -39,7 +40,10 @@ use mipidsi::models::ST7789;
 use mipidsi::options::ColorInversion;
 use mipidsi::{Builder, Display};
 use rsk_sdk::Confirm;
-use rsk_ui::{Button, ConfirmPrompt, PinKey, PinPad, Screen, StatusKind};
+use rsk_ui::{
+    ALLOW_RECT, AdjustKey, BRIGHTNESS_LEVELS, Button, ConfirmPrompt, HomeView, NavTab,
+    PasskeysView, PinKey, PinPad, RootEntry, Screen, SettingsPage, SettingsView, StatusKind,
+};
 
 use crate::led;
 use crate::presence::{CANCEL_REQUESTED, PRESENCE_TIMEOUT_MS, UP_PENDING};
@@ -59,6 +63,46 @@ static AMBIENT_QUIET_UNTIL_MS: AtomicU32 = AtomicU32::new(0);
 /// How long to hold the ambient screen back after a modal ends — long enough to
 /// cover the platform's next-command round-trip, short enough to feel immediate.
 const AMBIENT_QUIET_MS: u32 = 400;
+
+/// Auto-close the settings menu after this long without a tap, returning to idle.
+/// While the menu is open it busy-waits on the thread executor, so the worker is
+/// parked and a host command waits behind it — this bound caps that to a walked-away
+/// user's worst case (and is shorter than a normal touch-confirm wait).
+const MENU_INACTIVITY_MS: u64 = 15_000;
+
+/// How long the user must hold the on-screen approve button before it confirms — long
+/// enough that an accidental brush can't approve, short enough to feel responsive. The
+/// button fills as the hold builds, and lifting the finger early resets it.
+const HOLD_MS: u64 = 800;
+
+/// Backlight PWM `top` (8-bit, like the LED): a brightness level maps to a compare
+/// value `0..=BL_TOP`.
+const BL_TOP: u16 = 255;
+
+/// Device identity shown read-only on the settings Info page.
+pub struct DeviceInfo {
+    /// bcdDevice firmware build counter.
+    pub version: u16,
+    /// RP2350 chip serial (chipid).
+    pub chipid: u64,
+}
+
+/// PWM config for the GPIO16 backlight: 8-bit `top`, non-inverted (high = lit), with
+/// `duty` as the on-fraction. Shared by `main`'s initial (zero-duty) construction and
+/// every live brightness change so the polarity always matches.
+pub fn backlight_cfg(duty: u16) -> PwmConfig {
+    // `PwmConfig` is `#[non_exhaustive]`, so build from Default and set fields.
+    let mut cfg = PwmConfig::default();
+    cfg.top = BL_TOP;
+    cfg.compare_a = duty.min(BL_TOP);
+    cfg
+}
+
+/// Map a brightness level (`1..=BRIGHTNESS_LEVELS`) to a backlight duty (compare).
+fn level_duty(level: u8) -> u16 {
+    let l = level.clamp(1, BRIGHTNESS_LEVELS) as u16;
+    (l * BL_TOP) / BRIGHTNESS_LEVELS as u16
+}
 
 /// The fully-built ST7789 panel (write-only, blocking SPI1, no framebuffer).
 type Panel = Display<SpiInterface<'static, PanelSpi, Output<'static>>, ST7789, Output<'static>>;
@@ -116,7 +160,9 @@ pub struct PanelHw {
     pub cs: Output<'static>,
     pub dc: Output<'static>,
     pub rst: Output<'static>,
-    pub bl: Output<'static>,
+    /// GPIO16 backlight, driven as PWM for brightness (constructed at zero duty so
+    /// the panel stays dark through init — no white flash).
+    pub bl: Pwm<'static>,
     pub buf: &'static mut [u8],
 }
 
@@ -131,16 +177,19 @@ pub struct TouchHw {
 pub struct Ui {
     panel: Panel,
     touch: Touch,
-    // Backlight (GPIO16) and the CST328 reset (GPIO17), held for the device's
-    // lifetime, never toggled again: an embassy `Output` disconnects its pad on
-    // drop (sets funcsel = Null), so letting these drop when `build` returns would
-    // kill the backlight (a black panel) and float the touch reset.
-    #[allow(dead_code)]
-    bl: Output<'static>,
+    /// Backlight on GPIO16, driven as PWM for brightness control and held for the
+    /// device's lifetime (dropping it disconnects the pad → black panel).
+    bl: Pwm<'static>,
+    // The CST328 reset (GPIO17), held so its pad isn't disconnected on drop (an
+    // embassy `Output` sets funcsel = Null when dropped); never toggled after build.
     #[allow(dead_code)]
     tp_rst: Output<'static>,
     /// What is currently on screen, so the status loop only repaints on a change.
     shown: Option<Screen>,
+    /// Read-only identity shown on the settings Info page.
+    info: DeviceInfo,
+    /// Current backlight level (`1..=BRIGHTNESS_LEVELS`), edited from the menu.
+    brightness: u8,
 }
 
 impl Ui {
@@ -149,7 +198,7 @@ impl Ui {
     /// Blocking (~200 ms of panel/touch reset) — `main` calls this *after* the USB
     /// task is spawned, so the interrupt executor keeps enumerating while these
     /// busy-waits run on the thread executor; enumeration is never delayed.
-    pub fn build(panel: PanelHw, touch: TouchHw) -> Ui {
+    pub fn build(panel: PanelHw, touch: TouchHw, info: DeviceInfo) -> Ui {
         let PanelHw {
             spi,
             cs,
@@ -179,7 +228,9 @@ impl Ui {
             .unwrap();
 
         let _ = rsk_ui::render(&mut panel, &Screen::Splash);
-        bl.set_high(); // backlight on only once there is something to show (no white flash)
+        // Backlight up to full only now there is something to show (it was built at
+        // zero duty, so the panel stayed dark through init — no white flash).
+        bl.set_config(&backlight_cfg(level_duty(BRIGHTNESS_LEVELS)));
 
         // CST328 reset pulse (high → low → high), then normal reporting mode.
         tp_rst.set_high();
@@ -197,8 +248,149 @@ impl Ui {
             bl,
             tp_rst,
             shown: None,
+            info,
+            brightness: BRIGHTNESS_LEVELS,
         }
     }
+
+    /// Apply a brightness level (`1..=BRIGHTNESS_LEVELS`) to the backlight PWM and
+    /// remember it for the menu's gauge.
+    fn set_brightness(&mut self, level: u8) {
+        self.brightness = level.clamp(1, BRIGHTNESS_LEVELS);
+        self.bl
+            .set_config(&backlight_cfg(level_duty(self.brightness)));
+    }
+
+    /// Paint a settings page, snapshotting the live brightness/timeout/identity into
+    /// the view. Clears `shown` so the ambient loop repaints once the menu releases
+    /// the panel.
+    fn render_settings(&mut self, page: SettingsPage) {
+        let view = SettingsView {
+            page,
+            brightness: self.brightness,
+            timeout_secs: (PRESENCE_TIMEOUT_MS.load(Ordering::Relaxed) / 1000) as u16,
+            version: self.info.version,
+            chipid: self.info.chipid,
+        };
+        let _ = rsk_ui::render(&mut self.panel, &Screen::Settings(view));
+        self.shown = None;
+    }
+
+    /// The interactive on-device settings menu. Synchronous and busy-waiting like the
+    /// confirm / PIN modals, so it owns the panel with the same natural mutual
+    /// exclusion against the worker (single thread executor: while this spins, no
+    /// applet command is serviced — bounded by [`MENU_INACTIVITY_MS`]). Navigates
+    /// Root → sub-pages, applies brightness/timeout live, and hands the panel back to
+    /// the ambient status loop on Close / Back or after the inactivity timeout.
+    fn run_settings(&mut self) {
+        // Let the finger that opened the menu lift before polling, so it isn't read
+        // as the first menu tap.
+        let opened = Instant::now();
+        self.touch
+            .wait_release(opened, Duration::from_millis(MENU_INACTIVITY_MS));
+
+        let mut page = SettingsPage::Root;
+        self.render_settings(page);
+        let mut last = Instant::now();
+        let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
+
+        loop {
+            if let Some(p) = self.touch.read() {
+                last = Instant::now();
+                let mut repaint = true;
+                match page {
+                    SettingsPage::Root => match rsk_ui::hit_settings_root(p) {
+                        Some(RootEntry::Brightness) => page = SettingsPage::Brightness,
+                        Some(RootEntry::Timeout) => page = SettingsPage::Timeout,
+                        Some(RootEntry::Info) => page = SettingsPage::Info,
+                        Some(RootEntry::Close) => break,
+                        None => repaint = false,
+                    },
+                    SettingsPage::Brightness => match rsk_ui::hit_adjust(p) {
+                        Some(AdjustKey::Minus) => {
+                            self.set_brightness(rsk_ui::step_brightness(self.brightness, -1))
+                        }
+                        Some(AdjustKey::Plus) => {
+                            self.set_brightness(rsk_ui::step_brightness(self.brightness, 1))
+                        }
+                        Some(AdjustKey::Back) => page = SettingsPage::Root,
+                        None => repaint = false,
+                    },
+                    SettingsPage::Timeout => match rsk_ui::hit_adjust(p) {
+                        Some(AdjustKey::Minus) => adjust_timeout(-1),
+                        Some(AdjustKey::Plus) => adjust_timeout(1),
+                        Some(AdjustKey::Back) => page = SettingsPage::Root,
+                        None => repaint = false,
+                    },
+                    SettingsPage::Info => match rsk_ui::hit_adjust(p) {
+                        Some(AdjustKey::Back) => page = SettingsPage::Root,
+                        _ => repaint = false,
+                    },
+                }
+                // One tap = one action: wait for release (bounded) before the next.
+                self.touch.wait_release(last, idle_limit);
+                if repaint {
+                    self.render_settings(page);
+                }
+            }
+            if last.elapsed() >= idle_limit {
+                break;
+            }
+            block_for(Duration::from_millis(TOUCH_POLL_MS));
+        }
+
+        // Hand the panel back to the ambient loop, briefly holding it so the return
+        // to idle doesn't fight a stale repaint.
+        AMBIENT_QUIET_UNTIL_MS.store(
+            (Instant::now().as_millis() as u32).wrapping_add(AMBIENT_QUIET_MS),
+            Ordering::Relaxed,
+        );
+        self.shown = None;
+    }
+
+    /// The Passkeys tab — a stub for now: show the resident-credential placeholder and
+    /// wait for a nav tap (back to Home) or the inactivity timeout. Same synchronous
+    /// busy-wait / worker-mutual-exclusion model as [`Ui::run_settings`].
+    fn run_passkeys(&mut self) {
+        let opened = Instant::now();
+        self.touch
+            .wait_release(opened, Duration::from_millis(MENU_INACTIVITY_MS));
+        let _ = rsk_ui::render(
+            &mut self.panel,
+            &Screen::Passkeys(PasskeysView { count: 0 }),
+        );
+        self.shown = None;
+        let mut last = Instant::now();
+        let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
+        loop {
+            if let Some(p) = self.touch.read() {
+                last = Instant::now();
+                // Any nav tap leaves the stub (back to the Home idle screen).
+                if rsk_ui::hit_nav(p).is_some() {
+                    break;
+                }
+                self.touch.wait_release(last, idle_limit);
+            }
+            if last.elapsed() >= idle_limit {
+                break;
+            }
+            block_for(Duration::from_millis(TOUCH_POLL_MS));
+        }
+        AMBIENT_QUIET_UNTIL_MS.store(
+            (Instant::now().as_millis() as u32).wrapping_add(AMBIENT_QUIET_MS),
+            Ordering::Relaxed,
+        );
+        self.shown = None;
+    }
+}
+
+/// Step the live presence/touch timeout to the next/previous menu choice and store
+/// it (the seconds → ms atomic the waits read). Runtime-only: a reboot re-seeds it
+/// from the phy record, so persisting it across boots is a later, flash-format change.
+fn adjust_timeout(delta: i8) {
+    let cur = (PRESENCE_TIMEOUT_MS.load(Ordering::Relaxed) / 1000) as u16;
+    let next = rsk_ui::step_timeout(cur, delta);
+    PRESENCE_TIMEOUT_MS.store(next as u32 * 1000, Ordering::Relaxed);
 }
 
 /// Map the LED status engine's index ([`led::status`]) onto the on-screen status,
@@ -228,10 +420,24 @@ pub async fn status_task(ui: &'static RefCell<Ui>) {
         let quiet_over =
             now.wrapping_sub(AMBIENT_QUIET_UNTIL_MS.load(Ordering::Relaxed)) as i32 >= 0;
         if quiet_over && let Ok(mut u) = ui.try_borrow_mut() {
-            let screen = Screen::Status(status_to_kind(led::status()));
+            let kind = status_to_kind(led::status());
+            let screen = Screen::Home(HomeView { status: kind });
             if u.shown != Some(screen) {
                 let _ = rsk_ui::render(&mut u.panel, &screen);
                 u.shown = Some(screen);
+            }
+            // Interactive idle: a tap on the bottom nav opens a tab. Only while idle —
+            // a confirm/PIN modal owns this executor synchronously, so this loop can't
+            // even run mid-ceremony to begin with.
+            if kind == StatusKind::Idle
+                && let Some(p) = u.touch.read()
+            {
+                match rsk_ui::hit_nav(p) {
+                    Some(NavTab::Settings) => u.run_settings(),
+                    Some(NavTab::Passkeys) => u.run_passkeys(),
+                    // Home (already shown) or a tap above the nav bar: nothing.
+                    _ => {}
+                }
             }
         }
         Timer::after_millis(100).await;
@@ -287,13 +493,44 @@ impl TouchPresence {
             let mut u = self.ui.borrow_mut();
             let _ = rsk_ui::render(&mut u.panel, &Screen::Confirm(prompt));
             u.shown = None; // force the status loop to repaint once we release it
+            // Deny is a single tap; Approve is a deliberate hold that fills the button
+            // as it builds (an accidental brush can't approve). The base button was
+            // painted by the `render(Screen::Confirm)` above; the fill then grows in
+            // place (no per-poll card clear → no flicker). Lifting the finger — or
+            // sliding off the button — repaints the base, clearing the fill.
+            let mut hold_start: Option<Instant> = None;
+            let mut last_num: u16 = 0;
             loop {
-                if let Some(p) = u.touch.read() {
-                    match rsk_ui::hit_confirm(p) {
-                        Some(Button::Allow) => break Outcome::Confirmed,
-                        Some(Button::Deny) => break Outcome::Declined,
-                        // A tap in a margin/gap selects nothing — keep waiting.
-                        None => {}
+                match u.touch.read().and_then(rsk_ui::hit_confirm) {
+                    Some(Button::Deny) => break Outcome::Declined,
+                    Some(Button::Allow) => {
+                        let held = hold_start.get_or_insert_with(Instant::now).elapsed();
+                        let num = held.as_millis().min(HOLD_MS) as u16;
+                        let _ = rsk_ui::render_hold_fill(
+                            &mut u.panel,
+                            ALLOW_RECT,
+                            "Hold to approve",
+                            last_num,
+                            num,
+                            HOLD_MS as u16,
+                            rsk_ui::theme::APPROVE,
+                        );
+                        last_num = num;
+                        if held >= Duration::from_millis(HOLD_MS) {
+                            break Outcome::Confirmed;
+                        }
+                    }
+                    // Finger lifted or slid off the buttons: reset a building hold.
+                    None => {
+                        if hold_start.take().is_some() {
+                            let _ = rsk_ui::render_hold_button(
+                                &mut u.panel,
+                                ALLOW_RECT,
+                                "Hold to approve",
+                                rsk_ui::theme::APPROVE,
+                            );
+                            last_num = 0;
+                        }
                     }
                 }
                 if CANCEL_REQUESTED.load(Ordering::Relaxed) {

@@ -16,9 +16,12 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod glyph;
 pub mod render;
+pub mod theme;
 pub mod touch;
-pub use render::{render, render_pin_dots};
+pub use glyph::Glyph;
+pub use render::{render, render_hold_button, render_hold_fill, render_pin_dots};
 
 /// Panel geometry (Waveshare RP2350-Touch-LCD-2.8, ST7789T3, portrait).
 pub const PANEL_W: u16 = 240;
@@ -162,27 +165,28 @@ pub enum Button {
     Deny,
 }
 
-/// Floating-button geometry: the two large Allow/Deny targets sit inset from the
-/// panel edges with a gap between them, rather than filling the screen edge-to-
-/// edge. The dead space this leaves is deliberate security margin — a tap in a
-/// margin or in the centre gap selects *nothing* ([`hit_confirm`] returns `None`),
-/// so a careless edge tap can't approve. The buttons are still large (96×64) so a
-/// deliberate press is easy.
-pub const BTN_W: u16 = 96;
-/// Button height.
-pub const BTN_H: u16 = 64;
+/// Approve-screen button geometry: a narrow **Deny** on the left (a single tap, the
+/// safe default) and a wider **Hold-to-approve** on the right (a deliberate sustained
+/// press — the firmware fills it as you hold, so a brush can't approve). Both float
+/// above the bottom edge; the space around them is security margin, so a tap in a
+/// margin or the gap selects *nothing* ([`hit_confirm`] → `None`).
+pub const BTN_H: u16 = 56;
 /// Inset from the left/right panel edges.
-const BTN_SIDE: u16 = 16;
-/// Gap between the Deny and Allow buttons.
-const BTN_GAP: u16 = 16;
+const BTN_SIDE: u16 = 14;
+/// Gap between the Deny and Hold-to-approve buttons.
+const BTN_GAP: u16 = 12;
 /// Float above the bottom panel edge.
-const BTN_BOTTOM: u16 = 28;
-/// Top of the button row; the prompt text fills the space above it.
+const BTN_BOTTOM: u16 = 16;
+/// Deny button width (narrow — the safe action needs no emphasis).
+const DENY_W: u16 = 84;
+/// Hold-to-approve width (the rest of the row — the wider, deliberate action).
+const ALLOW_W: u16 = PANEL_W - 2 * BTN_SIDE - DENY_W - BTN_GAP;
+/// Top of the button row; the trusted prompt fills the space above it.
 pub const BTN_BAND_TOP: u16 = PANEL_H - BTN_H - BTN_BOTTOM;
-/// Deny on the left (the safe default), floating.
-pub const DENY_RECT: Rect = Rect::new(BTN_SIDE, BTN_BAND_TOP, BTN_W, BTN_H);
-/// Allow on the right, floating; a full [`BTN_GAP`] separates it from Deny.
-pub const ALLOW_RECT: Rect = Rect::new(BTN_SIDE + BTN_W + BTN_GAP, BTN_BAND_TOP, BTN_W, BTN_H);
+/// Deny on the left (the safe default), a single tap.
+pub const DENY_RECT: Rect = Rect::new(BTN_SIDE, BTN_BAND_TOP, DENY_W, BTN_H);
+/// Hold-to-approve on the right, wider; a full [`BTN_GAP`] separates it from Deny.
+pub const ALLOW_RECT: Rect = Rect::new(BTN_SIDE + DENY_W + BTN_GAP, BTN_BAND_TOP, ALLOW_W, BTN_H);
 
 // Compile-time layout invariants (paint and hit-test share these rects): the two
 // floating buttons are disjoint with a real gap between them, and both sit fully
@@ -307,6 +311,268 @@ pub fn hit_pin(p: Point) -> Option<PinKey> {
     None
 }
 
+// --- Settings menu (interactive idle) --------------------------------------
+
+/// Which settings page is on screen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SettingsPage {
+    /// The top-level list: Brightness / Touch timeout / Info / Close.
+    Root,
+    /// Backlight-level adjust (−/+/Back).
+    Brightness,
+    /// Touch-timeout adjust (−/+/Back).
+    Timeout,
+    /// Read-only device info (Back only).
+    Info,
+}
+
+/// Discrete backlight steps the brightness page cycles through (1 = dimmest kept on,
+/// never 0 — the menu never blanks the panel you're navigating).
+pub const BRIGHTNESS_LEVELS: u8 = 5;
+/// Touch-timeout choices in seconds the timeout page steps between.
+pub const TIMEOUT_CHOICES: [u16; 5] = [10, 20, 30, 60, 120];
+
+/// The settings view model: the current page plus the live values its pages show.
+/// Carried in [`Screen::Settings`] so the renderer paints the current brightness
+/// level, timeout and device identity without reaching into the firmware.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SettingsView {
+    pub page: SettingsPage,
+    /// Backlight level `1..=BRIGHTNESS_LEVELS`.
+    pub brightness: u8,
+    /// Current presence/touch timeout, seconds.
+    pub timeout_secs: u16,
+    /// bcdDevice firmware build counter, shown in hex on the Info page.
+    pub version: u16,
+    /// RP2350 chip serial, shown in hex on the Info page.
+    pub chipid: u64,
+}
+
+/// An entry on the settings Root list.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RootEntry {
+    Brightness,
+    Timeout,
+    Info,
+    Close,
+}
+
+/// A control on an adjust page (brightness / timeout). The Info page uses only
+/// [`AdjustKey::Back`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AdjustKey {
+    Minus,
+    Plus,
+    Back,
+}
+
+/// Root list: four full-width rows (Brightness / Timeout / Info / Close).
+const ROW_X: u16 = 16;
+const ROW_W: u16 = PANEL_W - 2 * ROW_X;
+const ROW_H: u16 = 48;
+const ROW_GAP: u16 = 12;
+const ROW_Y0: u16 = 70;
+/// Number of Root list rows.
+pub const SETTINGS_ROWS: u16 = 4;
+
+/// The rectangle of Root list row `i` — single source of truth for the renderer and
+/// [`hit_settings_root`].
+pub const fn settings_row_rect(i: u16) -> Rect {
+    Rect::new(ROW_X, ROW_Y0 + i * (ROW_H + ROW_GAP), ROW_W, ROW_H)
+}
+
+/// The Root entry painted on row `i`, in list order.
+pub const fn settings_row_entry(i: u16) -> RootEntry {
+    match i {
+        0 => RootEntry::Brightness,
+        1 => RootEntry::Timeout,
+        2 => RootEntry::Info,
+        _ => RootEntry::Close,
+    }
+}
+
+/// Adjust-page controls: a big −/+ pair and a full-width Back below them.
+const ADJ_W: u16 = 88;
+const ADJ_H: u16 = 80;
+const ADJ_Y: u16 = 150;
+/// Decrement target (left).
+pub const ADJ_MINUS_RECT: Rect = Rect::new(16, ADJ_Y, ADJ_W, ADJ_H);
+/// Increment target (right).
+pub const ADJ_PLUS_RECT: Rect = Rect::new(PANEL_W - 16 - ADJ_W, ADJ_Y, ADJ_W, ADJ_H);
+/// Back/Close target, full-width along the bottom — shared by every sub-page.
+pub const BACK_RECT: Rect = Rect::new(16, 262, PANEL_W - 32, 46);
+
+// Compile-time layout invariants (paint and hit-test share these rects): the Root
+// rows fit on-panel with a real gap; the −/+ controls are disjoint with a gap and
+// sit above Back. A bad geometry edit fails the build.
+const _: () = {
+    assert!(ROW_GAP > 0);
+    // At least one brightness step (the level-bar math would underflow at 0).
+    assert!(BRIGHTNESS_LEVELS >= 1);
+    let last = settings_row_rect(SETTINGS_ROWS - 1);
+    assert!(last.x + last.w <= PANEL_W && last.y + last.h <= PANEL_H);
+    assert!(ADJ_MINUS_RECT.x + ADJ_MINUS_RECT.w < ADJ_PLUS_RECT.x);
+    assert!(ADJ_PLUS_RECT.x + ADJ_PLUS_RECT.w <= PANEL_W);
+    assert!(ADJ_MINUS_RECT.y + ADJ_MINUS_RECT.h <= BACK_RECT.y);
+    assert!(BACK_RECT.x + BACK_RECT.w <= PANEL_W && BACK_RECT.y + BACK_RECT.h <= PANEL_H);
+};
+
+/// Which Root entry, if any, a tap at `p` selects. Rows are disjoint by
+/// construction, so at most one matches; a tap in a gap selects nothing.
+pub fn hit_settings_root(p: Point) -> Option<RootEntry> {
+    let mut i = 0;
+    while i < SETTINGS_ROWS {
+        if settings_row_rect(i).contains(p) {
+            return Some(settings_row_entry(i));
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Which adjust control, if any, a tap at `p` selects (brightness/timeout pages; the
+/// Info page acts only on [`AdjustKey::Back`]). Disjoint by construction.
+pub fn hit_adjust(p: Point) -> Option<AdjustKey> {
+    if ADJ_MINUS_RECT.contains(p) {
+        Some(AdjustKey::Minus)
+    } else if ADJ_PLUS_RECT.contains(p) {
+        Some(AdjustKey::Plus)
+    } else if BACK_RECT.contains(p) {
+        Some(AdjustKey::Back)
+    } else {
+        None
+    }
+}
+
+/// Step the brightness level by `delta` (+1/−1), clamped to `1..=BRIGHTNESS_LEVELS`.
+/// The display task applies the result to the backlight PWM; the menu only models it.
+pub fn step_brightness(level: u8, delta: i8) -> u8 {
+    (level as i16 + delta as i16).clamp(1, BRIGHTNESS_LEVELS as i16) as u8
+}
+
+/// Step the touch timeout to the next/previous [`TIMEOUT_CHOICES`] entry by `delta`
+/// (+1/−1), snapping a non-listed current value (e.g. a phy-record override that
+/// isn't one of the menu's choices) to the nearest choice first. Returns seconds.
+pub fn step_timeout(cur_secs: u16, delta: i8) -> u16 {
+    let mut idx = 0;
+    let mut best = u16::MAX;
+    let mut i = 0;
+    while i < TIMEOUT_CHOICES.len() {
+        let d = cur_secs.abs_diff(TIMEOUT_CHOICES[i]);
+        if d < best {
+            best = d;
+            idx = i;
+        }
+        i += 1;
+    }
+    let ni = (idx as i32 + delta as i32).clamp(0, TIMEOUT_CHOICES.len() as i32 - 1) as usize;
+    TIMEOUT_CHOICES[ni]
+}
+
+/// Lowercase-hex nibble (`0-9a-f`).
+const fn hex_nibble(n: u8) -> u8 {
+    if n < 10 { b'0' + n } else { b'a' + (n - 10) }
+}
+
+/// Lowercase-hex a `u16` into a fixed 4-byte buffer — no alloc, for the Info screen.
+/// Always printable ASCII, so [`core::str::from_utf8`] on it never fails.
+pub fn hex_u16(v: u16) -> [u8; 4] {
+    let mut out = [0u8; 4];
+    let mut i = 0;
+    while i < 4 {
+        out[i] = hex_nibble(((v >> ((3 - i) * 4)) & 0xF) as u8);
+        i += 1;
+    }
+    out
+}
+
+/// Lowercase-hex a `u64` into a fixed 16-byte buffer — no alloc, for the Info screen.
+pub fn hex_u64(v: u64) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    let mut i = 0;
+    while i < 16 {
+        out[i] = hex_nibble(((v >> ((15 - i) * 4)) & 0xF) as u8);
+        i += 1;
+    }
+    out
+}
+
+// --- Design-system widgets (the re-skin layout) ----------------------------
+
+/// Header-bar height (title + a status glyph live in this top strip).
+pub const HEADER_H: u16 = 30;
+
+/// Bottom navigation-bar height.
+pub const NAV_H: u16 = 38;
+/// Top edge of the bottom nav bar.
+pub const NAV_TOP: u16 = PANEL_H - NAV_H;
+
+/// A bottom-nav destination (the three top-level tabs).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NavTab {
+    Home,
+    Passkeys,
+    Settings,
+}
+
+/// The nav tabs in display (left-to-right) order.
+pub const NAV_TABS: [NavTab; 3] = [NavTab::Home, NavTab::Passkeys, NavTab::Settings];
+const NAV_CELL_W: u16 = PANEL_W / 3;
+
+/// The rect of nav tab `i` (`0..3`) — single source of truth for the renderer and
+/// [`hit_nav`].
+pub const fn nav_tab_rect(i: u16) -> Rect {
+    Rect::new(i * NAV_CELL_W, NAV_TOP, NAV_CELL_W, NAV_H)
+}
+
+/// Which nav tab a tap selects, or `None` if it lands above the nav bar.
+pub fn hit_nav(p: Point) -> Option<NavTab> {
+    if p.y < NAV_TOP {
+        return None;
+    }
+    let i = (p.x / NAV_CELL_W).min(NAV_TABS.len() as u16 - 1);
+    Some(NAV_TABS[i as usize])
+}
+
+/// List-row height (a lifted card holding icon + label + trailing + chevron).
+pub const LIST_ROW_H: u16 = 30;
+const LIST_ROW_GAP: u16 = 6;
+const LIST_ROW_X: u16 = 10;
+/// List-row width, inset from both panel edges.
+pub const LIST_ROW_W: u16 = PANEL_W - 2 * LIST_ROW_X;
+
+/// The rect of list row `i`, for a list whose first row starts at `y0`. Screen-
+/// supplied `y0` lets Home (rows low, under the status block) and Settings (rows
+/// from the top) share one row geometry. Single source of truth for paint + hit.
+pub const fn row_rect(y0: u16, i: u16) -> Rect {
+    Rect::new(
+        LIST_ROW_X,
+        y0 + i * (LIST_ROW_H + LIST_ROW_GAP),
+        LIST_ROW_W,
+        LIST_ROW_H,
+    )
+}
+
+/// Which list row (`0..n`) a tap selects, for a list of `n` rows starting at `y0`.
+/// Rows are disjoint by construction, so at most one matches.
+pub fn hit_list(p: Point, y0: u16, n: u16) -> Option<u16> {
+    let mut i = 0;
+    while i < n {
+        if row_rect(y0, i).contains(p) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+// Compile-time: the nav tiles the width and sits on-panel; rows keep a real gap.
+const _: () = {
+    assert!(NAV_CELL_W * 3 <= PANEL_W);
+    assert!(NAV_TOP + NAV_H <= PANEL_H);
+    assert!(LIST_ROW_GAP > 0 && LIST_ROW_X > 0 && HEADER_H < NAV_TOP);
+};
+
 /// The device's current status, mirrored from the LED status engine so the panel
 /// can show the same idle/working/touch state the onboard LED would.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -329,19 +595,37 @@ impl StatusKind {
     }
 }
 
-/// Top-level screen the display task renders: the boot splash, the idle/status
-/// screen, the trusted Allow/Deny prompt, and the built-in-UV PIN pad. The settings
-/// menu and lock screen land in later phases.
+/// What the Home tab shows: the device status, mirrored from the LED engine. Info
+/// rows backed by live data (PIN set, passkey count) land in a later wave.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct HomeView {
+    pub status: StatusKind,
+}
+
+/// What the Passkeys tab shows — a stub for now: the resident-credential count. The
+/// full list + per-credential detail land in a later wave.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PasskeysView {
+    pub count: u16,
+}
+
+/// Top-level screen the display task renders. The three top-level **tabs** (Home,
+/// Passkeys, Settings) carry the bottom nav bar and are shown by the idle loop; the
+/// **modals** (Splash, Confirm, Pin) are full-screen and shown by the worker.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Screen {
     /// One-time boot splash.
     Splash,
-    /// Idle/working indicator.
-    Status(StatusKind),
-    /// A pending Allow/Deny decision.
+    /// The Home tab — status indicator + bottom nav.
+    Home(HomeView),
+    /// The Passkeys tab — resident credentials (stubbed) + bottom nav.
+    Passkeys(PasskeysView),
+    /// A pending trusted Deny / Hold-to-approve decision.
     Confirm(ConfirmPrompt),
     /// The built-in-UV PIN pad, showing how many digits have been entered (masked).
     Pin(PinPad),
+    /// The on-device settings menu (Root list or one of its sub-pages) + bottom nav.
+    Settings(SettingsView),
 }
 
 #[cfg(kani)]
@@ -398,6 +682,36 @@ mod proofs {
         kani::assume(c1 < PIN_COLS && r1 < PIN_ROWS && c2 < PIN_COLS && r2 < PIN_ROWS);
         kani::assume((c1, r1) != (c2, r2));
         assert!(!(pin_key_rect(c1, r1).contains(p) && pin_key_rect(c2, r2).contains(p)));
+    }
+
+    /// No tap selects two settings controls at once: any two distinct Root rows are
+    /// disjoint, and the −/+/Back adjust controls are mutually disjoint — so a stray
+    /// touch can't, say, both decrement and go Back.
+    #[kani::proof]
+    fn settings_keys_disjoint() {
+        let p = Point::new(kani::any(), kani::any());
+        let (i, j): (u16, u16) = (kani::any(), kani::any());
+        kani::assume(i < SETTINGS_ROWS && j < SETTINGS_ROWS && i != j);
+        assert!(!(settings_row_rect(i).contains(p) && settings_row_rect(j).contains(p)));
+        assert!(!(ADJ_MINUS_RECT.contains(p) && ADJ_PLUS_RECT.contains(p)));
+        assert!(!(ADJ_MINUS_RECT.contains(p) && BACK_RECT.contains(p)));
+        assert!(!(ADJ_PLUS_RECT.contains(p) && BACK_RECT.contains(p)));
+    }
+
+    /// No tap selects two nav tabs at once, and no tap selects two list rows at once
+    /// (for any first-row offset) — so the design-system navigation can't misfire.
+    #[kani::proof]
+    fn nav_and_rows_disjoint() {
+        let p = Point::new(kani::any(), kani::any());
+        let (i, j): (u16, u16) = (kani::any(), kani::any());
+        kani::assume(i < 3 && j < 3 && i != j);
+        assert!(!(nav_tab_rect(i).contains(p) && nav_tab_rect(j).contains(p)));
+
+        let y0: u16 = kani::any();
+        kani::assume(y0 <= PANEL_H);
+        let (a, b): (u16, u16) = (kani::any(), kani::any());
+        kani::assume(a < 8 && b < 8 && a != b);
+        assert!(!(row_rect(y0, a).contains(p) && row_rect(y0, b).contains(p)));
     }
 }
 
@@ -460,8 +774,8 @@ mod tests {
 
     #[test]
     fn hit_centres_of_each_button() {
-        let deny_c = Point::new(DENY_RECT.x + BTN_W / 2, DENY_RECT.y + BTN_H / 2);
-        let allow_c = Point::new(ALLOW_RECT.x + BTN_W / 2, ALLOW_RECT.y + BTN_H / 2);
+        let deny_c = Point::new(DENY_RECT.x + DENY_RECT.w / 2, DENY_RECT.y + BTN_H / 2);
+        let allow_c = Point::new(ALLOW_RECT.x + ALLOW_RECT.w / 2, ALLOW_RECT.y + BTN_H / 2);
         assert_eq!(hit_confirm(deny_c), Some(Button::Deny));
         assert_eq!(hit_confirm(allow_c), Some(Button::Allow));
     }
@@ -472,8 +786,9 @@ mod tests {
         // Above the button row (the prompt area).
         assert_eq!(hit_confirm(Point::new(PANEL_W / 2, BTN_BAND_TOP - 1)), None);
         assert_eq!(hit_confirm(Point::new(0, 0)), None);
-        // The centre gap between the two floating buttons.
-        assert_eq!(hit_confirm(Point::new(PANEL_W / 2, mid_h)), None);
+        // The gap between Deny and the (wider) Hold-to-approve button.
+        let gap_x = DENY_RECT.x + DENY_RECT.w + 2;
+        assert_eq!(hit_confirm(Point::new(gap_x, mid_h)), None);
         // The left and right side margins, at button height.
         assert_eq!(hit_confirm(Point::new(2, mid_h)), None);
         assert_eq!(hit_confirm(Point::new(PANEL_W - 2, mid_h)), None);
@@ -520,5 +835,125 @@ mod tests {
         assert_eq!(hit_pin(Point::new(k.x + PIN_KEY_W + 1, k.y + 2)), None);
         // Below the grid (bottom-left margin) selects nothing.
         assert_eq!(hit_pin(Point::new(0, PANEL_H - 1)), None);
+    }
+
+    #[test]
+    fn settings_root_rows_map_in_order() {
+        let want = [
+            RootEntry::Brightness,
+            RootEntry::Timeout,
+            RootEntry::Info,
+            RootEntry::Close,
+        ];
+        for (i, &e) in want.iter().enumerate() {
+            let r = settings_row_rect(i as u16);
+            let c = Point::new(r.x + r.w / 2, r.y + r.h / 2);
+            assert_eq!(hit_settings_root(c), Some(e));
+            assert_eq!(settings_row_entry(i as u16), e);
+        }
+        // The gap between two rows selects nothing.
+        let r0 = settings_row_rect(0);
+        assert_eq!(
+            hit_settings_root(Point::new(r0.x + r0.w / 2, r0.y + r0.h + 1)),
+            None
+        );
+        // Above the list (header area) selects nothing.
+        assert_eq!(hit_settings_root(Point::new(PANEL_W / 2, 10)), None);
+    }
+
+    #[test]
+    fn adjust_controls_hit_their_keys() {
+        let centers = [
+            (ADJ_MINUS_RECT, AdjustKey::Minus),
+            (ADJ_PLUS_RECT, AdjustKey::Plus),
+            (BACK_RECT, AdjustKey::Back),
+        ];
+        for (r, key) in centers {
+            assert_eq!(
+                hit_adjust(Point::new(r.x + r.w / 2, r.y + r.h / 2)),
+                Some(key)
+            );
+        }
+        // The gap between − and + selects nothing.
+        let gap_x = ADJ_MINUS_RECT.x + ADJ_MINUS_RECT.w + 1;
+        assert_eq!(hit_adjust(Point::new(gap_x, ADJ_Y + ADJ_H / 2)), None);
+    }
+
+    #[test]
+    fn hex_helpers_are_lowercase_ascii() {
+        assert_eq!(core::str::from_utf8(&hex_u16(0x078A)).unwrap(), "078a");
+        assert_eq!(core::str::from_utf8(&hex_u16(0)).unwrap(), "0000");
+        assert_eq!(core::str::from_utf8(&hex_u16(0xFFFF)).unwrap(), "ffff");
+        assert_eq!(
+            core::str::from_utf8(&hex_u64(0x0123_4567_89ab_cdef)).unwrap(),
+            "0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn timeout_choices_are_sorted_and_nonzero() {
+        // The timeout page steps through these; a non-monotone or zero entry would
+        // make −/+ misbehave.
+        assert!(TIMEOUT_CHOICES.windows(2).all(|w| w[0] < w[1]));
+        assert!(TIMEOUT_CHOICES.iter().all(|&s| s > 0));
+        // BRIGHTNESS_LEVELS >= 1 is a compile-time invariant (the const block above),
+        // so it needs no runtime assert here.
+    }
+
+    #[test]
+    fn step_brightness_clamps_at_both_ends() {
+        assert_eq!(step_brightness(1, -1), 1);
+        assert_eq!(step_brightness(BRIGHTNESS_LEVELS, 1), BRIGHTNESS_LEVELS);
+        assert_eq!(step_brightness(3, 1), 4);
+        assert_eq!(step_brightness(3, -1), 2);
+    }
+
+    #[test]
+    fn step_timeout_steps_clamps_and_snaps() {
+        // An exact-listed value steps to its neighbour.
+        assert_eq!(step_timeout(30, 1), 60);
+        assert_eq!(step_timeout(30, -1), 20);
+        // Clamps at both ends of the choice list.
+        let last = TIMEOUT_CHOICES[TIMEOUT_CHOICES.len() - 1];
+        assert_eq!(step_timeout(TIMEOUT_CHOICES[0], -1), TIMEOUT_CHOICES[0]);
+        assert_eq!(step_timeout(last, 1), last);
+        // A non-listed current value (e.g. a 5 s phy override) snaps to nearest (10)
+        // before stepping.
+        assert_eq!(step_timeout(5, -1), 10);
+        assert_eq!(step_timeout(5, 1), 20);
+    }
+
+    #[test]
+    fn nav_tabs_map_left_to_right() {
+        for (i, &tab) in NAV_TABS.iter().enumerate() {
+            let r = nav_tab_rect(i as u16);
+            let c = Point::new(r.x + r.w / 2, r.y + r.h / 2);
+            assert_eq!(hit_nav(c), Some(tab));
+        }
+        // A tap above the nav bar selects no tab.
+        assert_eq!(hit_nav(Point::new(PANEL_W / 2, NAV_TOP - 1)), None);
+        // The far corners still resolve to the edge tabs (no dead gap).
+        assert_eq!(hit_nav(Point::new(0, NAV_TOP)), Some(NavTab::Home));
+        assert_eq!(
+            hit_nav(Point::new(PANEL_W - 1, PANEL_H - 1)),
+            Some(NavTab::Settings)
+        );
+    }
+
+    #[test]
+    fn list_rows_hit_in_order_and_gaps_miss() {
+        let y0 = 40;
+        for i in 0..5u16 {
+            let r = row_rect(y0, i);
+            assert_eq!(hit_list(Point::new(r.x + 2, r.y + r.h / 2), y0, 5), Some(i));
+        }
+        // The gap between rows 0 and 1 selects nothing.
+        let r0 = row_rect(y0, 0);
+        assert_eq!(hit_list(Point::new(r0.x + 2, r0.y + r0.h + 1), y0, 5), None);
+        // A row index beyond `n` isn't matched.
+        assert_eq!(
+            hit_list(Point::new(r0.x + 2, row_rect(y0, 6).y + 2), y0, 5),
+            None
+        );
     }
 }

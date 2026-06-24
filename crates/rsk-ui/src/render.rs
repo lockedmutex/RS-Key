@@ -12,7 +12,7 @@
 
 use embedded_graphics::{
     Drawable,
-    draw_target::DrawTarget,
+    draw_target::{DrawTarget, DrawTargetExt},
     geometry::{Point as EgPoint, Size},
     mono_font::{
         MonoFont, MonoTextStyle,
@@ -20,28 +20,37 @@ use embedded_graphics::{
     },
     pixelcolor::Rgb565,
     prelude::{RgbColor, WebColors},
-    primitives::{Circle, Primitive, PrimitiveStyle, Rectangle, RoundedRectangle},
+    primitives::{
+        Circle, Line, Primitive, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle,
+        RoundedRectangle, StrokeAlignment,
+    },
     text::{Alignment, Baseline, Text, TextStyle, TextStyleBuilder},
 };
 
 use crate::{
-    ALLOW_RECT, ConfirmPrompt, DENY_RECT, PANEL_W, PIN_CANCEL_RECT, PIN_COLS, PIN_ROWS, PinKey,
-    PinPad, Rect, Screen, StatusKind, pin_grid_key, pin_key_rect,
+    ADJ_MINUS_RECT, ADJ_PLUS_RECT, ALLOW_RECT, BACK_RECT, BRIGHTNESS_LEVELS, ConfirmPrompt,
+    DENY_RECT, Glyph, HomeView, NAV_H, NAV_TABS, NAV_TOP, NavTab, PANEL_W, PIN_CANCEL_RECT,
+    PIN_COLS, PIN_ROWS, PasskeysView, PinKey, PinPad, Point, Rect, Screen, SettingsPage,
+    SettingsView, StatusKind, glyph, hex_u16, hex_u64, nav_tab_rect, pin_grid_key, pin_key_rect,
+    settings_row_rect, theme,
 };
 
-const BG: Rgb565 = Rgb565::BLACK;
-const FG: Rgb565 = Rgb565::WHITE;
-const MUTED: Rgb565 = Rgb565::CSS_SLATE_GRAY;
-/// Allow on the right is green, Deny on the left is red — muted, not vivid, so the
-/// colors read as calm confirmation rather than alarm while still backing up the
-/// fixed left/right geometry, making the *meaning* of a tap doubly unambiguous.
-const ALLOW_FILL: Rgb565 = Rgb565::CSS_SEA_GREEN;
-const DENY_FILL: Rgb565 = Rgb565::CSS_INDIAN_RED;
+// Local semantic aliases, all sourced from `theme` so the whole renderer speaks one
+// palette (these equal their tokens — re-sourcing is hygiene, not a visual change).
+const BG: Rgb565 = theme::PANEL_BG;
+const FG: Rgb565 = theme::TEXT;
+const MUTED: Rgb565 = theme::MUTED;
+/// Affirmative fill — the PIN pad's OK key and the brightness level bar. Calm
+/// sea-green, not vivid, so it reads as confirmation rather than alarm. The decline
+/// pair (Deny / Cancel) is a low-emphasis outline in [`theme::DENY`] instead, so
+/// there is no filled-red counterpart const here.
+const ALLOW_FILL: Rgb565 = theme::APPROVE;
 /// Corner radius for the floating buttons — enough to read as rounded cards.
 const BTN_RADIUS: u32 = 12;
-/// Neutral fill for the numeric PIN keys; OK reuses the Allow green, Del the muted
-/// gray, Cancel the Deny red, so the affirmative/destructive keys stand out.
-const KEY_FILL: Rgb565 = Rgb565::CSS_STEEL_BLUE;
+/// Fill for the numeric PIN keys and the settings −/+ steppers — a dark neutral card
+/// ([`theme::KEY_BG`]) edged with [`theme::KEY_BORDER`]. The affirmative OK is a solid
+/// Allow-green key and Del a backspace glyph, so the special keys still stand out.
+const KEY_FILL: Rgb565 = theme::KEY_BG;
 
 /// Center the screen horizontally on a half-pixel-free integer midline.
 const MIDX: i32 = PANEL_W as i32 / 2;
@@ -55,9 +64,11 @@ where
     target.clear(BG)?;
     match screen {
         Screen::Splash => splash(target),
-        Screen::Status(kind) => status(target, *kind),
+        Screen::Home(v) => home(target, v),
+        Screen::Passkeys(v) => passkeys(target, v),
         Screen::Confirm(prompt) => confirm(target, prompt),
         Screen::Pin(pad) => pin(target, pad),
+        Screen::Settings(view) => settings(target, view),
     }
 }
 
@@ -72,40 +83,170 @@ fn splash<D: DrawTarget<Color = Rgb565>>(t: &mut D) -> Result<(), D::Error> {
     )
 }
 
-fn status<D: DrawTarget<Color = Rgb565>>(t: &mut D, kind: StatusKind) -> Result<(), D::Error> {
-    let color = status_color(kind);
-    text(t, "RS-Key", EgPoint::new(MIDX, 24), &FONT_6X13, MUTED)?;
-    Circle::new(EgPoint::new(MIDX - 12, 120), 24)
-        .into_styled(PrimitiveStyle::with_fill(color))
-        .draw(t)?;
-    text(t, kind.label(), EgPoint::new(MIDX, 210), &FONT_10X20, color)
+/// The Home tab: header, a large status indicator (Ready / Working …), one info row,
+/// and the bottom nav. The old MENU affordance is gone — the nav bar is the way into
+/// Passkeys / Settings now.
+fn home<D: DrawTarget<Color = Rgb565>>(t: &mut D, v: &HomeView) -> Result<(), D::Error> {
+    render_header(t, "RS-Key", false, Some(Glyph::Usb))?;
+    if matches!(v.status, StatusKind::Idle) {
+        glyph::draw(
+            t,
+            Glyph::CheckCircle,
+            Point::new(MIDX as u16 - 22, 64),
+            44,
+            theme::ACCENT,
+        )?;
+        text(
+            t,
+            "Ready",
+            EgPoint::new(MIDX, 140),
+            &FONT_10X20,
+            theme::ACCENT,
+        )?;
+    } else {
+        let c = status_color(v.status);
+        Circle::new(EgPoint::new(MIDX - 18, 70), 36)
+            .into_styled(PrimitiveStyle::with_fill(c))
+            .draw(t)?;
+        text(t, v.status.label(), EgPoint::new(MIDX, 140), &FONT_10X20, c)?;
+    }
+    render_row(
+        t,
+        crate::row_rect(180, 0),
+        Glyph::Usb,
+        "USB connected",
+        None,
+        false,
+    )?;
+    render_nav(t, NavTab::Home)
 }
 
+/// The Passkeys tab — a stub: a key glyph and the resident-credential count, plus the
+/// bottom nav. The full list + per-credential detail land in a later wave.
+fn passkeys<D: DrawTarget<Color = Rgb565>>(t: &mut D, v: &PasskeysView) -> Result<(), D::Error> {
+    render_header(t, "Passkeys", true, None)?;
+    glyph::draw(
+        t,
+        Glyph::Key,
+        Point::new(MIDX as u16 - 18, 84),
+        36,
+        theme::MUTED,
+    )?;
+    if v.count == 0 {
+        text(
+            t,
+            "No passkeys yet",
+            EgPoint::new(MIDX, 150),
+            &FONT_6X13,
+            theme::MUTED,
+        )?;
+    } else {
+        let mut buf = [0u8; 5];
+        text(
+            t,
+            fmt_u16(v.count, &mut buf),
+            EgPoint::new(MIDX, 146),
+            &FONT_10X20,
+            theme::TEXT,
+        )?;
+        text(
+            t,
+            "passkeys saved",
+            EgPoint::new(MIDX, 176),
+            &FONT_6X13,
+            theme::MUTED,
+        )?;
+    }
+    render_nav(t, NavTab::Passkeys)
+}
+
+/// The trusted Approve prompt: header + shield, the operation title, the relying-
+/// party card (generic globe + sanitized rp id / account), a "did you start this?"
+/// caution, and the Deny / Hold-to-approve buttons. The hold button starts empty; the
+/// firmware fills it via [`render_hold_button`] as the user holds.
 fn confirm<D: DrawTarget<Color = Rgb565>>(t: &mut D, p: &ConfirmPrompt) -> Result<(), D::Error> {
-    text(t, p.title, EgPoint::new(MIDX, 40), &FONT_9X15_BOLD, FG)?;
-    // The relying-party fields, already sanitized to short printable ASCII by
-    // `Label::clamp`. Phase 2 wraps a long rp id across lines + marks truncation;
-    // for now one centered line each, clipped at the panel edge by the target.
+    render_header(t, "RS-Key", false, Some(Glyph::Shield))?;
+    glyph::draw(t, Glyph::Shield, Point::new(20, 42), 22, theme::ACCENT)?;
+    text_left(t, p.title, EgPoint::new(50, 53), &FONT_10X20, theme::TEXT)?;
+    // Relying-party card, only when the request carries rp text.
     if !p.primary.is_empty() {
-        text(
+        let card = Rect::new(14, 80, PANEL_W - 28, 46);
+        RoundedRectangle::with_equal_corners(eg_rect(card), Size::new(8, 8))
+            .into_styled(PrimitiveStyle::with_fill(theme::ROW_BG))
+            .draw(t)?;
+        glyph::draw(
             t,
-            p.primary.as_str(),
-            EgPoint::new(MIDX, 96),
-            &FONT_6X13,
-            FG,
+            Glyph::Globe,
+            Point::new(card.x + 10, card.y + 13),
+            20,
+            theme::MUTED,
         )?;
+        let tx = card.x as i32 + 40;
+        if p.secondary.is_empty() {
+            text_left(
+                t,
+                p.primary.as_str(),
+                EgPoint::new(tx, card.y as i32 + 23),
+                &FONT_6X13,
+                theme::TEXT,
+            )?;
+        } else {
+            text_left(
+                t,
+                p.primary.as_str(),
+                EgPoint::new(tx, card.y as i32 + 16),
+                &FONT_6X13,
+                theme::TEXT,
+            )?;
+            text_left(
+                t,
+                p.secondary.as_str(),
+                EgPoint::new(tx, card.y as i32 + 32),
+                &FONT_6X13,
+                theme::MUTED,
+            )?;
+        }
     }
-    if !p.secondary.is_empty() {
-        text(
-            t,
-            p.secondary.as_str(),
-            EgPoint::new(MIDX, 124),
-            &FONT_6X13,
-            MUTED,
-        )?;
-    }
-    button(t, DENY_RECT, "Deny", DENY_FILL)?;
-    button(t, ALLOW_RECT, "Allow", ALLOW_FILL)
+    // Caution — a deliberate, plain-language warning against phishing.
+    glyph::draw(t, Glyph::Warn, Point::new(16, 144), 15, theme::WARN)?;
+    text_left(
+        t,
+        "Approve only if you",
+        EgPoint::new(38, 148),
+        &FONT_6X13,
+        theme::WARN,
+    )?;
+    text_left(
+        t,
+        "started this",
+        EgPoint::new(38, 164),
+        &FONT_6X13,
+        theme::WARN,
+    )?;
+    // Deny is a single tap (low emphasis); Approve is a deliberate hold that fills.
+    outline_button(t, DENY_RECT, "Deny", theme::DENY)?;
+    render_hold_button(t, ALLOW_RECT, "Hold to approve", theme::APPROVE)
+}
+
+/// An outlined (not filled) rounded button — the low-emphasis action (Deny).
+fn outline_button<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    r: Rect,
+    label: &str,
+    color: Rgb565,
+) -> Result<(), D::Error> {
+    // Inside-aligned stroke: the outline stays within `r`, so a button's paint never
+    // bleeds past the exact rect the hit-test maps (the Allow/Deny contract).
+    RoundedRectangle::with_equal_corners(eg_rect(r), Size::new(BTN_RADIUS, BTN_RADIUS))
+        .into_styled(
+            PrimitiveStyleBuilder::new()
+                .stroke_color(color)
+                .stroke_width(2)
+                .stroke_alignment(StrokeAlignment::Inside)
+                .build(),
+        )
+        .draw(t)?;
+    text(t, label, center(r), &FONT_9X15_BOLD, color)
 }
 
 /// Fill a rounded floating button and center its caption — the fill and the
@@ -124,25 +265,89 @@ fn button<D: DrawTarget<Color = Rgb565>>(
     text(t, label, center(r), &FONT_9X15_BOLD, FG)
 }
 
-/// The built-in-UV PIN pad: a header (title + Cancel), the masked entry, then the
-/// 3×4 key grid. Each key is painted in the exact [`pin_key_rect`] that
-/// [`crate::hit_pin`] maps a tap to, and only masked dots — never the digits — are
-/// shown.
+/// Paint a rounded key surface at `r`: a `fill`, plus (when `bordered`) a subtle
+/// [`theme::KEY_BORDER`] edge so a dark key still reads as pressable. The caller
+/// centres the digit or glyph on top. Shared by the PIN pad and the settings ±.
+fn key_surface<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    r: Rect,
+    fill: Rgb565,
+    bordered: bool,
+) -> Result<(), D::Error> {
+    RoundedRectangle::with_equal_corners(eg_rect(r), Size::new(BTN_RADIUS, BTN_RADIUS))
+        .into_styled(PrimitiveStyle::with_fill(fill))
+        .draw(t)?;
+    if bordered {
+        RoundedRectangle::with_equal_corners(eg_rect(r), Size::new(BTN_RADIUS, BTN_RADIUS))
+            .into_styled(
+                PrimitiveStyleBuilder::new()
+                    .stroke_color(theme::KEY_BORDER)
+                    .stroke_width(1)
+                    .stroke_alignment(StrokeAlignment::Inside)
+                    .build(),
+            )
+            .draw(t)?;
+    }
+    Ok(())
+}
+
+/// Draw glyph `g` of side `size` centred in `r`.
+fn glyph_centered<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    g: Glyph,
+    r: Rect,
+    size: u16,
+    color: Rgb565,
+) -> Result<(), D::Error> {
+    glyph::draw(
+        t,
+        g,
+        Point::new(r.x + r.w / 2 - size / 2, r.y + r.h / 2 - size / 2),
+        size,
+        color,
+    )
+}
+
+/// The built-in-UV PIN pad in the new design language: a lock-marked header with a
+/// low-emphasis outlined Cancel, the cyan masked entry, then the 3×4 grid of dark
+/// neutral key cards — Del a backspace glyph, OK a solid green check. Each key is
+/// painted in the exact [`pin_key_rect`] that [`crate::hit_pin`] maps a tap to, and
+/// only masked dots — never the digits — are shown.
 fn pin<D: DrawTarget<Color = Rgb565>>(t: &mut D, pad: &PinPad) -> Result<(), D::Error> {
-    text(t, "Enter PIN", EgPoint::new(MIDX, 22), &FONT_9X15_BOLD, FG)?;
-    button(t, PIN_CANCEL_RECT, "Cancel", DENY_FILL)?;
+    // Custom header (not `render_header`): Cancel keeps its top-left hit rect — clear
+    // of the digit grid, so a digit tap can never abandon entry — so the title is
+    // centred between it and a Lock that marks this as the secure-entry screen.
+    text(t, "Enter PIN", EgPoint::new(MIDX, 20), &FONT_9X15_BOLD, FG)?;
+    glyph::draw(
+        t,
+        Glyph::Lock,
+        Point::new(PANEL_W - 26, 6),
+        18,
+        theme::ACCENT,
+    )?;
+    outline_button(t, PIN_CANCEL_RECT, "Cancel", theme::DENY)?;
     masked_entry(t, pad.entered)?;
     let mut row = 0;
     while row < PIN_ROWS {
         let mut col = 0;
         while col < PIN_COLS {
-            let key = pin_grid_key(col, row);
-            let fill = match key {
-                PinKey::Ok => ALLOW_FILL,
-                PinKey::Del => MUTED,
-                _ => KEY_FILL,
-            };
-            button(t, pin_key_rect(col, row), key_label(key), fill)?;
+            let r = pin_key_rect(col, row);
+            match pin_grid_key(col, row) {
+                // OK is a solid green key with a white check; Del a backspace glyph on a
+                // dark card; the digits are dark cards with a white numeral.
+                PinKey::Ok => {
+                    key_surface(t, r, ALLOW_FILL, false)?;
+                    glyph_centered(t, Glyph::Check, r, 24, FG)?;
+                }
+                PinKey::Del => {
+                    key_surface(t, r, KEY_FILL, true)?;
+                    glyph_centered(t, Glyph::Backspace, r, 24, MUTED)?;
+                }
+                key => {
+                    key_surface(t, r, KEY_FILL, true)?;
+                    text(t, key_label(key), center(r), &FONT_9X15_BOLD, FG)?;
+                }
+            }
             col += 1;
         }
         row += 1;
@@ -150,7 +355,7 @@ fn pin<D: DrawTarget<Color = Rgb565>>(t: &mut D, pad: &PinPad) -> Result<(), D::
     Ok(())
 }
 
-/// One filled dot per entered digit (capped to a row width), centered — the PIN
+/// One filled cyan dot per entered digit (capped to a row width), centered — the PIN
 /// itself is never rendered, only its length.
 fn masked_entry<D: DrawTarget<Color = Rgb565>>(t: &mut D, entered: usize) -> Result<(), D::Error> {
     const MAX_DOTS: usize = 10;
@@ -160,7 +365,7 @@ fn masked_entry<D: DrawTarget<Color = Rgb565>>(t: &mut D, entered: usize) -> Res
     let start = MIDX - (n * STEP) / 2 + (STEP - DIA as i32) / 2;
     for i in 0..n {
         Circle::new(EgPoint::new(start + i * STEP, 54), DIA)
-            .into_styled(PrimitiveStyle::with_fill(FG))
+            .into_styled(PrimitiveStyle::with_fill(theme::ACCENT))
             .draw(t)?;
     }
     Ok(())
@@ -239,11 +444,386 @@ fn eg_rect(r: Rect) -> Rectangle {
     )
 }
 
+// --- Design-system widgets (the re-skin layout) ----------------------------
+
+fn left_mid() -> TextStyle {
+    TextStyleBuilder::new()
+        .alignment(Alignment::Left)
+        .baseline(Baseline::Middle)
+        .build()
+}
+
+fn right_mid() -> TextStyle {
+    TextStyleBuilder::new()
+        .alignment(Alignment::Right)
+        .baseline(Baseline::Middle)
+        .build()
+}
+
+/// Left-aligned, vertically-centred text (list-row labels, header titles).
+fn text_left<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    s: &str,
+    at: EgPoint,
+    font: &'static MonoFont<'static>,
+    color: Rgb565,
+) -> Result<(), D::Error> {
+    Text::with_text_style(s, at, MonoTextStyle::new(font, color), left_mid()).draw(t)?;
+    Ok(())
+}
+
+/// Right-aligned, vertically-centred text (trailing row status / values).
+fn text_right<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    s: &str,
+    at: EgPoint,
+    font: &'static MonoFont<'static>,
+    color: Rgb565,
+) -> Result<(), D::Error> {
+    Text::with_text_style(s, at, MonoTextStyle::new(font, color), right_mid()).draw(t)?;
+    Ok(())
+}
+
+/// The top header strip: a title (accent or muted) at the left, an optional status
+/// glyph at the right.
+pub fn render_header<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    title: &str,
+    accent: bool,
+    right: Option<Glyph>,
+) -> Result<(), D::Error> {
+    let color = if accent { theme::ACCENT } else { theme::MUTED };
+    text_left(t, title, EgPoint::new(12, 15), &FONT_9X15_BOLD, color)?;
+    if let Some(g) = right {
+        glyph::draw(t, g, Point::new(PANEL_W - 26, 6), 18, theme::MUTED)?;
+    }
+    Ok(())
+}
+
+/// One list row: a lifted card, a leading glyph, the label, an optional trailing
+/// coloured status/value, and an optional chevron. The geometry is the caller's
+/// `rect` (from `row_rect`), so paint and [`crate::hit_list`] share it.
+pub fn render_row<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    rect: Rect,
+    icon: Glyph,
+    label: &str,
+    trailing: Option<(&str, Rgb565)>,
+    chevron: bool,
+) -> Result<(), D::Error> {
+    RoundedRectangle::with_equal_corners(eg_rect(rect), Size::new(6, 6))
+        .into_styled(PrimitiveStyle::with_fill(theme::ROW_BG))
+        .draw(t)?;
+    let cy = rect.y as i32 + rect.h as i32 / 2;
+    glyph::draw(
+        t,
+        icon,
+        Point::new(rect.x + 8, (cy - 7) as u16),
+        14,
+        theme::MUTED,
+    )?;
+    text_left(
+        t,
+        label,
+        EgPoint::new(rect.x as i32 + 28, cy),
+        &FONT_6X13,
+        theme::TEXT,
+    )?;
+    let mut right_x = rect.x as i32 + rect.w as i32 - 8;
+    if chevron {
+        right_x -= 12;
+        glyph::draw(
+            t,
+            Glyph::Chevron,
+            Point::new(right_x as u16, (cy - 6) as u16),
+            12,
+            theme::MUTED,
+        )?;
+    }
+    if let Some((txt, col)) = trailing {
+        text_right(t, txt, EgPoint::new(right_x - 4, cy), &FONT_6X13, col)?;
+    }
+    Ok(())
+}
+
+/// The bottom nav bar: a surface + hairline, the `active` tab in accent and the rest
+/// dimmed. Glyphs sit in the exact [`nav_tab_rect`] cells [`crate::hit_nav`] maps.
+pub fn render_nav<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    active: NavTab,
+) -> Result<(), D::Error> {
+    Rectangle::new(
+        EgPoint::new(0, NAV_TOP as i32),
+        Size::new(PANEL_W as u32, NAV_H as u32),
+    )
+    .into_styled(PrimitiveStyle::with_fill(theme::NAV_BG))
+    .draw(t)?;
+    Line::new(
+        EgPoint::new(0, NAV_TOP as i32),
+        EgPoint::new(PANEL_W as i32 - 1, NAV_TOP as i32),
+    )
+    .into_styled(PrimitiveStyle::with_stroke(theme::HAIRLINE, 1))
+    .draw(t)?;
+    for (i, &tab) in NAV_TABS.iter().enumerate() {
+        let r = nav_tab_rect(i as u16);
+        let color = if tab == active {
+            theme::ACCENT
+        } else {
+            theme::NAV_INACTIVE
+        };
+        let g = match tab {
+            NavTab::Home => Glyph::Home,
+            NavTab::Passkeys => Glyph::Key,
+            NavTab::Settings => Glyph::Gear,
+        };
+        glyph::draw(
+            t,
+            g,
+            Point::new(r.x + r.w / 2 - 10, r.y + r.h / 2 - 10),
+            20,
+            color,
+        )?;
+    }
+    Ok(())
+}
+
+/// The `fill`-coloured outline and the centred label of a hold button — re-stamped on
+/// top of the fill so the advancing edge never eats them.
+fn hold_outline_and_label<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    rect: Rect,
+    label: &str,
+    color: Rgb565,
+) -> Result<(), D::Error> {
+    RoundedRectangle::with_equal_corners(eg_rect(rect), Size::new(BTN_RADIUS, BTN_RADIUS))
+        .into_styled(
+            PrimitiveStyleBuilder::new()
+                .stroke_color(color)
+                .stroke_width(1)
+                .stroke_alignment(StrokeAlignment::Inside)
+                .build(),
+        )
+        .draw(t)?;
+    // Small caption so longer labels ("Hold to approve") fit the button width.
+    text(t, label, center(rect), &FONT_6X13, theme::TEXT)
+}
+
+/// The **static base** of a hold-to-confirm button: a dark card, the `fill`-coloured
+/// outline and the centred label. Painted once when the screen appears and again on a
+/// hold reset; [`render_hold_fill`] then grows the fill over it without re-clearing the
+/// card, so the build-up never flickers.
+pub fn render_hold_button<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    rect: Rect,
+    label: &str,
+    fill: Rgb565,
+) -> Result<(), D::Error> {
+    RoundedRectangle::with_equal_corners(eg_rect(rect), Size::new(BTN_RADIUS, BTN_RADIUS))
+        .into_styled(PrimitiveStyle::with_fill(theme::ROW_BG))
+        .draw(t)?;
+    hold_outline_and_label(t, rect, label, fill)
+}
+
+/// Grow the hold fill from `prev_num/den` to `num/den` of the button width, drawn over
+/// the existing base/fill with **no card clear**, so repainting each poll doesn't
+/// flicker. The fill is the button's *own* rounded-rect shape painted through a clip of
+/// only the advancing strip `[prev_w, w]`: so its rounded corners are exactly the base's
+/// (no square corner ever pokes past the card — the artifact the earlier left-rounded
+/// approach left when narrow widths clamped the radius), the advancing edge is the flat
+/// clip boundary, and only the thin new strip is painted (the centred label is overdrawn
+/// ~2px at a time, not washed every frame). Pass `prev_num == 0` to start a fresh fill.
+pub fn render_hold_fill<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    rect: Rect,
+    label: &str,
+    prev_num: u16,
+    num: u16,
+    den: u16,
+    fill: Rgb565,
+) -> Result<(), D::Error> {
+    if den > 0 {
+        let frac = |n: u16| (rect.w as u32 * n.min(den) as u32 / den as u32).min(rect.w as u32);
+        let (w, pw) = (frac(num), frac(prev_num));
+        if w > pw {
+            let strip = Rectangle::new(
+                EgPoint::new(rect.x as i32 + pw as i32, rect.y as i32),
+                Size::new(w - pw, rect.h as u32),
+            );
+            let mut clipped = t.clipped(&strip);
+            RoundedRectangle::with_equal_corners(eg_rect(rect), Size::new(BTN_RADIUS, BTN_RADIUS))
+                .into_styled(PrimitiveStyle::with_fill(fill))
+                .draw(&mut clipped)?;
+        }
+    }
+    hold_outline_and_label(t, rect, label, fill)
+}
+
+// --- Settings menu ---------------------------------------------------------
+
+/// Paint the on-screen settings menu — dispatch by page. Every tappable control is
+/// painted in the exact rect its `hit_*` test maps a tap to (the Allow/Deny contract,
+/// extended to the menu).
+fn settings<D: DrawTarget<Color = Rgb565>>(t: &mut D, v: &SettingsView) -> Result<(), D::Error> {
+    match v.page {
+        SettingsPage::Root => settings_root(t),
+        SettingsPage::Brightness => settings_brightness(t, v.brightness),
+        SettingsPage::Timeout => settings_timeout(t, v.timeout_secs),
+        SettingsPage::Info => settings_info(t, v.version, v.chipid),
+    }
+}
+
+/// The Root list: a header and the option rows, each in its `settings_row_rect` —
+/// the new list look, with leading glyphs and a drill-in chevron.
+fn settings_root<D: DrawTarget<Color = Rgb565>>(t: &mut D) -> Result<(), D::Error> {
+    render_header(t, "Settings", true, None)?;
+    render_row(
+        t,
+        settings_row_rect(0),
+        Glyph::Sun,
+        "Brightness",
+        None,
+        true,
+    )?;
+    render_row(
+        t,
+        settings_row_rect(1),
+        Glyph::Clock,
+        "Touch timeout",
+        None,
+        true,
+    )?;
+    render_row(
+        t,
+        settings_row_rect(2),
+        Glyph::Info,
+        "Device info",
+        None,
+        true,
+    )?;
+    render_row(t, settings_row_rect(3), Glyph::Home, "Close", None, false)
+}
+
+/// Brightness adjust: a coarse level bar plus the shared −/+/Back controls.
+fn settings_brightness<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    level: u8,
+) -> Result<(), D::Error> {
+    render_header(t, "Brightness", true, None)?;
+    level_bar(t, level)?;
+    adjust_controls(t)
+}
+
+/// Touch-timeout adjust: the current value in seconds plus −/+/Back.
+fn settings_timeout<D: DrawTarget<Color = Rgb565>>(t: &mut D, secs: u16) -> Result<(), D::Error> {
+    render_header(t, "Touch timeout", true, None)?;
+    let mut buf = [0u8; 8];
+    text(
+        t,
+        fmt_secs(secs, &mut buf),
+        EgPoint::new(MIDX, 104),
+        &FONT_10X20,
+        theme::TEXT,
+    )?;
+    adjust_controls(t)
+}
+
+/// Read-only device info: model, firmware version (bcdDevice) and chip serial, plus
+/// Back. The numbers are hex-formatted with no alloc.
+fn settings_info<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    version: u16,
+    chipid: u64,
+) -> Result<(), D::Error> {
+    render_header(t, "Device info", true, None)?;
+    text(
+        t,
+        "RS-Key trusted display",
+        EgPoint::new(MIDX, 72),
+        &FONT_6X13,
+        MUTED,
+    )?;
+    text(t, "Version", EgPoint::new(MIDX, 108), &FONT_6X13, MUTED)?;
+    let mut vbuf = [b'0', b'x', 0, 0, 0, 0];
+    vbuf[2..].copy_from_slice(&hex_u16(version));
+    text(t, str8(&vbuf), EgPoint::new(MIDX, 130), &FONT_10X20, FG)?;
+    text(t, "Serial", EgPoint::new(MIDX, 170), &FONT_6X13, MUTED)?;
+    let sh = hex_u64(chipid);
+    text(t, str8(&sh), EgPoint::new(MIDX, 192), &FONT_6X13, FG)?;
+    button(t, BACK_RECT, "Back", MUTED)
+}
+
+/// The −/+/Back controls shared by both adjust pages, painted in their hit rects.
+fn adjust_controls<D: DrawTarget<Color = Rgb565>>(t: &mut D) -> Result<(), D::Error> {
+    key_surface(t, ADJ_MINUS_RECT, KEY_FILL, true)?;
+    text(t, "-", center(ADJ_MINUS_RECT), &FONT_9X15_BOLD, FG)?;
+    key_surface(t, ADJ_PLUS_RECT, KEY_FILL, true)?;
+    text(t, "+", center(ADJ_PLUS_RECT), &FONT_9X15_BOLD, FG)?;
+    button(t, BACK_RECT, "Back", MUTED)
+}
+
+/// A row of `BRIGHTNESS_LEVELS` segments, the first `filled` lit green — a coarse
+/// gauge, centered above the −/+ controls.
+fn level_bar<D: DrawTarget<Color = Rgb565>>(t: &mut D, filled: u8) -> Result<(), D::Error> {
+    const SEG_W: u16 = 32;
+    const SEG_H: u16 = 28;
+    const SEG_GAP: u16 = 8;
+    const BAR_Y: i32 = 96;
+    let total = BRIGHTNESS_LEVELS as u16;
+    let span = total * SEG_W + (total - 1) * SEG_GAP;
+    let x0 = MIDX - span as i32 / 2;
+    for i in 0..total {
+        let fill = if i < filled as u16 { ALLOW_FILL } else { MUTED };
+        Rectangle::new(
+            EgPoint::new(x0 + i as i32 * (SEG_W + SEG_GAP) as i32, BAR_Y),
+            Size::new(SEG_W as u32, SEG_H as u32),
+        )
+        .into_styled(PrimitiveStyle::with_fill(fill))
+        .draw(t)?;
+    }
+    Ok(())
+}
+
+/// `&str` view of an all-ASCII fixed buffer (the hex/decimal we built); falls back to
+/// empty rather than panic if the invariant were ever broken.
+fn str8(buf: &[u8]) -> &str {
+    core::str::from_utf8(buf).unwrap_or("")
+}
+
+/// Decimal-format `v` into the tail of `buf`, returning the written slice (no alloc).
+fn fmt_u16(mut v: u16, buf: &mut [u8; 5]) -> &str {
+    let mut i = buf.len();
+    if v == 0 {
+        i -= 1;
+        buf[i] = b'0';
+    }
+    while v > 0 {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    str8(&buf[i..])
+}
+
+/// Format `secs` as `"NN s"` into `buf` (≤5 digits + " s" ≤ 8).
+fn fmt_secs(secs: u16, buf: &mut [u8; 8]) -> &str {
+    let mut tmp = [0u8; 5];
+    let num = fmt_u16(secs, &mut tmp);
+    let n = num.len();
+    buf[..n].copy_from_slice(num.as_bytes());
+    buf[n] = b' ';
+    buf[n + 1] = b's';
+    str8(&buf[..n + 2])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BTN_W, PANEL_H};
+    use crate::{HomeView, PANEL_H, PasskeysView};
     use embedded_graphics::{Pixel, geometry::OriginDimensions};
+
+    fn has_color(d: &Rec, r: Rect, c: Rgb565) -> bool {
+        (r.y..r.y + r.h).any(|y| (r.x..r.x + r.w).any(|x| d.at(x, y) == c))
+    }
 
     /// A `DrawTarget` that records into a 240×320 buffer and, like a real panel,
     /// clips out-of-bounds pixels — but flags that it had to (`oob`), so a test can
@@ -308,54 +888,69 @@ mod tests {
     }
 
     #[test]
-    fn every_status_fits_and_draws() {
-        for kind in [
+    fn every_home_status_fits_and_draws_with_nav() {
+        for status in [
             StatusKind::Boot,
             StatusKind::Idle,
             StatusKind::Processing,
             StatusKind::Touch,
         ] {
             let mut d = Rec::new();
-            render(&mut d, &Screen::Status(kind)).unwrap();
-            assert!(!d.oob, "status {kind:?} drew outside the panel");
-            assert!(d.drew_anything(), "status {kind:?} drew nothing");
+            render(&mut d, &Screen::Home(HomeView { status })).unwrap();
+            assert!(!d.oob, "home {status:?} drew outside the panel");
+            assert!(d.drew_anything(), "home {status:?} drew nothing");
+            // The bottom nav is always present on a tab; Home is the active one.
+            assert!(
+                has_color(&d, crate::nav_tab_rect(0), theme::ACCENT),
+                "home nav tab not accented on {status:?}"
+            );
         }
     }
 
-    /// The core security property: the *Allow* control is painted in `ALLOW_RECT`
-    /// and *Deny* in `DENY_RECT` — exactly the regions `hit_confirm` maps a tap to —
-    /// each in its own color, with the operation title above the button band.
     #[test]
-    fn confirm_paints_allow_and_deny_in_their_hit_rects() {
+    fn passkeys_stub_fits_and_draws() {
+        for count in [0u16, 7] {
+            let mut d = Rec::new();
+            render(&mut d, &Screen::Passkeys(PasskeysView { count })).unwrap();
+            assert!(!d.oob && d.drew_anything());
+            assert!(has_color(&d, crate::nav_tab_rect(1), theme::ACCENT));
+        }
+    }
+
+    /// The core security property: the Hold-to-approve control lives in `ALLOW_RECT`
+    /// (in the approve colour) and Deny in `DENY_RECT` (in the deny colour) — exactly
+    /// the regions `hit_confirm` maps a tap to — with the sanitized rp id on screen.
+    #[test]
+    fn confirm_paints_deny_and_hold_in_their_hit_rects() {
         let p = ConfirmPrompt::new("Sign in?", b"github.com", b"alice");
         let mut d = Rec::new();
         render(&mut d, &Screen::Confirm(p)).unwrap();
         assert!(!d.oob, "confirm drew outside the panel");
-
-        // Each floating button carries its fill, sampled near the top edge — on the
-        // flat span between the rounded corners and above the centered caption.
-        assert_eq!(d.at(ALLOW_RECT.x + BTN_W / 2, ALLOW_RECT.y + 4), ALLOW_FILL);
-        assert_eq!(d.at(DENY_RECT.x + BTN_W / 2, DENY_RECT.y + 4), DENY_FILL);
-        assert!(d.any_non_bg_in(ALLOW_RECT));
-        assert!(d.any_non_bg_in(DENY_RECT));
-        // The title sits in the prompt area above the button band, in foreground.
-        assert!((0..crate::BTN_BAND_TOP).any(|y| (0..PANEL_W).any(|x| d.at(x, y) == FG)));
-        // Rounded corners: the very corner pixel is background, not button fill.
-        assert_eq!(d.at(ALLOW_RECT.x, ALLOW_RECT.y), BG);
-        assert_eq!(d.at(DENY_RECT.x, DENY_RECT.y), BG);
+        // Deny carries the deny colour in DENY_RECT; Hold the approve colour in
+        // ALLOW_RECT — paint and hit-test share the rect.
+        assert!(
+            has_color(&d, DENY_RECT, theme::DENY),
+            "Deny not in its rect"
+        );
+        assert!(
+            has_color(&d, ALLOW_RECT, theme::APPROVE),
+            "Hold not in its rect"
+        );
+        // The two never overlap (disjoint by construction).
+        assert!(!has_color(&d, DENY_RECT, theme::APPROVE));
     }
 
     #[test]
-    fn confirm_button_band_does_not_intrude_on_the_prompt_area() {
-        // Nothing of the (filled) buttons is painted above the reserved band, so a
-        // stray prompt-area tap can never land on button paint.
+    fn confirm_buttons_stay_below_the_prompt_band() {
+        // No approve/deny-coloured paint strays above the button band, so a tap in the
+        // prompt area can never land on a button.
         let p = ConfirmPrompt::new("Register key?", b"example.org", b"");
         let mut d = Rec::new();
         render(&mut d, &Screen::Confirm(p)).unwrap();
         let row = crate::BTN_BAND_TOP - 1;
         assert!((0..PANEL_W).all(|x| {
             let c = d.at(x, row);
-            c != ALLOW_FILL && c != DENY_FILL
+            c != theme::APPROVE && c != theme::DENY
         }));
     }
 
@@ -368,11 +963,11 @@ mod tests {
         let ok = pin_key_rect(2, 3);
         assert_eq!(d.at(ok.x + crate::PIN_KEY_W / 2, ok.y + 3), ALLOW_FILL);
         assert!(d.any_non_bg_in(ok));
-        // A digit key and the Cancel target carry paint.
+        // A digit key carries paint; Cancel is the low-emphasis outline in the deny colour.
         assert!(d.any_non_bg_in(pin_key_rect(0, 0)));
-        assert!(d.any_non_bg_in(PIN_CANCEL_RECT));
-        // Four entered digits paint masked dots in the band above the grid.
-        assert!((40..72).any(|y| (0..PANEL_W).any(|x| d.at(x, y) != BG)));
+        assert!(has_color(&d, PIN_CANCEL_RECT, theme::DENY));
+        // Four entered digits paint cyan masked dots in the band above the grid.
+        assert!(has_color(&d, Rect::new(0, 48, PANEL_W, 24), theme::ACCENT));
     }
 
     #[test]
@@ -391,5 +986,128 @@ mod tests {
         );
         // The band still carries dots for the new digit count.
         assert!((48..72).any(|y| (0..PANEL_W).any(|x| d.at(x, y) != BG)));
+    }
+
+    fn view(page: SettingsPage) -> SettingsView {
+        SettingsView {
+            page,
+            brightness: 3,
+            timeout_secs: 30,
+            version: 0x078A,
+            chipid: 0x0123_4567_89ab_cdef,
+        }
+    }
+
+    #[test]
+    fn every_settings_page_fits_and_draws() {
+        for page in [
+            SettingsPage::Root,
+            SettingsPage::Brightness,
+            SettingsPage::Timeout,
+            SettingsPage::Info,
+        ] {
+            let mut d = Rec::new();
+            render(&mut d, &Screen::Settings(view(page))).unwrap();
+            assert!(!d.oob, "settings {page:?} drew outside the panel");
+            assert!(d.drew_anything(), "settings {page:?} drew nothing");
+        }
+    }
+
+    #[test]
+    fn settings_root_paints_every_row_in_its_hit_rect() {
+        let mut d = Rec::new();
+        render(&mut d, &Screen::Settings(view(SettingsPage::Root))).unwrap();
+        for i in 0..crate::SETTINGS_ROWS {
+            assert!(
+                d.any_non_bg_in(settings_row_rect(i)),
+                "root row {i} unpainted"
+            );
+        }
+    }
+
+    #[test]
+    fn adjust_pages_paint_controls_in_their_hit_rects() {
+        for page in [SettingsPage::Brightness, SettingsPage::Timeout] {
+            let mut d = Rec::new();
+            render(&mut d, &Screen::Settings(view(page))).unwrap();
+            assert!(d.any_non_bg_in(ADJ_MINUS_RECT), "{page:?} minus unpainted");
+            assert!(d.any_non_bg_in(ADJ_PLUS_RECT), "{page:?} plus unpainted");
+            assert!(d.any_non_bg_in(BACK_RECT), "{page:?} back unpainted");
+        }
+    }
+
+    #[test]
+    fn brightness_bar_lights_more_segments_at_higher_levels() {
+        // The bar band is just above the −/+ controls; a higher level fills more of it.
+        let band = Rect::new(0, 96, PANEL_W, 28);
+        let count_lit = |level: u8| {
+            let mut v = view(SettingsPage::Brightness);
+            v.brightness = level;
+            let mut d = Rec::new();
+            render(&mut d, &Screen::Settings(v)).unwrap();
+            (band.x..band.x + band.w)
+                .filter(|&x| (band.y..band.y + band.h).any(|y| d.at(x, y) == ALLOW_FILL))
+                .count()
+        };
+        assert!(
+            count_lit(4) > count_lit(1),
+            "more brightness must light more bar"
+        );
+    }
+
+    #[test]
+    fn header_row_and_nav_draw_within_bounds() {
+        let mut d = Rec::new();
+        render_header(&mut d, "Settings", true, Some(Glyph::Shield)).unwrap();
+        let r = crate::row_rect(40, 0);
+        render_row(&mut d, r, Glyph::Lock, "PIN", Some(("OK", theme::OK)), true).unwrap();
+        render_nav(&mut d, NavTab::Settings).unwrap();
+        assert!(!d.oob, "design-system widgets drew outside the panel");
+        // The list-row card fills its rect (sampled on the flat top span).
+        assert_eq!(d.at(r.x + r.w / 2, r.y + 3), theme::ROW_BG);
+    }
+
+    #[test]
+    fn nav_accents_only_the_active_tab() {
+        let mut d = Rec::new();
+        render_nav(&mut d, NavTab::Settings).unwrap();
+        let has = |r: Rect, c: Rgb565| {
+            (r.y..r.y + r.h).any(|y| (r.x..r.x + r.w).any(|x| d.at(x, y) == c))
+        };
+        assert!(
+            has(crate::nav_tab_rect(2), theme::ACCENT),
+            "active tab not accented"
+        );
+        assert!(
+            !has(crate::nav_tab_rect(0), theme::ACCENT),
+            "inactive tab accented"
+        );
+    }
+
+    #[test]
+    fn hold_fill_grows_left_to_right_with_a_flat_edge() {
+        // Count fill pixels along the horizontal centre line only — whole-column
+        // sampling would also catch the fill-coloured outline (it spans the full
+        // width) and mask the progress difference.
+        let r = Rect::new(20, 200, 120, 60);
+        let yc = r.y + r.h / 2;
+        let lit = |num: u16| {
+            let mut d = Rec::new();
+            render_hold_fill(&mut d, r, "Hold", 0, num, 10, theme::APPROVE).unwrap();
+            (r.x..r.x + r.w)
+                .filter(|&x| d.at(x, yc) == theme::APPROVE)
+                .count()
+        };
+        assert!(
+            lit(8) > lit(2),
+            "more hold progress must fill more of the button"
+        );
+        // The advancing edge is flat (only the left corners are rounded), so the fill
+        // reaches the top row right up to its right edge — a rounded-all-corners fill
+        // would leave that corner empty (the artifact this guards against).
+        let mut d = Rec::new();
+        render_hold_fill(&mut d, r, "Hold", 0, 5, 10, theme::APPROVE).unwrap();
+        let w = r.w / 2; // num/den = 5/10
+        assert_eq!(d.at(r.x + w - 3, r.y + 2), theme::APPROVE);
     }
 }
