@@ -26,7 +26,7 @@
 //! flowing and a full-frame repaint never stalls enumeration.
 
 use core::cell::RefCell;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use embassy_rp::gpio::Output;
 use embassy_rp::i2c::{Blocking as I2cBlocking, I2c};
@@ -49,6 +49,16 @@ const CST328_ADDR: u16 = 0x1A;
 /// Touch poll cadence during a confirm wait; `block_for` keeps interrupts on, so
 /// the high-priority USB executor runs between polls (mirrors the BOOTSEL wait).
 const TOUCH_POLL_MS: u64 = 16;
+
+/// Until this ms-since-boot the ambient status loop must not repaint. A modal
+/// (PIN pad / Approve-Deny) sets it on exit so a back-to-back hand-off — pad →
+/// confirm during one UV ceremony — doesn't flash the idle/working screen in the
+/// brief host round-trip gap between the two. After the window the ambient screen
+/// repaints as usual (returning to idle).
+static AMBIENT_QUIET_UNTIL_MS: AtomicU32 = AtomicU32::new(0);
+/// How long to hold the ambient screen back after a modal ends — long enough to
+/// cover the platform's next-command round-trip, short enough to feel immediate.
+const AMBIENT_QUIET_MS: u32 = 400;
 
 /// The fully-built ST7789 panel (write-only, blocking SPI1, no framebuffer).
 type Panel = Display<SpiInterface<'static, PanelSpi, Output<'static>>, ST7789, Output<'static>>;
@@ -211,7 +221,13 @@ fn status_to_kind(s: u8) -> StatusKind {
 pub async fn status_task(ui: &'static RefCell<Ui>) {
     Timer::after_millis(600).await; // let the boot splash linger
     loop {
-        if let Ok(mut u) = ui.try_borrow_mut() {
+        // Skip the ambient repaint while a modal hand-off is in flight, so the
+        // status screen never flickers between the pad and the confirm prompt.
+        // Wrap-safe deadline check (millis truncated to u32 wrap every ~49 days).
+        let now = Instant::now().as_millis() as u32;
+        let quiet_over =
+            now.wrapping_sub(AMBIENT_QUIET_UNTIL_MS.load(Ordering::Relaxed)) as i32 >= 0;
+        if quiet_over && let Ok(mut u) = ui.try_borrow_mut() {
             let screen = Screen::Status(status_to_kind(led::status()));
             if u.shown != Some(screen) {
                 let _ = rsk_ui::render(&mut u.panel, &screen);
@@ -292,6 +308,12 @@ impl TouchPresence {
 
         UP_PENDING.store(false, Ordering::Relaxed);
         CANCEL_REQUESTED.store(false, Ordering::Relaxed);
+        // Hold the ambient status screen back briefly so this modal handing off to
+        // another (pad → Approve/Deny) doesn't flash the idle screen between them.
+        AMBIENT_QUIET_UNTIL_MS.store(
+            (Instant::now().as_millis() as u32).wrapping_add(AMBIENT_QUIET_MS),
+            Ordering::Relaxed,
+        );
         led::set_status(saved);
         outcome
     }
@@ -364,6 +386,12 @@ impl TouchPresence {
 
         UP_PENDING.store(false, Ordering::Relaxed);
         CANCEL_REQUESTED.store(false, Ordering::Relaxed);
+        // Hold the ambient status screen back briefly so this modal handing off to
+        // another (pad → Approve/Deny) doesn't flash the idle screen between them.
+        AMBIENT_QUIET_UNTIL_MS.store(
+            (Instant::now().as_millis() as u32).wrapping_add(AMBIENT_QUIET_MS),
+            Ordering::Relaxed,
+        );
         led::set_status(saved);
         outcome
     }

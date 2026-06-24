@@ -86,7 +86,9 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   a deliberate divergence from the shared metadata statement, which describes the
   standard (screenless) key. The pad repaints only its masked-entry row per
   keystroke — a tiny partial update, not a full-frame redraw — so typing a digit
-  does not flash the whole screen. bcdDevice 0x0786 → 0x0788.
+  does not flash the whole screen; and the ambient status screen is held back
+  briefly between the pad and the Approve/Deny prompt so it does not blip the
+  idle/working screen in the hand-off. bcdDevice 0x0786 → 0x0789.
 
 ### Changed
 
