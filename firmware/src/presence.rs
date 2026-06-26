@@ -1,17 +1,23 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 RS-Key contributors
 
-//! Physical user presence over the BOOTSEL button, sampled via the
-//! QSPI-CS-to-Hi-Z trick in a RAM function. The wait blocks the worker while the
-//! high-priority transports stream keepalives reporting `UPNEEDED` ([`up_pending`]).
-//! One [`BootselPresence`] serves every applet's `UserPresence` trait; a touch is
-//! required by default, and the opt-in `no-touch` feature makes `request` confirm
-//! instantly (for the automated suites, which cannot press a button).
+//! Physical user presence over either the BOOTSEL button (default) or a dedicated
+//! GPIO button (`PRESENCE_PIN`). BOOTSEL samples use the QSPI-CS-to-Hi-Z trick in a
+//! RAM function; a GPIO button is polled active-low with an internal pull-up. The
+//! wait blocks the worker while the high-priority transports stream keepalives
+//! reporting `UPNEEDED` ([`up_pending`]). One [`BootselPresence`] serves every
+//! applet's `UserPresence` trait; a touch is required by default, and the opt-in
+//! `no-touch` feature makes `request` confirm instantly (for the automated suites,
+//! which cannot press a button). The `display` build takes presence from the
+//! touchscreen ([`crate::display::TouchPresence`]) instead, so this whole module is
+//! compiled out there.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 #[cfg(not(feature = "display"))]
 use embassy_rp::Peri;
+#[cfg(not(feature = "display"))]
+use embassy_rp::gpio::{AnyPin, Input, Pull};
 #[cfg(not(feature = "display"))]
 use embassy_rp::peripherals::BOOTSEL;
 
@@ -78,19 +84,27 @@ enum Outcome {
     Cancelled,
 }
 
-/// User presence via the BOOTSEL button.
+/// User presence via BOOTSEL (default) or a dedicated GPIO button.
 #[cfg(not(feature = "display"))]
 pub struct BootselPresence {
     #[cfg_attr(feature = "no-touch", allow(dead_code))]
-    bootsel: Peri<'static, BOOTSEL>,
+    button: Button,
+}
+
+/// The presence source: the BOOTSEL hardware button, or an active-low GPIO button.
+#[cfg(not(feature = "display"))]
+#[cfg_attr(feature = "no-touch", allow(dead_code))]
+enum Button {
+    Bootsel(Peri<'static, BOOTSEL>),
+    Gpio(Input<'static>),
 }
 
 /// The presence backend the [`crate::worker::Worker`] owns, selected at build
 /// time so the worker wiring stays backend-agnostic. The standard key confirms
-/// with the BOOTSEL button; the `display` build swaps this alias to the
-/// [`crate::display::TouchPresence`] that renders on-screen Approve/Deny and
-/// returns a real `Declined` — every applet's `UserPresence` trait is satisfied
-/// by whichever backend this names, so only this alias changes.
+/// with the BOOTSEL button (or a `PRESENCE_PIN` GPIO); the `display` build swaps
+/// this alias to the [`crate::display::TouchPresence`] that renders on-screen
+/// Approve/Deny and returns a real `Declined` — every applet's `UserPresence`
+/// trait is satisfied by whichever backend this names, so only this alias changes.
 #[cfg(not(feature = "display"))]
 pub type Presence = BootselPresence;
 #[cfg(feature = "display")]
@@ -98,17 +112,45 @@ pub type Presence = crate::display::TouchPresence;
 
 #[cfg(not(feature = "display"))]
 impl BootselPresence {
-    pub fn new(bootsel: Peri<'static, BOOTSEL>) -> Self {
-        Self { bootsel }
+    /// Build the default BOOTSEL-backed presence source.
+    pub fn new_bootsel(bootsel: Peri<'static, BOOTSEL>) -> Self {
+        Self {
+            button: Button::Bootsel(bootsel),
+        }
     }
 
-    /// One non-blocking sample of the BOOTSEL level, for the typed-ticket button
-    /// watcher. On the `no-touch` build it never samples — the test build sees no
-    /// press and does no QSPI-CS polling.
+    /// Build a GPIO-backed presence source on `pin` (active-low, pull-up).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `pin` is out of the RP2350A range `0..=29`.
+    pub fn new_gpio(pin: u8) -> Self {
+        assert!(
+            pin <= 29,
+            "PRESENCE_PIN={pin} out of range 0..=29 (RP2350A GPIOs)"
+        );
+        // Safety: `main` guarantees this pin is not handed to another driver.
+        let any = unsafe { AnyPin::steal(pin) };
+        let input = Input::new(any, Pull::Up);
+        Self {
+            button: Button::Gpio(input),
+        }
+    }
+
+    #[cfg(not(feature = "no-touch"))]
+    fn pressed(&mut self) -> bool {
+        match &mut self.button {
+            Button::Bootsel(bootsel) => is_bootsel_pressed(bootsel.reborrow()),
+            Button::Gpio(button) => button.is_low(),
+        }
+    }
+
+    /// One non-blocking sample of the active presence source, for the typed-ticket
+    /// button watcher. On the `no-touch` build it never samples.
     pub fn poll_pressed(&mut self) -> bool {
         #[cfg(not(feature = "no-touch"))]
         {
-            is_bootsel_pressed(self.bootsel.reborrow())
+            self.pressed()
         }
         #[cfg(feature = "no-touch")]
         {
@@ -130,7 +172,7 @@ impl BootselPresence {
         // Wait for a press; a CTAPHID_CANCEL aborts it, and with neither before
         // the timeout it times out.
         let result = loop {
-            if is_bootsel_pressed(self.bootsel.reborrow()) {
+            if self.pressed() {
                 break Outcome::Confirmed;
             }
             if CANCEL_REQUESTED.load(Ordering::Relaxed) {
@@ -145,7 +187,7 @@ impl BootselPresence {
         // immediately satisfy the next operation.
         if result == Outcome::Confirmed {
             let release = Instant::now();
-            while is_bootsel_pressed(self.bootsel.reborrow()) {
+            while self.pressed() {
                 if release.elapsed() >= timeout {
                     break;
                 }

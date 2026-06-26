@@ -130,6 +130,19 @@ const XOSC_DELAY_MULT: u32 = env_u32(env!("PK_XOSC_DELAY_MULT"));
 // numbering (1=gpio, 2=pimoroni, 3=ws2812).
 #[cfg(not(led_kind = "none"))]
 const BUILD_LED_PIN: u8 = env_u16(env!("PK_LED_PIN")) as u8;
+const BUILD_PRESENCE_IS_GPIO: bool = env_u16(env!("PK_PRESENCE_IS_GPIO")) != 0;
+#[cfg(not(feature = "display"))]
+const BUILD_PRESENCE_PIN: u8 = env_u16(env!("PK_PRESENCE_PIN")) as u8;
+
+// A `display` build takes user presence from the touchscreen, not a GPIO button, so a
+// `PRESENCE_PIN` would be silently ignored — fail the build loudly instead (mirrors
+// the LED_KIND guard above). The non-display path consumes both consts directly.
+#[cfg(feature = "display")]
+const _: () = assert!(
+    !BUILD_PRESENCE_IS_GPIO,
+    "PRESENCE_PIN has no effect on a `display` build (presence is the touchscreen); \
+     drop PRESENCE_PIN, or build without --features display"
+);
 #[cfg(led_kind = "ws2812")]
 const BUILD_DRIVER: u8 = 3;
 #[cfg(led_kind = "gpio")]
@@ -337,7 +350,7 @@ async fn main(spawner: Spawner) {
     config.max_power = 100;
     config.max_packet_size_0 = 64;
     // bcdDevice build counter; also surfaced on the trusted-display Info page.
-    let device_release: u16 = 0x0791;
+    let device_release: u16 = 0x0792;
     config.device_release = device_release;
 
     let mut builder = Builder::new(
@@ -433,6 +446,12 @@ async fn main(spawner: Spawner) {
             .and_then(|p| p.led_gpio)
             .filter(|&g| g <= 29)
             .unwrap_or(BUILD_LED_PIN);
+        if BUILD_PRESENCE_IS_GPIO && BUILD_PRESENCE_PIN == led_gpio {
+            panic!(
+                "PRESENCE_PIN={} conflicts with active LED pin",
+                BUILD_PRESENCE_PIN
+            );
+        }
         // PHY led_driver (1=gpio, 2=pimoroni, 3=ws2812) overrides the build kind;
         // anything else (unset, or the N/A esp32 value) keeps the build default.
         let led_driver = match phy.as_ref().and_then(|p| p.led_driver) {
@@ -617,8 +636,18 @@ async fn main(spawner: Spawner) {
 
     core1::spawn(p.CORE1);
 
+    // Standard key: BOOTSEL by default, or a dedicated `PRESENCE_PIN` GPIO button.
+    // Display build: the touchscreen is the presence source (a `PRESENCE_PIN` is
+    // rejected at compile time — see the `BUILD_PRESENCE_IS_GPIO` assert above).
     #[cfg(not(feature = "display"))]
-    let presence_ref = PRESENCE.init(RefCell::new(BootselPresence::new(p.BOOTSEL)));
+    let presence_ref = {
+        let presence = if BUILD_PRESENCE_IS_GPIO {
+            BootselPresence::new_gpio(BUILD_PRESENCE_PIN)
+        } else {
+            BootselPresence::new_bootsel(p.BOOTSEL)
+        };
+        PRESENCE.init(RefCell::new(presence))
+    };
     #[cfg(feature = "display")]
     let presence_ref = PRESENCE.init(RefCell::new(display::TouchPresence::new(display_ui)));
     let platform_ref = RESCUE_PLATFORM.init(RefCell::new(rescue_platform::RescuePlatform));

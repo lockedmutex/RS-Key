@@ -156,6 +156,15 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   tab now goes straight there instead of dropping back to Home first — and each tab
   repaints the moment it is tapped rather than after the finger lifts, so switching
   feels immediate. bcdDevice 0x078F → 0x0791.
+- **Configurable GPIO presence button (`PRESENCE_PIN`).** The user-presence input can
+  be remapped from BOOTSEL to a dedicated GPIO at compile time: `PRESENCE_PIN=<0..=29>`
+  selects an active-low button with an internal pull-up (e.g. a touch sensor to ground),
+  while the default (`bootsel`) keeps the BOOTSEL path byte-for-byte. The chosen pin is
+  guarded — it must not collide with the active LED pin (boot panic) and is rejected on
+  a `display` build (where the touchscreen is the presence source). One new `unsafe`
+  (`AnyPin::steal` for the runtime-selected pin) documented in `docs/unsafe.md`. Thanks
+  to @lpiob for the contribution ([#17](https://github.com/TheMaxMur/RS-Key/pull/17)).
+  bcdDevice 0x0791 → 0x0792.
 
 ### Changed
 
