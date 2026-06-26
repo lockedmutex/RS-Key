@@ -25,7 +25,7 @@ use rsk_fs::{Fs, Sealed, Storage};
 pub use rsk_openpgp::Rng;
 use rsk_openpgp::keys::make_rsa_response;
 // PIV reuses the OpenPGP user-presence trait, so the firmware's existing
-// `impl rsk_openpgp::UserPresence for BootselPresence` already drives PIV touch.
+// `impl rsk_openpgp::UserPresence for ButtonPresence` already drives PIV touch.
 use rsa::RsaPrivateKey;
 use rsa::traits::PublicKeyParts;
 pub use rsk_openpgp::{AlwaysConfirm, Presence, UserPresence};

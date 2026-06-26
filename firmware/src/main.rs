@@ -72,7 +72,7 @@ compile_error!(
 use flash_storage::{FLASH_SIZE, FlashStorage};
 use handler::{FidoRng, Store};
 #[cfg(not(feature = "display"))]
-use presence::BootselPresence;
+use presence::ButtonPresence;
 use worker::{ClientCcid, ClientCtap, Worker};
 
 use panic_halt as _;
@@ -642,9 +642,9 @@ async fn main(spawner: Spawner) {
     #[cfg(not(feature = "display"))]
     let presence_ref = {
         let presence = if BUILD_PRESENCE_IS_GPIO {
-            BootselPresence::new_gpio(BUILD_PRESENCE_PIN)
+            ButtonPresence::new_gpio(BUILD_PRESENCE_PIN)
         } else {
-            BootselPresence::new_bootsel(p.BOOTSEL)
+            ButtonPresence::new_bootsel(p.BOOTSEL)
         };
         PRESENCE.init(RefCell::new(presence))
     };

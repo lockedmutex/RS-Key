@@ -91,7 +91,7 @@ numeric pin to embassy's type-erased `AnyPin`. `AnyPin::steal` is `unsafe`
 because the caller must guarantee unique ownership of that hardware pin.
 *Safe alternative:* none for a runtime-selected GPIO; the safe constructors
 require a statically known pin type.
-*Containment:* one call site in `BootselPresence::new_gpio`, gated by pin-range
+*Containment:* one call site in `ButtonPresence::new_gpio`, gated by pin-range
 validation and the single-owner invariant from `main` (the chosen presence pin
 is never handed to the LED/backends; an LED/presence conflict panics at boot).
 

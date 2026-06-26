@@ -192,7 +192,7 @@ impl<'a> Worker<'a> {
     /// `presence` is the one BOOTSEL button, shared (through its `RefCell`) by the
     /// FIDO handler (CTAP user presence), the OpenPGP applet (the UIF DOs), the
     /// OTP applet (CHAL_BTN_TRIG) and the OATH applet (PROP_TOUCH credentials) —
-    /// the `&RefCell<BootselPresence>` coerces to each applet's `UserPresence`
+    /// the `&RefCell<ButtonPresence>` coerces to each applet's `UserPresence`
     /// trait.
     #[allow(clippy::too_many_arguments)] // one-time wiring from main
     pub fn new(

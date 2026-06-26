@@ -5,7 +5,7 @@
 //! GPIO button (`PRESENCE_PIN`). BOOTSEL samples use the QSPI-CS-to-Hi-Z trick in a
 //! RAM function; a GPIO button is polled active-low with an internal pull-up. The
 //! wait blocks the worker while the high-priority transports stream keepalives
-//! reporting `UPNEEDED` ([`up_pending`]). One [`BootselPresence`] serves every
+//! reporting `UPNEEDED` ([`up_pending`]). One [`ButtonPresence`] serves every
 //! applet's `UserPresence` trait; a touch is required by default, and the opt-in
 //! `no-touch` feature makes `request` confirm instantly (for the automated suites,
 //! which cannot press a button). The `display` build takes presence from the
@@ -86,7 +86,7 @@ enum Outcome {
 
 /// User presence via BOOTSEL (default) or a dedicated GPIO button.
 #[cfg(not(feature = "display"))]
-pub struct BootselPresence {
+pub struct ButtonPresence {
     #[cfg_attr(feature = "no-touch", allow(dead_code))]
     button: Button,
 }
@@ -106,12 +106,12 @@ enum Button {
 /// Approve/Deny and returns a real `Declined` — every applet's `UserPresence`
 /// trait is satisfied by whichever backend this names, so only this alias changes.
 #[cfg(not(feature = "display"))]
-pub type Presence = BootselPresence;
+pub type Presence = ButtonPresence;
 #[cfg(feature = "display")]
 pub type Presence = crate::display::TouchPresence;
 
 #[cfg(not(feature = "display"))]
-impl BootselPresence {
+impl ButtonPresence {
     /// Build the default BOOTSEL-backed presence source.
     pub fn new_bootsel(bootsel: Peri<'static, BOOTSEL>) -> Self {
         Self {
@@ -204,7 +204,7 @@ impl BootselPresence {
 }
 
 #[cfg(not(feature = "display"))]
-impl rsk_fido::UserPresence for BootselPresence {
+impl rsk_fido::UserPresence for ButtonPresence {
     fn request(&mut self, _confirm: rsk_fido::Confirm<'_>) -> rsk_fido::Presence {
         #[cfg(not(feature = "no-touch"))]
         {
@@ -222,7 +222,7 @@ impl rsk_fido::UserPresence for BootselPresence {
 }
 
 #[cfg(not(feature = "display"))]
-impl rsk_openpgp::UserPresence for BootselPresence {
+impl rsk_openpgp::UserPresence for ButtonPresence {
     fn request(&mut self, _confirm: rsk_openpgp::Confirm<'_>) -> rsk_openpgp::Presence {
         #[cfg(not(feature = "no-touch"))]
         {
@@ -241,7 +241,7 @@ impl rsk_openpgp::UserPresence for BootselPresence {
 }
 
 #[cfg(not(feature = "display"))]
-impl rsk_otp::UserPresence for BootselPresence {
+impl rsk_otp::UserPresence for ButtonPresence {
     fn request(&mut self, _confirm: rsk_otp::Confirm<'_>) -> rsk_otp::Presence {
         #[cfg(not(feature = "no-touch"))]
         {
@@ -259,7 +259,7 @@ impl rsk_otp::UserPresence for BootselPresence {
 }
 
 #[cfg(not(feature = "display"))]
-impl rsk_oath::UserPresence for BootselPresence {
+impl rsk_oath::UserPresence for ButtonPresence {
     fn request(&mut self, _confirm: rsk_oath::Confirm<'_>) -> rsk_oath::Presence {
         #[cfg(not(feature = "no-touch"))]
         {
