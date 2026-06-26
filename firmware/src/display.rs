@@ -39,12 +39,14 @@ use mipidsi::interface::SpiInterface;
 use mipidsi::models::ST7789;
 use mipidsi::options::ColorInversion;
 use mipidsi::{Builder, Display};
+use rsk_crypto::Device;
 use rsk_sdk::Confirm;
 use rsk_ui::{
-    ALLOW_RECT, AdjustKey, BRIGHTNESS_LEVELS, Button, ConfirmPrompt, HomeView, NavTab,
-    PasskeysView, PinKey, PinPad, RootEntry, Screen, SettingsPage, SettingsView, StatusKind,
+    ALLOW_RECT, AccountRow, AdjustKey, BRIGHTNESS_LEVELS, Button, ConfirmPrompt, HomeView, Label,
+    NavTab, PinKey, PinPad, RootEntry, RpRow, Screen, SettingsPage, SettingsView, StatusKind,
 };
 
+use crate::handler::Store;
 use crate::led;
 use crate::presence::{CANCEL_REQUESTED, PRESENCE_TIMEOUT_MS, UP_PENDING};
 
@@ -85,6 +87,33 @@ pub struct DeviceInfo {
     pub version: u16,
     /// RP2350 chip serial (chipid).
     pub chipid: u64,
+}
+
+/// The device key material the read-only passkey enumerator needs to load and unbox
+/// the resident-credential seed from `EF_KEY_DEV` — the same identity the worker's
+/// `Ctx` carries, kept as owned copies so the display task can build a [`Device`] on
+/// demand (when the Passkeys tab is open) without holding the seed itself.
+pub struct DeviceKeys {
+    pub serial_id: [u8; 8],
+    pub serial_hash: [u8; 32],
+    pub otp_mkek: Option<[u8; 32]>,
+}
+
+impl DeviceKeys {
+    fn device(&self) -> Device<'_> {
+        Device {
+            serial_hash: &self.serial_hash,
+            serial_id: &self.serial_id,
+            otp_key: self.otp_mkek.as_ref(),
+        }
+    }
+}
+
+/// Outcome of the per-RP service-detail screen: return to the Passkeys list, or leave
+/// the tab to another nav destination (`None` = the idle Home screen).
+enum ServiceResult {
+    Back,
+    Leave(Option<NavTab>),
 }
 
 /// PWM config for the GPIO16 backlight: 8-bit `top`, non-inverted (high = lit), with
@@ -190,6 +219,13 @@ pub struct Ui {
     info: DeviceInfo,
     /// Current backlight level (`1..=BRIGHTNESS_LEVELS`), edited from the menu.
     brightness: u8,
+    /// The shared flash store — the same `RefCell` the worker uses. The Passkeys tab
+    /// borrows it to enumerate resident credentials; safe because the worker is parked
+    /// (it never holds the borrow across an `.await`) while this thread-executor task
+    /// runs.
+    fs: &'static RefCell<Store>,
+    /// Device identity for unboxing the resident-credential seed on demand.
+    keys: DeviceKeys,
 }
 
 impl Ui {
@@ -198,7 +234,13 @@ impl Ui {
     /// Blocking (~200 ms of panel/touch reset) — `main` calls this *after* the USB
     /// task is spawned, so the interrupt executor keeps enumerating while these
     /// busy-waits run on the thread executor; enumeration is never delayed.
-    pub fn build(panel: PanelHw, touch: TouchHw, info: DeviceInfo) -> Ui {
+    pub fn build(
+        panel: PanelHw,
+        touch: TouchHw,
+        info: DeviceInfo,
+        fs: &'static RefCell<Store>,
+        keys: DeviceKeys,
+    ) -> Ui {
         let PanelHw {
             spi,
             cs,
@@ -250,6 +292,8 @@ impl Ui {
             shown: None,
             info,
             brightness: BRIGHTNESS_LEVELS,
+            fs,
+            keys,
         }
     }
 
@@ -282,15 +326,15 @@ impl Ui {
     /// applet command is serviced — bounded by [`MENU_INACTIVITY_MS`]). Navigates
     /// Root → sub-pages, applies brightness/timeout live, and hands the panel back to
     /// the ambient status loop on Close / Back or after the inactivity timeout.
-    fn run_settings(&mut self) {
-        // Let the finger that opened the menu lift before polling, so it isn't read
-        // as the first menu tap.
-        let opened = Instant::now();
-        self.touch
-            .wait_release(opened, Duration::from_millis(MENU_INACTIVITY_MS));
-
+    fn run_settings(&mut self) -> Option<NavTab> {
+        // Render first (so the switch feels instant), then let the opening finger lift
+        // before polling so it isn't read as the first menu tap. Settings has no nav
+        // bar, so it always returns to idle — `None` — but the signature matches the
+        // other tabs for the [`status_task`] navigation dispatcher.
         let mut page = SettingsPage::Root;
         self.render_settings(page);
+        self.touch
+            .wait_release(Instant::now(), Duration::from_millis(MENU_INACTIVITY_MS));
         let mut last = Instant::now();
         let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
 
@@ -339,8 +383,14 @@ impl Ui {
             block_for(Duration::from_millis(TOUCH_POLL_MS));
         }
 
-        // Hand the panel back to the ambient loop, briefly holding it so the return
-        // to idle doesn't fight a stale repaint.
+        self.end_modal();
+        None
+    }
+
+    /// Hand the panel back to the ambient loop on a modal's exit, briefly holding the
+    /// status repaint back so a hand-off (modal → idle, or modal → next tab) doesn't
+    /// flash a stale frame.
+    fn end_modal(&mut self) {
         AMBIENT_QUIET_UNTIL_MS.store(
             (Instant::now().as_millis() as u32).wrapping_add(AMBIENT_QUIET_MS),
             Ordering::Relaxed,
@@ -348,39 +398,143 @@ impl Ui {
         self.shown = None;
     }
 
-    /// The Passkeys tab — a stub for now: show the resident-credential placeholder and
-    /// wait for a nav tap (back to Home) or the inactivity timeout. Same synchronous
-    /// busy-wait / worker-mutual-exclusion model as [`Ui::run_settings`].
-    fn run_passkeys(&mut self) {
-        let opened = Instant::now();
+    /// The Passkeys tab — list resident relying parties (read-only), with a drill-in to
+    /// each RP's accounts. Enumerates from the shared flash store on entry (the worker is
+    /// parked while this synchronous loop runs, so the borrow is safe). Returns the next
+    /// nav destination so the [`status_task`] dispatcher can switch tabs directly:
+    /// `Some(tab)` opens that tab, `None` returns to the idle Home screen.
+    fn run_passkeys(&mut self) -> Option<NavTab> {
+        // Snapshot the RP list and render first (so the switch feels instant), then let
+        // the opening finger lift. `hashes` parallels `rows` (the UI model carries no
+        // rpIdHash) so a drilled-in RP can enumerate its own credentials.
+        let mut rows = [RpRow::default(); rsk_ui::PK_ROWS_MAX];
+        let mut hashes = [[0u8; 32]; rsk_ui::PK_ROWS_MAX];
+        let (n, total) = self.load_rps(&mut rows, &mut hashes);
+        self.render_list(&rows[..n], total);
         self.touch
-            .wait_release(opened, Duration::from_millis(MENU_INACTIVITY_MS));
-        let _ = rsk_ui::render(
-            &mut self.panel,
-            &Screen::Passkeys(PasskeysView { count: 0 }),
-        );
+            .wait_release(Instant::now(), Duration::from_millis(MENU_INACTIVITY_MS));
+
+        let mut last = Instant::now();
+        let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
+        let next = loop {
+            if let Some(p) = self.touch.read() {
+                last = Instant::now();
+                if let Some(i) = rsk_ui::hit_list(p, rsk_ui::PK_LIST_TOP, n as u16) {
+                    match self.run_service(&rows[i as usize].id, &hashes[i as usize]) {
+                        ServiceResult::Back => {
+                            self.render_list(&rows[..n], total);
+                            self.touch.wait_release(Instant::now(), idle_limit);
+                            last = Instant::now();
+                            continue;
+                        }
+                        ServiceResult::Leave(target) => break target,
+                    }
+                } else if let Some(tab) = rsk_ui::hit_nav(p) {
+                    match tab {
+                        // Already on this tab — ignore (don't drop to Home).
+                        NavTab::Passkeys => {}
+                        NavTab::Home => break None,
+                        NavTab::Settings => break Some(NavTab::Settings),
+                    }
+                }
+                self.touch.wait_release(last, idle_limit);
+            }
+            if last.elapsed() >= idle_limit {
+                break None;
+            }
+            block_for(Duration::from_millis(TOUCH_POLL_MS));
+        };
+        self.end_modal();
+        next
+    }
+
+    /// One RP's read-only detail: list its resident accounts. The back chevron (or a tap
+    /// on the active Passkeys tab) returns to the list; another nav tab leaves the
+    /// Passkeys tab; the back chevron only ever returns [`ServiceResult::Back`].
+    fn run_service(&mut self, title: &Label, hash: &[u8; 32]) -> ServiceResult {
+        let mut accts = [AccountRow::default(); rsk_ui::PK_ROWS_MAX];
+        let (n, total) = self.load_accts(hash, &mut accts);
+        let _ = rsk_ui::render_service(&mut self.panel, title, &accts[..n], total);
         self.shown = None;
+        self.touch
+            .wait_release(Instant::now(), Duration::from_millis(MENU_INACTIVITY_MS));
+
         let mut last = Instant::now();
         let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
         loop {
             if let Some(p) = self.touch.read() {
                 last = Instant::now();
-                // Any nav tap leaves the stub (back to the Home idle screen).
-                if rsk_ui::hit_nav(p).is_some() {
-                    break;
+                if rsk_ui::hit_pk_back(p) {
+                    return ServiceResult::Back;
+                }
+                if let Some(tab) = rsk_ui::hit_nav(p) {
+                    return match tab {
+                        // The active tab drills back out to its own list.
+                        NavTab::Passkeys => ServiceResult::Back,
+                        NavTab::Home => ServiceResult::Leave(None),
+                        NavTab::Settings => ServiceResult::Leave(Some(NavTab::Settings)),
+                    };
                 }
                 self.touch.wait_release(last, idle_limit);
             }
             if last.elapsed() >= idle_limit {
-                break;
+                return ServiceResult::Leave(None);
             }
             block_for(Duration::from_millis(TOUCH_POLL_MS));
         }
-        AMBIENT_QUIET_UNTIL_MS.store(
-            (Instant::now().as_millis() as u32).wrapping_add(AMBIENT_QUIET_MS),
-            Ordering::Relaxed,
-        );
+    }
+
+    /// Repaint the Passkeys list (a full-frame paint) and mark the panel for the ambient
+    /// loop to refresh once the tab closes.
+    fn render_list(&mut self, rows: &[RpRow], total: u16) {
+        let _ = rsk_ui::render_passkeys_list(&mut self.panel, rows, total);
         self.shown = None;
+    }
+
+    /// Enumerate resident RPs into `rows` (+ their rpIdHashes into `hashes`), returning
+    /// the kept count and the true total. Reads + decrypts from the shared store; the
+    /// seed is loaded and zeroized inside the enumerator (the display never holds it).
+    fn load_rps(&self, rows: &mut [RpRow], hashes: &mut [[u8; 32]]) -> (usize, u16) {
+        let dev = self.keys.device();
+        let mut store = self.fs.borrow_mut();
+        let mut n = 0usize;
+        let total = rsk_fido::passkeys::for_each_rp(&dev, &mut *store, |rp| {
+            if n < rows.len() {
+                rows[n] = RpRow {
+                    id: Label::clamp(rp.rp_id.as_bytes()),
+                    accounts: rp.count,
+                };
+                hashes[n] = rp.rp_id_hash;
+                n += 1;
+            }
+        });
+        (n, total.min(u16::MAX as usize) as u16)
+    }
+
+    /// Enumerate the resident accounts under `hash` into `accts`. The label is the user
+    /// name, else the display name, else a placeholder (a binary user id is not a legible
+    /// label); credProtect ≥ 2 marks the row UV-gated.
+    fn load_accts(&self, hash: &[u8; 32], accts: &mut [AccountRow]) -> (usize, u16) {
+        let dev = self.keys.device();
+        let mut store = self.fs.borrow_mut();
+        let mut n = 0usize;
+        let total = rsk_fido::passkeys::for_each_cred(&dev, &mut *store, hash, |a| {
+            if n < accts.len() {
+                let name = if !a.user_name.is_empty() {
+                    Label::clamp(a.user_name.as_bytes())
+                } else if !a.user_display_name.is_empty() {
+                    Label::clamp(a.user_display_name.as_bytes())
+                } else {
+                    Label::clamp(b"(no name)")
+                };
+                accts[n] = AccountRow {
+                    name,
+                    protected: a.cred_protect >= 2,
+                };
+                n += 1;
+            }
+        });
+        (n, total.min(u16::MAX as usize) as u16)
     }
 }
 
@@ -428,15 +582,20 @@ pub async fn status_task(ui: &'static RefCell<Ui>) {
             }
             // Interactive idle: a tap on the bottom nav opens a tab. Only while idle —
             // a confirm/PIN modal owns this executor synchronously, so this loop can't
-            // even run mid-ceremony to begin with.
+            // even run mid-ceremony to begin with. Each tab modal returns the next nav
+            // destination, so the user can switch tab→tab directly (e.g. Passkeys →
+            // Settings) without first dropping back to Home.
             if kind == StatusKind::Idle
                 && let Some(p) = u.touch.read()
             {
-                match rsk_ui::hit_nav(p) {
-                    Some(NavTab::Settings) => u.run_settings(),
-                    Some(NavTab::Passkeys) => u.run_passkeys(),
-                    // Home (already shown) or a tap above the nav bar: nothing.
-                    _ => {}
+                let mut target = rsk_ui::hit_nav(p);
+                while let Some(tab) = target {
+                    target = match tab {
+                        // Home is the idle ambient screen — end the nav session.
+                        NavTab::Home => None,
+                        NavTab::Settings => u.run_settings(),
+                        NavTab::Passkeys => u.run_passkeys(),
+                    };
                 }
             }
         }

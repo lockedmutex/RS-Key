@@ -44,6 +44,8 @@ pub enum Glyph {
     Gear,
     /// A right chevron — "this row drills in".
     Chevron,
+    /// A left chevron — the service-detail "back to the list" affordance.
+    Back,
     /// A shield — the trusted-approval prompt.
     Shield,
     /// A globe — the generic relying-party marker.
@@ -85,6 +87,9 @@ pub fn draw<D: DrawTarget<Color = Rgb565>>(
 
     match g {
         Glyph::Chevron => Polyline::new(&[gp(6, 3), gp(11, 8), gp(6, 13)])
+            .into_styled(stroke)
+            .draw(t),
+        Glyph::Back => Polyline::new(&[gp(11, 3), gp(6, 8), gp(11, 13)])
             .into_styled(stroke)
             .draw(t),
         Glyph::Check => Polyline::new(&[gp(3, 9), gp(7, 13), gp(13, 4)])
@@ -253,7 +258,7 @@ mod tests {
         }
     }
 
-    const ALL: [Glyph; 15] = [
+    const ALL: [Glyph; 16] = [
         Glyph::Usb,
         Glyph::Check,
         Glyph::Backspace,
@@ -263,6 +268,7 @@ mod tests {
         Glyph::Home,
         Glyph::Gear,
         Glyph::Chevron,
+        Glyph::Back,
         Glyph::Shield,
         Glyph::Globe,
         Glyph::Warn,

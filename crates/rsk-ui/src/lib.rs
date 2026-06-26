@@ -21,7 +21,10 @@ pub mod render;
 pub mod theme;
 pub mod touch;
 pub use glyph::Glyph;
-pub use render::{render, render_hold_button, render_hold_fill, render_pin_dots};
+pub use render::{
+    render, render_hold_button, render_hold_fill, render_passkeys_list, render_pin_dots,
+    render_service,
+};
 
 /// Panel geometry (Waveshare RP2350-Touch-LCD-2.8, ST7789T3, portrait).
 pub const PANEL_W: u16 = 240;
@@ -602,11 +605,44 @@ pub struct HomeView {
     pub status: StatusKind,
 }
 
-/// What the Passkeys tab shows — a stub for now: the resident-credential count. The
-/// full list + per-credential detail land in a later wave.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct PasskeysView {
-    pub count: u16,
+// --- Passkeys list + service detail ----------------------------------------
+
+/// Max passkey rows painted on the list / detail. No scroll yet — the footer shows
+/// the true total, so a longer set is summarised honestly, never silently cut.
+pub const PK_ROWS_MAX: usize = 6;
+/// Top of the first passkey row — below the header, clear of the nav bar + footer.
+pub const PK_LIST_TOP: u16 = 40;
+
+/// One relying-party row on the Passkeys list: a sanitized rpId and how many resident
+/// credentials it holds. The firmware fills these from `rsk_fido::passkeys`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct RpRow {
+    pub id: Label,
+    pub accounts: u8,
+}
+
+/// One account row on the per-RP service detail: a sanitized account label and whether
+/// the credential is UV-gated (credProtect ≥ 2).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct AccountRow {
+    pub name: Label,
+    pub protected: bool,
+}
+
+/// The service-detail back affordance: the header's top-left, so a tap there returns
+/// to the Passkeys list. In the header strip, clear of the rows and the nav bar.
+pub const PK_BACK_RECT: Rect = Rect::new(0, 0, 40, HEADER_H);
+
+// Compile-time: the back chevron sits in the header above the first row, and the
+// visible rows fit between the list top and the nav bar.
+const _: () = {
+    assert!(PK_BACK_RECT.y + PK_BACK_RECT.h <= PK_LIST_TOP);
+    assert!(PK_LIST_TOP + (PK_ROWS_MAX as u16) * (LIST_ROW_H + LIST_ROW_GAP) <= NAV_TOP);
+};
+
+/// Did a tap at `p` hit the service-detail back chevron?
+pub fn hit_pk_back(p: Point) -> bool {
+    PK_BACK_RECT.contains(p)
 }
 
 /// Top-level screen the display task renders. The three top-level **tabs** (Home,
@@ -618,8 +654,6 @@ pub enum Screen {
     Splash,
     /// The Home tab — status indicator + bottom nav.
     Home(HomeView),
-    /// The Passkeys tab — resident credentials (stubbed) + bottom nav.
-    Passkeys(PasskeysView),
     /// A pending trusted Deny / Hold-to-approve decision.
     Confirm(ConfirmPrompt),
     /// The built-in-UV PIN pad, showing how many digits have been entered (masked).
@@ -712,6 +746,17 @@ mod proofs {
         let (a, b): (u16, u16) = (kani::any(), kani::any());
         kani::assume(a < 8 && b < 8 && a != b);
         assert!(!(row_rect(y0, a).contains(p) && row_rect(y0, b).contains(p)));
+    }
+
+    /// The service-detail back chevron can't be confused with a passkey row tap or a
+    /// nav-bar tap, so returning to the list never collides with selecting one.
+    #[kani::proof]
+    fn passkeys_back_clear_of_rows_and_nav() {
+        let p = Point::new(kani::any(), kani::any());
+        let i: u16 = kani::any();
+        kani::assume((i as usize) < PK_ROWS_MAX);
+        assert!(!(hit_pk_back(p) && row_rect(PK_LIST_TOP, i).contains(p)));
+        assert!(!(hit_pk_back(p) && p.y >= NAV_TOP));
     }
 }
 

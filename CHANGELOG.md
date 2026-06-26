@@ -139,6 +139,23 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   clip, so its corners exactly match the card — no square corner pokes past it — and
   the advancing edge is flat. bcdDevice
   0x078D → 0x078F.
+- **Trusted-display variant — on-device Passkeys browser (read-only, experimental,
+  opt-in).** The Passkeys tab is no longer a stub: it lists the resident (discoverable)
+  credentials stored on the device — one row per relying party (generic globe + the
+  real rpId + account count), drilling into a per-RP detail that lists each account
+  (user name / display name, with a "UV" tag for credProtect-gated credentials). It is
+  strictly **read-only** — no rename or delete yet (a later wave) — and the data is
+  decrypted on the device, never on the host: a small additive `rsk-fido::passkeys`
+  walk loads the device seed from `EF_KEY_DEV`, unboxes the `EF_RP` / `EF_CRED` records
+  the worker already seals at rest, and zeroizes the seed before returning, so the
+  display task never holds it. No CTAP / wire change — the FIDO-conformance
+  `authenticatorCredentialManagement` path is untouched. The brand of a relying party
+  can't be shown (the device only has the rpId string, not a logo or trademark), and
+  there is no "last used" time (no per-credential timestamps are stored). Navigation
+  switches tab→tab **directly** — tapping Settings (or Home) from inside the Passkeys
+  tab now goes straight there instead of dropping back to Home first — and each tab
+  repaints the moment it is tapped rather than after the finger lifts, so switching
+  feels immediate. bcdDevice 0x078F → 0x0791.
 
 ### Changed
 

@@ -337,7 +337,7 @@ async fn main(spawner: Spawner) {
     config.max_power = 100;
     config.max_packet_size_0 = 64;
     // bcdDevice build counter; also surfaced on the trusted-display Info page.
-    let device_release: u16 = 0x078F;
+    let device_release: u16 = 0x0791;
     config.device_release = device_release;
 
     let mut builder = Builder::new(
@@ -592,11 +592,21 @@ async fn main(spawner: Spawner) {
             version: device_release,
             chipid: u64::from_le_bytes(serial_id),
         };
+        // The device key material the read-only Passkeys tab needs to unbox the
+        // resident-credential seed on demand (the same identity the worker's `Ctx`
+        // carries). Copied — these are all `Copy`, so the worker below still gets them.
+        let keys = display::DeviceKeys {
+            serial_id,
+            serial_hash,
+            otp_mkek,
+        };
         // Reborrow the `&'static mut` from the cell as a shared `&'static` so both
         // `status_task` and the `TouchPresence` backend can hold it (a shared
-        // reference is `Copy`; the `RefCell` provides the interior mutability).
-        let ui: &'static RefCell<display::Ui> =
-            UI.init(RefCell::new(display::Ui::build(panel, touch, info)));
+        // reference is `Copy`; the `RefCell` provides the interior mutability). The
+        // panel also shares the worker's `fs_ref` to enumerate resident credentials.
+        let ui: &'static RefCell<display::Ui> = UI.init(RefCell::new(display::Ui::build(
+            panel, touch, info, fs_ref, keys,
+        )));
         spawner.spawn(display::status_task(ui).unwrap());
         ui
     };

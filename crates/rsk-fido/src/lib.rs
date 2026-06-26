@@ -30,6 +30,7 @@ pub mod journal;
 pub mod keyderiv;
 pub mod largeblobs;
 pub mod makecredential;
+pub mod passkeys;
 pub mod reset;
 pub mod seed;
 pub mod selection;

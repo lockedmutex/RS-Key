@@ -28,11 +28,11 @@ use embedded_graphics::{
 };
 
 use crate::{
-    ADJ_MINUS_RECT, ADJ_PLUS_RECT, ALLOW_RECT, BACK_RECT, BRIGHTNESS_LEVELS, ConfirmPrompt,
-    DENY_RECT, Glyph, HomeView, NAV_H, NAV_TABS, NAV_TOP, NavTab, PANEL_W, PIN_CANCEL_RECT,
-    PIN_COLS, PIN_ROWS, PasskeysView, PinKey, PinPad, Point, Rect, Screen, SettingsPage,
-    SettingsView, StatusKind, glyph, hex_u16, hex_u64, nav_tab_rect, pin_grid_key, pin_key_rect,
-    settings_row_rect, theme,
+    ADJ_MINUS_RECT, ADJ_PLUS_RECT, ALLOW_RECT, AccountRow, BACK_RECT, BRIGHTNESS_LEVELS,
+    ConfirmPrompt, DENY_RECT, Glyph, HomeView, Label, NAV_H, NAV_TABS, NAV_TOP, NavTab, PANEL_W,
+    PIN_CANCEL_RECT, PIN_COLS, PIN_ROWS, PK_LIST_TOP, PinKey, PinPad, Point, Rect, RpRow, Screen,
+    SettingsPage, SettingsView, StatusKind, glyph, hex_u16, hex_u64, nav_tab_rect, pin_grid_key,
+    pin_key_rect, settings_row_rect, theme,
 };
 
 // Local semantic aliases, all sourced from `theme` so the whole renderer speaks one
@@ -65,7 +65,6 @@ where
     match screen {
         Screen::Splash => splash(target),
         Screen::Home(v) => home(target, v),
-        Screen::Passkeys(v) => passkeys(target, v),
         Screen::Confirm(prompt) => confirm(target, prompt),
         Screen::Pin(pad) => pin(target, pad),
         Screen::Settings(view) => settings(target, view),
@@ -121,43 +120,105 @@ fn home<D: DrawTarget<Color = Rgb565>>(t: &mut D, v: &HomeView) -> Result<(), D:
     render_nav(t, NavTab::Home)
 }
 
-/// The Passkeys tab — a stub: a key glyph and the resident-credential count, plus the
-/// bottom nav. The full list + per-credential detail land in a later wave.
-fn passkeys<D: DrawTarget<Color = Rgb565>>(t: &mut D, v: &PasskeysView) -> Result<(), D::Error> {
+/// The Passkeys tab: header, one row per relying party (generic globe + sanitized
+/// rpId + account count + drill-in chevron), an "N items" footer, and the nav bar.
+/// `total` is the true RP count even when `rows` holds only the first `PK_ROWS_MAX`.
+/// A full-frame paint (the list is static once shown), so it clears first. Standalone
+/// rather than a `Screen` variant — the list data is too large for the `Copy` enum.
+pub fn render_passkeys_list<D>(t: &mut D, rows: &[RpRow], total: u16) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    t.clear(BG)?;
     render_header(t, "Passkeys", true, None)?;
-    glyph::draw(
-        t,
-        Glyph::Key,
-        Point::new(MIDX as u16 - 18, 84),
-        36,
-        theme::MUTED,
-    )?;
-    if v.count == 0 {
+    if rows.is_empty() {
+        glyph::draw(t, Glyph::Key, Point::new(MIDX as u16 - 18, 96), 36, MUTED)?;
         text(
             t,
             "No passkeys yet",
-            EgPoint::new(MIDX, 150),
+            EgPoint::new(MIDX, 160),
             &FONT_6X13,
-            theme::MUTED,
+            MUTED,
         )?;
     } else {
-        let mut buf = [0u8; 5];
-        text(
-            t,
-            fmt_u16(v.count, &mut buf),
-            EgPoint::new(MIDX, 146),
-            &FONT_10X20,
-            theme::TEXT,
-        )?;
-        text(
-            t,
-            "passkeys saved",
-            EgPoint::new(MIDX, 176),
-            &FONT_6X13,
-            theme::MUTED,
-        )?;
+        for (i, r) in rows.iter().enumerate() {
+            let mut buf = [0u8; 16];
+            let unit = if r.accounts == 1 {
+                "account"
+            } else {
+                "accounts"
+            };
+            let trailing = fmt_count(r.accounts as u16, unit, &mut buf);
+            render_row(
+                t,
+                crate::row_rect(PK_LIST_TOP, i as u16),
+                Glyph::Globe,
+                r.id.as_str(),
+                Some((trailing, MUTED)),
+                true,
+            )?;
+        }
+        footer_count(t, total, if total == 1 { "item" } else { "items" })?;
     }
     render_nav(t, NavTab::Passkeys)
+}
+
+/// The per-RP service detail: a back-chevron header + the (truncated) rpId, one row per
+/// resident account (key glyph + sanitized name + a "UV" tag when credProtect-gated),
+/// an "N accounts" footer, and the nav bar. Read-only — rename/delete are a later wave.
+pub fn render_service<D>(
+    t: &mut D,
+    title: &Label,
+    accounts: &[AccountRow],
+    total: u16,
+) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    t.clear(BG)?;
+    glyph::draw(t, Glyph::Back, Point::new(8, 7), 16, theme::ACCENT)?;
+    text_left(
+        t,
+        title.as_str(),
+        EgPoint::new(44, 15),
+        &FONT_9X15_BOLD,
+        theme::ACCENT,
+    )?;
+    for (i, a) in accounts.iter().enumerate() {
+        let trailing = if a.protected {
+            Some(("UV", theme::ACCENT))
+        } else {
+            None
+        };
+        render_row(
+            t,
+            crate::row_rect(PK_LIST_TOP, i as u16),
+            Glyph::Key,
+            a.name.as_str(),
+            trailing,
+            false,
+        )?;
+    }
+    footer_count(t, total, if total == 1 { "account" } else { "accounts" })?;
+    render_nav(t, NavTab::Passkeys)
+}
+
+/// A right-aligned `"<n> <unit>"` footer just above the nav bar (the list / detail
+/// total), in the muted colour.
+fn footer_count<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    n: u16,
+    unit: &str,
+) -> Result<(), D::Error> {
+    let mut buf = [0u8; 16];
+    let s = fmt_count(n, unit, &mut buf);
+    text_right(
+        t,
+        s,
+        EgPoint::new(PANEL_W as i32 - 12, NAV_TOP as i32 - 10),
+        &FONT_6X13,
+        MUTED,
+    )
 }
 
 /// The trusted Approve prompt: header + shield, the operation title, the relying-
@@ -815,10 +876,25 @@ fn fmt_secs(secs: u16, buf: &mut [u8; 8]) -> &str {
     str8(&buf[..n + 2])
 }
 
+/// Format `"<n> <unit>"` into `buf` with no alloc (e.g. `"2 accounts"`); returns
+/// empty if it wouldn't fit, so the caller never panics on a tiny buffer.
+fn fmt_count<'a>(n: u16, unit: &str, buf: &'a mut [u8]) -> &'a str {
+    let mut tmp = [0u8; 5];
+    let num = fmt_u16(n, &mut tmp);
+    let end = num.len() + 1 + unit.len();
+    if end > buf.len() {
+        return "";
+    }
+    buf[..num.len()].copy_from_slice(num.as_bytes());
+    buf[num.len()] = b' ';
+    buf[num.len() + 1..end].copy_from_slice(unit.as_bytes());
+    str8(&buf[..end])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{HomeView, PANEL_H, PasskeysView};
+    use crate::{HomeView, PANEL_H};
     use embedded_graphics::{Pixel, geometry::OriginDimensions};
 
     fn has_color(d: &Rec, r: Rect, c: Rgb565) -> bool {
@@ -908,12 +984,61 @@ mod tests {
     }
 
     #[test]
-    fn passkeys_stub_fits_and_draws() {
-        for count in [0u16, 7] {
-            let mut d = Rec::new();
-            render(&mut d, &Screen::Passkeys(PasskeysView { count })).unwrap();
-            assert!(!d.oob && d.drew_anything());
-            assert!(has_color(&d, crate::nav_tab_rect(1), theme::ACCENT));
+    fn passkeys_list_paints_rows_in_their_hit_rects() {
+        let rows = [
+            RpRow {
+                id: Label::clamp(b"github.com"),
+                accounts: 2,
+            },
+            RpRow {
+                id: Label::clamp(b"google.com"),
+                accounts: 1,
+            },
+        ];
+        let mut d = Rec::new();
+        render_passkeys_list(&mut d, &rows, 2).unwrap();
+        assert!(!d.oob, "list drew outside the panel");
+        // Each RP row is a card in the exact rect hit_list maps a tap to.
+        for i in 0..rows.len() as u16 {
+            assert!(
+                has_color(&d, crate::row_rect(PK_LIST_TOP, i), theme::ROW_BG),
+                "row {i} card missing from its hit rect"
+            );
+        }
+        assert!(has_color(&d, crate::nav_tab_rect(1), theme::ACCENT));
+    }
+
+    #[test]
+    fn passkeys_list_empty_state_draws() {
+        let mut d = Rec::new();
+        render_passkeys_list(&mut d, &[], 0).unwrap();
+        assert!(!d.oob && d.drew_anything());
+        assert!(has_color(&d, crate::nav_tab_rect(1), theme::ACCENT));
+    }
+
+    #[test]
+    fn service_detail_paints_accounts_and_back_affordance() {
+        let accounts = [
+            AccountRow {
+                name: Label::clamp(b"alex@example.com"),
+                protected: true,
+            },
+            AccountRow {
+                name: Label::clamp(b"alex.dev"),
+                protected: false,
+            },
+        ];
+        let title = Label::clamp(b"github.com");
+        let mut d = Rec::new();
+        render_service(&mut d, &title, &accounts, 2).unwrap();
+        assert!(!d.oob, "detail drew outside the panel");
+        // The back chevron paints in PK_BACK_RECT — where hit_pk_back maps a tap.
+        assert!(
+            has_color(&d, crate::PK_BACK_RECT, theme::ACCENT),
+            "back chevron missing from its hit rect"
+        );
+        for i in 0..accounts.len() as u16 {
+            assert!(d.any_non_bg_in(crate::row_rect(PK_LIST_TOP, i)));
         }
     }
 
