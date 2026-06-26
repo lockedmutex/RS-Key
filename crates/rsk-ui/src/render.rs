@@ -293,6 +293,89 @@ where
     render_hold_button(t, DEL_HOLD_RECT, "Hold to delete", theme::DENY)
 }
 
+/// The trusted Factory-Reset confirm screen (reached from Settings → Factory reset):
+/// a header back chevron to cancel, a centred warning, a plain-language note that
+/// every credential and the PIN are erased, and the full-width hold-to-confirm button
+/// — the same [`DEL_HOLD_RECT`] geometry the delete flow uses, so only a deliberate
+/// hold commits. The firmware gates it on the device PIN (if set) before the hold.
+pub fn render_confirm_factory_reset<D>(t: &mut D) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    t.clear(BG)?;
+    glyph::draw(t, Glyph::Back, Point::new(8, 7), 16, theme::DENY)?;
+    text_left(
+        t,
+        "Factory reset",
+        EgPoint::new(44, 15),
+        &FONT_9X15_BOLD,
+        theme::DENY,
+    )?;
+    // Large centred warning triangle marks this as the destructive screen.
+    glyph::draw(
+        t,
+        Glyph::Warn,
+        Point::new(PANEL_W / 2 - 16, 56),
+        32,
+        theme::WARN,
+    )?;
+    text_left(
+        t,
+        "Erases ALL passkeys, keys,",
+        EgPoint::new(16, 122),
+        &FONT_6X13,
+        theme::WARN,
+    )?;
+    text_left(
+        t,
+        "and the device PIN. This",
+        EgPoint::new(16, 140),
+        &FONT_6X13,
+        theme::WARN,
+    )?;
+    text_left(
+        t,
+        "cannot be undone.",
+        EgPoint::new(16, 158),
+        &FONT_6X13,
+        theme::WARN,
+    )?;
+    render_hold_button(t, DEL_HOLD_RECT, "Hold to reset", theme::DENY)
+}
+
+/// The "wiping" notice shown after a factory reset is confirmed: a centred warning
+/// plus "Do not unplug", painted once before the multi-second flash scrub (which
+/// blocks the panel) so the screen isn't frozen on the full hold button. No
+/// controls — the device reboots itself when the wipe finishes.
+pub fn render_erasing<D>(t: &mut D) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    t.clear(BG)?;
+    glyph::draw(
+        t,
+        Glyph::Warn,
+        Point::new(PANEL_W / 2 - 16, 104),
+        32,
+        theme::DENY,
+    )?;
+    text(
+        t,
+        "Erasing...",
+        EgPoint::new(MIDX, 168),
+        &FONT_10X20,
+        theme::TEXT,
+    )?;
+    text(
+        t,
+        "Do not unplug",
+        EgPoint::new(MIDX, 196),
+        &FONT_6X13,
+        MUTED,
+    )?;
+    Ok(())
+}
+
 /// The trusted Approve prompt: header + shield, the operation title, the relying-
 /// party card (generic globe + sanitized rp id / account), a "did you start this?"
 /// caution, and the Deny / Hold-to-approve buttons. The hold button starts empty; the
@@ -833,7 +916,44 @@ fn settings_root<D: DrawTarget<Color = Rgb565>>(t: &mut D) -> Result<(), D::Erro
         None,
         true,
     )?;
-    render_row(t, settings_row_rect(3), Glyph::Home, "Close", None, false)
+    // Factory reset is destructive, so it's drawn in the decline colour (warning
+    // glyph + red label) instead of the neutral row style — see the mockup.
+    danger_row(t, settings_row_rect(3), "Factory reset")?;
+    render_row(t, settings_row_rect(4), Glyph::Home, "Close", None, false)
+}
+
+/// A destructive option row: the [`render_row`] card, but with a warning glyph,
+/// label, and drill-in chevron all in the decline colour.
+fn danger_row<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    rect: Rect,
+    label: &str,
+) -> Result<(), D::Error> {
+    RoundedRectangle::with_equal_corners(eg_rect(rect), Size::new(6, 6))
+        .into_styled(PrimitiveStyle::with_fill(theme::ROW_BG))
+        .draw(t)?;
+    let cy = rect.y as i32 + rect.h as i32 / 2;
+    glyph::draw(
+        t,
+        Glyph::Warn,
+        Point::new(rect.x + 8, (cy - 7) as u16),
+        14,
+        theme::DENY,
+    )?;
+    text_left(
+        t,
+        label,
+        EgPoint::new(rect.x as i32 + 28, cy),
+        &FONT_6X13,
+        theme::DENY,
+    )?;
+    glyph::draw(
+        t,
+        Glyph::Chevron,
+        Point::new(rect.x + rect.w - 20, (cy - 6) as u16),
+        12,
+        theme::DENY,
+    )
 }
 
 /// Brightness adjust: a coarse level bar plus the shared −/+/Back controls.
@@ -1128,6 +1248,24 @@ mod tests {
         assert!(
             has_color(&d, crate::DEL_HOLD_RECT, theme::DENY),
             "Hold-to-delete not in its rect"
+        );
+        assert!(
+            has_color(&d, crate::PK_BACK_RECT, theme::DENY),
+            "cancel chevron not in its rect"
+        );
+    }
+
+    /// The Factory-Reset confirm screen paints its hold control in `DEL_HOLD_RECT`
+    /// and the cancel chevron in `PK_BACK_RECT` (both in the decline colour) — the
+    /// regions `hit_del_hold` / `hit_pk_back` map a tap to.
+    #[test]
+    fn confirm_factory_reset_paints_hold_and_cancel_in_their_hit_rects() {
+        let mut d = Rec::new();
+        render_confirm_factory_reset(&mut d).unwrap();
+        assert!(!d.oob, "confirm-factory-reset drew outside the panel");
+        assert!(
+            has_color(&d, crate::DEL_HOLD_RECT, theme::DENY),
+            "Hold-to-reset not in its rect"
         );
         assert!(
             has_color(&d, crate::PK_BACK_RECT, theme::DENY),

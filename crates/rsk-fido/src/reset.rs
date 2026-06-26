@@ -8,9 +8,9 @@
 use rsk_fs::Storage;
 
 use crate::consts::{
-    EF_ALWAYS_UV, EF_AUTHTOKEN, EF_BACKUP_SEALED, EF_COUNTER, EF_CRED, EF_EA_ENABLED, EF_EE_DEV,
-    EF_KEY_DEV, EF_KEY_DEV_ENC, EF_LARGEBLOB, EF_MINPINLEN, EF_PAUTHTOKEN, EF_PIN, EF_RP,
-    MAX_RESIDENT_CREDENTIALS,
+    EF_ALWAYS_UV, EF_ATT_CHAIN, EF_ATT_KEY, EF_AUTHTOKEN, EF_BACKUP_SEALED, EF_COUNTER, EF_CRED,
+    EF_EA_ENABLED, EF_EE_DEV, EF_KEY_DEV, EF_KEY_DEV_ENC, EF_LARGEBLOB, EF_MINPINLEN,
+    EF_PAUTHTOKEN, EF_PIN, EF_RP, MAX_RESIDENT_CREDENTIALS,
 };
 use crate::error::{CtapError, CtapResult};
 use crate::journal;
@@ -81,6 +81,16 @@ fn is_fido_fid(fid: u16) -> bool {
         )
         || (EF_CRED..EF_CRED + MAX_RESIDENT_CREDENTIALS).contains(&fid)
         || (EF_RP..EF_RP + MAX_RESIDENT_CREDENTIALS).contains(&fid)
+}
+
+/// Whether `fid` survives an on-device **factory reset** (the trusted-display
+/// "erase everything" flow, which wipes FIDO *and* the other applets — wider than
+/// `authenticatorReset`). Only the org-provisioned batch attestation is kept: it
+/// is device identity, not user data, and `authenticatorReset` preserves it too.
+/// The fused OTP / secure-boot state is untouched by a flash wipe regardless. The
+/// display passes this predicate to [`rsk_fs::Fs::factory_wipe`].
+pub fn survives_factory_reset(fid: u16) -> bool {
+    fid == EF_ATT_KEY.get() || fid == EF_ATT_CHAIN
 }
 
 #[cfg(test)]
@@ -160,6 +170,18 @@ mod tests {
         assert_eq!(&lb[..ln], &crate::consts::LARGEBLOB_INITIAL);
         // Session state cleared.
         assert_eq!(state.paut.permissions, 0);
+    }
+
+    #[test]
+    fn factory_reset_keeps_only_attestation() {
+        use crate::consts::{EF_ATT_CHAIN, EF_ATT_KEY, EF_KEY_DEV};
+        // The org attestation (device identity) survives an on-device factory reset.
+        assert!(survives_factory_reset(EF_ATT_KEY.get()));
+        assert!(survives_factory_reset(EF_ATT_CHAIN));
+        // User secrets and the device seed do not.
+        assert!(!survives_factory_reset(EF_PIN));
+        assert!(!survives_factory_reset(EF_CRED));
+        assert!(!survives_factory_reset(EF_KEY_DEV.get()));
     }
 
     struct Fixed(crate::Presence);

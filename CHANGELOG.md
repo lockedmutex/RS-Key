@@ -156,6 +156,19 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   tab now goes straight there instead of dropping back to Home first — and each tab
   repaints the moment it is tapped rather than after the finger lifts, so switching
   feels immediate. bcdDevice 0x078F → 0x0791.
+- **Trusted-display variant — on-device factory reset (experimental, opt-in).** A
+  new danger row in the Settings menu erases the device from the trusted panel: tap
+  **Factory reset**, enter the device PIN if one is set (verified locally, like the
+  delete flow), then **hold** the confirm button. The back chevron, a slid-off
+  finger, or the inactivity timeout all abandon it without erasing anything. A
+  completed hold wipes **every applet's data** — FIDO passkeys and PIN, PIV,
+  OpenPGP, and OATH — physically scrubbing the flash (no superseded secret survives
+  a raw dump), then reboots; the next boot re-provisions a fresh seed, so the device
+  returns blank. Only the org-provisioned batch attestation (device identity, not
+  user data) and the fused OTP / secure-boot state survive — matching what the host
+  `authenticatorReset` keeps. Unlike that host command, this clears all applets, not
+  just FIDO. Implemented as a generic `Fs::factory_wipe` (host-tested) plus a reboot,
+  so the display task needs no rng or session state. bcdDevice 0x0797 → 0x0798.
 - **Trusted-display variant — on-device passkey deletion (experimental, opt-in).**
   The Passkeys tab moves from read-only to its first **write** action: tapping an
   account on a relying party's detail opens a trusted Confirm-Delete screen naming

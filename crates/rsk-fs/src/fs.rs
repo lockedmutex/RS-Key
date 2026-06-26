@@ -250,6 +250,45 @@ impl<S: Storage> Fs<S> {
         self.storage.compact()
     }
 
+    /// Factory-wipe: erase every stored key except those `preserve` keeps, then
+    /// physically scrub the backing store so no superseded secret survives a raw
+    /// flash dump. The caller supplies the keep-set (e.g. the org attestation,
+    /// which is device identity rather than user data) and is expected to reboot
+    /// afterwards — the device re-provisions a fresh seed on the next boot, and a
+    /// [`compact`](Self::compact) lap leaves the partition with only the preserved
+    /// keys live.
+    ///
+    /// The removal is unconditional — unlike [`delete`](Self::delete) it does not
+    /// consult the present-cache, because every key the backend enumerates is live
+    /// by definition, so removing it directly both wipes it and stays O(items)
+    /// (there are no absent probes to skip). Keys are taken in bounded batches: the
+    /// enumerator can't run while the store mutates, so each pass collects a batch,
+    /// removes it, and re-enumerates until only the preserved keys remain.
+    pub fn factory_wipe(&mut self, preserve: impl Fn(u16) -> bool) -> Result<()> {
+        loop {
+            let mut batch = [0u16; 64];
+            let mut n = 0usize;
+            self.storage.for_each_key(&mut |fid| {
+                if !preserve(fid) && n < batch.len() {
+                    batch[n] = fid;
+                    n += 1;
+                }
+            });
+            if n == 0 {
+                break;
+            }
+            for &fid in &batch[..n] {
+                self.storage.remove(fid)?;
+            }
+        }
+        // The caches described the now-erased store; reset them so any reuse before
+        // the reboot re-probes the backend (the dynamic set is gone too), then scrub.
+        self.present.fill(0);
+        self.decided.fill(0);
+        self.dynamic.clear();
+        self.storage.compact()
+    }
+
     /// Store file contents, registering a dynamic file if new.
     pub fn put(&mut self, fid: u16, data: &[u8]) -> Result<()> {
         self.storage.write(fid, data)?;
@@ -584,6 +623,38 @@ mod tests {
         let mut buf = [0u8; 8];
         assert_eq!(fs.read(KEY_DEV, &mut buf), Some(4));
         assert_eq!(&buf[..4], &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn factory_wipe_erases_all_but_preserved() {
+        let mut fs = fs();
+        fs.put(0x1080, b"pin").unwrap(); // a static-range file
+        fs.put(0xCF01, b"cred").unwrap(); // a dynamic resident credential
+        fs.put(0xC000, b"ctr").unwrap(); // a counter
+        fs.put(0xAAAA, b"keep").unwrap(); // stands in for the preserved attestation
+
+        fs.factory_wipe(|fid| fid == 0xAAAA).unwrap();
+
+        let mut buf = [0u8; 8];
+        // Everything not preserved is gone — including the dynamic-file registration.
+        assert!(fs.read(0x1080, &mut buf).is_none());
+        assert!(fs.read(0xCF01, &mut buf).is_none());
+        assert!(fs.read(0xC000, &mut buf).is_none());
+        assert!(fs.search(0xCF01).is_none());
+        // The preserved key survives, contents intact.
+        assert_eq!(fs.read(0xAAAA, &mut buf), Some(4));
+        assert_eq!(&buf[..4], b"keep");
+    }
+
+    #[test]
+    fn factory_wipe_with_nothing_to_keep_empties_the_store() {
+        let mut fs = fs();
+        fs.put(0xCF01, b"a").unwrap();
+        fs.put(0xCF02, b"b").unwrap();
+        fs.factory_wipe(|_| false).unwrap();
+        let mut seen = 0;
+        fs.for_each_key(&mut |_| seen += 1);
+        assert_eq!(seen, 0);
     }
 
     #[test]

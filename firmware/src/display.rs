@@ -353,6 +353,12 @@ impl Ui {
                         Some(RootEntry::Brightness) => page = SettingsPage::Brightness,
                         Some(RootEntry::Timeout) => page = SettingsPage::Timeout,
                         Some(RootEntry::Info) => page = SettingsPage::Info,
+                        // A confirmed reset reboots and never returns; on cancel, fall
+                        // back to the Root list (repaint below) with a fresh timeout.
+                        Some(RootEntry::FactoryReset) => {
+                            self.run_factory_reset();
+                            last = Instant::now();
+                        }
                         Some(RootEntry::Close) => break,
                         None => repaint = false,
                     },
@@ -698,15 +704,29 @@ impl Ui {
         self.shown = None;
         self.touch.wait_release(Instant::now(), idle_limit);
 
+        if self.hold_to_confirm("Hold to delete") {
+            let _ = rsk_fido::passkeys::delete_cred(&mut self.fs.borrow_mut(), fid);
+        }
+        self.end_modal();
+    }
+
+    /// The shared hold-to-confirm gesture on [`rsk_ui::DEL_HOLD_RECT`]: fill the
+    /// button as the finger holds, returning `true` only once it is held the full
+    /// [`HOLD_MS`] (so a brush can't commit). The header back chevron, a lifted or
+    /// slid-off finger then the inactivity timeout, or a queued host command all
+    /// return `false`. The caller paints the surrounding screen first; `label` is
+    /// the button caption. Used by both the delete and factory-reset confirms.
+    fn hold_to_confirm(&mut self, label: &str) -> bool {
+        let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
         let mut hold_start: Option<Instant> = None;
         let mut last_num: u16 = 0;
         let mut last = Instant::now();
-        let confirmed = loop {
+        loop {
             let mut on_hold = false;
             if let Some(p) = self.touch.read() {
                 last = Instant::now();
                 if rsk_ui::hit_pk_back(p) {
-                    break false; // cancel
+                    return false; // cancel
                 }
                 if rsk_ui::hit_del_hold(p) {
                     on_hold = true;
@@ -715,7 +735,7 @@ impl Ui {
                     let _ = rsk_ui::render_hold_fill(
                         &mut self.panel,
                         rsk_ui::DEL_HOLD_RECT,
-                        "Hold to delete",
+                        label,
                         last_num,
                         num,
                         HOLD_MS as u16,
@@ -723,7 +743,7 @@ impl Ui {
                     );
                     last_num = num;
                     if held >= Duration::from_millis(HOLD_MS) {
-                        break true;
+                        return true;
                     }
                 }
             }
@@ -732,21 +752,52 @@ impl Ui {
                 let _ = rsk_ui::render_hold_button(
                     &mut self.panel,
                     rsk_ui::DEL_HOLD_RECT,
-                    "Hold to delete",
+                    label,
                     rsk_ui::theme::DENY,
                 );
                 last_num = 0;
             }
             // A queued host command aborts the (uncommitted) confirm so the worker can
-            // run; nothing is deleted unless the hold actually completes.
+            // run; nothing commits unless the hold actually completes.
             if crate::worker::host_request_pending() || last.elapsed() >= idle_limit {
-                break false; // timeout / yield
+                return false; // timeout / yield
             }
             block_for(Duration::from_millis(TOUCH_POLL_MS));
-        };
+        }
+    }
 
-        if confirmed {
-            let _ = rsk_fido::passkeys::delete_cred(&mut self.fs.borrow_mut(), fid);
+    /// The on-device factory-reset flow (Settings → Factory reset): paint the danger
+    /// confirm screen, gate on the device PIN (if set, exactly like delete), then
+    /// require a deliberate hold before erasing every applet's data. The back
+    /// chevron, a slid-off finger, or the inactivity timeout all abandon it without a
+    /// write. On a completed hold it shows the wiping notice, erases all flash but the
+    /// org attestation ([`rsk_fido::survives_factory_reset`]), and reboots — the next
+    /// boot re-provisions a fresh seed, so the device returns blank. Diverges (resets)
+    /// on confirm; returns only when cancelled.
+    fn run_factory_reset(&mut self) {
+        let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
+        let _ = rsk_ui::render_confirm_factory_reset(&mut self.panel);
+        self.shown = None;
+        self.touch.wait_release(Instant::now(), idle_limit);
+
+        if !self.local_pin_gate() {
+            return; // no PIN set is fine; a wrong PIN or decline aborts — nothing erased
+        }
+        // The pad (if shown) overwrote the confirm screen; repaint it for the hold.
+        let _ = rsk_ui::render_confirm_factory_reset(&mut self.panel);
+        self.shown = None;
+        self.touch.wait_release(Instant::now(), idle_limit);
+
+        if self.hold_to_confirm("Hold to reset") {
+            // The scrub blocks the panel for seconds, so paint the notice first, then
+            // wipe everything but the attestation and reboot into a fresh device. The
+            // reboot clears RAM and re-seeds at boot, so no rng/state is needed here.
+            let _ = rsk_ui::render_erasing(&mut self.panel);
+            let _ = self
+                .fs
+                .borrow_mut()
+                .factory_wipe(rsk_fido::survives_factory_reset);
+            cortex_m::peripheral::SCB::sys_reset();
         }
         self.end_modal();
     }

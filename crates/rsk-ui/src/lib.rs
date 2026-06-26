@@ -22,8 +22,8 @@ pub mod theme;
 pub mod touch;
 pub use glyph::Glyph;
 pub use render::{
-    render, render_confirm_delete, render_hold_button, render_hold_fill, render_passkeys_list,
-    render_pin_dots, render_service,
+    render, render_confirm_delete, render_confirm_factory_reset, render_erasing,
+    render_hold_button, render_hold_fill, render_passkeys_list, render_pin_dots, render_service,
 };
 
 /// Panel geometry (Waveshare RP2350-Touch-LCD-2.8, ST7789T3, portrait).
@@ -357,6 +357,9 @@ pub enum RootEntry {
     Brightness,
     Timeout,
     Info,
+    /// Erase every applet's data and return to a fresh device (danger-styled,
+    /// gated by a hold-to-confirm and the device PIN if one is set).
+    FactoryReset,
     Close,
 }
 
@@ -369,14 +372,15 @@ pub enum AdjustKey {
     Back,
 }
 
-/// Root list: four full-width rows (Brightness / Timeout / Info / Close).
+/// Root list: five full-width rows (Brightness / Timeout / Info / Factory reset /
+/// Close) — sized to fit all five above the panel bottom.
 const ROW_X: u16 = 16;
 const ROW_W: u16 = PANEL_W - 2 * ROW_X;
-const ROW_H: u16 = 48;
-const ROW_GAP: u16 = 12;
-const ROW_Y0: u16 = 70;
+const ROW_H: u16 = 40;
+const ROW_GAP: u16 = 10;
+const ROW_Y0: u16 = 66;
 /// Number of Root list rows.
-pub const SETTINGS_ROWS: u16 = 4;
+pub const SETTINGS_ROWS: u16 = 5;
 
 /// The rectangle of Root list row `i` — single source of truth for the renderer and
 /// [`hit_settings_root`].
@@ -390,6 +394,7 @@ pub const fn settings_row_entry(i: u16) -> RootEntry {
         0 => RootEntry::Brightness,
         1 => RootEntry::Timeout,
         2 => RootEntry::Info,
+        3 => RootEntry::FactoryReset,
         _ => RootEntry::Close,
     }
 }
@@ -919,6 +924,7 @@ mod tests {
             RootEntry::Brightness,
             RootEntry::Timeout,
             RootEntry::Info,
+            RootEntry::FactoryReset,
             RootEntry::Close,
         ];
         for (i, &e) in want.iter().enumerate() {
