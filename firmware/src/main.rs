@@ -360,7 +360,7 @@ async fn main(spawner: Spawner) {
     config.max_power = 100;
     config.max_packet_size_0 = 64;
     // bcdDevice build counter; also surfaced on the trusted-display Info page.
-    let device_release: u16 = 0x0793;
+    let device_release: u16 = 0x0797;
     config.device_release = device_release;
 
     let mut builder = Builder::new(
@@ -592,7 +592,10 @@ async fn main(spawner: Spawner) {
         use embassy_rp::spi::{Config as SpiConfig, Spi};
 
         let mut spi_cfg = SpiConfig::default();
-        spi_cfg.frequency = 40_000_000; // ST7789 takes ≤62.5 MHz; 40 is a safe bringup start
+        // The ST7789 tops out at 62.5 MHz; running there (vs the 40 MHz bringup value)
+        // cuts a full-frame repaint ~35% for snappier screen transitions. If the panel's
+        // flex cable ever shows tearing/garbling, drop back toward 40 MHz.
+        spi_cfg.frequency = 62_500_000;
         let spi = Spi::new_blocking(p.SPI1, p.PIN_10, p.PIN_11, p.PIN_12, spi_cfg);
 
         let mut i2c_cfg = I2cConfig::default();

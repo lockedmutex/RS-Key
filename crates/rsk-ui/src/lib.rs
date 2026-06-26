@@ -22,8 +22,8 @@ pub mod theme;
 pub mod touch;
 pub use glyph::Glyph;
 pub use render::{
-    render, render_hold_button, render_hold_fill, render_passkeys_list, render_pin_dots,
-    render_service,
+    render, render_confirm_delete, render_hold_button, render_hold_fill, render_passkeys_list,
+    render_pin_dots, render_service,
 };
 
 /// Panel geometry (Waveshare RP2350-Touch-LCD-2.8, ST7789T3, portrait).
@@ -645,6 +645,29 @@ pub fn hit_pk_back(p: Point) -> bool {
     PK_BACK_RECT.contains(p)
 }
 
+// --- Confirm-delete (a destructive Passkeys mutation) ----------------------
+
+/// The full-width **Hold to delete** button on the Confirm-Delete screen. There is
+/// no tap-able Deny — the header [`PK_BACK_RECT`] chevron cancels, and the delete
+/// itself is a single deliberate hold (the firmware fills it as you hold, so a brush
+/// can't delete). It shares the approve-screen button band so the destructive action
+/// sits where the eye expects the primary control, but spans the full width (it is
+/// alone there) and is painted / filled in [`theme::DENY`].
+pub const DEL_HOLD_RECT: Rect = Rect::new(BTN_SIDE, BTN_BAND_TOP, PANEL_W - 2 * BTN_SIDE, BTN_H);
+
+// Compile-time: the hold button sits fully inside the panel and below the header
+// back chevron, so a cancel tap and a delete hold can never overlap.
+const _: () = {
+    assert!(DEL_HOLD_RECT.x > 0 && DEL_HOLD_RECT.x + DEL_HOLD_RECT.w <= PANEL_W);
+    assert!(DEL_HOLD_RECT.y > PK_BACK_RECT.y + PK_BACK_RECT.h);
+    assert!(DEL_HOLD_RECT.y + DEL_HOLD_RECT.h <= PANEL_H);
+};
+
+/// Did a tap at `p` hit the Confirm-Delete hold button?
+pub fn hit_del_hold(p: Point) -> bool {
+    DEL_HOLD_RECT.contains(p)
+}
+
 /// Top-level screen the display task renders. The three top-level **tabs** (Home,
 /// Passkeys, Settings) carry the bottom nav bar and are shown by the idle loop; the
 /// **modals** (Splash, Confirm, Pin) are full-screen and shown by the worker.
@@ -757,6 +780,14 @@ mod proofs {
         kani::assume((i as usize) < PK_ROWS_MAX);
         assert!(!(hit_pk_back(p) && row_rect(PK_LIST_TOP, i).contains(p)));
         assert!(!(hit_pk_back(p) && p.y >= NAV_TOP));
+    }
+
+    /// On the Confirm-Delete screen the destructive hold button and the cancel
+    /// (back) chevron are disjoint, so no tap can both cancel and start a delete.
+    #[kani::proof]
+    fn del_hold_clear_of_back() {
+        let p = Point::new(kani::any(), kani::any());
+        assert!(!(hit_del_hold(p) && hit_pk_back(p)));
     }
 }
 

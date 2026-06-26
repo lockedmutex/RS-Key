@@ -29,10 +29,10 @@ use embedded_graphics::{
 
 use crate::{
     ADJ_MINUS_RECT, ADJ_PLUS_RECT, ALLOW_RECT, AccountRow, BACK_RECT, BRIGHTNESS_LEVELS,
-    ConfirmPrompt, DENY_RECT, Glyph, HomeView, Label, NAV_H, NAV_TABS, NAV_TOP, NavTab, PANEL_W,
-    PIN_CANCEL_RECT, PIN_COLS, PIN_ROWS, PK_LIST_TOP, PinKey, PinPad, Point, Rect, RpRow, Screen,
-    SettingsPage, SettingsView, StatusKind, glyph, hex_u16, hex_u64, nav_tab_rect, pin_grid_key,
-    pin_key_rect, settings_row_rect, theme,
+    ConfirmPrompt, DEL_HOLD_RECT, DENY_RECT, Glyph, HomeView, Label, NAV_H, NAV_TABS, NAV_TOP,
+    NavTab, PANEL_W, PIN_CANCEL_RECT, PIN_COLS, PIN_ROWS, PK_LIST_TOP, PinKey, PinPad, Point, Rect,
+    RpRow, Screen, SettingsPage, SettingsView, StatusKind, glyph, hex_u16, hex_u64, nav_tab_rect,
+    pin_grid_key, pin_key_rect, settings_row_rect, theme,
 };
 
 // Local semantic aliases, all sourced from `theme` so the whole renderer speaks one
@@ -165,7 +165,8 @@ where
 
 /// The per-RP service detail: a back-chevron header + the (truncated) rpId, one row per
 /// resident account (key glyph + sanitized name + a "UV" tag when credProtect-gated),
-/// an "N accounts" footer, and the nav bar. Read-only — rename/delete are a later wave.
+/// an "N accounts" footer, and the nav bar. The firmware makes each row tappable to
+/// start the Confirm-Delete flow ([`render_confirm_delete`]); rename is a later wave.
 pub fn render_service<D>(
     t: &mut D,
     title: &Label,
@@ -219,6 +220,77 @@ fn footer_count<D: DrawTarget<Color = Rgb565>>(
         &FONT_6X13,
         MUTED,
     )
+}
+
+/// The trusted Confirm-Delete screen for a resident passkey: the back (cancel)
+/// chevron and a "Delete passkey" header in the decline colour, a card naming the
+/// relying party and account about to be removed, a plain-language warning, and the
+/// full-width **Hold to delete** button. The hold button starts empty; the firmware
+/// grows it via [`render_hold_fill`] as the user holds. Standalone full-frame (like
+/// [`render_service`]) — the labels are too large for the `Copy` `Screen` enum.
+pub fn render_confirm_delete<D>(t: &mut D, rp: &Label, account: &Label) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    t.clear(BG)?;
+    glyph::draw(t, Glyph::Back, Point::new(8, 7), 16, theme::DENY)?;
+    text_left(
+        t,
+        "Delete passkey",
+        EgPoint::new(44, 15),
+        &FONT_9X15_BOLD,
+        theme::DENY,
+    )?;
+    // Card naming exactly what is about to be removed: relying party + account.
+    let card = Rect::new(14, 54, PANEL_W - 28, 46);
+    RoundedRectangle::with_equal_corners(eg_rect(card), Size::new(8, 8))
+        .into_styled(PrimitiveStyle::with_fill(theme::ROW_BG))
+        .draw(t)?;
+    glyph::draw(
+        t,
+        Glyph::Globe,
+        Point::new(card.x + 10, card.y + 13),
+        20,
+        theme::MUTED,
+    )?;
+    let tx = card.x as i32 + 40;
+    text_left(
+        t,
+        rp.as_str(),
+        EgPoint::new(tx, card.y as i32 + 16),
+        &FONT_6X13,
+        theme::TEXT,
+    )?;
+    text_left(
+        t,
+        account.as_str(),
+        EgPoint::new(tx, card.y as i32 + 32),
+        &FONT_6X13,
+        theme::MUTED,
+    )?;
+    // Plain-language warning — including the honest caveat that the site is not told.
+    text_left(
+        t,
+        "This removes the passkey",
+        EgPoint::new(16, 124),
+        &FONT_6X13,
+        theme::WARN,
+    )?;
+    text_left(
+        t,
+        "from RS-Key. The site may",
+        EgPoint::new(16, 142),
+        &FONT_6X13,
+        theme::WARN,
+    )?;
+    text_left(
+        t,
+        "still expect it.",
+        EgPoint::new(16, 160),
+        &FONT_6X13,
+        theme::WARN,
+    )?;
+    render_hold_button(t, DEL_HOLD_RECT, "Hold to delete", theme::DENY)
 }
 
 /// The trusted Approve prompt: header + shield, the operation title, the relying-
@@ -1040,6 +1112,27 @@ mod tests {
         for i in 0..accounts.len() as u16 {
             assert!(d.any_non_bg_in(crate::row_rect(PK_LIST_TOP, i)));
         }
+    }
+
+    /// The Confirm-Delete screen paints its hold control in `DEL_HOLD_RECT` and the
+    /// cancel chevron in `PK_BACK_RECT` (both in the decline colour) — exactly the
+    /// regions `hit_del_hold` / `hit_pk_back` map a tap to — with the rp + account on
+    /// screen so the user sees what they are removing.
+    #[test]
+    fn confirm_delete_paints_hold_and_cancel_in_their_hit_rects() {
+        let rp = Label::clamp(b"github.com");
+        let account = Label::clamp(b"alex@example.com");
+        let mut d = Rec::new();
+        render_confirm_delete(&mut d, &rp, &account).unwrap();
+        assert!(!d.oob, "confirm-delete drew outside the panel");
+        assert!(
+            has_color(&d, crate::DEL_HOLD_RECT, theme::DENY),
+            "Hold-to-delete not in its rect"
+        );
+        assert!(
+            has_color(&d, crate::PK_BACK_RECT, theme::DENY),
+            "cancel chevron not in its rect"
+        );
     }
 
     /// The core security property: the Hold-to-approve control lives in `ALLOW_RECT`

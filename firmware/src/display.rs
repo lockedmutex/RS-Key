@@ -35,6 +35,8 @@ use embassy_rp::pwm::{Config as PwmConfig, Pwm};
 use embassy_rp::spi::{Blocking as SpiBlocking, Spi};
 use embassy_time::{Delay, Duration, Instant, Timer, block_for};
 use embedded_hal_bus::spi::ExclusiveDevice;
+use zeroize::Zeroize;
+
 use mipidsi::interface::SpiInterface;
 use mipidsi::models::ST7789;
 use mipidsi::options::ColorInversion;
@@ -66,11 +68,15 @@ static AMBIENT_QUIET_UNTIL_MS: AtomicU32 = AtomicU32::new(0);
 /// cover the platform's next-command round-trip, short enough to feel immediate.
 const AMBIENT_QUIET_MS: u32 = 400;
 
-/// Auto-close the settings menu after this long without a tap, returning to idle.
-/// While the menu is open it busy-waits on the thread executor, so the worker is
-/// parked and a host command waits behind it — this bound caps that to a walked-away
-/// user's worst case (and is shorter than a normal touch-confirm wait).
-const MENU_INACTIVITY_MS: u64 = 15_000;
+/// Auto-close an open on-device tab / menu (Passkeys / Settings / a Confirm-Delete)
+/// after this long *without a tap*, returning to the idle status screen — a privacy
+/// backstop so a walked-away device doesn't leave the passkey list (or a menu) on
+/// screen indefinitely. It is **not** the host-starvation guard: while a tab is open
+/// the worker is parked (single thread executor), but the browse loops poll
+/// [`crate::worker::host_request_pending`] and yield the instant a host command
+/// arrives, so this bound can be generous (a comfortable browse) without making the
+/// host wait for it.
+const MENU_INACTIVITY_MS: u64 = 60_000;
 
 /// How long the user must hold the on-screen approve button before it confirms — long
 /// enough that an accidental brush can't approve, short enough to feel responsive. The
@@ -377,7 +383,9 @@ impl Ui {
                     self.render_settings(page);
                 }
             }
-            if last.elapsed() >= idle_limit {
+            // A host command is queued — yield to the parked worker at once, rather
+            // than making it wait out the (now generous) inactivity bound.
+            if crate::worker::host_request_pending() || last.elapsed() >= idle_limit {
                 break;
             }
             block_for(Duration::from_millis(TOUCH_POLL_MS));
@@ -387,14 +395,12 @@ impl Ui {
         None
     }
 
-    /// Hand the panel back to the ambient loop on a modal's exit, briefly holding the
-    /// status repaint back so a hand-off (modal → idle, or modal → next tab) doesn't
-    /// flash a stale frame.
+    /// Hand the panel back to the ambient loop on a modal's exit. Closing a tab back to
+    /// idle is repainted *immediately* by [`status_task`]'s dispatcher, and a tab → next
+    /// tab hand-off renders the new tab directly, so neither needs the ambient-quiet
+    /// window (that is only for the pad → confirm gap, set in `confirm_wait` /
+    /// `collect_pin`). So this just clears the last-shown marker.
     fn end_modal(&mut self) {
-        AMBIENT_QUIET_UNTIL_MS.store(
-            (Instant::now().as_millis() as u32).wrapping_add(AMBIENT_QUIET_MS),
-            Ordering::Relaxed,
-        );
         self.shown = None;
     }
 
@@ -439,7 +445,9 @@ impl Ui {
                 }
                 self.touch.wait_release(last, idle_limit);
             }
-            if last.elapsed() >= idle_limit {
+            // Yield to the parked worker the instant a host command arrives, so
+            // browsing never starves it — the timeout is only the walked-away backstop.
+            if crate::worker::host_request_pending() || last.elapsed() >= idle_limit {
                 break None;
             }
             block_for(Duration::from_millis(TOUCH_POLL_MS));
@@ -448,19 +456,22 @@ impl Ui {
         next
     }
 
-    /// One RP's read-only detail: list its resident accounts. The back chevron (or a tap
-    /// on the active Passkeys tab) returns to the list; another nav tab leaves the
-    /// Passkeys tab; the back chevron only ever returns [`ServiceResult::Back`].
+    /// One RP's detail: list its resident accounts, and let a tap on an account start the
+    /// Confirm-Delete flow ([`run_delete`]). The back chevron (or a tap on the active
+    /// Passkeys tab) returns to the list; another nav tab leaves the Passkeys tab; the
+    /// back chevron only ever returns [`ServiceResult::Back`]. After a delete the set is
+    /// reloaded — when the last account goes, the screen drops back to the list (whose RP
+    /// row is gone too).
     fn run_service(&mut self, title: &Label, hash: &[u8; 32]) -> ServiceResult {
+        let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
         let mut accts = [AccountRow::default(); rsk_ui::PK_ROWS_MAX];
-        let (n, total) = self.load_accts(hash, &mut accts);
+        let mut fids = [0u16; rsk_ui::PK_ROWS_MAX];
+        let (mut n, mut total) = self.load_accts(hash, &mut accts, &mut fids);
         let _ = rsk_ui::render_service(&mut self.panel, title, &accts[..n], total);
         self.shown = None;
-        self.touch
-            .wait_release(Instant::now(), Duration::from_millis(MENU_INACTIVITY_MS));
+        self.touch.wait_release(Instant::now(), idle_limit);
 
         let mut last = Instant::now();
-        let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
         loop {
             if let Some(p) = self.touch.read() {
                 last = Instant::now();
@@ -475,9 +486,25 @@ impl Ui {
                         NavTab::Settings => ServiceResult::Leave(Some(NavTab::Settings)),
                     };
                 }
+                if let Some(i) = rsk_ui::hit_list(p, rsk_ui::PK_LIST_TOP, n as u16) {
+                    self.run_delete(title, &accts[i as usize].name, fids[i as usize]);
+                    let r = self.load_accts(hash, &mut accts, &mut fids);
+                    n = r.0;
+                    total = r.1;
+                    if n == 0 {
+                        return ServiceResult::Back;
+                    }
+                    let _ = rsk_ui::render_service(&mut self.panel, title, &accts[..n], total);
+                    self.shown = None;
+                    self.touch.wait_release(Instant::now(), idle_limit);
+                    last = Instant::now();
+                    continue;
+                }
                 self.touch.wait_release(last, idle_limit);
             }
-            if last.elapsed() >= idle_limit {
+            // Same yield as the list: a pending host command takes priority over an
+            // open read-only detail.
+            if crate::worker::host_request_pending() || last.elapsed() >= idle_limit {
                 return ServiceResult::Leave(None);
             }
             block_for(Duration::from_millis(TOUCH_POLL_MS));
@@ -511,10 +538,16 @@ impl Ui {
         (n, total.min(u16::MAX as usize) as u16)
     }
 
-    /// Enumerate the resident accounts under `hash` into `accts`. The label is the user
-    /// name, else the display name, else a placeholder (a binary user id is not a legible
-    /// label); credProtect ≥ 2 marks the row UV-gated.
-    fn load_accts(&self, hash: &[u8; 32], accts: &mut [AccountRow]) -> (usize, u16) {
+    /// Enumerate the resident accounts under `hash` into `accts`, recording each one's
+    /// `EF_CRED` slot fid into the parallel `fids` (the key [`run_delete`] takes to
+    /// remove it). The label is the user name, else the display name, else a placeholder
+    /// (a binary user id is not a legible label); credProtect ≥ 2 marks the row UV-gated.
+    fn load_accts(
+        &self,
+        hash: &[u8; 32],
+        accts: &mut [AccountRow],
+        fids: &mut [u16],
+    ) -> (usize, u16) {
         let dev = self.keys.device();
         let mut store = self.fs.borrow_mut();
         let mut n = 0usize;
@@ -531,10 +564,191 @@ impl Ui {
                     name,
                     protected: a.cred_protect >= 2,
                 };
+                fids[n] = a.ef_cred_fid;
                 n += 1;
             }
         });
         (n, total.min(u16::MAX as usize) as u16)
+    }
+
+    /// Collect a PIN on the on-screen pad (the trusted built-in-UV input). Renders the
+    /// masked keypad, block-polls the CST328 accumulating ASCII digits into `out`, and
+    /// honours the same UP_PENDING / CANCEL_REQUESTED / timeout contract as the confirm
+    /// wait. Owns the panel via `&mut self` (single thread executor → the worker is
+    /// parked), so both the host built-in-UV path ([`TouchPresence::collect_pin`]) and a
+    /// display-initiated gate ([`run_delete`]) share one pad. Each key debounces to
+    /// release; OK commits only at/above `min_len`, Del backspaces, Cancel declines. The
+    /// entered digits are the caller's to zeroize after verifying.
+    fn collect_pin(&mut self, min_len: usize, out: &mut [u8]) -> rsk_fido::PinEntry {
+        let saved = led::status();
+        led::set_status(led::STATUS_TOUCH);
+        CANCEL_REQUESTED.store(false, Ordering::Relaxed);
+        UP_PENDING.store(true, Ordering::Relaxed);
+
+        let start = Instant::now();
+        let timeout = Duration::from_millis(PRESENCE_TIMEOUT_MS.load(Ordering::Relaxed) as u64);
+        let mut entered = 0usize;
+
+        let _ = rsk_ui::render(&mut self.panel, &Screen::Pin(PinPad::new(entered)));
+        self.shown = None; // force the status loop to repaint once we release it
+        let outcome = loop {
+            if let Some(p) = self.touch.read() {
+                let mut repaint = true;
+                let done = match rsk_ui::hit_pin(p) {
+                    Some(PinKey::Digit(d)) => {
+                        if entered < out.len() {
+                            out[entered] = b'0' + d;
+                            entered += 1;
+                        }
+                        None
+                    }
+                    Some(PinKey::Del) => {
+                        entered = entered.saturating_sub(1);
+                        None
+                    }
+                    Some(PinKey::Ok) if entered >= min_len => {
+                        Some(rsk_fido::PinEntry::Entered(entered))
+                    }
+                    Some(PinKey::Cancel) => Some(rsk_fido::PinEntry::Declined),
+                    _ => {
+                        repaint = false;
+                        None
+                    }
+                };
+                if repaint && done.is_none() {
+                    let _ = rsk_ui::render_pin_dots(&mut self.panel, entered);
+                }
+                self.touch.wait_release(start, timeout);
+                if let Some(o) = done {
+                    break o;
+                }
+            }
+            if CANCEL_REQUESTED.load(Ordering::Relaxed) {
+                break rsk_fido::PinEntry::Cancelled;
+            }
+            if start.elapsed() >= timeout {
+                break rsk_fido::PinEntry::Timeout;
+            }
+            block_for(Duration::from_millis(TOUCH_POLL_MS));
+        };
+
+        UP_PENDING.store(false, Ordering::Relaxed);
+        CANCEL_REQUESTED.store(false, Ordering::Relaxed);
+        AMBIENT_QUIET_UNTIL_MS.store(
+            (Instant::now().as_millis() as u32).wrapping_add(AMBIENT_QUIET_MS),
+            Ordering::Relaxed,
+        );
+        led::set_status(saved);
+        outcome
+    }
+
+    /// Gate a destructive local action behind the device PIN when one is set: collect it
+    /// on the pad and verify it locally against the same `EF_PIN` and retry counter the
+    /// host PIN path uses. A wrong entry re-prompts (the pad reappears empty) until the
+    /// right PIN, a decline / timeout, or the counter is spent. Returns whether the
+    /// action may proceed (`true` = no PIN set, or the correct PIN was entered).
+    fn local_pin_gate(&mut self) -> bool {
+        if !rsk_fido::passkeys::pin_is_set(&mut self.fs.borrow_mut()) {
+            return true;
+        }
+        let mut pin = [0u8; 64];
+        let proceed = loop {
+            // CTAP's 4-digit floor; `verify_local_pin` checks the exact PIN regardless,
+            // so a higher `minPINLength` policy is still satisfied by typing it in full.
+            match self.collect_pin(4, &mut pin) {
+                rsk_fido::PinEntry::Entered(len) => {
+                    let dev = self.keys.device();
+                    let verdict = rsk_fido::passkeys::verify_local_pin(
+                        &dev,
+                        &mut self.fs.borrow_mut(),
+                        &pin[..len.min(pin.len())],
+                    );
+                    match verdict {
+                        rsk_fido::passkeys::LocalPin::Ok => break true,
+                        // Re-prompt on a wrong PIN until the budget runs out (Blocked).
+                        rsk_fido::passkeys::LocalPin::Wrong { .. } => {}
+                        rsk_fido::passkeys::LocalPin::Blocked => break false,
+                    }
+                }
+                // Cancel / timeout / cancelled-by-host: abandon the action.
+                _ => break false,
+            }
+        };
+        pin.zeroize();
+        proceed
+    }
+
+    /// The Confirm-Delete flow for one resident passkey (mockup screens 6 → 10): paint
+    /// the trusted confirm screen naming the rp + account, gate on the device PIN (if
+    /// set), then require a deliberate **hold** on the delete button before removing the
+    /// credential. The header back chevron, a slid-off finger, or the inactivity timeout
+    /// all abandon it without a write. Synchronous like the other modals (the worker is
+    /// parked), so the `self.fs` borrows can't race.
+    fn run_delete(&mut self, rp: &Label, account: &Label, fid: u16) {
+        let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
+        let _ = rsk_ui::render_confirm_delete(&mut self.panel, rp, account);
+        self.shown = None;
+        self.touch.wait_release(Instant::now(), idle_limit);
+
+        if !self.local_pin_gate() {
+            return; // no PIN, wrong PIN, or declined — nothing removed
+        }
+        // The pad (if shown) overwrote the confirm screen; repaint it for the hold.
+        let _ = rsk_ui::render_confirm_delete(&mut self.panel, rp, account);
+        self.shown = None;
+        self.touch.wait_release(Instant::now(), idle_limit);
+
+        let mut hold_start: Option<Instant> = None;
+        let mut last_num: u16 = 0;
+        let mut last = Instant::now();
+        let confirmed = loop {
+            let mut on_hold = false;
+            if let Some(p) = self.touch.read() {
+                last = Instant::now();
+                if rsk_ui::hit_pk_back(p) {
+                    break false; // cancel
+                }
+                if rsk_ui::hit_del_hold(p) {
+                    on_hold = true;
+                    let held = hold_start.get_or_insert_with(Instant::now).elapsed();
+                    let num = held.as_millis().min(HOLD_MS) as u16;
+                    let _ = rsk_ui::render_hold_fill(
+                        &mut self.panel,
+                        rsk_ui::DEL_HOLD_RECT,
+                        "Hold to delete",
+                        last_num,
+                        num,
+                        HOLD_MS as u16,
+                        rsk_ui::theme::DENY,
+                    );
+                    last_num = num;
+                    if held >= Duration::from_millis(HOLD_MS) {
+                        break true;
+                    }
+                }
+            }
+            // Finger lifted or slid off the button: reset a building hold.
+            if !on_hold && hold_start.take().is_some() {
+                let _ = rsk_ui::render_hold_button(
+                    &mut self.panel,
+                    rsk_ui::DEL_HOLD_RECT,
+                    "Hold to delete",
+                    rsk_ui::theme::DENY,
+                );
+                last_num = 0;
+            }
+            // A queued host command aborts the (uncommitted) confirm so the worker can
+            // run; nothing is deleted unless the hold actually completes.
+            if crate::worker::host_request_pending() || last.elapsed() >= idle_limit {
+                break false; // timeout / yield
+            }
+            block_for(Duration::from_millis(TOUCH_POLL_MS));
+        };
+
+        if confirmed {
+            let _ = rsk_fido::passkeys::delete_cred(&mut self.fs.borrow_mut(), fid);
+        }
+        self.end_modal();
     }
 }
 
@@ -589,6 +803,7 @@ pub async fn status_task(ui: &'static RefCell<Ui>) {
                 && let Some(p) = u.touch.read()
             {
                 let mut target = rsk_ui::hit_nav(p);
+                let opened_tab = matches!(target, Some(NavTab::Settings | NavTab::Passkeys));
                 while let Some(tab) = target {
                     target = match tab {
                         // Home is the idle ambient screen — end the nav session.
@@ -596,6 +811,16 @@ pub async fn status_task(ui: &'static RefCell<Ui>) {
                         NavTab::Settings => u.run_settings(),
                         NavTab::Passkeys => u.run_passkeys(),
                     };
+                }
+                // A tab session just closed back to idle: repaint Home now instead of
+                // waiting out the next poll, so closing a tab feels instant. Skip it if a
+                // host command is now queued — the worker paints next (no stale flash).
+                if opened_tab && !crate::worker::host_request_pending() {
+                    let screen = Screen::Home(HomeView {
+                        status: status_to_kind(led::status()),
+                    });
+                    let _ = rsk_ui::render(&mut u.panel, &screen);
+                    u.shown = Some(screen);
                 }
             }
         }
@@ -714,82 +939,12 @@ impl TouchPresence {
         outcome
     }
 
-    /// Run the built-in-UV PIN pad: render the masked keypad, block-poll the CST328,
-    /// and accumulate ASCII digits into `out`. Each key is debounced to release, so
-    /// one tap is one press; OK commits only at/above `min_len` (a too-short entry
-    /// can't reach the verifier and burn a retry), Del backspaces, Cancel declines.
-    /// Honors the same UP_PENDING / CANCEL_REQUESTED / timeout contract as the
-    /// confirm wait. The entered digits are the caller's to zeroize after verifying.
+    /// Collect a PIN on the on-screen pad for the host built-in-UV path (clientPIN 0x06).
+    /// The pad loop lives on [`Ui`] (which owns the panel + touch); borrow the shared
+    /// `Ui` and run it there, so the host path and a display-initiated gate
+    /// ([`Ui::run_delete`]) share one implementation.
     fn collect_pin_impl(&mut self, min_len: usize, out: &mut [u8]) -> rsk_fido::PinEntry {
-        let saved = led::status();
-        led::set_status(led::STATUS_TOUCH);
-        CANCEL_REQUESTED.store(false, Ordering::Relaxed);
-        UP_PENDING.store(true, Ordering::Relaxed);
-
-        let start = Instant::now();
-        let timeout = Duration::from_millis(PRESENCE_TIMEOUT_MS.load(Ordering::Relaxed) as u64);
-        let mut entered = 0usize;
-
-        let outcome = {
-            let mut u = self.ui.borrow_mut();
-            let _ = rsk_ui::render(&mut u.panel, &Screen::Pin(PinPad::new(entered)));
-            u.shown = None; // force the status loop to repaint once we release it
-            loop {
-                if let Some(p) = u.touch.read() {
-                    let mut repaint = true;
-                    let done = match rsk_ui::hit_pin(p) {
-                        Some(PinKey::Digit(d)) => {
-                            if entered < out.len() {
-                                out[entered] = b'0' + d;
-                                entered += 1;
-                            }
-                            None
-                        }
-                        Some(PinKey::Del) => {
-                            entered = entered.saturating_sub(1);
-                            None
-                        }
-                        Some(PinKey::Ok) if entered >= min_len => {
-                            Some(rsk_fido::PinEntry::Entered(entered))
-                        }
-                        Some(PinKey::Cancel) => Some(rsk_fido::PinEntry::Declined),
-                        // OK below the minimum, or a tap in a gap: nothing changes.
-                        _ => {
-                            repaint = false;
-                            None
-                        }
-                    };
-                    if repaint && done.is_none() {
-                        // Partial update: only the masked-entry row changes per
-                        // keystroke, so repaint just that strip — no full-frame
-                        // clear, no flicker.
-                        let _ = rsk_ui::render_pin_dots(&mut u.panel, entered);
-                    }
-                    u.touch.wait_release(start, timeout);
-                    if let Some(o) = done {
-                        break o;
-                    }
-                }
-                if CANCEL_REQUESTED.load(Ordering::Relaxed) {
-                    break rsk_fido::PinEntry::Cancelled;
-                }
-                if start.elapsed() >= timeout {
-                    break rsk_fido::PinEntry::Timeout;
-                }
-                block_for(Duration::from_millis(TOUCH_POLL_MS));
-            }
-        };
-
-        UP_PENDING.store(false, Ordering::Relaxed);
-        CANCEL_REQUESTED.store(false, Ordering::Relaxed);
-        // Hold the ambient status screen back briefly so this modal handing off to
-        // another (pad → Approve/Deny) doesn't flash the idle screen between them.
-        AMBIENT_QUIET_UNTIL_MS.store(
-            (Instant::now().as_millis() as u32).wrapping_add(AMBIENT_QUIET_MS),
-            Ordering::Relaxed,
-        );
-        led::set_status(saved);
-        outcome
+        self.ui.borrow_mut().collect_pin(min_len, out)
     }
 }
 

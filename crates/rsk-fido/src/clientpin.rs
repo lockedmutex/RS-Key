@@ -17,8 +17,8 @@ use minicbor::{Decoder, Encoder};
 use zeroize::Zeroize;
 
 use rsk_crypto::pinproto::{self, PinProto};
-use rsk_crypto::sha256;
-use rsk_fs::Storage;
+use rsk_crypto::{Device, sha256};
+use rsk_fs::{Fs, Storage};
 
 use crate::cbordec::{cbor, def_map};
 use crate::consts::{EF_MINPINLEN, EF_PIN, MAX_PIN_RETRIES, MIN_PIN_LENGTH};
@@ -656,6 +656,92 @@ fn pinproto_ct_eq(a: &[u8], b: &[u8]) -> bool {
     rsk_crypto::ct_eq(a, b)
 }
 
+/// Outcome of a device-local PIN verify ([`verify_local_pin`]).
+pub enum LocalPin {
+    /// Correct PIN; the retry counter was reset to the full budget.
+    Ok,
+    /// Wrong PIN; `retries_left` attempts remain before the hard lock.
+    Wrong { retries_left: u8 },
+    /// No PIN set, the retry budget is spent, or a flash glitch was caught on
+    /// read-back — the gated action must not proceed.
+    Blocked,
+}
+
+/// Whether a clientPIN is set. The trusted display gates a destructive local
+/// action behind the PIN only when one exists (otherwise the hold gesture alone
+/// stands in for user verification).
+pub fn pin_is_set<S: Storage>(fs: &mut Fs<S>) -> bool {
+    fs.has_data(EF_PIN)
+}
+
+/// Verify a PIN typed on the device's own pad for a display-initiated action (a
+/// local Passkeys delete — there is no host and no CTAP session). It reuses
+/// [`verify_pin_hash`]'s persistent anti-bruteforce gate verbatim — the EF_PIN
+/// retry counter is decremented before the compare and read back fail-closed, a
+/// correct PIN resets it and migrates a legacy PIN-wrapped seed, a wrong attempt
+/// at zero is a hard block — but deliberately omits the CTAP-session side effects
+/// (`state.regenerate`, the RAM 3-strikes power-cycle lock, the journal) that are
+/// meaningless off the host path and need a `Ctx` the display task does not hold.
+/// The persistent 8-try counter is the real gate and is identical here, so this
+/// opens no faster path to grind the PIN than USB already does. The caller
+/// zeroizes `pin`.
+pub fn verify_local_pin<S: Storage>(dev: &Device, fs: &mut Fs<S>, pin: &[u8]) -> LocalPin {
+    let mut pin_data = [0u8; PIN_FILE_LEN];
+    let Some(n) = fs.read(EF_PIN, &mut pin_data) else {
+        return LocalPin::Blocked;
+    };
+    if n != PIN_FILE_LEN || pin_data[0] == 0 {
+        return LocalPin::Blocked;
+    }
+    pin_data[0] -= 1;
+    if fs.put(EF_PIN, &pin_data).is_err() {
+        return LocalPin::Blocked;
+    }
+    // Trust the decremented counter only after reading it back — the same
+    // fail-closed anti-glitch gate `verify_pin_hash` applies (a torn program could
+    // otherwise persist the old, higher count while RAM marched on).
+    let mut readback = [0u8; PIN_FILE_LEN];
+    match fs.read(EF_PIN, &mut readback) {
+        Some(PIN_FILE_LEN) if readback[0] == pin_data[0] => {}
+        _ => return LocalPin::Blocked,
+    }
+    let retries = pin_data[0];
+
+    let mut pin_hash = sha256(pin);
+    let cand = dev.pin_derive_verifier(&pin_hash[..16]);
+    let mut matched = pinproto_ct_eq(&cand, &pin_data[3..PIN_FILE_LEN]);
+    if !matched && dev.otp_key.is_some() {
+        // Pre-OTP verifier fallback, identical to `verify_pin_hash`.
+        let cand_old = dev.without_otp().pin_derive_verifier(&pin_hash[..16]);
+        if pinproto_ct_eq(&cand_old, &pin_data[3..PIN_FILE_LEN]) {
+            pin_data[3..PIN_FILE_LEN].copy_from_slice(&cand);
+            matched = true;
+        }
+    }
+    if !matched {
+        pin_hash.zeroize();
+        if retries == 0 {
+            return LocalPin::Blocked;
+        }
+        return LocalPin::Wrong {
+            retries_left: retries,
+        };
+    }
+
+    // Correct PIN: migrate a legacy PIN-wrapped seed (only openable now), then
+    // reset the counter. Fail closed if either flash write fails.
+    let migrated = migrate_keydev_pin(dev, fs, &pin_hash[..16]).is_ok();
+    pin_hash.zeroize();
+    if !migrated {
+        return LocalPin::Blocked;
+    }
+    pin_data[0] = MAX_PIN_RETRIES;
+    if fs.put(EF_PIN, &pin_data).is_err() {
+        return LocalPin::Blocked;
+    }
+    LocalPin::Ok
+}
+
 fn encode<F>(out: &mut [u8], f: F) -> Result<usize, CtapError>
 where
     F: FnOnce(
@@ -1061,6 +1147,66 @@ mod tests {
         let mut pf = [0u8; PIN_FILE_LEN];
         assert_eq!(fs.read(EF_PIN, &mut pf), Some(PIN_FILE_LEN));
         pf[0]
+    }
+
+    /// Device-local verify (the display delete gate): a correct PIN verifies and
+    /// resets the budget, a wrong one is rejected and spends exactly one retry —
+    /// the same persistent counter the host PIN path uses.
+    #[test]
+    fn local_pin_correct_wrong_and_reset() {
+        let (mut fs, _rng, _state, _plat) = setup_with_pin(b"1234");
+        assert!(matches!(
+            verify_local_pin(&dev(), &mut fs, b"1234"),
+            LocalPin::Ok
+        ));
+        assert_eq!(ef_pin_retries(&mut fs), MAX_PIN_RETRIES);
+        match verify_local_pin(&dev(), &mut fs, b"9999") {
+            LocalPin::Wrong { retries_left } => assert_eq!(retries_left, MAX_PIN_RETRIES - 1),
+            _ => panic!("expected Wrong"),
+        }
+        assert_eq!(ef_pin_retries(&mut fs), MAX_PIN_RETRIES - 1);
+        // A later correct PIN restores the full budget.
+        assert!(matches!(
+            verify_local_pin(&dev(), &mut fs, b"1234"),
+            LocalPin::Ok
+        ));
+        assert_eq!(ef_pin_retries(&mut fs), MAX_PIN_RETRIES);
+    }
+
+    /// The persistent gate hard-blocks once the budget is spent, and never
+    /// underflows past zero — even a correct PIN can't recover after the lock.
+    #[test]
+    fn local_pin_blocks_at_zero() {
+        let (mut fs, _rng, _state, _plat) = setup_with_pin(b"1234");
+        for _ in 0..MAX_PIN_RETRIES - 1 {
+            assert!(matches!(
+                verify_local_pin(&dev(), &mut fs, b"0000"),
+                LocalPin::Wrong { .. }
+            ));
+        }
+        assert!(matches!(
+            verify_local_pin(&dev(), &mut fs, b"0000"),
+            LocalPin::Blocked
+        ));
+        assert_eq!(ef_pin_retries(&mut fs), 0);
+        assert!(matches!(
+            verify_local_pin(&dev(), &mut fs, b"1234"),
+            LocalPin::Blocked
+        ));
+    }
+
+    /// `pin_is_set` tracks EF_PIN; with no PIN a local verify is Blocked (the
+    /// caller is expected to gate on `pin_is_set` first).
+    #[test]
+    fn local_pin_is_set_and_unset() {
+        let (mut fs, _rng, _state, _plat) = setup_with_pin(b"1234");
+        assert!(pin_is_set(&mut fs));
+        let (mut bare, _rng2) = setup();
+        assert!(!pin_is_set(&mut bare));
+        assert!(matches!(
+            verify_local_pin(&dev(), &mut bare, b"1234"),
+            LocalPin::Blocked
+        ));
     }
 
     /// Built-in UV: with a PIN set host-side, obtain a pinUvAuthToken via the

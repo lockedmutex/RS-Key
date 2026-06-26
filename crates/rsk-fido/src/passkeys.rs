@@ -20,6 +20,12 @@ use rsk_fs::{Fs, Storage};
 use crate::consts::{EF_CRED, EF_RP, MAX_RESIDENT_CREDENTIALS};
 use crate::credential::{RECORD_PREFIX, RP_PREFIX, credential_load, slot_map, unseal_rp_id};
 
+/// The device-local PIN gate for a display-initiated mutation (e.g. a Passkeys
+/// delete), re-exported here so the trusted display reaches the whole on-device
+/// Passkeys seam — read walks, [`delete_cred`], and the PIN check — through one
+/// module. Defined next to the canonical `verify_pin_hash` in `clientpin`.
+pub use crate::clientpin::{LocalPin, pin_is_set, verify_local_pin};
+
 /// Largest EF_RP record (count + rpIdHash + boxed domain); domains are short.
 const RP_REC_MAX: usize = 256;
 /// Largest EF_CRED record — up to ~1 KiB with a large credBlob.
@@ -46,6 +52,9 @@ pub struct AccountView<'a> {
     pub user_id: &'a [u8],
     /// credProtect level (0..=3); ≥2 marks a UV-gated credential.
     pub cred_protect: u64,
+    /// The `EF_CRED` slot fid this credential occupies — the key
+    /// [`delete_cred`] takes to remove it from the on-device Passkeys view.
+    pub ef_cred_fid: u16,
 }
 
 /// Visit each resident RP (those with ≥1 credential), decrypting its rpId domain,
@@ -133,11 +142,41 @@ where
             user_display_name: cred.user_display_name,
             user_id: cred.user_id,
             cred_protect: cred.ext.cred_protect,
+            ef_cred_fid: EF_CRED + i,
         });
     }
     seed.zeroize();
     scratch.zeroize(); // held the decrypted account names
     total
+}
+
+/// Delete the resident credential stored at `ef_cred_fid` (an `EF_CRED` slot fid,
+/// as surfaced by [`AccountView::ef_cred_fid`]), then decrement — or remove — its
+/// `EF_RP` record. The rpIdHash is the cleartext record prefix, so unlike the read
+/// walks this needs no seed. Returns whether a credential was removed; an
+/// out-of-range fid or an empty/short slot is a no-op returning `false`.
+///
+/// This is the on-device counterpart of CTAP `deleteCredential` (0x06): the same
+/// flash effect, but keyed by slot (what the on-device walk holds) instead of by
+/// the host's resident id. Cred-first then RP-decrement matches that path's order.
+pub fn delete_cred<S: Storage>(fs: &mut Fs<S>, ef_cred_fid: u16) -> bool {
+    if !(EF_CRED..EF_CRED + MAX_RESIDENT_CREDENTIALS).contains(&ef_cred_fid) {
+        return false;
+    }
+    let mut buf = [0u8; CRED_REC_MAX];
+    let Some(n) = fs.read(ef_cred_fid, &mut buf) else {
+        return false;
+    };
+    if n.min(buf.len()) < RECORD_PREFIX {
+        return false;
+    }
+    let mut rp_id_hash = [0u8; 32];
+    rp_id_hash.copy_from_slice(&buf[..32]);
+    if fs.delete(ef_cred_fid).is_err() {
+        return false;
+    }
+    let _ = crate::credmgmt::decrement_rp(fs, &rp_id_hash);
+    true
 }
 
 #[cfg(test)]
@@ -329,5 +368,68 @@ mod tests {
         let total = for_each_cred(&dev(), &mut fs, &unknown, |_| calls += 1);
         assert_eq!(total, 0);
         assert_eq!(calls, 0);
+    }
+
+    fn fids_under(fs: &mut Fs<RamStorage>, rp_id: &str) -> std::vec::Vec<u16> {
+        let h = sha256(rp_id.as_bytes());
+        let mut fids = std::vec::Vec::new();
+        for_each_cred(&dev(), fs, &h, |a| fids.push(a.ef_cred_fid));
+        fids
+    }
+
+    #[test]
+    fn delete_drops_cred_and_decrements_rp() {
+        let (mut fs, seed) = provisioned();
+        add(&mut fs, &seed, 1, "github.com", b"u-a", "a", "A", 0);
+        add(&mut fs, &seed, 2, "github.com", b"u-b", "b", "B", 0);
+        add(&mut fs, &seed, 3, "google.com", b"u-c", "c", "C", 0);
+
+        let gh = fids_under(&mut fs, "github.com");
+        assert_eq!(gh.len(), 2);
+        assert!(delete_cred(&mut fs, gh[0]));
+
+        // The other github account survives, google is untouched.
+        assert_eq!(fids_under(&mut fs, "github.com").len(), 1);
+        assert_eq!(fids_under(&mut fs, "google.com").len(), 1);
+        // The EF_RP count was decremented (2 → 1), so the RP still lists once.
+        let mut counts = std::vec::Vec::new();
+        for_each_rp(&dev(), &mut fs, |rp| {
+            counts.push((rp.rp_id.to_string(), rp.count));
+        });
+        counts.sort();
+        assert_eq!(
+            counts,
+            std::vec![("github.com".to_string(), 1), ("google.com".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn delete_last_cred_removes_rp() {
+        let (mut fs, seed) = provisioned();
+        add(&mut fs, &seed, 1, "solo.example", b"u", "n", "N", 0);
+        add(&mut fs, &seed, 2, "keep.example", b"u", "n", "N", 0);
+
+        let solo = fids_under(&mut fs, "solo.example");
+        assert_eq!(solo.len(), 1);
+        assert!(delete_cred(&mut fs, solo[0]));
+
+        // The RP record is gone with its last credential, so the walk no longer
+        // surfaces it — only the untouched RP remains.
+        let mut seen = std::vec::Vec::new();
+        let total = for_each_rp(&dev(), &mut fs, |rp| seen.push(rp.rp_id.to_string()));
+        assert_eq!(total, 1);
+        assert_eq!(seen, std::vec!["keep.example".to_string()]);
+    }
+
+    #[test]
+    fn delete_bad_fid_is_noop() {
+        let (mut fs, seed) = provisioned();
+        add(&mut fs, &seed, 1, "github.com", b"u", "n", "N", 0);
+        // Out of range below / at the EF_RP boundary, and an in-range but empty slot.
+        assert!(!delete_cred(&mut fs, EF_CRED - 1));
+        assert!(!delete_cred(&mut fs, EF_CRED + MAX_RESIDENT_CREDENTIALS));
+        assert!(!delete_cred(&mut fs, EF_CRED + 200));
+        // The real credential is still there — nothing was removed.
+        assert_eq!(fids_under(&mut fs, "github.com").len(), 1);
     }
 }

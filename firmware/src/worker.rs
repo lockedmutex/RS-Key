@@ -78,6 +78,16 @@ static DONE: Signal<Cs, ()> = Signal::new();
 /// ordering (the client waits for the INIT reply) makes Relaxed sufficient.
 static MSG_DESELECT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Whether a transport request is queued for the worker but not yet picked up. The
+/// trusted-display browse modals (Passkeys / Settings) poll this: while one is open
+/// the worker is parked on the single thread executor, so a host command would wait
+/// behind it — yielding back to idle the instant one arrives lets the worker run,
+/// which is a precise alternative to capping the wait with a blind inactivity timeout.
+#[cfg(feature = "display")]
+pub(crate) fn host_request_pending() -> bool {
+    REQ.signaled()
+}
+
 /// Hand `data` to the worker as `kind`, await its response, copy it into `out`,
 /// return the length. The caller (a transport on the high-priority executor) wraps
 /// the `DONE.wait()` in a keepalive `select`, so keepalives keep flowing while the

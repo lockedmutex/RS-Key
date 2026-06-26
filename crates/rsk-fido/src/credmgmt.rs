@@ -15,7 +15,7 @@ use minicbor::{Decoder, Encoder};
 use zeroize::Zeroize;
 
 use rsk_crypto::pinproto::PinProto;
-use rsk_fs::Storage;
+use rsk_fs::{Fs, Storage};
 
 use crate::cbordec::{cbor, def_arr, def_map};
 use crate::consts::{
@@ -523,35 +523,38 @@ fn delete_credential<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, cred_id: &[u8]) ->
             ctx.fs
                 .delete(EF_CRED + i)
                 .map_err(|_| CtapError::NotAllowed)?;
-            decrement_rp(ctx, &rp_id_hash)?;
+            decrement_rp(ctx.fs, &rp_id_hash)?;
             return Ok(0);
         }
     }
     Err(CtapError::NoCredentials)
 }
 
-fn decrement_rp<S: Storage, R: Rng>(
-    ctx: &mut Ctx<S, R>,
+/// Decrement the `EF_RP` count for `rp_id_hash`, deleting the record when it hits
+/// zero. Shared by the CTAP `deleteCredential` (0x06) and the trusted-display
+/// [`crate::passkeys::delete_cred`] so both keep the RP index consistent the same
+/// way. Touches only the flash store, never the session state.
+pub(crate) fn decrement_rp<S: Storage>(
+    fs: &mut Fs<S>,
     rp_id_hash: &[u8; 32],
 ) -> Result<(), CtapError> {
     let mut rp = [0u8; 256];
     let mut occupied = [false; MAX_RESIDENT_CREDENTIALS as usize];
-    slot_map(ctx.fs, EF_RP, &mut occupied);
+    slot_map(fs, EF_RP, &mut occupied);
     for j in 0..MAX_RESIDENT_CREDENTIALS {
         if !occupied[j as usize] {
             continue;
         }
-        let Some(m) = ctx.fs.read(EF_RP + j, &mut rp) else {
+        let Some(m) = fs.read(EF_RP + j, &mut rp) else {
             continue;
         };
         let m = m.min(rp.len());
         if m >= RP_PREFIX && rp[1..RP_PREFIX] == *rp_id_hash {
             rp[0] = rp[0].saturating_sub(1);
             if rp[0] == 0 {
-                let _ = ctx.fs.delete(EF_RP + j);
+                let _ = fs.delete(EF_RP + j);
             } else {
-                ctx.fs
-                    .put(EF_RP + j, &rp[..m])
+                fs.put(EF_RP + j, &rp[..m])
                     .map_err(|_| CtapError::NotAllowed)?;
             }
             break;

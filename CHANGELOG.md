@@ -156,6 +156,35 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   tab now goes straight there instead of dropping back to Home first — and each tab
   repaints the moment it is tapped rather than after the finger lifts, so switching
   feels immediate. bcdDevice 0x078F → 0x0791.
+- **Trusted-display variant — on-device passkey deletion (experimental, opt-in).**
+  The Passkeys tab moves from read-only to its first **write** action: tapping an
+  account on a relying party's detail opens a trusted Confirm-Delete screen naming
+  exactly what will be removed, and — if a clientPIN is set — asks for it on the
+  on-screen pad (the same built-in-UV input, verified **locally** against the same
+  `EF_PIN` and retry counter the host PIN path uses, so it never crosses the host and
+  shares the anti-bruteforce budget), then requires a deliberate **hold** on the
+  delete button before the credential is removed. A brush, a slid-off finger, the back
+  chevron, or the inactivity timeout all abandon it without a write. The delete mirrors
+  CTAP `deleteCredential` (0x06) on flash — the `EF_CRED` record is removed and its
+  `EF_RP` count decremented (the RP row disappears with its last credential) — keyed by
+  slot rather than the host's resident id, with `decrement_rp` now shared between the
+  two paths. No CTAP / wire change. bcdDevice 0x0793 → 0x0794.
+- **Trusted-display variant — on-device tabs no longer time out mid-browse.** The
+  Passkeys / Settings tabs (and the Confirm-Delete screen) used a short 15 s inactivity
+  auto-close that dropped you back to the Home screen even when you were just reading.
+  That timeout existed only so a walked-away open tab couldn't park the worker and make
+  a host command wait behind it — so the guard is now **precise**: the browse loops poll
+  whether a host request is actually queued and yield to the worker the instant one
+  arrives. With host-starvation handled exactly, the blind timeout is relaxed to 60 s —
+  comfortable for reading a passkey list — while still returning to the idle "Ready"
+  screen when the device is genuinely left unattended (so the credential list isn't left
+  on screen indefinitely). Closing a tab is also snappier: returning to Home (e.g.
+  Settings → Close, or the Home nav button from Passkeys) used to wait out a ~400 ms
+  ambient-repaint hold — a window meant only for the PIN-pad → confirm hand-off — before
+  the Home screen came back; the dispatcher now repaints Home the moment the tab returns,
+  so the transition is immediate. The panel SPI clock is also raised from 40 MHz to the
+  ST7789's 62.5 MHz maximum, cutting each full-frame repaint by ~35%. bcdDevice 0x0794 →
+  0x0797.
 - **Configurable GPIO presence button (`PRESENCE_PIN`).** The user-presence input can
   be remapped from BOOTSEL to a dedicated GPIO at compile time: `PRESENCE_PIN=<0..=29>`
   selects an active-low button with an internal pull-up (e.g. a touch sensor to ground),
