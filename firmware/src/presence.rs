@@ -3,7 +3,8 @@
 
 //! Physical user presence over either the BOOTSEL button (default) or a dedicated
 //! GPIO button (`PRESENCE_PIN`). BOOTSEL samples use the QSPI-CS-to-Hi-Z trick in a
-//! RAM function; a GPIO button is polled active-low with an internal pull-up. The
+//! RAM function; a GPIO button is polled active-low with an internal pull-up by
+//! default, or active-high with a pull-down when `PRESENCE_ACTIVE_HIGH` is set. The
 //! wait blocks the worker while the high-priority transports stream keepalives
 //! reporting `UPNEEDED` ([`up_pending`]). One [`ButtonPresence`] serves every
 //! applet's `UserPresence` trait; a touch is required by default, and the opt-in
@@ -91,12 +92,13 @@ pub struct ButtonPresence {
     button: Button,
 }
 
-/// The presence source: the BOOTSEL hardware button, or an active-low GPIO button.
+/// The presence source: the BOOTSEL hardware button, or a GPIO button (the bool is
+/// `active_high` — `true` reads a press as logic high, `false` as logic low).
 #[cfg(not(feature = "display"))]
 #[cfg_attr(feature = "no-touch", allow(dead_code))]
 enum Button {
     Bootsel(Peri<'static, BOOTSEL>),
-    Gpio(Input<'static>),
+    Gpio(Input<'static>, bool),
 }
 
 /// The presence backend the [`crate::worker::Worker`] owns, selected at build
@@ -119,21 +121,24 @@ impl ButtonPresence {
         }
     }
 
-    /// Build a GPIO-backed presence source on `pin` (active-low, pull-up).
+    /// Build a GPIO-backed presence source on `pin`. `active_high` picks the polarity:
+    /// `false` = active-low (button to ground, internal pull-up, a press reads low);
+    /// `true` = active-high (pull-down, a press reads high — e.g. a touch sensor).
     ///
     /// # Panics
     ///
     /// Panics if `pin` is out of the RP2350A range `0..=29`.
-    pub fn new_gpio(pin: u8) -> Self {
+    pub fn new_gpio(pin: u8, active_high: bool) -> Self {
         assert!(
             pin <= 29,
             "PRESENCE_PIN={pin} out of range 0..=29 (RP2350A GPIOs)"
         );
         // Safety: `main` guarantees this pin is not handed to another driver.
         let any = unsafe { AnyPin::steal(pin) };
-        let input = Input::new(any, Pull::Up);
+        let pull = if active_high { Pull::Down } else { Pull::Up };
+        let input = Input::new(any, pull);
         Self {
-            button: Button::Gpio(input),
+            button: Button::Gpio(input, active_high),
         }
     }
 
@@ -141,7 +146,13 @@ impl ButtonPresence {
     fn pressed(&mut self) -> bool {
         match &mut self.button {
             Button::Bootsel(bootsel) => is_bootsel_pressed(bootsel.reborrow()),
-            Button::Gpio(button) => button.is_low(),
+            Button::Gpio(button, active_high) => {
+                if *active_high {
+                    button.is_high()
+                } else {
+                    button.is_low()
+                }
+            }
         }
     }
 

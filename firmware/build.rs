@@ -77,6 +77,15 @@ fn main() {
     println!("cargo:rustc-env=PK_PRESENCE_PIN={presence_pin}");
     println!("cargo:rerun-if-env-changed=PRESENCE_PIN");
 
+    // GPIO presence polarity: default active-low (button to ground, internal pull-up).
+    // `PRESENCE_ACTIVE_HIGH=1` flips it to active-high (pull-down, pressed = high) for
+    // a touch sensor / button to VCC. Only meaningful with a GPIO `PRESENCE_PIN`.
+    println!(
+        "cargo:rustc-env=PK_PRESENCE_ACTIVE_HIGH={}",
+        if resolve_presence_active_high() { 1 } else { 0 }
+    );
+    println!("cargo:rerun-if-env-changed=PRESENCE_ACTIVE_HIGH");
+
     // LED backend (default `ws2812`, the Waveshare RP2350-One). Selected at
     // compile time so only the chosen driver — and its dependencies (PIO, PWM) —
     // is built. `gpio` = a plain on/off indicator, `pimoroni` = a 3-pin PWM RGB
@@ -217,6 +226,17 @@ fn resolve_presence_pin() -> (bool, u8) {
         "PRESENCE_PIN={pin} out of range 0..=29 (RP2350A GPIOs)"
     );
     (true, pin)
+}
+
+/// Resolve `PRESENCE_ACTIVE_HIGH` to a bool — default `false` (active-low). Accepts
+/// `1`/`true`/`yes`/`on` for true and `0`/`false`/`no`/`off`/empty for false.
+fn resolve_presence_active_high() -> bool {
+    let raw = env::var("PRESENCE_ACTIVE_HIGH").unwrap_or_default();
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "false" | "no" | "off" => false,
+        "1" | "true" | "yes" | "on" => true,
+        other => panic!("PRESENCE_ACTIVE_HIGH={other:?} must be a boolean (0/1, true/false)"),
+    }
 }
 
 /// Resolve `LED_KIND` (the LED driver backend) to a known value; defaults to

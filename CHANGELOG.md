@@ -161,10 +161,13 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   selects an active-low button with an internal pull-up (e.g. a touch sensor to ground),
   while the default (`bootsel`) keeps the BOOTSEL path byte-for-byte. The chosen pin is
   guarded — it must not collide with the active LED pin (boot panic) and is rejected on
-  a `display` build (where the touchscreen is the presence source). One new `unsafe`
-  (`AnyPin::steal` for the runtime-selected pin) documented in `docs/unsafe.md`. Thanks
-  to @lpiob for the contribution ([#17](https://github.com/TheMaxMur/RS-Key/pull/17)).
-  bcdDevice 0x0791 → 0x0792.
+  a `display` build (where the touchscreen is the presence source). The button's
+  polarity is configurable: active-low by default (button to ground, internal pull-up),
+  or active-high with `PRESENCE_ACTIVE_HIGH=1` (internal pull-down) for a capacitive
+  touch sensor or a button to VCC. One new `unsafe` (`AnyPin::steal` for the
+  runtime-selected pin) documented in `docs/unsafe.md`. Thanks to @lpiob for the
+  original contribution ([#17](https://github.com/TheMaxMur/RS-Key/pull/17)).
+  bcdDevice 0x0791 → 0x0793.
 
 ### Changed
 

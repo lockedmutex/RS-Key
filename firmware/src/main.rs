@@ -133,6 +133,16 @@ const BUILD_LED_PIN: u8 = env_u16(env!("PK_LED_PIN")) as u8;
 const BUILD_PRESENCE_IS_GPIO: bool = env_u16(env!("PK_PRESENCE_IS_GPIO")) != 0;
 #[cfg(not(feature = "display"))]
 const BUILD_PRESENCE_PIN: u8 = env_u16(env!("PK_PRESENCE_PIN")) as u8;
+#[cfg(not(feature = "display"))]
+const BUILD_PRESENCE_ACTIVE_HIGH: bool = env_u16(env!("PK_PRESENCE_ACTIVE_HIGH")) != 0;
+
+// Active-high polarity only applies to a GPIO presence button (BOOTSEL has a fixed
+// sense); flag a stray `PRESENCE_ACTIVE_HIGH` set without a GPIO `PRESENCE_PIN`.
+#[cfg(not(feature = "display"))]
+const _: () = assert!(
+    !BUILD_PRESENCE_ACTIVE_HIGH || BUILD_PRESENCE_IS_GPIO,
+    "PRESENCE_ACTIVE_HIGH only applies with a GPIO PRESENCE_PIN"
+);
 
 // A `display` build takes user presence from the touchscreen, not a GPIO button, so a
 // `PRESENCE_PIN` would be silently ignored — fail the build loudly instead (mirrors
@@ -350,7 +360,7 @@ async fn main(spawner: Spawner) {
     config.max_power = 100;
     config.max_packet_size_0 = 64;
     // bcdDevice build counter; also surfaced on the trusted-display Info page.
-    let device_release: u16 = 0x0792;
+    let device_release: u16 = 0x0793;
     config.device_release = device_release;
 
     let mut builder = Builder::new(
@@ -642,7 +652,7 @@ async fn main(spawner: Spawner) {
     #[cfg(not(feature = "display"))]
     let presence_ref = {
         let presence = if BUILD_PRESENCE_IS_GPIO {
-            ButtonPresence::new_gpio(BUILD_PRESENCE_PIN)
+            ButtonPresence::new_gpio(BUILD_PRESENCE_PIN, BUILD_PRESENCE_ACTIVE_HIGH)
         } else {
             ButtonPresence::new_bootsel(p.BOOTSEL)
         };
