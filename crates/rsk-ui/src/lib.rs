@@ -24,7 +24,8 @@ pub mod touch;
 pub use glyph::Glyph;
 pub use render::{
     render, render_confirm_delete, render_confirm_factory_reset, render_erasing,
-    render_hold_button, render_hold_fill, render_passkeys_list, render_pin_dots, render_service,
+    render_hold_button, render_hold_fill, render_passkeys_list, render_pin_blocked,
+    render_pin_dots, render_service,
 };
 
 /// Panel geometry (Waveshare RP2350-Touch-LCD-2.8, ST7789T3, portrait).
@@ -230,17 +231,58 @@ pub enum PinKey {
     Cancel,
 }
 
-/// What the PIN screen shows: how many digits have been entered, rendered as masked
-/// dots — never the digits themselves, which the firmware keeps and never paints.
+/// A feedback line shown under the pad after a rejected entry, so a wrong PIN is not a
+/// silent re-prompt. Distinct from the header `title`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PinCaption {
+    /// The entered PIN was wrong; `retries_left` attempts remain before the hard lock.
+    WrongPin { retries_left: u8 },
+    /// The two new-PIN entries didn't match (the set/change confirm step).
+    Mismatch,
+}
+
+/// What the PIN screen shows: how many digits have been entered (rendered as masked
+/// dots — never the digits themselves, which the firmware keeps and never paints), a
+/// short header naming the step ("Enter PIN", "New PIN", "Confirm PIN", …) so the same
+/// pad serves built-in UV, the unlock/delete gates, and the on-device set/change flow,
+/// and an optional [`PinCaption`] feedback line for a rejected entry.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PinPad {
     /// Count of digits entered so far (shown masked).
     pub entered: usize,
+    /// The header caption — a trusted, firmware-supplied `&'static str`, never RP data.
+    pub title: &'static str,
+    /// Feedback under the pad after a rejected entry; `None` on a fresh prompt.
+    pub caption: Option<PinCaption>,
 }
 
 impl PinPad {
+    /// The default pad header ("Enter PIN") — built-in UV and the local verify gates.
     pub const fn new(entered: usize) -> Self {
-        Self { entered }
+        Self::with_title(entered, "Enter PIN")
+    }
+
+    /// A pad with a custom header (the set/change flow's "New PIN" / "Confirm PIN" /
+    /// "Current PIN" steps). `title` must be a trusted constant, not untrusted RP text.
+    pub const fn with_title(entered: usize, title: &'static str) -> Self {
+        Self {
+            entered,
+            title,
+            caption: None,
+        }
+    }
+
+    /// A pad with a header and a feedback caption (a wrong-PIN re-prompt).
+    pub const fn with_caption(
+        entered: usize,
+        title: &'static str,
+        caption: Option<PinCaption>,
+    ) -> Self {
+        Self {
+            entered,
+            title,
+            caption,
+        }
     }
 }
 
@@ -321,7 +363,7 @@ pub fn hit_pin(p: Point) -> Option<PinKey> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SettingsPage {
     /// The top-level list: Brightness / Touch timeout / Display sleep / Info / Lock now /
-    /// Factory reset (the title-bar back chevron exits — there is no "Close" row).
+    /// Security (the title-bar back chevron exits — there is no "Close" row).
     Root,
     /// Backlight-level adjust (−/+/Back).
     Brightness,
@@ -332,6 +374,9 @@ pub enum SettingsPage {
     Sleep,
     /// Read-only device info (Back only).
     Info,
+    /// The Security sub-page: Set / Change PIN and the (danger) Factory reset. Reached
+    /// from the Root "Security" row; the title-bar back chevron returns to Root.
+    Security,
 }
 
 /// Discrete backlight steps the brightness page cycles through (1 = dimmest kept on,
@@ -360,6 +405,9 @@ pub struct SettingsView {
     pub version: u16,
     /// RP2350 chip serial, shown in hex on the Info page.
     pub chipid: u64,
+    /// Whether a device PIN is set — the Security page shows "Change PIN" if so, else
+    /// "Set PIN".
+    pub pin_set: bool,
 }
 
 /// An entry on the settings Root list.
@@ -373,8 +421,19 @@ pub enum RootEntry {
     /// Lock the on-device UI now — show the [`Screen::Locked`] screen so the passkeys
     /// browser and settings need the device PIN to reopen (no-op if no PIN is set).
     LockNow,
-    /// Erase every applet's data and return to a fresh device (danger-styled,
-    /// gated by a hold-to-confirm and the device PIN if one is set).
+    /// Drill into the Security sub-page ([`SettingsPage::Security`]) — Set / Change PIN
+    /// and Factory reset.
+    Security,
+}
+
+/// An entry on the Security sub-page list.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SecurityEntry {
+    /// Set the device PIN (when none is set) or change it (verifying the current PIN
+    /// first) — the on-device create/confirm-PIN flow.
+    ChangePin,
+    /// Erase every applet's data and return to a fresh device (danger-styled, gated by a
+    /// hold-to-confirm and the device PIN if one is set).
     FactoryReset,
 }
 
@@ -388,7 +447,7 @@ pub enum AdjustKey {
 }
 
 /// Root list: six full-width rows (Brightness / Touch timeout / Display sleep / Info /
-/// Lock now / Factory reset) — the title-bar back chevron exits the menu, so there is no
+/// Lock now / Security) — the title-bar back chevron exits the menu, so there is no
 /// "Close" row. Sized so all six fit below the chrome and above the panel bottom (a
 /// const-assert validates it) at a touch-comfortable row height.
 const ROW_X: u16 = 16;
@@ -413,8 +472,35 @@ pub const fn settings_row_entry(i: u16) -> RootEntry {
         2 => RootEntry::Sleep,
         3 => RootEntry::Info,
         4 => RootEntry::LockNow,
-        _ => RootEntry::FactoryReset,
+        _ => RootEntry::Security,
     }
+}
+
+/// Number of Security sub-page rows (Change/Set PIN, Factory reset). They reuse the
+/// first [`settings_row_rect`] slots, so they inherit the Root list's proven-disjoint
+/// geometry (a const-assert keeps them within the Root row count).
+pub const SECURITY_ROWS: u16 = 2;
+const _: () = assert!(SECURITY_ROWS <= SETTINGS_ROWS);
+
+/// The Security entry on row `i`, in list order.
+pub const fn security_row_entry(i: u16) -> SecurityEntry {
+    match i {
+        0 => SecurityEntry::ChangePin,
+        _ => SecurityEntry::FactoryReset,
+    }
+}
+
+/// Which Security entry, if any, a tap at `p` selects. Reuses [`settings_row_rect`] for
+/// the first [`SECURITY_ROWS`] rows (disjoint by construction).
+pub fn hit_security(p: Point) -> Option<SecurityEntry> {
+    let mut i = 0;
+    while i < SECURITY_ROWS {
+        if settings_row_rect(i).contains(p) {
+            return Some(security_row_entry(i));
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Adjust-page controls: a big −/+ pair and a full-width Back below them.
@@ -1016,7 +1102,7 @@ mod tests {
             RootEntry::Sleep,
             RootEntry::Info,
             RootEntry::LockNow,
-            RootEntry::FactoryReset,
+            RootEntry::Security,
         ];
         for (i, &e) in want.iter().enumerate() {
             let r = settings_row_rect(i as u16);
@@ -1032,6 +1118,23 @@ mod tests {
         );
         // Above the list (header area) selects nothing.
         assert_eq!(hit_settings_root(Point::new(PANEL_W / 2, 10)), None);
+    }
+
+    #[test]
+    fn security_rows_map_in_order() {
+        let want = [SecurityEntry::ChangePin, SecurityEntry::FactoryReset];
+        for (i, &e) in want.iter().enumerate() {
+            let r = settings_row_rect(i as u16);
+            let c = Point::new(r.x + r.w / 2, r.y + r.h / 2);
+            assert_eq!(hit_security(c), Some(e));
+            assert_eq!(security_row_entry(i as u16), e);
+        }
+        // A tap past the Security rows (a later Root slot) selects no Security entry.
+        let beyond = settings_row_rect(SECURITY_ROWS);
+        assert_eq!(
+            hit_security(Point::new(beyond.x + beyond.w / 2, beyond.y + beyond.h / 2)),
+            None
+        );
     }
 
     #[test]

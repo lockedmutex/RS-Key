@@ -31,6 +31,11 @@ use crate::{Ctx, PinEntry, Rng};
 
 const PIN_FILE_LEN: usize = 35; // retries(1) + len(1) + format(1) + verifier(32)
 const PADDED_PIN_LEN: usize = 64;
+/// The longest PIN the host clientPIN path can represent: CTAP pads the PIN into a
+/// 64-byte buffer that must keep a trailing zero, so 63 bytes is the ceiling (the host
+/// rejects a 64th non-zero byte). The device-local set enforces the same cap so a PIN
+/// chosen on the panel always stays verifiable over USB too.
+pub const MAX_PIN_LENGTH: usize = PADDED_PIN_LEN - 1;
 
 #[derive(Default)]
 struct Req<'a> {
@@ -259,7 +264,7 @@ fn change_pin<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [u8]
     res?;
     // The new PIN met minPINLength (store_new_pin), so the change satisfies a
     // pending forced-PIN-change policy.
-    clear_force_change(ctx)?;
+    clear_force_change(ctx.fs)?;
     ctx.state.reset_pin_uv_auth_token(ctx.rng);
     ctx.state.reset_persistent_token(ctx.rng);
     ctx.state.needs_power_cycle = false;
@@ -403,7 +408,7 @@ fn get_uv_token<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [u
     // The interactive step: collect the PIN on the device and verify it locally. A
     // short entry (below minPINLength) is refused by the pad without a verify, so it
     // can't burn a retry; an actual mismatch does, exactly like a host PIN.
-    let min = min_pin_length(ctx) as usize;
+    let min = min_pin_length(ctx.fs) as usize;
     let mut pin = [0u8; PADDED_PIN_LEN];
     let entry = ctx.presence.collect_pin(min, &mut pin);
     let verified = perform_builtin_uv(ctx, entry, &pin);
@@ -591,8 +596,28 @@ fn verify_pin_hash<S: Storage, R: Rng>(
     Ok(())
 }
 
-/// Validate the padded new PIN and store the EF_PIN verifier. The seed is not
-/// touched — it stays kbase-only so UP-only operations keep working.
+/// Hash the PIN, derive its device-sealed verifier, and persist it to `EF_PIN` with a
+/// fresh retry budget — the storage core shared by the host set/change path
+/// ([`store_new_pin`]) and the device-local set ([`store_local_pin`]). It enforces no
+/// policy and touches no CTAP session state; the callers do. The seed is not touched —
+/// it stays kbase-only so UP-only operations keep working.
+fn write_pin_verifier<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    pin: &[u8],
+) -> Result<(), CtapError> {
+    let mut dhash = sha256(pin);
+    let mut pin_data = [0u8; PIN_FILE_LEN];
+    pin_data[0] = MAX_PIN_RETRIES;
+    pin_data[1] = pin.len() as u8;
+    pin_data[2] = 1; // verifier format 1
+    pin_data[3..].copy_from_slice(&dev.pin_derive_verifier(&dhash[..16]));
+    dhash.zeroize();
+    fs.put(EF_PIN, &pin_data).map_err(|_| CtapError::Other)
+}
+
+/// Validate the padded new PIN and store the EF_PIN verifier (the host setPIN/changePIN
+/// path).
 fn store_new_pin<S: Storage, R: Rng>(
     ctx: &mut Ctx<S, R>,
     padded: &[u8; 64],
@@ -604,27 +629,21 @@ fn store_new_pin<S: Storage, R: Rng>(
         .iter()
         .position(|&b| b == 0)
         .unwrap_or(PADDED_PIN_LEN);
-    let min_pin = min_pin_length(ctx);
+    let min_pin = min_pin_length(ctx.fs);
     if (pin_len as u8) < min_pin {
         return Err(CtapError::PinPolicyViolation);
     }
-    let mut dhash = sha256(&padded[..pin_len]);
-    let mut pin_data = [0u8; PIN_FILE_LEN];
-    pin_data[0] = MAX_PIN_RETRIES;
-    pin_data[1] = pin_len as u8;
-    pin_data[2] = 1; // verifier format 1
-    pin_data[3..].copy_from_slice(&ctx.dev.pin_derive_verifier(&dhash[..16]));
-    dhash.zeroize();
-    ctx.fs
-        .put(EF_PIN, &pin_data)
-        .map_err(|_| CtapError::Other)?;
+    write_pin_verifier(&ctx.dev, ctx.fs, &padded[..pin_len])?;
     ctx.state.needs_power_cycle = false;
     Ok(())
 }
 
-fn min_pin_length<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>) -> u8 {
+/// The configured minimum PIN length (`EF_MINPINLEN[0]`), or the CTAP default when no
+/// policy is set. Takes `Fs` directly (not a `Ctx`) so the trusted-display set-PIN flow
+/// can read the floor it must enforce without a `Ctx` it does not hold.
+pub fn min_pin_length<S: Storage>(fs: &mut Fs<S>) -> u8 {
     let mut buf = [0u8; 2];
-    match ctx.fs.read(EF_MINPINLEN, &mut buf) {
+    match fs.read(EF_MINPINLEN, &mut buf) {
         Some(n) if n >= 1 => buf[0],
         _ => MIN_PIN_LENGTH,
     }
@@ -638,15 +657,14 @@ fn force_change_pending<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>) -> bool {
 
 /// A successful changePIN satisfies the policy: drop the flag, keep the
 /// minimum and the RP-id hash list (EF_MINPINLEN = [min, force, hashes…]).
-fn clear_force_change<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>) -> Result<(), CtapError> {
+fn clear_force_change<S: Storage>(fs: &mut Fs<S>) -> Result<(), CtapError> {
     let mut buf = [0u8; 2 + 32 * 8]; // matches config's MAX_MIN_PIN_RPIDS cap
-    if let Some(n) = ctx.fs.read(EF_MINPINLEN, &mut buf)
+    if let Some(n) = fs.read(EF_MINPINLEN, &mut buf)
         && n >= 2
         && buf[1] != 0
     {
         buf[1] = 0;
-        ctx.fs
-            .put(EF_MINPINLEN, &buf[..n])
+        fs.put(EF_MINPINLEN, &buf[..n])
             .map_err(|_| CtapError::Other)?;
     }
     Ok(())
@@ -665,6 +683,18 @@ pub enum LocalPin {
     /// No PIN set, the retry budget is spent, or a flash glitch was caught on
     /// read-back — the gated action must not proceed.
     Blocked,
+}
+
+/// Why a device-local PIN set/change ([`store_local_pin`]) was refused.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SetPinError {
+    /// The new PIN is shorter than the configured `minPINLength`; `min` is that floor.
+    TooShort { min: u8 },
+    /// The new PIN is longer than [`MAX_PIN_LENGTH`] — the host clientPIN path could not
+    /// represent it, so it is refused here too; `max` is that ceiling.
+    TooLong { max: u8 },
+    /// The `EF_PIN` write failed (flash error) — no PIN was stored.
+    Storage,
 }
 
 /// Whether a clientPIN is set. The trusted display gates a destructive local
@@ -740,6 +770,39 @@ pub fn verify_local_pin<S: Storage>(dev: &Device, fs: &mut Fs<S>, pin: &[u8]) ->
         return LocalPin::Blocked;
     }
     LocalPin::Ok
+}
+
+/// Set or replace the device PIN from the trusted display (the on-device Set / Change
+/// PIN flow). Writes the same `EF_PIN` verifier the host setPIN/changePIN path stores —
+/// device-sealed, format 1, with a fresh retry budget — so the host afterwards sees a
+/// clientPIN exactly as if it had been set over USB. It enforces both `minPINLength` and
+/// the host-representable [`MAX_PIN_LENGTH`] ceiling (so a panel-set PIN stays usable over
+/// USB) but, mirroring [`verify_local_pin`], deliberately omits the CTAP-session
+/// side effects (token regeneration, the journal) that need a `Ctx` the display task
+/// does not hold and are meaningless with no host session. The CALLER verifies the
+/// *current* PIN first when one is set (so a change still proves knowledge of the old
+/// PIN) and zeroizes `pin`. A pending forced-PIN-change flag is cleared best-effort
+/// since a satisfied new PIN meets the policy.
+pub fn store_local_pin<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    pin: &[u8],
+) -> Result<(), SetPinError> {
+    let min = min_pin_length(fs);
+    if (pin.len() as u8) < min {
+        return Err(SetPinError::TooShort { min });
+    }
+    if pin.len() > MAX_PIN_LENGTH {
+        return Err(SetPinError::TooLong {
+            max: MAX_PIN_LENGTH as u8,
+        });
+    }
+    write_pin_verifier(dev, fs, pin).map_err(|_| SetPinError::Storage)?;
+    // The new PIN meets the policy, so drop any pending forced-change marker. The PIN is
+    // already stored, so a flash hiccup here is benign (a stale flag only re-prompts a
+    // change on the host) — don't fail the set over it.
+    let _ = clear_force_change(fs);
+    Ok(())
 }
 
 fn encode<F>(out: &mut [u8], f: F) -> Result<usize, CtapError>
@@ -1206,6 +1269,96 @@ mod tests {
         assert!(matches!(
             verify_local_pin(&dev(), &mut bare, b"1234"),
             LocalPin::Blocked
+        ));
+    }
+
+    /// Device-local set (the on-device Set/Change PIN flow) must write the *same*
+    /// EF_PIN verifier the host setPIN path stores for the same PIN + device — so a PIN
+    /// chosen on the screen is honored over USB exactly as if it had been set there.
+    #[test]
+    fn store_local_pin_matches_the_host_verifier() {
+        let (mut host_fs, _r, _s, _p) = setup_with_pin(b"246810");
+        let mut host_pf = [0u8; PIN_FILE_LEN];
+        assert_eq!(host_fs.read(EF_PIN, &mut host_pf), Some(PIN_FILE_LEN));
+
+        let (mut fs, _rng) = setup();
+        store_local_pin(&dev(), &mut fs, b"246810").unwrap();
+        let mut local_pf = [0u8; PIN_FILE_LEN];
+        assert_eq!(fs.read(EF_PIN, &mut local_pf), Some(PIN_FILE_LEN));
+
+        assert_eq!(host_pf, local_pf, "local set must match the host verifier");
+        assert!(matches!(
+            verify_local_pin(&dev(), &mut fs, b"246810"),
+            LocalPin::Ok
+        ));
+    }
+
+    /// The set flow enforces `minPINLength`: the CTAP-default floor of 4, then a stricter
+    /// policy floor — and a refused set stores nothing.
+    #[test]
+    fn store_local_pin_enforces_min_length() {
+        let (mut fs, _rng) = setup();
+        match store_local_pin(&dev(), &mut fs, b"12") {
+            Err(SetPinError::TooShort { min }) => assert_eq!(min, MIN_PIN_LENGTH),
+            _ => panic!("expected TooShort at the default floor"),
+        }
+        assert!(!pin_is_set(&mut fs));
+        // A policy floor of 6 refuses a 4-digit PIN…
+        fs.put(EF_MINPINLEN, &[6, 0]).unwrap();
+        match store_local_pin(&dev(), &mut fs, b"1234") {
+            Err(SetPinError::TooShort { min }) => assert_eq!(min, 6),
+            _ => panic!("expected TooShort at the policy floor"),
+        }
+        assert!(!pin_is_set(&mut fs));
+        // …but accepts one that meets it.
+        store_local_pin(&dev(), &mut fs, b"123456").unwrap();
+        assert!(pin_is_set(&mut fs));
+        assert!(matches!(
+            verify_local_pin(&dev(), &mut fs, b"123456"),
+            LocalPin::Ok
+        ));
+    }
+
+    /// The set flow caps the new PIN at the host-representable maximum, so a panel-set PIN
+    /// can never be one the host clientPIN path is unable to verify (a lockout footgun).
+    #[test]
+    fn store_local_pin_enforces_max_length() {
+        // The 63-byte ceiling is accepted and verifies…
+        let (mut fs, _rng) = setup();
+        let at_max = [b'1'; MAX_PIN_LENGTH];
+        store_local_pin(&dev(), &mut fs, &at_max).unwrap();
+        assert!(matches!(
+            verify_local_pin(&dev(), &mut fs, &at_max),
+            LocalPin::Ok
+        ));
+        // …one byte over is refused and stores nothing.
+        let (mut fs2, _rng2) = setup();
+        match store_local_pin(&dev(), &mut fs2, &[b'1'; MAX_PIN_LENGTH + 1]) {
+            Err(SetPinError::TooLong { max }) => assert_eq!(max as usize, MAX_PIN_LENGTH),
+            other => panic!("expected TooLong, got {other:?}"),
+        }
+        assert!(!pin_is_set(&mut fs2));
+    }
+
+    /// A device-local change installs the new PIN with a fresh retry budget and rotates
+    /// it: the old PIN stops verifying, the new one verifies.
+    #[test]
+    fn store_local_pin_change_resets_budget_and_rotates() {
+        let (mut fs, _rng, _state, _plat) = setup_with_pin(b"1234");
+        assert!(matches!(
+            verify_local_pin(&dev(), &mut fs, b"9999"),
+            LocalPin::Wrong { .. }
+        ));
+        assert_eq!(ef_pin_retries(&mut fs), MAX_PIN_RETRIES - 1);
+        store_local_pin(&dev(), &mut fs, b"4711").unwrap();
+        assert_eq!(ef_pin_retries(&mut fs), MAX_PIN_RETRIES);
+        assert!(matches!(
+            verify_local_pin(&dev(), &mut fs, b"1234"),
+            LocalPin::Wrong { .. }
+        ));
+        assert!(matches!(
+            verify_local_pin(&dev(), &mut fs, b"4711"),
+            LocalPin::Ok
         ));
     }
 

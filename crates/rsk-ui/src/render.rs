@@ -25,10 +25,10 @@ use embedded_graphics::{
 use crate::{
     ADJ_MINUS_RECT, ADJ_PLUS_RECT, ALLOW_RECT, AccountRow, BACK_RECT, BRIGHTNESS_LEVELS,
     ConfirmPrompt, DEL_HOLD_RECT, DENY_RECT, Glyph, HomeView, Label, NAV_H, NAV_TABS, NAV_TOP,
-    NavTab, PANEL_W, PIN_CANCEL_RECT, PIN_COLS, PIN_ROWS, PK_LIST_TOP, PinKey, PinPad, Point, Rect,
-    RpRow, STATUS_BAR_H, Screen, SettingsPage, SettingsView, StatusKind, TITLE_BACK_RECT,
-    TITLE_BAR_H, font, font::Role, glyph, hex_u16, hex_u64, nav_tab_rect, pin_grid_key,
-    pin_key_rect, settings_row_rect, theme,
+    NavTab, PANEL_H, PANEL_W, PIN_CANCEL_RECT, PIN_COLS, PIN_ROWS, PK_LIST_TOP, PinCaption, PinKey,
+    PinPad, Point, Rect, RpRow, STATUS_BAR_H, Screen, SettingsPage, SettingsView, StatusKind,
+    TITLE_BACK_RECT, TITLE_BAR_H, font, font::Role, glyph, hex_u16, hex_u64, nav_tab_rect,
+    pin_grid_key, pin_key_rect, settings_row_rect, theme,
 };
 
 // Local semantic aliases, all sourced from `theme` so the whole renderer speaks one
@@ -406,6 +406,53 @@ where
     Ok(())
 }
 
+/// The "PIN blocked" notice, shown when a local PIN gate exhausts the retry budget
+/// (the counter reached zero). A danger padlock in a tinted circle, a "PIN blocked"
+/// heading, and a two-line hint that recovery is a host-side reset — on-device actions
+/// (unlock, delete, factory reset) all share that one blocked `EF_PIN` counter, so the
+/// escape hatch is the host's touch-only `authenticatorReset`. No controls; the caller
+/// waits for a tap or a short timeout, then returns.
+pub fn render_pin_blocked<D>(t: &mut D) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    t.clear(BG)?;
+    const DIA: u32 = 70;
+    let circle_top = 84;
+    Circle::new(EgPoint::new(MIDX - DIA as i32 / 2, circle_top), DIA)
+        .into_styled(PrimitiveStyle::with_fill(theme::DANGER_BG))
+        .draw(t)?;
+    let cyc = circle_top + DIA as i32 / 2;
+    glyph::draw(
+        t,
+        Glyph::Lock,
+        Point::new((MIDX - 17) as u16, (cyc - 17) as u16),
+        34,
+        theme::DANGER,
+    )?;
+    text(
+        t,
+        "PIN blocked",
+        EgPoint::new(MIDX, 188),
+        Role::Heading,
+        theme::DANGER,
+    )?;
+    text(
+        t,
+        "Too many wrong PINs.",
+        EgPoint::new(MIDX, 216),
+        Role::Body,
+        MUTED,
+    )?;
+    text(
+        t,
+        "Reset from a host to recover.",
+        EgPoint::new(MIDX, 236),
+        Role::Body,
+        MUTED,
+    )
+}
+
 /// The trusted Approve prompt: header + shield, the operation title, the relying-
 /// party card (generic globe + sanitized rp id / account), a "did you start this?"
 /// caution, and the Deny / Hold-to-approve buttons. The hold button starts empty; the
@@ -563,7 +610,7 @@ fn pin<D: DrawTarget<Color = Rgb565>>(t: &mut D, pad: &PinPad) -> Result<(), D::
     // Custom header (not `render_header`): Cancel keeps its top-left hit rect — clear
     // of the digit grid, so a digit tap can never abandon entry — so the title is
     // centred between it and a Lock that marks this as the secure-entry screen.
-    text(t, "Enter PIN", EgPoint::new(MIDX, 20), Role::Heading, FG)?;
+    text(t, pad.title, EgPoint::new(MIDX, 20), Role::Heading, FG)?;
     glyph::draw(
         t,
         Glyph::Lock,
@@ -606,7 +653,40 @@ fn pin<D: DrawTarget<Color = Rgb565>>(t: &mut D, pad: &PinPad) -> Result<(), D::
         }
         row += 1;
     }
+    // A rejected entry leaves a danger-coloured caption in the strip below the grid, so a
+    // wrong PIN / mismatch is visible rather than a silent re-prompt.
+    if let Some(caption) = pad.caption {
+        text(
+            t,
+            pin_caption_text(caption),
+            EgPoint::new(MIDX, PANEL_H as i32 - 9),
+            Role::Body,
+            theme::DANGER,
+        )?;
+    }
     Ok(())
+}
+
+/// The feedback line for a [`PinCaption`]. Wrong-PIN counts index a fixed table so the
+/// remaining attempts render with no alloc (the counter never exceeds the retry budget).
+fn pin_caption_text(c: PinCaption) -> &'static str {
+    const WRONG: [&str; 9] = [
+        "Wrong PIN, 0 left",
+        "Wrong PIN, 1 left",
+        "Wrong PIN, 2 left",
+        "Wrong PIN, 3 left",
+        "Wrong PIN, 4 left",
+        "Wrong PIN, 5 left",
+        "Wrong PIN, 6 left",
+        "Wrong PIN, 7 left",
+        "Wrong PIN, 8 left",
+    ];
+    match c {
+        PinCaption::WrongPin { retries_left } => {
+            WRONG[(retries_left as usize).min(WRONG.len() - 1)]
+        }
+        PinCaption::Mismatch => "PINs don't match",
+    }
 }
 
 /// One filled cyan dot per entered digit (capped to a row width), centered — the PIN
@@ -989,6 +1069,7 @@ fn settings<D: DrawTarget<Color = Rgb565>>(t: &mut D, v: &SettingsView) -> Resul
         SettingsPage::Timeout => settings_timeout(t, v.timeout_secs),
         SettingsPage::Sleep => settings_sleep(t, v.sleep_secs),
         SettingsPage::Info => settings_info(t, v.version, v.chipid),
+        SettingsPage::Security => settings_security(t, v.pin_set),
     }
 }
 
@@ -1041,9 +1122,36 @@ fn settings_root<D: DrawTarget<Color = Rgb565>>(t: &mut D) -> Result<(), D::Erro
         None,
         false,
     )?;
-    // Factory reset is destructive, so it's drawn in the decline colour (warning
-    // glyph + red label) instead of the neutral row style — see the mockup.
-    danger_row(t, settings_row_rect(5), "Factory reset")
+    // Security drills into the Set/Change PIN + Factory reset sub-page (the design's
+    // settings → security flow), keeping the destructive reset one tap deeper.
+    render_row(
+        t,
+        settings_row_rect(5),
+        Glyph::Shield,
+        "Security",
+        None,
+        true,
+    )
+}
+
+/// The Security sub-page: the PIN action (labelled by whether a PIN is set) above the
+/// danger-styled Factory reset. Both rows reuse the Root list geometry; the title-bar
+/// back chevron returns to the Root list.
+fn settings_security<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    pin_set: bool,
+) -> Result<(), D::Error> {
+    status_bar(t)?;
+    title_bar(t, "Security", theme::ACCENT, true)?;
+    render_row(
+        t,
+        settings_row_rect(0),
+        Glyph::Lock,
+        if pin_set { "Change PIN" } else { "Set PIN" },
+        None,
+        true,
+    )?;
+    danger_row(t, settings_row_rect(1), "Factory reset")
 }
 
 /// A destructive option row: the [`render_row`] card, but with a warning glyph,
@@ -1321,6 +1429,18 @@ mod tests {
     }
 
     #[test]
+    fn pin_blocked_screen_fits_and_warns() {
+        let mut d = Rec::new();
+        render_pin_blocked(&mut d).unwrap();
+        assert!(!d.oob, "pin-blocked screen drew outside the panel");
+        // The "PIN blocked" heading is painted in the danger colour.
+        assert!(
+            has_color(&d, Rect::new(0, 176, PANEL_W, 28), theme::DANGER),
+            "danger 'PIN blocked' heading missing"
+        );
+    }
+
+    #[test]
     fn every_home_status_fits_and_draws_with_nav() {
         for status in [
             StatusKind::Boot,
@@ -1492,6 +1612,35 @@ mod tests {
     }
 
     #[test]
+    fn pin_caption_paints_below_the_grid_in_the_danger_colour() {
+        // A wrong-PIN re-prompt carries a danger-coloured caption in the strip under the
+        // last key row (grid bottom is y300; the caption sits in 300..320).
+        let mut d = Rec::new();
+        let pad = PinPad::with_caption(
+            0,
+            "Enter PIN",
+            Some(PinCaption::WrongPin { retries_left: 3 }),
+        );
+        render(&mut d, &Screen::Pin(pad)).unwrap();
+        assert!(!d.oob, "caption drew outside the panel");
+        assert!(
+            has_color(&d, Rect::new(0, 301, PANEL_W, PANEL_H - 301), theme::DANGER),
+            "wrong-PIN caption must paint in the danger colour below the grid"
+        );
+        // A fresh prompt (no caption) leaves that strip blank.
+        let mut clean = Rec::new();
+        render(&mut clean, &Screen::Pin(PinPad::new(0))).unwrap();
+        assert!(
+            !has_color(
+                &clean,
+                Rect::new(0, 301, PANEL_W, PANEL_H - 301),
+                theme::DANGER
+            ),
+            "a fresh pad must not show a caption"
+        );
+    }
+
+    #[test]
     fn pin_dots_partial_update_leaves_keys_intact() {
         let mut d = Rec::new();
         render(&mut d, &Screen::Pin(PinPad::new(2))).unwrap();
@@ -1517,6 +1666,7 @@ mod tests {
             sleep_secs: 60,
             version: 0x078A,
             chipid: 0x0123_4567_89ab_cdef,
+            pin_set: true,
         }
     }
 
@@ -1528,11 +1678,35 @@ mod tests {
             SettingsPage::Timeout,
             SettingsPage::Sleep,
             SettingsPage::Info,
+            SettingsPage::Security,
         ] {
             let mut d = Rec::new();
             render(&mut d, &Screen::Settings(view(page))).unwrap();
             assert!(!d.oob, "settings {page:?} drew outside the panel");
             assert!(d.drew_anything(), "settings {page:?} drew nothing");
+        }
+    }
+
+    #[test]
+    fn security_page_paints_both_rows_under_either_pin_state() {
+        for pin_set in [false, true] {
+            let mut v = view(SettingsPage::Security);
+            v.pin_set = pin_set;
+            let mut d = Rec::new();
+            render(&mut d, &Screen::Settings(v)).unwrap();
+            assert!(
+                !d.oob,
+                "security (pin_set={pin_set}) drew outside the panel"
+            );
+            // Both Security rows are painted in the rects `hit_security` maps taps to.
+            assert!(
+                d.any_non_bg_in(settings_row_rect(0)),
+                "PIN row unpainted (pin_set={pin_set})"
+            );
+            assert!(
+                d.any_non_bg_in(settings_row_rect(1)),
+                "Factory reset row unpainted (pin_set={pin_set})"
+            );
         }
     }
 

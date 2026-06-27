@@ -15,6 +15,24 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Added
 
+- **On-device Set / Change PIN (trusted display, experimental).** The device PIN can now
+  be set and changed entirely on the panel — no host. A new **Settings → Security**
+  sub-page offers **Set PIN** (when none is set) or **Change PIN** (which first verifies
+  the current PIN on the on-screen pad), then prompts for the new PIN twice; the two
+  entries must match before it is stored. The PIN never leaves the device, and it is
+  written as the **same `EF_PIN` verifier** (device-sealed, fresh retry budget) the host
+  clientPIN setPIN/changePIN path stores — so afterwards the host sees a clientPIN exactly
+  as if it had been set over USB, and a satisfied `minPINLength` policy (the pad enforces
+  the floor and shows it) clears any pending forced-change marker. To make room without
+  shrinking the touch targets, the destructive **Factory reset** moved from the Settings
+  root into this Security sub-page (one tap deeper), matching the design's settings →
+  security flow. A wrong entry on any on-device PIN pad (unlock, delete, factory reset,
+  and the set/change current-PIN step) now shows a "Wrong PIN, N left" caption with the
+  remaining attempts before lockout instead of a silent re-prompt, and a New ≠ Confirm
+  mismatch shows "PINs don't match". When the retry budget is spent, a dedicated "PIN
+  blocked" screen explains the lockout and that recovery is a host-side reset (every
+  on-device action shares the one blocked `EF_PIN` counter). Display flavor only.
+  bcdDevice 0x07A1 → 0x07A4.
 - **Trusted-display lock / unlock (on-device UI lock, experimental).** The panel can
   now be **locked** so the on-device UI — the passkeys browser and Settings — needs the
   device PIN to reopen, showing a "Locked / Touch to unlock" screen; a tap opens the

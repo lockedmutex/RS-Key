@@ -46,7 +46,8 @@ use rsk_crypto::Device;
 use rsk_sdk::Confirm;
 use rsk_ui::{
     ALLOW_RECT, AccountRow, AdjustKey, BRIGHTNESS_LEVELS, Button, ConfirmPrompt, HomeView, Label,
-    NavTab, PinKey, PinPad, RootEntry, RpRow, Screen, SettingsPage, SettingsView, StatusKind,
+    NavTab, PinCaption, PinKey, PinPad, RootEntry, RpRow, Screen, SecurityEntry, SettingsPage,
+    SettingsView, StatusKind,
 };
 
 use crate::handler::Store;
@@ -422,7 +423,7 @@ impl Ui {
         // PIN vanished after the lock — and EF_PIN can only vanish via a factory reset,
         // which reboots into the unlocked state, so "no PIN ⇒ unlock" is never reachable
         // as a bypass (and is the correct behaviour: nothing to verify against).
-        if self.local_pin_gate() {
+        if self.local_pin_gate("Enter PIN") {
             self.locked = false;
         }
         self.end_modal();
@@ -466,6 +467,7 @@ impl Ui {
             sleep_secs: (SLEEP_TIMEOUT_MS.load(Ordering::Relaxed) / 1000) as u16,
             version: self.info.version,
             chipid: self.info.chipid,
+            pin_set: rsk_fido::passkeys::pin_is_set(&mut self.fs.borrow_mut()),
         };
         let _ = rsk_ui::render(&mut self.panel, &Screen::Settings(view));
         self.shown = None;
@@ -515,13 +517,30 @@ impl Ui {
                                 self.lock_now();
                                 break;
                             }
-                            // A confirmed reset reboots and never returns; on cancel, fall
-                            // back to the Root list (repaint below) with a fresh timeout.
-                            Some(RootEntry::FactoryReset) => {
-                                self.run_factory_reset();
-                                last = Instant::now();
-                            }
+                            // Security drills into the Set/Change PIN + Factory reset
+                            // sub-page (the destructive reset now lives one tap deeper).
+                            Some(RootEntry::Security) => page = SettingsPage::Security,
                             None => repaint = false,
+                        }
+                    }
+                    SettingsPage::Security => {
+                        // The title-bar back chevron returns to the Root list.
+                        if rsk_ui::hit_title_back(p) {
+                            page = SettingsPage::Root;
+                        } else {
+                            match rsk_ui::hit_security(p) {
+                                Some(SecurityEntry::ChangePin) => {
+                                    self.run_set_pin();
+                                    last = Instant::now();
+                                }
+                                // A confirmed reset reboots and never returns; on cancel,
+                                // fall back to this page (repaint below) with a fresh timeout.
+                                Some(SecurityEntry::FactoryReset) => {
+                                    self.run_factory_reset();
+                                    last = Instant::now();
+                                }
+                                None => repaint = false,
+                            }
                         }
                     }
                     SettingsPage::Brightness => match rsk_ui::hit_adjust(p) {
@@ -770,6 +789,8 @@ impl Ui {
     /// already consumed), so it blocks to the presence timeout as before.
     fn collect_pin(
         &mut self,
+        title: &'static str,
+        caption: Option<PinCaption>,
         min_len: usize,
         out: &mut [u8],
         yield_to_host: bool,
@@ -786,7 +807,10 @@ impl Ui {
         // A built-in-UV PIN entry can arrive while the panel slept — restore it first.
         self.wake();
         note_activity();
-        let _ = rsk_ui::render(&mut self.panel, &Screen::Pin(PinPad::new(entered)));
+        let _ = rsk_ui::render(
+            &mut self.panel,
+            &Screen::Pin(PinPad::with_caption(entered, title, caption)),
+        );
         self.shown = None; // force the status loop to repaint once we release it
         let outcome = loop {
             if let Some(p) = self.touch.read() {
@@ -848,18 +872,21 @@ impl Ui {
 
     /// Gate a destructive local action behind the device PIN when one is set: collect it
     /// on the pad and verify it locally against the same `EF_PIN` and retry counter the
-    /// host PIN path uses. A wrong entry re-prompts (the pad reappears empty) until the
-    /// right PIN, a decline / timeout, or the counter is spent. Returns whether the
-    /// action may proceed (`true` = no PIN set, or the correct PIN was entered).
-    fn local_pin_gate(&mut self) -> bool {
+    /// host PIN path uses. A wrong entry re-prompts with a "Wrong PIN, N left" caption
+    /// (the remaining attempts) until the right PIN, a decline / timeout, or the counter
+    /// is spent. Returns whether the action may proceed (`true` = no PIN set, or the
+    /// correct PIN was entered).
+    fn local_pin_gate(&mut self, title: &'static str) -> bool {
         if !rsk_fido::passkeys::pin_is_set(&mut self.fs.borrow_mut()) {
             return true;
         }
         let mut pin = [0u8; 64];
+        let mut caption = None;
+        let mut blocked = false;
         let proceed = loop {
             // CTAP's 4-digit floor; `verify_local_pin` checks the exact PIN regardless,
             // so a higher `minPINLength` policy is still satisfied by typing it in full.
-            match self.collect_pin(4, &mut pin, true) {
+            match self.collect_pin(title, caption, 4, &mut pin, true) {
                 rsk_fido::PinEntry::Entered(len) => {
                     let dev = self.keys.device();
                     let verdict = rsk_fido::passkeys::verify_local_pin(
@@ -869,9 +896,16 @@ impl Ui {
                     );
                     match verdict {
                         rsk_fido::passkeys::LocalPin::Ok => break true,
-                        // Re-prompt on a wrong PIN until the budget runs out (Blocked).
-                        rsk_fido::passkeys::LocalPin::Wrong { .. } => {}
-                        rsk_fido::passkeys::LocalPin::Blocked => break false,
+                        // Re-prompt showing the remaining attempts until the budget runs out.
+                        rsk_fido::passkeys::LocalPin::Wrong { retries_left } => {
+                            caption = Some(PinCaption::WrongPin { retries_left });
+                        }
+                        // Budget spent — note it and break; the notice is shown below, once
+                        // the immutable `dev` borrow has been released.
+                        rsk_fido::passkeys::LocalPin::Blocked => {
+                            blocked = true;
+                            break false;
+                        }
                     }
                 }
                 // Cancel / timeout / cancelled-by-host: abandon the action.
@@ -879,7 +913,36 @@ impl Ui {
             }
         };
         pin.zeroize();
+        if blocked {
+            self.show_pin_blocked();
+        }
         proceed
+    }
+
+    /// After a local PIN gate exhausts the retry budget, show the "PIN blocked" notice
+    /// rather than silently closing the pad. Held until a tap or ~5 s (or a queued host
+    /// command), so the lockout — recoverable only by a host-side reset, since every
+    /// on-device action shares the one blocked `EF_PIN` counter — is explained.
+    fn show_pin_blocked(&mut self) {
+        let _ = rsk_ui::render_pin_blocked(&mut self.panel);
+        self.shown = None;
+        // Let the final wrong-PIN tap lift, then hold the notice, dismissable by a fresh tap.
+        let start = Instant::now();
+        self.touch
+            .wait_release(start, Duration::from_millis(MENU_INACTIVITY_MS));
+        let show = Duration::from_millis(5000);
+        let t0 = Instant::now();
+        loop {
+            if self.touch.read().is_some() {
+                self.touch.wait_release(t0, show);
+                break;
+            }
+            if crate::worker::host_request_pending() || t0.elapsed() >= show {
+                break;
+            }
+            block_for(Duration::from_millis(TOUCH_POLL_MS));
+        }
+        note_activity();
     }
 
     /// The Confirm-Delete flow for one resident passkey (mockup screens 6 → 10): gate on
@@ -895,7 +958,7 @@ impl Ui {
         // Gate on the device PIN first: when one is set the pad is shown straight away,
         // so the confirm screen below doesn't flash for a frame behind it. With no PIN,
         // `local_pin_gate` returns at once and the confirm screen is the first thing seen.
-        if !self.local_pin_gate() {
+        if !self.local_pin_gate("Enter PIN") {
             return; // no PIN, wrong PIN, or declined — nothing removed
         }
         // The destructive-action screen: name the rp + account, then require the hold.
@@ -979,7 +1042,7 @@ impl Ui {
         self.touch.wait_release(Instant::now(), idle_limit);
         // PIN gate first (when set) so the pad doesn't flash the confirm screen behind it;
         // no PIN returns at once and the confirm screen below is shown directly.
-        if !self.local_pin_gate() {
+        if !self.local_pin_gate("Enter PIN") {
             return; // no PIN set is fine; a wrong PIN or decline aborts — nothing erased
         }
         // The destructive-action screen, then a deliberate hold to commit.
@@ -998,6 +1061,61 @@ impl Ui {
                 .factory_wipe(rsk_fido::survives_factory_reset);
             cortex_m::peripheral::SCB::sys_reset();
         }
+        self.end_modal();
+    }
+
+    /// The on-device Set / Change PIN flow (Settings → Security → Set/Change PIN). When a
+    /// PIN is already set it is verified first via [`local_pin_gate`] (so a change still
+    /// proves knowledge of the current PIN; a first-time set returns at once with no
+    /// prompt), then the new PIN is entered twice and the two must match before it is
+    /// written to `EF_PIN` with a fresh retry budget — the same verifier the host
+    /// setPIN/changePIN path stores, so the host then sees a clientPIN unchanged. A wrong
+    /// current PIN, a decline, a timeout, or a queued host command abandons it without a
+    /// write; a mismatch clears both entries and re-prompts. Synchronous like the other
+    /// modals (the worker is parked). The pad enforces the `minPINLength` floor and
+    /// [`store_local_pin`] re-checks it.
+    fn run_set_pin(&mut self) {
+        // Let the Security-row tap's finger lift before the pad reads digits.
+        self.touch
+            .wait_release(Instant::now(), Duration::from_millis(MENU_INACTIVITY_MS));
+        if !self.local_pin_gate("Current PIN") {
+            return; // wrong current PIN, decline, timeout, or host yield — nothing changed
+        }
+        let min = rsk_fido::passkeys::min_pin_length(&mut self.fs.borrow_mut()) as usize;
+        // Size the pad buffers to the host-representable maximum so the pad can't accept a
+        // digit beyond it (`collect_pin` caps at `out.len()`); a PIN chosen here is then
+        // always one the host clientPIN path can verify, and `store_local_pin` re-checks.
+        let mut new = [0u8; rsk_fido::passkeys::MAX_PIN_LENGTH];
+        let mut confirm = [0u8; rsk_fido::passkeys::MAX_PIN_LENGTH];
+        // After a New ≠ Confirm mismatch, re-prompt "New PIN" with a visible reason.
+        let mut new_caption = None;
+        loop {
+            new.zeroize();
+            confirm.zeroize();
+            let n1 = match self.collect_pin("New PIN", new_caption, min, &mut new, true) {
+                rsk_fido::PinEntry::Entered(n) => n.min(new.len()),
+                _ => break, // declined / timeout / host yield — nothing set
+            };
+            let n2 = match self.collect_pin("Confirm PIN", None, min, &mut confirm, true) {
+                rsk_fido::PinEntry::Entered(n) => n.min(confirm.len()),
+                _ => break, // confirm declined / timeout / host yield
+            };
+            if n1 == n2 && rsk_crypto::ct_eq(&new[..n1], &confirm[..n2]) {
+                let dev = self.keys.device();
+                // The pad already enforced the length floor; a flash error is the only
+                // realistic failure and leaves no PIN set — abandon either way.
+                let _ = rsk_fido::passkeys::store_local_pin(
+                    &dev,
+                    &mut self.fs.borrow_mut(),
+                    &new[..n1],
+                );
+                break;
+            }
+            // Mismatch: re-prompt from "New PIN" with the reason; the loop clears both.
+            new_caption = Some(PinCaption::Mismatch);
+        }
+        new.zeroize();
+        confirm.zeroize();
         self.end_modal();
     }
 }
@@ -1291,7 +1409,9 @@ impl TouchPresence {
     /// `Ui` and run it there, so the host path and a display-initiated gate
     /// ([`Ui::run_delete`]) share one implementation.
     fn collect_pin_impl(&mut self, min_len: usize, out: &mut [u8]) -> rsk_fido::PinEntry {
-        self.ui.borrow_mut().collect_pin(min_len, out, false)
+        self.ui
+            .borrow_mut()
+            .collect_pin("Enter PIN", None, min_len, out, false)
     }
 }
 

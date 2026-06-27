@@ -20,11 +20,16 @@ use rsk_fs::{Fs, Storage};
 use crate::consts::{EF_CRED, EF_RP, MAX_RESIDENT_CREDENTIALS};
 use crate::credential::{RECORD_PREFIX, RP_PREFIX, credential_load, slot_map, unseal_rp_id};
 
-/// The device-local PIN gate for a display-initiated mutation (e.g. a Passkeys
-/// delete), re-exported here so the trusted display reaches the whole on-device
-/// Passkeys seam — read walks, [`delete_cred`], and the PIN check — through one
-/// module. Defined next to the canonical `verify_pin_hash` in `clientpin`.
-pub use crate::clientpin::{LocalPin, pin_is_set, verify_local_pin};
+/// The device-local PIN seam for a display-initiated action, re-exported here so the
+/// trusted display reaches the whole on-device Passkeys/PIN seam — read walks,
+/// [`delete_cred`], the PIN check ([`verify_local_pin`]) and the on-device set/change
+/// ([`store_local_pin`]) — through one module. Defined next to the canonical
+/// `verify_pin_hash` in `clientpin`. [`min_pin_length`] is the floor the set flow shows
+/// on the pad and enforces.
+pub use crate::clientpin::{
+    LocalPin, MAX_PIN_LENGTH, SetPinError, min_pin_length, pin_is_set, store_local_pin,
+    verify_local_pin,
+};
 
 /// Largest EF_RP record (count + rpIdHash + boxed domain); domains are short.
 const RP_REC_MAX: usize = 256;
