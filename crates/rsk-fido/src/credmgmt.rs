@@ -553,6 +553,11 @@ pub(crate) fn decrement_rp<S: Storage>(
             rp[0] = rp[0].saturating_sub(1);
             if rp[0] == 0 {
                 let _ = fs.delete(EF_RP + j);
+                // The RP is gone — drop its device-local nickname too. Best-effort and
+                // non-atomic with the line above: a power cut between them orphans a sealed
+                // nickname, but it is never surfaced (its EF_RP slot is now empty) and the
+                // rpIdHash-AAD binding rejects it if the slot is reused, so reset reclaims it.
+                let _ = fs.delete(crate::consts::EF_RPNICK + j);
             } else {
                 fs.put(EF_RP + j, &rp[..m])
                     .map_err(|_| CtapError::NotAllowed)?;

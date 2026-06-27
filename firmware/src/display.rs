@@ -644,7 +644,8 @@ impl Ui {
                     continue;
                 }
                 if let Some(i) = rsk_ui::hit_list(p, rsk_ui::PK_LIST_TOP, n as u16) {
-                    match self.run_service(&rows[i as usize].id, &hashes[i as usize]) {
+                    let row = rows[i as usize];
+                    match self.run_service(&row.id, &row.nick, &hashes[i as usize]) {
                         ServiceResult::Back => {
                             // A deleted last-account removes its RP, so the total can shrink —
                             // reload this page and clamp it if it scrolled off the end.
@@ -686,19 +687,23 @@ impl Ui {
         next
     }
 
-    /// One RP's detail: list its resident accounts, and let a tap on an account start the
-    /// Confirm-Delete flow ([`run_delete`]). The back chevron (or a tap on the active
-    /// Passkeys tab) returns to the list; another nav tab leaves the Passkeys tab; the
-    /// back chevron only ever returns [`ServiceResult::Back`]. After a delete the set is
-    /// reloaded — when the last account goes, the screen drops back to the list (whose RP
-    /// row is gone too).
-    fn run_service(&mut self, title: &Label, hash: &[u8; 32]) -> ServiceResult {
+    /// One RP's detail: show its name (the device-local nickname if set, else the rpId),
+    /// list its resident accounts, let a tap on an account start the Confirm-Delete flow
+    /// ([`run_delete`]), and the title-bar pencil open the rename flow ([`run_rename`]).
+    /// The back chevron (or a tap on the active Passkeys tab) returns to the list; another
+    /// nav tab leaves the Passkeys tab; the back chevron only ever returns
+    /// [`ServiceResult::Back`]. After a delete the set is reloaded — when the last account
+    /// goes, the screen drops back to the list (whose RP row is gone too).
+    fn run_service(&mut self, rp_id: &Label, nick0: &Label, hash: &[u8; 32]) -> ServiceResult {
         let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
         let mut accts = [AccountRow::default(); rsk_ui::PK_ROWS_MAX];
         let mut fids = [0u16; rsk_ui::PK_ROWS_MAX];
         let mut page: u16 = 0;
+        // The shown title tracks the nickname (Copy), so a rename updates it live.
+        let mut nick = *nick0;
+        let title = |nick: &Label| if nick.is_empty() { *rp_id } else { *nick };
         let (mut n, mut total) = self.load_accts(hash, &mut accts, &mut fids, page);
-        let _ = rsk_ui::render_service(&mut self.panel, title, &accts[..n], page, total);
+        let _ = rsk_ui::render_service(&mut self.panel, &title(&nick), &accts[..n], page, total);
         self.shown = None;
         self.touch.wait_release(Instant::now(), idle_limit);
 
@@ -713,6 +718,24 @@ impl Ui {
                 if rsk_ui::hit_title_back(p) {
                     return ServiceResult::Back;
                 }
+                if rsk_ui::hit_title_edit(p) {
+                    // The pencil: rename this RP's device-local nickname, then repaint with
+                    // the (possibly changed) title. The credential box is untouched.
+                    if let Some(new_nick) = self.run_rename(&nick, hash) {
+                        nick = new_nick;
+                    }
+                    let _ = rsk_ui::render_service(
+                        &mut self.panel,
+                        &title(&nick),
+                        &accts[..n],
+                        page,
+                        total,
+                    );
+                    self.shown = None;
+                    self.touch.wait_release(Instant::now(), idle_limit);
+                    last = Instant::now();
+                    continue;
+                }
                 if let Some(tab) = rsk_ui::hit_nav(p) {
                     return match tab {
                         // The active tab drills back out to its own list.
@@ -726,15 +749,20 @@ impl Ui {
                     let r = self.load_accts(hash, &mut accts, &mut fids, page);
                     n = r.0;
                     total = r.1;
-                    let _ =
-                        rsk_ui::render_service(&mut self.panel, title, &accts[..n], page, total);
+                    let _ = rsk_ui::render_service(
+                        &mut self.panel,
+                        &title(&nick),
+                        &accts[..n],
+                        page,
+                        total,
+                    );
                     self.shown = None;
                     self.touch.wait_release(last, idle_limit);
                     last = Instant::now();
                     continue;
                 }
                 if let Some(i) = rsk_ui::hit_list(p, rsk_ui::PK_LIST_TOP, n as u16) {
-                    self.run_delete(title, &accts[i as usize].name, fids[i as usize]);
+                    self.run_delete(&title(&nick), &accts[i as usize].name, fids[i as usize]);
                     let r = self.load_accts(hash, &mut accts, &mut fids, page);
                     n = r.0;
                     total = r.1;
@@ -749,8 +777,13 @@ impl Ui {
                         n = r.0;
                         total = r.1;
                     }
-                    let _ =
-                        rsk_ui::render_service(&mut self.panel, title, &accts[..n], page, total);
+                    let _ = rsk_ui::render_service(
+                        &mut self.panel,
+                        &title(&nick),
+                        &accts[..n],
+                        page,
+                        total,
+                    );
                     self.shown = None;
                     self.touch.wait_release(Instant::now(), idle_limit);
                     last = Instant::now();
@@ -762,6 +795,89 @@ impl Ui {
             // open read-only detail.
             if crate::worker::host_request_pending() || last.elapsed() >= idle_limit {
                 return ServiceResult::Leave(None);
+            }
+            block_for(Duration::from_millis(TOUCH_POLL_MS));
+        }
+    }
+
+    /// The rename screen: edit a relying party's device-local nickname with the character
+    /// wheel and persist it via [`rsk_fido::passkeys::set_rp_nickname`] — which seals the
+    /// label at rest and never touches the credential box, so the passkey keeps working.
+    /// Returns the committed nickname (empty = cleared) only when the store actually
+    /// persisted it, or `None` on cancel (back chevron / power-button sleep / a queued host
+    /// command / inactivity) *and* on a failed store (so the caller keeps the prior title
+    /// rather than showing an unsaved rename). Pre-filled with
+    /// the current nickname (empty if none); the wheel cycles `RENAME_CHARSET`, `+` appends
+    /// the candidate, `⌫` deletes, and the buffer is capped at `RP_NICK_MAX_LEN`.
+    fn run_rename(&mut self, current: &Label, hash: &[u8; 32]) -> Option<Label> {
+        let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
+        let charset = rsk_ui::RENAME_CHARSET;
+        let mut buf = [0u8; rsk_fido::passkeys::RP_NICK_MAX_LEN];
+        let mut len = 0usize;
+        for &b in current.as_str().as_bytes() {
+            if len < buf.len() {
+                buf[len] = b;
+                len += 1;
+            }
+        }
+        let mut cand = 0usize;
+        let val = |buf: &[u8], len: usize| -> Label { Label::clamp(&buf[..len]) };
+        let _ = rsk_ui::render_rename(&mut self.panel, val(&buf, len).as_str(), charset[cand]);
+        self.shown = None;
+        self.touch.wait_release(Instant::now(), idle_limit);
+
+        let mut last = Instant::now();
+        loop {
+            if self.sleep_button_pressed() {
+                return None;
+            }
+            if let Some(p) = self.touch.read() {
+                last = Instant::now();
+                if rsk_ui::hit_title_back(p) {
+                    return None; // cancel — no change persisted
+                }
+                if let Some(k) = rsk_ui::hit_rename(p) {
+                    match k {
+                        rsk_ui::RenameKey::Up => cand = (cand + 1) % charset.len(),
+                        rsk_ui::RenameKey::Down => {
+                            cand = (cand + charset.len() - 1) % charset.len()
+                        }
+                        rsk_ui::RenameKey::Insert => {
+                            if len < buf.len() {
+                                buf[len] = charset[cand];
+                                len += 1;
+                            }
+                        }
+                        rsk_ui::RenameKey::Backspace => len = len.saturating_sub(1),
+                        rsk_ui::RenameKey::Save => {
+                            let committed = val(&buf, len);
+                            let dev = self.keys.device();
+                            let saved = rsk_fido::passkeys::set_rp_nickname(
+                                &dev,
+                                &mut self.fs.borrow_mut(),
+                                hash,
+                                committed.as_str(),
+                            );
+                            // Only report the new title if it actually persisted — on a
+                            // failed store (no seed / full flash / RP vanished) keep the
+                            // prior title so the screen never claims an unsaved rename.
+                            return saved.then_some(committed);
+                        }
+                    }
+                    let _ = rsk_ui::render_rename(
+                        &mut self.panel,
+                        val(&buf, len).as_str(),
+                        charset[cand],
+                    );
+                    self.shown = None;
+                    self.touch.wait_release(last, idle_limit);
+                    last = Instant::now();
+                    continue;
+                }
+                self.touch.wait_release(last, idle_limit);
+            }
+            if crate::worker::host_request_pending() || last.elapsed() >= idle_limit {
+                return None;
             }
             block_for(Duration::from_millis(TOUCH_POLL_MS));
         }
@@ -787,6 +903,10 @@ impl Ui {
             if idx >= offset && n < rows.len() {
                 rows[n] = RpRow {
                     id: Label::clamp(rp.rp_id.as_bytes()),
+                    nick: rp
+                        .nickname
+                        .map(|s| Label::clamp(s.as_bytes()))
+                        .unwrap_or_default(),
                     accounts: rp.count,
                 };
                 hashes[n] = rp.rp_id_hash;

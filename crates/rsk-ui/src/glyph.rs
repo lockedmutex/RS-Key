@@ -65,6 +65,8 @@ pub enum Glyph {
     /// A counter-clockwise refresh ring — the post-factory-reset "erased / restarting"
     /// indicator (the design's grey rotate icon, distinct from the green success check).
     Rotate,
+    /// A pencil — the service-detail "rename" affordance (sets a device-local nickname).
+    Edit,
 }
 
 /// Draw `g` into the square box at `at` (top-left) of side `s` pixels, stroked in
@@ -251,6 +253,14 @@ pub fn draw<D: DrawTarget<Color = Rgb565>>(
                 .into_styled(stroke)
                 .draw(t)
         }
+        Glyph::Edit => {
+            // A slanted pencil body (lower-left nib → upper-right eraser) plus a band
+            // line marking the lead tip.
+            Polyline::new(&[gp(4, 13), gp(11, 6), gp(13, 8), gp(6, 15), gp(4, 13)])
+                .into_styled(stroke)
+                .draw(t)?;
+            Line::new(gp(6, 11), gp(8, 13)).into_styled(stroke).draw(t)
+        }
     }
 }
 
@@ -292,7 +302,7 @@ mod tests {
         }
     }
 
-    const ALL: [Glyph; 18] = [
+    const ALL: [Glyph; 19] = [
         Glyph::Usb,
         Glyph::Check,
         Glyph::Backspace,
@@ -311,6 +321,7 @@ mod tests {
         Glyph::Moon,
         Glyph::Info,
         Glyph::Rotate,
+        Glyph::Edit,
     ];
 
     #[test]

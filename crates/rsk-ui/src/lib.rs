@@ -25,7 +25,7 @@ pub use glyph::Glyph;
 pub use render::{
     render, render_audit_log, render_confirm_delete, render_confirm_factory_reset, render_erasing,
     render_hold_button, render_hold_fill, render_passkeys_list, render_pin_blocked,
-    render_pin_dots, render_service, render_success, render_success_circle,
+    render_pin_dots, render_rename, render_service, render_success, render_success_circle,
 };
 
 /// Panel geometry (Waveshare RP2350-Touch-LCD-2.8, ST7789T3, portrait).
@@ -667,6 +667,24 @@ pub fn hit_title_back(p: Point) -> bool {
     TITLE_BACK_RECT.contains(p)
 }
 
+/// The title-bar **edit** affordance — the service detail's pencil, mirroring the back
+/// chevron at the right edge of the title strip. A tap here opens the rename screen.
+pub const TITLE_EDIT_RECT: Rect = Rect::new(PANEL_W - 4 - 44, STATUS_BAR_H, 44, TITLE_BAR_H);
+
+/// Did a tap at `p` hit the title-bar edit (rename) affordance?
+pub fn hit_title_edit(p: Point) -> bool {
+    TITLE_EDIT_RECT.contains(p)
+}
+
+// Compile-time: the edit affordance sits in the title strip, clear of (right of) the
+// back chevron, so a back tap and a rename tap can never collide.
+const _: () = {
+    assert!(TITLE_EDIT_RECT.y >= STATUS_BAR_H);
+    assert!(TITLE_EDIT_RECT.y + TITLE_EDIT_RECT.h <= CONTENT_TOP);
+    assert!(TITLE_BACK_RECT.x + TITLE_BACK_RECT.w < TITLE_EDIT_RECT.x);
+    assert!(TITLE_EDIT_RECT.x + TITLE_EDIT_RECT.w <= PANEL_W);
+};
+
 /// Bottom navigation-bar height.
 pub const NAV_H: u16 = 38;
 /// Top edge of the bottom nav bar.
@@ -783,12 +801,26 @@ pub const PK_ROWS_MAX: usize = 5;
 /// and footer.
 pub const PK_LIST_TOP: u16 = CONTENT_TOP + 4;
 
-/// One relying-party row on the Passkeys list: a sanitized rpId and how many resident
-/// credentials it holds. The firmware fills these from `rsk_fido::passkeys`.
+/// One relying-party row on the Passkeys list: a sanitized rpId, an optional device-local
+/// nickname ([`render_passkeys_list`] shows it instead of the rpId when set), and how many
+/// resident credentials it holds. The firmware fills these from `rsk_fido::passkeys`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct RpRow {
     pub id: Label,
+    /// The device-local nickname, or empty for none (then the rpId `id` shows).
+    pub nick: Label,
     pub accounts: u8,
+}
+
+impl RpRow {
+    /// The label to show: the nickname if one is set, else the rpId.
+    pub fn shown(&self) -> &str {
+        if self.nick.is_empty() {
+            self.id.as_str()
+        } else {
+            self.nick.as_str()
+        }
+    }
 }
 
 /// One account row on the per-RP service detail: a sanitized account label and whether
@@ -888,6 +920,77 @@ const _: () = {
 pub fn hit_del_hold(p: Point) -> bool {
     DEL_HOLD_RECT.contains(p)
 }
+
+// --- Rename (set a device-local RP nickname via a character wheel) ----------
+
+/// The character set the rename wheel cycles through: lowercase, digits, and a few
+/// punctuation marks plus a trailing space. A deliberately small printable-ASCII
+/// alphabet — the stored nickname is sanitized by [`Label`] regardless, but cycling a
+/// known set keeps the wheel legible and the entry predictable.
+pub const RENAME_CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789-_. ";
+
+/// A key on the rename character wheel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RenameKey {
+    /// Cycle the candidate character up (next in [`RENAME_CHARSET`]).
+    Up,
+    /// Cycle the candidate character down (previous).
+    Down,
+    /// Append the current candidate to the nickname.
+    Insert,
+    /// Delete the last character of the nickname.
+    Backspace,
+    /// Commit the nickname.
+    Save,
+}
+
+/// The nickname value field (shows the current text + a caret).
+pub const RN_FIELD_RECT: Rect = Rect::new(12, CONTENT_TOP + 22, 216, 34);
+/// Cycle-up button (top of the centre column).
+pub const RN_UP_RECT: Rect = Rect::new(94, 122, 52, 36);
+/// Cycle-down button (bottom of the centre column).
+pub const RN_DOWN_RECT: Rect = Rect::new(94, 196, 52, 36);
+/// Backspace key (left of the wheel).
+pub const RN_BKSP_RECT: Rect = Rect::new(16, 160, 56, 56);
+/// Insert key (right of the wheel) — appends the candidate.
+pub const RN_INS_RECT: Rect = Rect::new(168, 160, 56, 56);
+/// The full-width **Save** button, in the shared bottom button band.
+pub const RN_SAVE_RECT: Rect = Rect::new(BTN_SIDE, BTN_BAND_TOP, PANEL_W - 2 * BTN_SIDE, BTN_H);
+
+/// Which rename-wheel key, if any, a tap at `p` selects. The rects are disjoint by
+/// construction (proven below), so at most one matches; the title-bar back chevron
+/// (handled separately) cancels.
+pub fn hit_rename(p: Point) -> Option<RenameKey> {
+    if RN_UP_RECT.contains(p) {
+        Some(RenameKey::Up)
+    } else if RN_DOWN_RECT.contains(p) {
+        Some(RenameKey::Down)
+    } else if RN_BKSP_RECT.contains(p) {
+        Some(RenameKey::Backspace)
+    } else if RN_INS_RECT.contains(p) {
+        Some(RenameKey::Insert)
+    } else if RN_SAVE_RECT.contains(p) {
+        Some(RenameKey::Save)
+    } else {
+        None
+    }
+}
+
+// Compile-time: every wheel control is on-panel, the field clears the status/title
+// chrome, the wheel sits above the Save band, and the five tap targets are pairwise
+// disjoint (so no tap is ambiguous). The centre column (Up/Down) is separated from the
+// side keys (Backspace/Insert) by x; Up/Down/Save are separated from each other by y.
+const _: () = {
+    assert!(RN_FIELD_RECT.y >= CONTENT_TOP);
+    assert!(RN_UP_RECT.y > RN_FIELD_RECT.y + RN_FIELD_RECT.h);
+    assert!(RN_UP_RECT.y + RN_UP_RECT.h <= RN_DOWN_RECT.y); // Up above Down
+    assert!(RN_DOWN_RECT.y + RN_DOWN_RECT.h <= RN_SAVE_RECT.y); // wheel above Save
+    assert!(RN_SAVE_RECT.y + RN_SAVE_RECT.h <= PANEL_H);
+    // Side keys are clear of the centre column by x.
+    assert!(RN_BKSP_RECT.x + RN_BKSP_RECT.w <= RN_UP_RECT.x);
+    assert!(RN_UP_RECT.x + RN_UP_RECT.w <= RN_INS_RECT.x);
+    assert!(RN_INS_RECT.x + RN_INS_RECT.w <= PANEL_W);
+};
 
 // --- Success screens (the design's "pop" confirmation moments) --------------
 
@@ -1121,6 +1224,23 @@ mod proofs {
         assert!(!(PAGER_PREV_RECT.contains(p) && PAGER_NEXT_RECT.contains(p)));
         assert!(!(hit_pager(p).is_some() && row_rect(PK_LIST_TOP, i).contains(p)));
         assert!(!(hit_pager(p).is_some() && p.y >= NAV_TOP));
+    }
+
+    /// On the rename screen no tap maps to two wheel keys, and a wheel tap never also
+    /// hits the back chevron (cancel) — so committing, editing, and cancelling can't be
+    /// confused for one another.
+    #[kani::proof]
+    fn rename_keys_are_unambiguous() {
+        let p = Point::new(kani::any(), kani::any());
+        let hits = [
+            RN_UP_RECT.contains(p),
+            RN_DOWN_RECT.contains(p),
+            RN_BKSP_RECT.contains(p),
+            RN_INS_RECT.contains(p),
+            RN_SAVE_RECT.contains(p),
+        ];
+        assert!(hits.iter().filter(|&&b| b).count() <= 1);
+        assert!(!(hit_rename(p).is_some() && hit_title_back(p)));
     }
 }
 
@@ -1425,5 +1545,48 @@ mod tests {
         assert_eq!(page_count(PK_ROWS_MAX as u16), 1);
         assert_eq!(page_count(PK_ROWS_MAX as u16 + 1), 2);
         assert_eq!(page_count(62), 13);
+    }
+
+    #[test]
+    fn rp_row_shows_nickname_over_rpid() {
+        let mut r = RpRow {
+            id: Label::clamp(b"github.com"),
+            nick: Label::default(),
+            accounts: 2,
+        };
+        assert_eq!(r.shown(), "github.com");
+        r.nick = Label::clamp(b"Work GitHub");
+        assert_eq!(r.shown(), "Work GitHub");
+    }
+
+    #[test]
+    fn rename_key_centres_hit_their_keys() {
+        let c = |r: Rect| Point::new(r.x + r.w / 2, r.y + r.h / 2);
+        assert_eq!(hit_rename(c(RN_UP_RECT)), Some(RenameKey::Up));
+        assert_eq!(hit_rename(c(RN_DOWN_RECT)), Some(RenameKey::Down));
+        assert_eq!(hit_rename(c(RN_BKSP_RECT)), Some(RenameKey::Backspace));
+        assert_eq!(hit_rename(c(RN_INS_RECT)), Some(RenameKey::Insert));
+        assert_eq!(hit_rename(c(RN_SAVE_RECT)), Some(RenameKey::Save));
+        // The field area (above the wheel) is not a wheel key.
+        assert_eq!(hit_rename(c(RN_FIELD_RECT)), None);
+    }
+
+    #[test]
+    fn title_edit_and_back_are_disjoint() {
+        let c = |r: Rect| Point::new(r.x + r.w / 2, r.y + r.h / 2);
+        assert!(hit_title_edit(c(TITLE_EDIT_RECT)));
+        assert!(!hit_title_back(c(TITLE_EDIT_RECT)));
+        assert!(hit_title_back(c(TITLE_BACK_RECT)));
+        assert!(!hit_title_edit(c(TITLE_BACK_RECT)));
+    }
+
+    #[test]
+    fn rename_charset_is_printable_and_cycles() {
+        assert!(!RENAME_CHARSET.is_empty());
+        assert!(RENAME_CHARSET.iter().all(|&b| (0x20..=0x7E).contains(&b)));
+        // Distinct entries (no accidental dup that would stall the wheel on a value).
+        for (i, &a) in RENAME_CHARSET.iter().enumerate() {
+            assert!(!RENAME_CHARSET[i + 1..].contains(&a), "duplicate {a:?}");
+        }
     }
 }

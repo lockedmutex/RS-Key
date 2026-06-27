@@ -17,8 +17,11 @@ use zeroize::Zeroize;
 use rsk_crypto::Device;
 use rsk_fs::{Fs, Storage};
 
-use crate::consts::{EF_CRED, EF_RP, MAX_RESIDENT_CREDENTIALS};
-use crate::credential::{RECORD_PREFIX, RP_PREFIX, credential_load, slot_map, unseal_rp_id};
+use crate::consts::{EF_CRED, EF_RP, EF_RPNICK, MAX_RESIDENT_CREDENTIALS};
+use crate::credential::{
+    NICK_BOX_MAX, RECORD_PREFIX, RP_PREFIX, credential_load, seal_nick, slot_map, unseal_nick,
+    unseal_rp_id,
+};
 
 /// The device-local PIN seam for a display-initiated action, re-exported here so the
 /// trusted display reaches the whole on-device Passkeys/PIN seam — read walks,
@@ -30,6 +33,9 @@ pub use crate::clientpin::{
     LocalPin, MAX_PIN_LENGTH, SetPinError, min_pin_length, pin_is_set, store_local_pin,
     verify_local_pin,
 };
+/// The on-device nickname length cap, re-exported here so the display sizes its rename
+/// buffer from the same constant the store enforces.
+pub use crate::consts::RP_NICK_MAX_LEN;
 
 /// Largest EF_RP record (count + rpIdHash + boxed domain); domains are short.
 const RP_REC_MAX: usize = 256;
@@ -45,6 +51,9 @@ pub struct RpView<'a> {
     pub rp_id_hash: [u8; 32],
     /// How many resident credentials this RP holds.
     pub count: u8,
+    /// The device-local display nickname ([`set_rp_nickname`]), if one is set —
+    /// borrowed from internal scratch like `rp_id`. `None` falls back to the rpId.
+    pub nickname: Option<&'a str>,
 }
 
 /// One resident credential's account identity, for the per-RP detail screen.
@@ -78,8 +87,14 @@ where
     };
     let mut occupied = [false; MAX_RESIDENT_CREDENTIALS as usize];
     slot_map(fs, EF_RP, &mut occupied);
+    // Which slots carry a nickname, mapped in one pass so absent nickname slots are
+    // never `fs.read`-probed (each such probe would rescan the whole partition).
+    let mut nick_present = [false; MAX_RESIDENT_CREDENTIALS as usize];
+    slot_map(fs, EF_RPNICK, &mut nick_present);
     let mut buf = [0u8; RP_REC_MAX];
     let mut plain = [0u8; RP_REC_MAX];
+    let mut nick_buf = [0u8; NICK_BOX_MAX];
+    let mut nick_plain = [0u8; RP_NICK_MAX_LEN];
     let mut total = 0usize;
     for i in 0..MAX_RESIDENT_CREDENTIALS {
         if !occupied[i as usize] {
@@ -98,16 +113,83 @@ where
         else {
             continue;
         };
+        // A nickname lives in the parallel EF_RPNICK slot; it opens only under this
+        // rpIdHash (the AEAD's AAD), so a stale slot-reuse leftover reads as `None`.
+        let nickname = if nick_present[i as usize] {
+            fs.read(EF_RPNICK + i, &mut nick_buf).and_then(|m| {
+                unseal_nick(
+                    &seed,
+                    &rp_id_hash,
+                    &nick_buf[..m.min(NICK_BOX_MAX)],
+                    &mut nick_plain,
+                )
+            })
+        } else {
+            None
+        };
         total += 1;
         f(RpView {
             rp_id,
             rp_id_hash,
             count: buf[0],
+            nickname,
         });
     }
     seed.zeroize();
     plain.zeroize(); // held the cleartext rp domains
+    nick_plain.zeroize(); // held the cleartext nicknames
     total
+}
+
+/// Set (or clear) the device-local display nickname for a resident RP. An empty `nick`
+/// deletes any existing nickname (the RP reverts to showing its rpId); a non-empty one
+/// (≤ [`RP_NICK_MAX_LEN`] bytes) is sealed at rest under the device seed and stored in
+/// the EF_RPNICK slot parallel to the RP's EF_RP record. Returns whether the change was
+/// persisted; `false` if the RP has no resident credentials (nothing to name), the
+/// nickname is too long, or the seed is unavailable. The credential box — and so the
+/// signing key — is never touched, so the passkey keeps working across a rename.
+pub fn set_rp_nickname<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    rp_id_hash: &[u8; 32],
+    nick: &str,
+) -> bool {
+    if nick.len() > RP_NICK_MAX_LEN {
+        return false;
+    }
+    let mut occupied = [false; MAX_RESIDENT_CREDENTIALS as usize];
+    slot_map(fs, EF_RP, &mut occupied);
+    let mut rp = [0u8; RP_REC_MAX];
+    let mut slot: Option<u16> = None;
+    for i in 0..MAX_RESIDENT_CREDENTIALS {
+        if !occupied[i as usize] {
+            continue;
+        }
+        if let Some(m) = fs.read(EF_RP + i, &mut rp)
+            && m.min(rp.len()) >= RP_PREFIX
+            && rp[1..RP_PREFIX] == *rp_id_hash
+        {
+            slot = Some(i);
+            break;
+        }
+    }
+    let Some(slot) = slot else {
+        return false; // no such resident RP
+    };
+    if nick.is_empty() {
+        let _ = fs.delete(EF_RPNICK + slot); // absent is fine — the RP ends up unnamed
+        return true;
+    }
+    let Some(mut seed) = crate::seed::load_keydev(dev, fs) else {
+        return false;
+    };
+    let mut rec = [0u8; NICK_BOX_MAX];
+    let ok = match seal_nick(&seed, rp_id_hash, nick, &mut rec) {
+        Ok(len) => fs.put(EF_RPNICK + slot, &rec[..len]).is_ok(),
+        Err(_) => false,
+    };
+    seed.zeroize();
+    ok
 }
 
 /// Visit each resident credential under `rp_id_hash` (slot order), decrypting its
@@ -436,5 +518,132 @@ mod tests {
         assert!(!delete_cred(&mut fs, EF_CRED + 200));
         // The real credential is still there — nothing was removed.
         assert_eq!(fids_under(&mut fs, "github.com").len(), 1);
+    }
+
+    // --- Device-local RP nicknames -----------------------------------------
+
+    /// The nickname as `for_each_rp` surfaces it for `rp_id`.
+    fn nick_of(fs: &mut Fs<RamStorage>, rp_id: &str) -> Option<std::string::String> {
+        let want = sha256(rp_id.as_bytes());
+        let mut out = None;
+        for_each_rp(&dev(), fs, |rp| {
+            if rp.rp_id_hash == want {
+                out = rp.nickname.map(|s| s.to_string());
+            }
+        });
+        out
+    }
+
+    #[test]
+    fn nickname_defaults_to_none_then_roundtrips() {
+        let (mut fs, seed) = provisioned();
+        add(&mut fs, &seed, 1, "github.com", b"u", "n", "N", 0);
+        let gh = sha256(b"github.com");
+        assert_eq!(
+            nick_of(&mut fs, "github.com"),
+            None,
+            "unset → rpId fallback"
+        );
+
+        assert!(set_rp_nickname(&dev(), &mut fs, &gh, "Work GitHub"));
+        assert_eq!(
+            nick_of(&mut fs, "github.com").as_deref(),
+            Some("Work GitHub")
+        );
+    }
+
+    #[test]
+    fn nickname_update_then_clear() {
+        let (mut fs, seed) = provisioned();
+        add(&mut fs, &seed, 1, "github.com", b"u", "n", "N", 0);
+        let gh = sha256(b"github.com");
+        assert!(set_rp_nickname(&dev(), &mut fs, &gh, "first"));
+        assert!(set_rp_nickname(&dev(), &mut fs, &gh, "second"));
+        assert_eq!(nick_of(&mut fs, "github.com").as_deref(), Some("second"));
+        // An empty nickname clears it — the RP reverts to its rpId.
+        assert!(set_rp_nickname(&dev(), &mut fs, &gh, ""));
+        assert_eq!(nick_of(&mut fs, "github.com"), None);
+    }
+
+    #[test]
+    fn nickname_on_unknown_rp_is_rejected() {
+        let (mut fs, _seed) = provisioned();
+        let ghost = sha256(b"nobody.example");
+        assert!(!set_rp_nickname(&dev(), &mut fs, &ghost, "ghost"));
+    }
+
+    #[test]
+    fn nickname_too_long_is_rejected_and_not_stored() {
+        let (mut fs, seed) = provisioned();
+        add(&mut fs, &seed, 1, "github.com", b"u", "n", "N", 0);
+        let gh = sha256(b"github.com");
+        let long = "a".repeat(RP_NICK_MAX_LEN + 1);
+        assert!(!set_rp_nickname(&dev(), &mut fs, &gh, &long));
+        assert_eq!(nick_of(&mut fs, "github.com"), None);
+        // Exactly the cap is accepted.
+        let max = "b".repeat(RP_NICK_MAX_LEN);
+        assert!(set_rp_nickname(&dev(), &mut fs, &gh, &max));
+        assert_eq!(
+            nick_of(&mut fs, "github.com").as_deref(),
+            Some(max.as_str())
+        );
+    }
+
+    #[test]
+    fn nickname_is_per_rp_and_survives_a_new_account() {
+        let (mut fs, seed) = provisioned();
+        add(&mut fs, &seed, 1, "github.com", b"u-a", "a", "A", 0);
+        add(&mut fs, &seed, 2, "google.com", b"u-b", "b", "B", 0);
+        let gh = sha256(b"github.com");
+        let gg = sha256(b"google.com");
+        assert!(set_rp_nickname(&dev(), &mut fs, &gh, "GH"));
+        assert!(set_rp_nickname(&dev(), &mut fs, &gg, "GG"));
+        // Adding another github account (bumps the count) must not disturb the nickname.
+        add(&mut fs, &seed, 3, "github.com", b"u-c", "c", "C", 0);
+        assert_eq!(nick_of(&mut fs, "github.com").as_deref(), Some("GH"));
+        assert_eq!(nick_of(&mut fs, "google.com").as_deref(), Some("GG"));
+    }
+
+    #[test]
+    fn nickname_is_dropped_when_its_rp_disappears() {
+        let (mut fs, seed) = provisioned();
+        add(&mut fs, &seed, 1, "solo.example", b"u", "n", "N", 0);
+        let h = sha256(b"solo.example");
+        assert!(set_rp_nickname(&dev(), &mut fs, &h, "Solo"));
+
+        // Delete the only credential — the RP (and its nickname) go away.
+        let solo = fids_under(&mut fs, "solo.example");
+        assert!(delete_cred(&mut fs, solo[0]));
+
+        // Re-create the same RP; it must NOT inherit the old nickname.
+        add(&mut fs, &seed, 2, "solo.example", b"u2", "n2", "N2", 0);
+        assert_eq!(
+            nick_of(&mut fs, "solo.example"),
+            None,
+            "a fresh RP at a reused slot is unnamed"
+        );
+    }
+
+    #[test]
+    fn nickname_is_sealed_at_rest() {
+        let (mut fs, seed) = provisioned();
+        add(&mut fs, &seed, 1, "github.com", b"u", "n", "N", 0);
+        let gh = sha256(b"github.com");
+        assert!(set_rp_nickname(&dev(), &mut fs, &gh, "secretname"));
+        // The cleartext must not appear in any EF_RPNICK slot's bytes.
+        let mut rec = [0u8; 256];
+        let mut found_cleartext = false;
+        for i in 0..MAX_RESIDENT_CREDENTIALS {
+            if let Some(n) = fs.read(EF_RPNICK + i, &mut rec) {
+                let n = n.min(rec.len());
+                if rec[..n]
+                    .windows(b"secretname".len())
+                    .any(|w| w == b"secretname")
+                {
+                    found_cleartext = true;
+                }
+            }
+        }
+        assert!(!found_cleartext, "nickname must be sealed, not cleartext");
     }
 }

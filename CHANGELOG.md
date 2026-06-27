@@ -15,6 +15,17 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Added
 
+- **Rename a passkey on the trusted display (experimental).** A relying party's detail
+  screen gains a pencil affordance (top-right of the title bar) that opens a character-wheel
+  editor to set a short **device-local nickname**, shown in place of the rpId on both the
+  detail screen and the Passkeys list. The nickname is a display-only label, **sealed at
+  rest** (ChaCha20-Poly1305 under the device seed, rpIdHash as AAD) in a new EF_RPNICK
+  region parallel to EF_RP; it is wiped by `authenticatorReset` and on-device factory reset,
+  and dropped automatically when its RP loses its last credential. Crucially it **never
+  touches the credential box**, so — unlike CTAP `updateUserInformation`, which reseals the
+  box and rotates the signing key — renaming a passkey here leaves it fully working. Because
+  it is device-local, the nickname is **not** reflected in host credential managers. Display
+  flavor only. bcdDevice 0x07A7 → 0x07A8.
 - **List paging on the trusted display (experimental).** The Passkeys list, a relying
   party's accounts, and the audit log now **page** through long sets instead of silently
   showing only the first few rows: a `‹` Prev / `›` Next bar with a "page / pages"

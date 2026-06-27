@@ -18,7 +18,7 @@ use embedded_graphics::{
     prelude::{RgbColor, WebColors},
     primitives::{
         Circle, Line, Primitive, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle,
-        RoundedRectangle, StrokeAlignment,
+        RoundedRectangle, StrokeAlignment, Triangle,
     },
 };
 
@@ -26,10 +26,11 @@ use crate::{
     ADJ_MINUS_RECT, ADJ_PLUS_RECT, ALLOW_RECT, AccountRow, AuditKind, AuditRow, BACK_RECT,
     BRIGHTNESS_LEVELS, ConfirmPrompt, DEL_HOLD_RECT, DENY_RECT, Glyph, HomeView, Label, NAV_H,
     NAV_TABS, NAV_TOP, NavTab, PAGER_NEXT_RECT, PAGER_PREV_RECT, PANEL_H, PANEL_W, PIN_CANCEL_RECT,
-    PIN_COLS, PIN_ROWS, PK_LIST_TOP, PinCaption, PinKey, PinPad, Point, Rect, RpRow, STATUS_BAR_H,
-    Screen, SettingsPage, SettingsView, StatusKind, SuccessKind, TITLE_BACK_RECT, TITLE_BAR_H,
-    font, font::Role, glyph, hex_u16, hex_u64, nav_tab_rect, page_count, pin_grid_key,
-    pin_key_rect, settings_row_rect, theme,
+    PIN_COLS, PIN_ROWS, PK_LIST_TOP, PinCaption, PinKey, PinPad, Point, RN_BKSP_RECT, RN_DOWN_RECT,
+    RN_FIELD_RECT, RN_INS_RECT, RN_SAVE_RECT, RN_UP_RECT, Rect, RpRow, STATUS_BAR_H, Screen,
+    SettingsPage, SettingsView, StatusKind, SuccessKind, TITLE_BACK_RECT, TITLE_BAR_H,
+    TITLE_EDIT_RECT, font, font::Role, glyph, hex_u16, hex_u64, nav_tab_rect, page_count,
+    pin_grid_key, pin_key_rect, settings_row_rect, theme,
 };
 
 // Local semantic aliases, all sourced from `theme` so the whole renderer speaks one
@@ -196,7 +197,7 @@ where
                 t,
                 crate::row_rect(PK_LIST_TOP, i as u16),
                 Glyph::Globe,
-                r.id.as_str(),
+                r.shown(),
                 Some((trailing, MUTED)),
                 true,
             )?;
@@ -206,10 +207,12 @@ where
     render_nav(t, NavTab::Passkeys)
 }
 
-/// The per-RP service detail: a back-chevron header + the (truncated) rpId, one row per
-/// resident account (key glyph + sanitized name + a "UV" tag when credProtect-gated),
-/// an "N accounts" footer, and the nav bar. The firmware makes each row tappable to
-/// start the Confirm-Delete flow ([`render_confirm_delete`]); rename is a later wave.
+/// The per-RP service detail: a back-chevron header + the (truncated) shown name (the
+/// device-local nickname or the rpId), a pencil [edit affordance](TITLE_EDIT_RECT) at the
+/// right of the title bar that opens the rename screen, one row per resident account (key
+/// glyph + sanitized name + a "UV" tag when credProtect-gated), an "N accounts" footer,
+/// and the nav bar. The firmware makes each row tappable to start the Confirm-Delete flow
+/// ([`render_confirm_delete`]).
 pub fn render_service<D>(
     t: &mut D,
     title: &Label,
@@ -223,6 +226,7 @@ where
     t.clear(BG)?;
     status_bar(t)?;
     title_bar(t, title.as_str(), theme::ACCENT, true)?;
+    glyph_centered(t, Glyph::Edit, TITLE_EDIT_RECT, 18, theme::ACCENT)?;
     for (i, a) in accounts.iter().enumerate() {
         let trailing = if a.protected {
             Some(("UV", theme::ACCENT))
@@ -240,6 +244,129 @@ where
     }
     list_tail(t, page, total, "account", "accounts")?;
     render_nav(t, NavTab::Passkeys)
+}
+
+/// The rename screen: a character-wheel editor for a relying party's device-local
+/// nickname. Status + title chrome (the back chevron cancels), a `NICKNAME` caption, the
+/// value field with a caret, then the wheel — a backspace key on the left, the ▲ / big
+/// candidate / ▼ centre column, and an insert (`+`) key on the right — over a full-width
+/// Save button. `value` is the current buffer; `candidate` the wheel's current byte
+/// (`b' '` shows as an underscore so a space is visible). The caret is static (no blink:
+/// there is no framebuffer / animation loop, as on the lock screen).
+pub fn render_rename<D>(t: &mut D, value: &str, candidate: u8) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    t.clear(BG)?;
+    status_bar(t)?;
+    title_bar(t, "Rename", theme::ACCENT, true)?;
+    text_left(
+        t,
+        "NICKNAME",
+        EgPoint::new(14, RN_FIELD_RECT.y as i32 - 10),
+        Role::Mono,
+        theme::CAPTION,
+    )?;
+
+    // The value field: a bordered surface holding the text and a static caret.
+    let field = RN_FIELD_RECT;
+    RoundedRectangle::with_equal_corners(eg_rect(field), Size::new(8, 8))
+        .into_styled(PrimitiveStyle::with_fill(theme::SURFACE))
+        .draw(t)?;
+    RoundedRectangle::with_equal_corners(eg_rect(field), Size::new(8, 8))
+        .into_styled(
+            PrimitiveStyleBuilder::new()
+                .stroke_color(theme::BORDER_FIELD)
+                .stroke_width(1)
+                .stroke_alignment(StrokeAlignment::Inside)
+                .build(),
+        )
+        .draw(t)?;
+    let pad = 10i32;
+    let inner = Rect::new(
+        field.x + pad as u16,
+        field.y,
+        field.w - 2 * pad as u16,
+        field.h,
+    );
+    let baseline = field.y as i32 + field.h as i32 / 2;
+    text_left_clipped(
+        t,
+        value,
+        EgPoint::new(inner.x as i32, baseline),
+        Role::Body,
+        FG,
+        inner,
+    )?;
+    let text_w = font::width(value, Role::Body).unwrap_or(0) as i32;
+    let caret_x = (inner.x as i32 + text_w).min(field.x as i32 + field.w as i32 - 6);
+    Line::new(
+        EgPoint::new(caret_x, field.y as i32 + 7),
+        EgPoint::new(caret_x, field.y as i32 + field.h as i32 - 7),
+    )
+    .into_styled(PrimitiveStyle::with_stroke(theme::ACCENT, 1))
+    .draw(t)?;
+
+    // The wheel: up / down arrows around the big candidate character.
+    key_surface(t, RN_UP_RECT, KEY_FILL, true)?;
+    wheel_arrow(t, RN_UP_RECT, true, theme::ACCENT)?;
+    key_surface(t, RN_DOWN_RECT, KEY_FILL, true)?;
+    wheel_arrow(t, RN_DOWN_RECT, false, theme::ACCENT)?;
+    let cy = (RN_UP_RECT.y + RN_UP_RECT.h + RN_DOWN_RECT.y) as i32 / 2;
+    if candidate == b' ' {
+        // A space candidate: a short underline so the wheel isn't blank.
+        Line::new(
+            EgPoint::new(MIDX - 10, cy + 9),
+            EgPoint::new(MIDX + 10, cy + 9),
+        )
+        .into_styled(PrimitiveStyle::with_stroke(FG, 2))
+        .draw(t)?;
+    } else {
+        let b = [candidate];
+        let s = core::str::from_utf8(&b).unwrap_or("?");
+        text(t, s, EgPoint::new(MIDX, cy), Role::Ready, FG)?;
+    }
+
+    // Backspace (left) and insert-candidate (right).
+    key_surface(t, RN_BKSP_RECT, theme::KEY_DARK, true)?;
+    glyph_centered(t, Glyph::Backspace, RN_BKSP_RECT, 22, MUTED)?;
+    key_surface(t, RN_INS_RECT, KEY_FILL, true)?;
+    let ic = center(RN_INS_RECT);
+    Line::new(EgPoint::new(ic.x - 9, ic.y), EgPoint::new(ic.x + 9, ic.y))
+        .into_styled(PrimitiveStyle::with_stroke(theme::ACCENT, 2))
+        .draw(t)?;
+    Line::new(EgPoint::new(ic.x, ic.y - 9), EgPoint::new(ic.x, ic.y + 9))
+        .into_styled(PrimitiveStyle::with_stroke(theme::ACCENT, 2))
+        .draw(t)?;
+
+    button(t, RN_SAVE_RECT, "Save", ALLOW_FILL)
+}
+
+/// A filled wheel arrow (▲ when `up`, else ▼) centred in `r`.
+fn wheel_arrow<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    r: Rect,
+    up: bool,
+    color: Rgb565,
+) -> Result<(), D::Error> {
+    let cx = (r.x + r.w / 2) as i32;
+    let cy = (r.y + r.h / 2) as i32;
+    let (apex, left, right) = if up {
+        (
+            EgPoint::new(cx, cy - 8),
+            EgPoint::new(cx - 9, cy + 6),
+            EgPoint::new(cx + 9, cy + 6),
+        )
+    } else {
+        (
+            EgPoint::new(cx, cy + 8),
+            EgPoint::new(cx - 9, cy - 6),
+            EgPoint::new(cx + 9, cy - 6),
+        )
+    };
+    Triangle::new(apex, left, right)
+        .into_styled(PrimitiveStyle::with_fill(color))
+        .draw(t)
 }
 
 /// The read-only on-device audit log (Settings → Security → Audit log): the most recent
@@ -1143,7 +1270,10 @@ pub fn status_bar<D: DrawTarget<Color = Rgb565>>(t: &mut D) -> Result<(), D::Err
 
 /// The **title bar** below the status bar: an optional back chevron (painted in
 /// [`TITLE_BACK_RECT`], the region [`crate::hit_title_back`] maps a tap to) and the
-/// screen `title`. The chevron tints with the title (both `color`), per the design.
+/// screen `title`. The chevron tints with the title (both `color`), per the design. The
+/// title is **clipped** to the strip left of the right-edge affordance zone
+/// ([`TITLE_EDIT_RECT`]): a long, user-controllable title (e.g. a device-local nickname)
+/// is cut at the boundary rather than overrunning off-panel or under the edit pencil.
 pub fn title_bar<D: DrawTarget<Color = Rgb565>>(
     t: &mut D,
     title: &str,
@@ -1163,7 +1293,14 @@ pub fn title_bar<D: DrawTarget<Color = Rgb565>>(
     } else {
         13
     };
-    text_left(t, title, EgPoint::new(tx, cy), Role::Heading, color)
+    let right = TITLE_EDIT_RECT.x.saturating_sub(4); // a gap before the affordance zone
+    let clip = Rect::new(
+        tx as u16,
+        STATUS_BAR_H,
+        right.saturating_sub(tx as u16),
+        TITLE_BAR_H,
+    );
+    text_left_clipped(t, title, EgPoint::new(tx, cy), Role::Heading, color, clip)
 }
 
 /// The top header strip: a title (accent or muted) at the left, an optional status
@@ -1797,10 +1934,12 @@ mod tests {
         let rows = [
             RpRow {
                 id: Label::clamp(b"github.com"),
+                nick: Label::default(),
                 accounts: 2,
             },
             RpRow {
                 id: Label::clamp(b"google.com"),
+                nick: Label::default(),
                 accounts: 1,
             },
         ];
@@ -1846,9 +1985,86 @@ mod tests {
             has_color(&d, crate::TITLE_BACK_RECT, theme::ACCENT),
             "back chevron missing from its title-bar hit rect"
         );
+        // The pencil edit affordance paints in TITLE_EDIT_RECT (the rename entry).
+        assert!(
+            d.any_non_bg_in(crate::TITLE_EDIT_RECT),
+            "edit affordance missing from its title-bar hit rect"
+        );
         for i in 0..accounts.len() as u16 {
             assert!(d.any_non_bg_in(crate::row_rect(PK_LIST_TOP, i)));
         }
+    }
+
+    #[test]
+    fn service_title_clips_a_wide_nickname_in_panel() {
+        // A max-length wide nickname (24 'W') must be clipped to the title strip, not
+        // overrun off-panel or under the edit pencil (TITLE_EDIT_RECT).
+        let accounts = [AccountRow {
+            name: Label::clamp(b"alex@example.com"),
+            protected: false,
+        }];
+        let wide = Label::clamp(&[b'W'; 24]);
+        let mut d = Rec::new();
+        render_service(&mut d, &wide, &accounts, 0, 1).unwrap();
+        assert!(!d.oob, "wide service title drew outside the panel");
+        // The pencil's region still gets its glyph (the title didn't paint over it... the
+        // clip ends before it).
+        assert!(d.any_non_bg_in(crate::TITLE_EDIT_RECT));
+    }
+
+    #[test]
+    fn rename_screen_paints_wheel_and_save() {
+        let mut d = Rec::new();
+        render_rename(&mut d, "work", b'a').unwrap();
+        assert!(!d.oob, "rename drew outside the panel");
+        assert!(d.drew_anything());
+        // The back chevron cancels; the Save button is the primary fill — both in their
+        // hit rects.
+        assert!(has_color(&d, crate::TITLE_BACK_RECT, theme::ACCENT));
+        assert!(
+            has_color(&d, crate::RN_SAVE_RECT, theme::ACCENT_FILL),
+            "Save button missing from its hit rect"
+        );
+        // Each wheel control paints something in its own tap target.
+        for r in [
+            crate::RN_UP_RECT,
+            crate::RN_DOWN_RECT,
+            crate::RN_BKSP_RECT,
+            crate::RN_INS_RECT,
+        ] {
+            assert!(d.any_non_bg_in(r), "wheel key {r:?} painted nothing");
+        }
+    }
+
+    #[test]
+    fn rename_space_candidate_stays_in_panel() {
+        // The space candidate takes a different (underline) draw path — still in-bounds,
+        // and an empty value (caret at the field start) must not spill either.
+        let mut d = Rec::new();
+        render_rename(&mut d, "", b' ').unwrap();
+        assert!(!d.oob, "rename(space) drew outside the panel");
+        assert!(d.drew_anything());
+    }
+
+    #[test]
+    fn rename_long_value_is_clipped_to_the_field() {
+        // A value far wider than the field must not paint past the panel (it is clipped).
+        let long = "abcdefghijklmnopqrstuvwx";
+        let mut d = Rec::new();
+        render_rename(&mut d, long, b'z').unwrap();
+        assert!(!d.oob, "rename(long) drew outside the panel");
+    }
+
+    #[test]
+    fn passkeys_list_shows_nickname_over_rpid() {
+        let rows = [RpRow {
+            id: Label::clamp(b"github.com"),
+            nick: Label::clamp(b"Work GitHub"),
+            accounts: 2,
+        }];
+        let mut d = Rec::new();
+        render_passkeys_list(&mut d, &rows, 0, 1).unwrap();
+        assert!(!d.oob && d.drew_anything());
     }
 
     /// The Confirm-Delete screen paints its hold control in `DEL_HOLD_RECT` and the

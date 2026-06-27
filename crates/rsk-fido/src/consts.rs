@@ -196,6 +196,14 @@ pub const EF_HARDENED: u16 = 0xCE14;
 pub const EF_COUNTER: u16 = 0xC000; // global signature counter
 pub const EF_CRED: u16 = 0xCF00; // resident credentials, 0xCF00..0xCFFF
 pub const EF_RP: u16 = 0xD000; // relying-party metadata, 0xD000..0xD0FF
+// Device-local relying-party display nicknames, 0xD300..0xD3FF (one slot per EF_RP
+// slot). A trusted-display-only label sealed at rest; never crosses the wire and is
+// not part of any credential, so it can't touch the box / signing key (PIV owns
+// 0xD100..=0xD2FF, so this sits clear of it). Additive: absent on devices upgraded
+// from before this region, which simply show the rpId.
+pub const EF_RPNICK: u16 = 0xD300;
+/// Longest device-local RP nickname (bytes) the trusted display stores + accepts.
+pub const RP_NICK_MAX_LEN: usize = 24;
 pub const EF_PIN: u16 = 0x1080; // PIN: [retries, len, format, verifier(32)]
 pub const EF_AUTHTOKEN: u16 = 0x1090; // pinUvAuthToken seed
 pub const EF_PAUTHTOKEN: u16 = 0x1091; // persistent pinUvAuthToken seed

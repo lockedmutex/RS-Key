@@ -26,6 +26,7 @@ use rsk_sdk::error::{Error, Result};
 
 use crate::consts::{
     ALG_ES256, CURVE_P256, EF_CRED, EF_RP, MAX_CREDBLOB_LENGTH, MAX_RESIDENT_CREDENTIALS,
+    RP_NICK_MAX_LEN,
 };
 use crate::keyderiv::{KEY_HANDLE_LEN, verify_key};
 
@@ -34,6 +35,9 @@ const CRED_PROTO_RESIDENT: &[u8; 4] = b"\xf1\xd0\x02\x03";
 /// Derive label for the EF_RP rpId box — domain-separated from the credential-id
 /// protos so the rpId box key can never coincide with a cred-box key.
 const RP_PROTO: &[u8] = b"RS-Key/EF_RP/rpId";
+/// Derive label for the device-local EF_RPNICK box — its own domain so the nickname
+/// box key is distinct from the rpId box and every cred-box key.
+const NICK_PROTO: &[u8] = b"RS-Key/EF_RPNICK/nick";
 const PROTO_LEN: usize = 4;
 const IV_LEN: usize = 12;
 const TAG_LEN: usize = 16;
@@ -42,6 +46,9 @@ const SILENT_TAG_LEN: usize = 16;
 const HEAD_LEN: usize = PROTO_LEN + IV_LEN; // 16
 /// Bytes around the ciphertext for proto 0x02: head + poly tag + silent tag.
 const WRAP_LEN_22: usize = HEAD_LEN + TAG_LEN + SILENT_TAG_LEN; // 48
+
+/// Largest EF_RPNICK record: `iv(12) ‖ ciphertext ‖ tag(16)` for a max-length nickname.
+pub(crate) const NICK_BOX_MAX: usize = IV_LEN + RP_NICK_MAX_LEN + TAG_LEN;
 
 /// Resident-id length.
 pub const CRED_RESIDENT_LEN: usize = 42;
@@ -600,6 +607,81 @@ pub(crate) fn unseal_rp_id<'a>(
     None
 }
 
+/// Box a device-local RP nickname under the device seed. Layout written to `out`:
+/// `iv(12) ‖ ciphertext ‖ poly1305_tag(16)`, ChaCha20-Poly1305 with the rpIdHash as
+/// AAD — same shape as [`seal_rp_id`]. Two differences matter:
+///
+/// * The nickname is **mutable** (unlike the immutable rpId domain), so the IV is
+///   synthetic over the *plaintext*: `iv = HMAC(key, rpIdHash ‖ nick)[..12]`. A fixed
+///   (key, iv) thus only ever encrypts the one nickname it was derived from, so a
+///   re-rename to a different string draws a different IV — no nonce reuse. Equal
+///   nicknames under different rpIdHashes also differ (the hash is folded in). The
+///   residual (a rename back to a prior value reproduces a prior box) is
+///   deterministic-encryption-level leakage, matching [`seal_rp_id`]'s own model.
+/// * The rpIdHash AAD binds the box to its RP, so a stale nickname left in a reused
+///   slot fails to open under a different RP — the AEAD itself is the slot-reuse guard,
+///   no cleartext key prefix is stored.
+pub(crate) fn seal_nick(
+    seed: &[u8; 32],
+    rp_id_hash: &[u8; 32],
+    nick: &str,
+    out: &mut [u8],
+) -> Result<usize> {
+    let id = nick.as_bytes();
+    if id.len() > RP_NICK_MAX_LEN {
+        return Err(Error::NoMemory);
+    }
+    let total = IV_LEN + id.len() + TAG_LEN;
+    if total > out.len() {
+        return Err(Error::NoMemory);
+    }
+    let mut key = derive_chacha_key(seed, NICK_PROTO);
+    let mut iv_src = [0u8; 32 + RP_NICK_MAX_LEN];
+    iv_src[..32].copy_from_slice(rp_id_hash);
+    iv_src[32..32 + id.len()].copy_from_slice(id);
+    let iv_full = hmac_sha256(&key, &iv_src[..32 + id.len()]);
+    let mut iv = [0u8; IV_LEN];
+    iv.copy_from_slice(&iv_full[..IV_LEN]);
+    out[..IV_LEN].copy_from_slice(&iv);
+    out[IV_LEN..IV_LEN + id.len()].copy_from_slice(id);
+    let tag = chacha20poly1305_encrypt(&key, &iv, rp_id_hash, &mut out[IV_LEN..IV_LEN + id.len()]);
+    out[IV_LEN + id.len()..total].copy_from_slice(&tag);
+    key.zeroize();
+    Ok(total)
+}
+
+/// Recover a device-local RP nickname from an EF_RPNICK record. Returns the nickname
+/// only if the box opens under this rpIdHash — an absent, short, or stale (slot-reused)
+/// record yields `None`, so the caller falls back to the rpId.
+pub(crate) fn unseal_nick<'a>(
+    seed: &[u8; 32],
+    rp_id_hash: &[u8; 32],
+    tail: &[u8],
+    out: &'a mut [u8],
+) -> Option<&'a str> {
+    let n = tail.len();
+    if n < IV_LEN + TAG_LEN {
+        return None;
+    }
+    let ct_len = n - IV_LEN - TAG_LEN;
+    if ct_len > out.len() {
+        return None; // `out` holds only the plaintext nickname, not the whole box
+    }
+    let mut iv = [0u8; IV_LEN];
+    iv.copy_from_slice(&tail[..IV_LEN]);
+    let mut tag = [0u8; TAG_LEN];
+    tag.copy_from_slice(&tail[n - TAG_LEN..]);
+    out[..ct_len].copy_from_slice(&tail[IV_LEN..IV_LEN + ct_len]);
+    let mut key = derive_chacha_key(seed, NICK_PROTO);
+    let ok = chacha20poly1305_decrypt(&key, &iv, rp_id_hash, &mut out[..ct_len], &tag).is_ok();
+    key.zeroize();
+    if ok {
+        core::str::from_utf8(&out[..ct_len]).ok()
+    } else {
+        None
+    }
+}
+
 /// Boot pass: re-box any legacy cleartext EF_RP record so a flash dump no longer
 /// reveals the cleartext list of relying parties. Idempotent and crash-safe —
 /// already-boxed records authenticate and are skipped, and a partially-migrated
@@ -876,5 +958,49 @@ mod tests {
         let m2 = fs.read(EF_RP, &mut rp).unwrap();
         assert_eq!(rp[0], 1, "same user must not bump the rp count");
         assert_eq!(m2, m);
+    }
+
+    #[test]
+    fn nick_seal_roundtrip_and_binds_to_rp() {
+        let rp_hash = sha256(b"github.com");
+        let mut out = [0u8; NICK_BOX_MAX];
+        let len = seal_nick(&SEED, &rp_hash, "Work GitHub", &mut out).unwrap();
+        // Not cleartext on flash.
+        assert!(!out[..len].windows(11).any(|w| w == b"Work GitHub"));
+
+        let mut plain = [0u8; RP_NICK_MAX_LEN];
+        let got = unseal_nick(&SEED, &rp_hash, &out[..len], &mut plain).unwrap();
+        assert_eq!(got, "Work GitHub");
+
+        // The rpIdHash is the AEAD's AAD, so the box won't open under another RP — this
+        // is the slot-reuse guard a stale leftover hits.
+        let other = sha256(b"evil.com");
+        let mut p2 = [0u8; RP_NICK_MAX_LEN];
+        assert!(unseal_nick(&SEED, &other, &out[..len], &mut p2).is_none());
+    }
+
+    #[test]
+    fn nick_rename_draws_a_fresh_iv() {
+        // The synthetic IV is plaintext-bound, so renaming to a different value uses a
+        // different IV — never reusing a nonce against a changed plaintext.
+        let rp_hash = sha256(b"github.com");
+        let mut a = [0u8; NICK_BOX_MAX];
+        let mut b = [0u8; NICK_BOX_MAX];
+        seal_nick(&SEED, &rp_hash, "first", &mut a).unwrap();
+        seal_nick(&SEED, &rp_hash, "secnd", &mut b).unwrap();
+        assert_ne!(
+            a[..IV_LEN],
+            b[..IV_LEN],
+            "different plaintext → different IV"
+        );
+    }
+
+    #[test]
+    fn nick_too_long_is_rejected_by_seal() {
+        let rp_hash = sha256(b"github.com");
+        let mut out = [0u8; NICK_BOX_MAX + 64];
+        let long = [b'a'; RP_NICK_MAX_LEN + 1];
+        let long = core::str::from_utf8(&long).unwrap();
+        assert!(seal_nick(&SEED, &rp_hash, long, &mut out).is_err());
     }
 }
