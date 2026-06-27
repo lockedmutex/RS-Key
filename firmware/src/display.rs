@@ -1057,11 +1057,17 @@ impl Ui {
     /// the instant a command arrives, mirroring the browse modals. The host built-in-UV
     /// path sets it `false`: there the host *is* waiting on this exact PIN (its `REQ` is
     /// already consumed), so it blocks to the presence timeout as before.
+    ///
+    /// `expected` is the number of placeholder dots the entry row outlines before any are
+    /// filled (the policy minimum length) — the design's fixed indicator. The caller
+    /// supplies it rather than this fn re-reading `fs`, because the host built-in-UV path
+    /// runs while the worker already holds `fs` borrowed (a re-read there would panic).
     fn collect_pin(
         &mut self,
         title: &'static str,
         caption: Option<PinCaption>,
         min_len: usize,
+        expected: u8,
         out: &mut [u8],
         yield_to_host: bool,
     ) -> rsk_fido::PinEntry {
@@ -1079,7 +1085,7 @@ impl Ui {
         note_activity();
         let _ = rsk_ui::render(
             &mut self.panel,
-            &Screen::Pin(PinPad::with_caption(entered, title, caption)),
+            &Screen::Pin(PinPad::with_caption(entered, title, caption).expecting(expected)),
         );
         self.shown = None; // force the status loop to repaint once we release it
         let outcome = loop {
@@ -1107,7 +1113,7 @@ impl Ui {
                     }
                 };
                 if repaint && done.is_none() {
-                    let _ = rsk_ui::render_pin_dots(&mut self.panel, entered);
+                    let _ = rsk_ui::render_pin_dots(&mut self.panel, entered, expected);
                 }
                 self.touch.wait_release(start, timeout);
                 if let Some(o) = done {
@@ -1147,16 +1153,29 @@ impl Ui {
     /// is spent. Returns whether the action may proceed (`true` = no PIN set, or the
     /// correct PIN was entered).
     fn local_pin_gate(&mut self, title: &'static str) -> bool {
-        if !rsk_fido::passkeys::pin_is_set(&mut self.fs.borrow_mut()) {
-            return true;
-        }
+        let (retries, expected) = {
+            let mut fs = self.fs.borrow_mut();
+            if !rsk_fido::passkeys::pin_is_set(&mut fs) {
+                return true;
+            }
+            (
+                rsk_fido::passkeys::pin_retries_left(&mut fs),
+                // The placeholder-dot count is the policy minimum, so the indicator
+                // matches the set/change and host-UV pads on the same device. The OK
+                // floor stays 4 (below) — these can differ, hence the explicit arg.
+                rsk_fido::passkeys::min_pin_length(&mut fs),
+            )
+        };
         let mut pin = [0u8; 64];
-        let mut caption = None;
+        // Show the remaining attempts up front (the design's enterpin "N tries
+        // remaining"); a wrong entry then swaps it for the danger "Wrong PIN, N left".
+        let mut caption = retries.map(|left| PinCaption::TriesRemaining { left });
         let mut blocked = false;
         let proceed = loop {
             // CTAP's 4-digit floor; `verify_local_pin` checks the exact PIN regardless,
             // so a higher `minPINLength` policy is still satisfied by typing it in full.
-            match self.collect_pin(title, caption, 4, &mut pin, true) {
+            // (A PIN set before the policy was raised may be shorter than `expected`.)
+            match self.collect_pin(title, caption, 4, expected, &mut pin, true) {
                 rsk_fido::PinEntry::Entered(len) => {
                     let dev = self.keys.device();
                     let verdict = rsk_fido::passkeys::verify_local_pin(
@@ -1403,16 +1422,25 @@ impl Ui {
         // always one the host clientPIN path can verify, and `store_local_pin` re-checks.
         let mut new = [0u8; rsk_fido::passkeys::MAX_PIN_LENGTH];
         let mut confirm = [0u8; rsk_fido::passkeys::MAX_PIN_LENGTH];
-        // After a New ≠ Confirm mismatch, re-prompt "New PIN" with a visible reason.
-        let mut new_caption = None;
+        // The createpin step opens with a muted "Choose a PIN" hint; a New ≠ Confirm
+        // mismatch re-prompts it with the danger-coloured reason instead.
+        let mut new_caption = Some(PinCaption::ChoosePin);
         loop {
             new.zeroize();
             confirm.zeroize();
-            let n1 = match self.collect_pin("New PIN", new_caption, min, &mut new, true) {
+            let expected = min.min(u8::MAX as usize) as u8;
+            let n1 = match self.collect_pin("New PIN", new_caption, min, expected, &mut new, true) {
                 rsk_fido::PinEntry::Entered(n) => n.min(new.len()),
                 _ => break, // declined / timeout / host yield — nothing set
             };
-            let n2 = match self.collect_pin("Confirm PIN", None, min, &mut confirm, true) {
+            let n2 = match self.collect_pin(
+                "Confirm PIN",
+                Some(PinCaption::Reenter),
+                min,
+                expected,
+                &mut confirm,
+                true,
+            ) {
                 rsk_fido::PinEntry::Entered(n) => n.min(confirm.len()),
                 _ => break, // confirm declined / timeout / host yield
             };
@@ -1754,9 +1782,15 @@ impl TouchPresence {
     /// `Ui` and run it there, so the host path and a display-initiated gate
     /// ([`Ui::run_delete`]) share one implementation.
     fn collect_pin_impl(&mut self, min_len: usize, out: &mut [u8]) -> rsk_fido::PinEntry {
+        // No up-front "N tries remaining" caption here, unlike the local unlock gate: the
+        // worker already holds the shared `fs` RefCell borrowed across this CTAP call
+        // (clientPIN 0x06 → get_uv_token), so re-reading the counter would double-borrow
+        // and panic. The placeholder dots (sized from `min_len`) still show; the host
+        // already exposes the retry count via getPINRetries / getUVRetries.
+        let expected = min_len.min(u8::MAX as usize) as u8;
         self.ui
             .borrow_mut()
-            .collect_pin("Enter PIN", None, min_len, out, false)
+            .collect_pin("Enter PIN", None, min_len, expected, out, false)
     }
 }
 

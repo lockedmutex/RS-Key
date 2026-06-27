@@ -1054,7 +1054,7 @@ fn pin<D: DrawTarget<Color = Rgb565>>(t: &mut D, pad: &PinPad) -> Result<(), D::
         16,
         theme::DENY,
     )?;
-    masked_entry(t, pad.entered)?;
+    masked_entry(t, pad.entered, pad.expected)?;
     let mut row = 0;
     while row < PIN_ROWS {
         let mut col = 0;
@@ -1080,15 +1080,21 @@ fn pin<D: DrawTarget<Color = Rgb565>>(t: &mut D, pad: &PinPad) -> Result<(), D::
         }
         row += 1;
     }
-    // A rejected entry leaves a danger-coloured caption in the strip below the grid, so a
-    // wrong PIN / mismatch is visible rather than a silent re-prompt.
+    // The caption strip below the grid: a rejection is danger-coloured (a wrong PIN /
+    // mismatch is visible, never a silent re-prompt); an informational hint (tries
+    // remaining / choose / re-enter) is muted so it reads as guidance, not an error.
     if let Some(caption) = pad.caption {
+        let color = if caption.is_rejection() {
+            theme::DANGER
+        } else {
+            MUTED
+        };
         text(
             t,
             pin_caption_text(caption),
             EgPoint::new(MIDX, PANEL_H as i32 - 9),
             Role::Body,
-            theme::DANGER,
+            color,
         )?;
     }
     Ok(())
@@ -1108,26 +1114,53 @@ fn pin_caption_text(c: PinCaption) -> &'static str {
         "Wrong PIN, 7 left",
         "Wrong PIN, 8 left",
     ];
+    // "N tries remaining" up front (the unlock pad), singular at one. Indexed by the live
+    // budget, which never exceeds the retry ceiling, so the table needs no alloc.
+    const TRIES: [&str; 9] = [
+        "0 tries remaining",
+        "1 try remaining",
+        "2 tries remaining",
+        "3 tries remaining",
+        "4 tries remaining",
+        "5 tries remaining",
+        "6 tries remaining",
+        "7 tries remaining",
+        "8 tries remaining",
+    ];
     match c {
         PinCaption::WrongPin { retries_left } => {
             WRONG[(retries_left as usize).min(WRONG.len() - 1)]
         }
         PinCaption::Mismatch => "PINs don't match",
+        PinCaption::TriesRemaining { left } => TRIES[(left as usize).min(TRIES.len() - 1)],
+        PinCaption::ChoosePin => "Choose a PIN",
+        PinCaption::Reenter => "Re-enter to confirm",
     }
 }
 
-/// One filled cyan dot per entered digit (capped to a row width), centered — the PIN
-/// itself is never rendered, only its length.
-fn masked_entry<D: DrawTarget<Color = Rgb565>>(t: &mut D, entered: usize) -> Result<(), D::Error> {
+/// The masked entry row: a filled accent dot per entered digit, over `expected` dim
+/// placeholder outlines (the design's fixed indicator) — so an empty pad already shows
+/// how many digits are wanted, and each keystroke fills one. The row sizes to the larger
+/// of the two so a PIN longer than the minimum grows past the outlines. The PIN itself is
+/// never rendered, only its length.
+fn masked_entry<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    entered: usize,
+    expected: u8,
+) -> Result<(), D::Error> {
     const MAX_DOTS: usize = 10;
     const DIA: u32 = 12;
     const STEP: i32 = 20;
-    let n = entered.min(MAX_DOTS) as i32;
-    let start = MIDX - (n * STEP) / 2 + (STEP - DIA as i32) / 2;
-    for i in 0..n {
-        Circle::new(EgPoint::new(start + i * STEP, 54), DIA)
-            .into_styled(PrimitiveStyle::with_fill(theme::ACCENT))
-            .draw(t)?;
+    let total = (expected as usize).max(entered).min(MAX_DOTS);
+    let start = MIDX - (total as i32 * STEP) / 2 + (STEP - DIA as i32) / 2;
+    for i in 0..total {
+        let at = EgPoint::new(start + i as i32 * STEP, 54);
+        let style = if i < entered {
+            PrimitiveStyle::with_fill(theme::ACCENT)
+        } else {
+            PrimitiveStyle::with_stroke(theme::CAPTION, 1)
+        };
+        Circle::new(at, DIA).into_styled(style).draw(t)?;
     }
     Ok(())
 }
@@ -1142,7 +1175,7 @@ const PIN_ENTRY_H: u32 = 24;
 /// `render(&Screen::Pin(..))`; each keystroke then calls this, so adding or removing
 /// a digit is a tiny partial update with no full-screen clear — and thus no flicker,
 /// unlike repainting the whole 240×320 frame per tap.
-pub fn render_pin_dots<D>(target: &mut D, entered: usize) -> Result<(), D::Error>
+pub fn render_pin_dots<D>(target: &mut D, entered: usize, expected: u8) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb565>,
 {
@@ -1152,7 +1185,7 @@ where
     )
     .into_styled(PrimitiveStyle::with_fill(BG))
     .draw(target)?;
-    masked_entry(target, entered)
+    masked_entry(target, entered, expected)
 }
 
 /// A static caption for a pad key — no alloc: digits index a fixed table.
@@ -2263,7 +2296,7 @@ mod tests {
         let ok = pin_key_rect(2, 3);
         let key_px = d.at(ok.x + crate::PIN_KEY_W / 2, ok.y + 3);
         // A partial dots update touches only the entry band, never the keys.
-        render_pin_dots(&mut d, 5).unwrap();
+        render_pin_dots(&mut d, 5, 0).unwrap();
         assert!(!d.oob);
         assert_eq!(
             d.at(ok.x + crate::PIN_KEY_W / 2, ok.y + 3),
@@ -2272,6 +2305,59 @@ mod tests {
         );
         // The band still carries dots for the new digit count.
         assert!((48..72).any(|y| (0..PANEL_W).any(|x| d.at(x, y) != BG)));
+    }
+
+    #[test]
+    fn pin_placeholders_outline_the_expected_minimum() {
+        let band = Rect::new(0, 48, PANEL_W, 24);
+        // An empty pad expecting 6 digits already outlines them — dim placeholder rings,
+        // no filled accent dot yet.
+        let mut empty = Rec::new();
+        render(&mut empty, &Screen::Pin(PinPad::new(0).expecting(6))).unwrap();
+        assert!(!empty.oob);
+        assert!(
+            has_color(&empty, band, theme::CAPTION),
+            "an empty pad must outline the expected digits"
+        );
+        assert!(
+            !has_color(&empty, band, theme::ACCENT),
+            "no digit entered yet, so no filled dot"
+        );
+        // Two of six entered: the row carries both filled (accent) and outlined (dim) dots.
+        let mut some = Rec::new();
+        render(&mut some, &Screen::Pin(PinPad::new(2).expecting(6))).unwrap();
+        assert!(has_color(&some, band, theme::ACCENT), "entered digits fill");
+        assert!(
+            has_color(&some, band, theme::CAPTION),
+            "the remaining placeholders stay outlined"
+        );
+    }
+
+    #[test]
+    fn pin_info_caption_paints_muted_not_danger() {
+        // The strip under the grid (grid bottom is y300; the caption sits in 301..320).
+        let strip = Rect::new(0, 301, PANEL_W, PANEL_H - 301);
+        for hint in [
+            PinCaption::TriesRemaining { left: 7 },
+            PinCaption::ChoosePin,
+            PinCaption::Reenter,
+        ] {
+            let mut d = Rec::new();
+            render(
+                &mut d,
+                &Screen::Pin(PinPad::with_caption(0, "Enter PIN", Some(hint))),
+            )
+            .unwrap();
+            assert!(!d.oob);
+            assert!(
+                has_color(&d, strip, MUTED),
+                "an informational hint must paint muted"
+            );
+            assert!(
+                !has_color(&d, strip, theme::DANGER),
+                "an informational hint must not use the danger colour"
+            );
+        }
     }
 
     fn view(page: SettingsPage) -> SettingsView {

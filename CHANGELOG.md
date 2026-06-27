@@ -15,6 +15,17 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Added
 
+- **PIN-entry indicator + "tries remaining" on the trusted display (experimental).** The
+  on-device PIN pad now matches the design's `enterpin` / `createpin` / `confirmpin`
+  screens: the entry row shows a row of **dim placeholder dots for the minimum length**
+  that fill with the accent colour as digits are typed (a longer PIN grows past them),
+  instead of a bare growing run. The on-device PIN gates — unlock, and the delete /
+  factory-reset / change-current-PIN prompts — open with a muted **"N tries remaining"**
+  line so the remaining attempts before lockout are visible up front (read from the same
+  `EF_PIN` counter without spending a try); a wrong entry still swaps it for the
+  danger-coloured "Wrong PIN, N left". The on-device **Set / Change PIN** steps gain
+  matching muted hints — **"Choose a PIN"** then **"Re-enter to confirm"**. Pure on-panel
+  feedback — no auth logic changed. Display flavor only. bcdDevice 0x07A8 → 0x07A9.
 - **Rename a passkey on the trusted display (experimental).** A relying party's detail
   screen gains a pencil affordance (top-right of the title bar) that opens a character-wheel
   editor to set a short **device-local nickname**, shown in place of the rpId on both the

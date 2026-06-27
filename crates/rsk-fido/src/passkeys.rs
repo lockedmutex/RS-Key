@@ -30,8 +30,8 @@ use crate::credential::{
 /// `verify_pin_hash` in `clientpin`. [`min_pin_length`] is the floor the set flow shows
 /// on the pad and enforces.
 pub use crate::clientpin::{
-    LocalPin, MAX_PIN_LENGTH, SetPinError, min_pin_length, pin_is_set, store_local_pin,
-    verify_local_pin,
+    LocalPin, MAX_PIN_LENGTH, SetPinError, min_pin_length, pin_is_set, pin_retries_left,
+    store_local_pin, verify_local_pin,
 };
 /// The on-device nickname length cap, re-exported here so the display sizes its rename
 /// buffer from the same constant the store enforces.

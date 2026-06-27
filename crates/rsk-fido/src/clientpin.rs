@@ -704,6 +704,20 @@ pub fn pin_is_set<S: Storage>(fs: &mut Fs<S>) -> bool {
     fs.has_data(EF_PIN)
 }
 
+/// The PIN's remaining retry budget (the `EF_PIN` counter), or `None` when no PIN is
+/// set. Read-only — unlike [`verify_local_pin`] it never decrements — so the trusted
+/// display can show "N tries remaining" up front on the unlock pad without spending a
+/// try. It is the same persistent counter the host clientPIN path enforces.
+pub fn pin_retries_left<S: Storage>(fs: &mut Fs<S>) -> Option<u8> {
+    let mut pin_data = [0u8; PIN_FILE_LEN];
+    let out = match fs.read(EF_PIN, &mut pin_data) {
+        Some(PIN_FILE_LEN) => Some(pin_data[0]),
+        _ => None,
+    };
+    pin_data.zeroize();
+    out
+}
+
 /// Verify a PIN typed on the device's own pad for a display-initiated action (a
 /// local Passkeys delete — there is no host and no CTAP session). It reuses
 /// [`verify_pin_hash`]'s persistent anti-bruteforce gate verbatim — the EF_PIN
@@ -1270,6 +1284,23 @@ mod tests {
             verify_local_pin(&dev(), &mut bare, b"1234"),
             LocalPin::Blocked
         ));
+    }
+
+    /// `pin_retries_left` reports the live budget for the unlock pad's "N tries
+    /// remaining" line — without spending a try — and is `None` when no PIN is set.
+    #[test]
+    fn pin_retries_left_reads_the_budget_without_spending_it() {
+        let (mut bare, _rng) = setup();
+        assert_eq!(pin_retries_left(&mut bare), None);
+        let (mut fs, _rng2, _state, _plat) = setup_with_pin(b"1234");
+        assert_eq!(pin_retries_left(&mut fs), Some(MAX_PIN_RETRIES));
+        // A read does not decrement; the counter only moves on a real verify.
+        assert_eq!(pin_retries_left(&mut fs), Some(MAX_PIN_RETRIES));
+        assert!(matches!(
+            verify_local_pin(&dev(), &mut fs, b"9999"),
+            LocalPin::Wrong { .. }
+        ));
+        assert_eq!(pin_retries_left(&mut fs), Some(MAX_PIN_RETRIES - 1));
     }
 
     /// Device-local set (the on-device Set/Change PIN flow) must write the *same*

@@ -231,28 +231,49 @@ pub enum PinKey {
     Cancel,
 }
 
-/// A feedback line shown under the pad after a rejected entry, so a wrong PIN is not a
-/// silent re-prompt. Distinct from the header `title`.
+/// The line shown under the pad: either a danger-coloured rejection (a wrong PIN is not
+/// a silent re-prompt) or a muted informational hint (the design's `enterpin` /
+/// `createpin` / `confirmpin` sub-labels). Distinct from the header `title`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PinCaption {
     /// The entered PIN was wrong; `retries_left` attempts remain before the hard lock.
     WrongPin { retries_left: u8 },
     /// The two new-PIN entries didn't match (the set/change confirm step).
     Mismatch,
+    /// Up-front on the unlock pad: how many attempts remain before the hard lock
+    /// (the design's `enterpin` "N tries remaining"). Muted, not a rejection.
+    TriesRemaining { left: u8 },
+    /// The set flow's first step (`createpin`): a muted "Choose a PIN" prompt.
+    ChoosePin,
+    /// The set flow's second step (`confirmpin`): a muted "Re-enter to confirm" prompt.
+    Reenter,
+}
+
+impl PinCaption {
+    /// Whether this caption is a rejection (danger-coloured) rather than an informational
+    /// hint (muted) — the renderer colours the line by this.
+    pub const fn is_rejection(self) -> bool {
+        matches!(self, Self::WrongPin { .. } | Self::Mismatch)
+    }
 }
 
 /// What the PIN screen shows: how many digits have been entered (rendered as masked
 /// dots — never the digits themselves, which the firmware keeps and never paints), a
 /// short header naming the step ("Enter PIN", "New PIN", "Confirm PIN", …) so the same
 /// pad serves built-in UV, the unlock/delete gates, and the on-device set/change flow,
-/// and an optional [`PinCaption`] feedback line for a rejected entry.
+/// an `expected` count of placeholder dots (the policy minimum, so the row reads as the
+/// design's fixed indicator rather than a growing run), and an optional [`PinCaption`]
+/// feedback / hint line.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PinPad {
     /// Count of digits entered so far (shown masked).
     pub entered: usize,
     /// The header caption — a trusted, firmware-supplied `&'static str`, never RP data.
     pub title: &'static str,
-    /// Feedback under the pad after a rejected entry; `None` on a fresh prompt.
+    /// Placeholder dots to outline before any are filled (the minimum PIN length). `0`
+    /// shows only the filled dots — a growing run with no placeholders.
+    pub expected: u8,
+    /// Feedback / hint under the pad; `None` on a bare prompt.
     pub caption: Option<PinCaption>,
 }
 
@@ -268,11 +289,12 @@ impl PinPad {
         Self {
             entered,
             title,
+            expected: 0,
             caption: None,
         }
     }
 
-    /// A pad with a header and a feedback caption (a wrong-PIN re-prompt).
+    /// A pad with a header and a feedback / hint caption.
     pub const fn with_caption(
         entered: usize,
         title: &'static str,
@@ -281,8 +303,16 @@ impl PinPad {
         Self {
             entered,
             title,
+            expected: 0,
             caption,
         }
+    }
+
+    /// Set the number of placeholder dots (the policy minimum), so the entry row reads as
+    /// the design's fixed indicator. The filled dots still grow past it for a longer PIN.
+    pub const fn expecting(mut self, expected: u8) -> Self {
+        self.expected = expected;
+        self
     }
 }
 
