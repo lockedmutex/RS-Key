@@ -25,7 +25,7 @@ pub use glyph::Glyph;
 pub use render::{
     render, render_confirm_delete, render_confirm_factory_reset, render_erasing,
     render_hold_button, render_hold_fill, render_passkeys_list, render_pin_blocked,
-    render_pin_dots, render_service,
+    render_pin_dots, render_service, render_success, render_success_circle,
 };
 
 /// Panel geometry (Waveshare RP2350-Touch-LCD-2.8, ST7789T3, portrait).
@@ -830,6 +830,30 @@ const _: () = {
 
 /// Did a tap at `p` hit the Confirm-Delete hold button?
 pub fn hit_del_hold(p: Point) -> bool {
+    DEL_HOLD_RECT.contains(p)
+}
+
+// --- Success screens (the design's "pop" confirmation moments) --------------
+
+/// Which celebratory success screen to paint — a successful approve, an on-device
+/// passkey delete, or a completed factory wipe. Each has its own glyph, colour, and
+/// wording (a green check for approve/delete; the grey [`Glyph::Rotate`] for the
+/// wipe, which restarts the device). The screen is a full-frame standalone like
+/// [`render_confirm_delete`] / [`render_pin_blocked`], not a `Screen` variant.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SuccessKind {
+    /// A host ceremony's trusted approval was granted (any applet).
+    Approved,
+    /// A resident passkey was deleted on-device.
+    Deleted,
+    /// The device was factory-wiped (about to reboot into a fresh state).
+    Wiped,
+}
+
+/// Did a tap at `p` hit the success screen's **Done** button? It shares the
+/// destructive-flow button band ([`DEL_HOLD_RECT`]), so no new geometry is
+/// introduced — the same disjointness invariants apply.
+pub fn hit_success_done(p: Point) -> bool {
     DEL_HOLD_RECT.contains(p)
 }
 

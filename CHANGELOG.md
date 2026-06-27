@@ -15,6 +15,15 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Added
 
+- **On-device success screens (trusted display, experimental).** The three device-driven
+  ceremonies that previously snapped straight back to the prior screen now end on a
+  brief confirmation, matching the design's "pop" moments: a granted **Approve** shows
+  a green-check **"Approved"** for ~0.4 s before the host ceremony resumes (auto-dismissing,
+  so it barely delays the host); an on-device **passkey delete** shows **"Passkey deleted"**
+  with a **Done** button; and a completed **factory reset** shows a grey rotate
+  **"RS-Key erased / Restarting…"** before the device reboots into its fresh state. The
+  success circle animates the design's scale-up "pop". Pure on-panel feedback — no auth
+  logic changed. Display flavor only. bcdDevice 0x07A4 → 0x07A5.
 - **On-device Set / Change PIN (trusted display, experimental).** The device PIN can now
   be set and changed entirely on the panel — no host. A new **Settings → Security**
   sub-page offers **Set PIN** (when none is set) or **Change PIN** (which first verifies

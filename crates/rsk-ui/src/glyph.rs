@@ -62,6 +62,9 @@ pub enum Glyph {
     Moon,
     /// An "i" in a ring — the device-info setting.
     Info,
+    /// A counter-clockwise refresh ring — the post-factory-reset "erased / restarting"
+    /// indicator (the design's grey rotate icon, distinct from the green success check).
+    Rotate,
 }
 
 /// Draw `g` into the square box at `at` (top-left) of side `s` pixels, stroked in
@@ -233,6 +236,21 @@ pub fn draw<D: DrawTarget<Color = Rgb565>>(
             circ(8, 5, 1).into_styled(fill).draw(t)?;
             Line::new(gp(8, 7), gp(8, 11)).into_styled(stroke).draw(t)
         }
+        Glyph::Rotate => {
+            // A near-full ring with a gap at the top, plus an arrowhead at the gap —
+            // the universal "reset / restart" mark for the wiped screen.
+            Arc::new(
+                gp(2, 2),
+                glen(12),
+                Angle::from_degrees(300.0),
+                Angle::from_degrees(300.0),
+            )
+            .into_styled(stroke)
+            .draw(t)?;
+            Polyline::new(&[gp(7, 2), gp(11, 4), gp(8, 7)])
+                .into_styled(stroke)
+                .draw(t)
+        }
     }
 }
 
@@ -274,7 +292,7 @@ mod tests {
         }
     }
 
-    const ALL: [Glyph; 17] = [
+    const ALL: [Glyph; 18] = [
         Glyph::Usb,
         Glyph::Check,
         Glyph::Backspace,
@@ -292,6 +310,7 @@ mod tests {
         Glyph::Clock,
         Glyph::Moon,
         Glyph::Info,
+        Glyph::Rotate,
     ];
 
     #[test]

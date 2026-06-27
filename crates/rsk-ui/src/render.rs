@@ -27,8 +27,8 @@ use crate::{
     ConfirmPrompt, DEL_HOLD_RECT, DENY_RECT, Glyph, HomeView, Label, NAV_H, NAV_TABS, NAV_TOP,
     NavTab, PANEL_H, PANEL_W, PIN_CANCEL_RECT, PIN_COLS, PIN_ROWS, PK_LIST_TOP, PinCaption, PinKey,
     PinPad, Point, Rect, RpRow, STATUS_BAR_H, Screen, SettingsPage, SettingsView, StatusKind,
-    TITLE_BACK_RECT, TITLE_BAR_H, font, font::Role, glyph, hex_u16, hex_u64, nav_tab_rect,
-    pin_grid_key, pin_key_rect, settings_row_rect, theme,
+    SuccessKind, TITLE_BACK_RECT, TITLE_BAR_H, font, font::Role, glyph, hex_u16, hex_u64,
+    nav_tab_rect, pin_grid_key, pin_key_rect, settings_row_rect, theme,
 };
 
 // Local semantic aliases, all sourced from `theme` so the whole renderer speaks one
@@ -450,6 +450,116 @@ where
         EgPoint::new(MIDX, 236),
         Role::Body,
         MUTED,
+    )
+}
+
+// --- Success screens -------------------------------------------------------
+
+/// Centre of the success "pop" circle.
+const SUCCESS_CY: i32 = 112;
+/// Resting diameter of the success circle (the 100% frame).
+const SUCCESS_DIA: u32 = 72;
+/// The fixed square the circle is cleared/redrawn within — large enough for the 1.06
+/// overshoot frame plus a margin, and clear of the heading below it, so a smaller pop
+/// frame fully erases a larger one without ever touching the static chrome.
+const SUCCESS_BOX: u32 = SUCCESS_DIA + 18;
+
+/// `(mark colour, circle fill, mark glyph, heading, subtitle)` for a success kind. A
+/// green check on a green tint for approve/delete; the grey [`Glyph::Rotate`] on a
+/// neutral chip for the wipe (which restarts, hence no green "all-good" check).
+fn success_visuals(kind: SuccessKind) -> (Rgb565, Rgb565, Glyph, &'static str, &'static str) {
+    match kind {
+        SuccessKind::Approved => (
+            theme::SUCCESS,
+            theme::SUCCESS_BG,
+            Glyph::Check,
+            "Approved",
+            "",
+        ),
+        SuccessKind::Deleted => (
+            theme::SUCCESS,
+            theme::SUCCESS_BG,
+            Glyph::Check,
+            "Passkey deleted",
+            "Removed from RS-Key.",
+        ),
+        SuccessKind::Wiped => (
+            theme::GREY,
+            theme::CHIP,
+            Glyph::Rotate,
+            "RS-Key erased",
+            "Restarting...",
+        ),
+    }
+}
+
+/// Paint a success screen's static chrome: the heading, an optional subtitle, and —
+/// when `with_button` — a primary **Done** button in [`DEL_HOLD_RECT`] (the firmware
+/// dismisses it via [`crate::hit_success_done`]). The circle area is left as
+/// background; the firmware animates the "pop" in with [`render_success_circle`],
+/// which repaints *only* the circle and so never disturbs (or flickers) this chrome.
+pub fn render_success<D>(t: &mut D, kind: SuccessKind, with_button: bool) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    t.clear(BG)?;
+    let (_, _, _, heading, subtitle) = success_visuals(kind);
+    text(t, heading, EgPoint::new(MIDX, 178), Role::Heading, FG)?;
+    if !subtitle.is_empty() {
+        text(t, subtitle, EgPoint::new(MIDX, 206), Role::Body, MUTED)?;
+    }
+    if with_button {
+        RoundedRectangle::with_equal_corners(
+            eg_rect(DEL_HOLD_RECT),
+            Size::new(BTN_RADIUS, BTN_RADIUS),
+        )
+        .into_styled(PrimitiveStyle::with_fill(theme::ACCENT_FILL))
+        .draw(t)?;
+        text(t, "Done", center(DEL_HOLD_RECT), Role::Strong, FG)?;
+    }
+    Ok(())
+}
+
+/// Repaint just the success circle at `scale_pct`% of its resting size — the building
+/// block of the firmware's pop (e.g. 60 → 106 → 100, ending at 100 for the resting
+/// frame). It clears the fixed [`SUCCESS_BOX`] to background first (so a smaller frame
+/// erases a larger one cleanly), then fills the tinted circle and centres the mark
+/// glyph at ~48% of the circle (the Lock-in-circle proportion on the blocked screen).
+pub fn render_success_circle<D>(
+    t: &mut D,
+    kind: SuccessKind,
+    scale_pct: u16,
+) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let (mark, fill, mark_glyph, _, _) = success_visuals(kind);
+    Rectangle::new(
+        EgPoint::new(
+            MIDX - SUCCESS_BOX as i32 / 2,
+            SUCCESS_CY - SUCCESS_BOX as i32 / 2,
+        ),
+        Size::new(SUCCESS_BOX, SUCCESS_BOX),
+    )
+    .into_styled(PrimitiveStyle::with_fill(BG))
+    .draw(t)?;
+    let dia = (SUCCESS_DIA * scale_pct as u32 / 100).max(4);
+    Circle::new(
+        EgPoint::new(MIDX - dia as i32 / 2, SUCCESS_CY - dia as i32 / 2),
+        dia,
+    )
+    .into_styled(PrimitiveStyle::with_fill(fill))
+    .draw(t)?;
+    let gs = (dia * 48 / 100).max(10) as u16;
+    glyph::draw(
+        t,
+        mark_glyph,
+        Point::new(
+            (MIDX - gs as i32 / 2) as u16,
+            (SUCCESS_CY - gs as i32 / 2) as u16,
+        ),
+        gs,
+        mark,
     )
 }
 
@@ -1346,7 +1456,7 @@ fn fmt_count<'a>(n: u16, unit: &str, buf: &'a mut [u8]) -> &'a str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{HomeView, PANEL_H};
+    use crate::{HomeView, PANEL_H, SuccessKind};
     use embedded_graphics::{Pixel, geometry::OriginDimensions};
 
     fn has_color(d: &Rec, r: Rect, c: Rgb565) -> bool {
@@ -1556,6 +1666,74 @@ mod tests {
             has_color(&d, crate::PK_BACK_RECT, theme::DENY),
             "cancel chevron not in its rect"
         );
+    }
+
+    /// Around the centred success circle — comfortably covers the mark glyph at any
+    /// pop scale, well clear of the heading band below it.
+    const SUCCESS_BAND: Rect = Rect::new(96, 88, 48, 52);
+
+    /// Every success kind paints its mark in the circle, stays in-panel, and uses the
+    /// design's colour (green check for approve/delete, grey rotate for the wipe).
+    #[test]
+    fn success_screens_fit_and_mark_their_kind() {
+        for (kind, mark) in [
+            (SuccessKind::Approved, theme::SUCCESS),
+            (SuccessKind::Deleted, theme::SUCCESS),
+            (SuccessKind::Wiped, theme::GREY),
+        ] {
+            let mut d = Rec::new();
+            render_success(&mut d, kind, false).unwrap();
+            render_success_circle(&mut d, kind, 100).unwrap();
+            assert!(!d.oob, "{kind:?} success drew outside the panel");
+            assert!(d.drew_anything(), "{kind:?} success drew nothing");
+            assert!(
+                has_color(&d, SUCCESS_BAND, mark),
+                "{kind:?} success mark colour missing from the circle"
+            );
+        }
+    }
+
+    /// The wipe screen is deliberately grey (it restarts), never the green success
+    /// check used by approve/delete — so the two read as different outcomes.
+    #[test]
+    fn wiped_success_is_grey_not_green() {
+        let mut d = Rec::new();
+        render_success(&mut d, SuccessKind::Wiped, false).unwrap();
+        render_success_circle(&mut d, SuccessKind::Wiped, 100).unwrap();
+        assert!(
+            !has_color(&d, SUCCESS_BAND, theme::SUCCESS),
+            "wipe screen must not use the green success colour"
+        );
+    }
+
+    /// The wait-for-Done variant paints the primary Done button in the exact region
+    /// `hit_success_done` maps a tap to.
+    #[test]
+    fn success_done_button_in_its_hit_rect() {
+        let mut d = Rec::new();
+        render_success(&mut d, SuccessKind::Deleted, true).unwrap();
+        assert!(!d.oob, "success-with-Done drew outside the panel");
+        assert!(
+            has_color(&d, crate::DEL_HOLD_RECT, theme::ACCENT_FILL),
+            "Done button not painted in its hit rect"
+        );
+        assert!(crate::hit_success_done(crate::Point::new(120, 270)));
+        assert!(!crate::hit_success_done(crate::Point::new(0, 0)));
+    }
+
+    /// Every pop frame — including the 1.06 overshoot — stays inside the fixed circle
+    /// box, so a frame never spills onto the heading below or off the panel.
+    #[test]
+    fn success_pop_frames_stay_in_box() {
+        for pct in [40u16, 55, 85, 100, 106] {
+            let mut d = Rec::new();
+            render_success_circle(&mut d, SuccessKind::Approved, pct).unwrap();
+            assert!(!d.oob, "pop frame {pct}% drew outside the panel");
+            assert!(
+                !d.any_non_bg_in(Rect::new(0, 170, PANEL_W, 60)),
+                "pop frame {pct}% bled into the heading / button area"
+            );
+        }
     }
 
     /// The core security property: the Hold-to-approve control lives in `ALLOW_RECT`

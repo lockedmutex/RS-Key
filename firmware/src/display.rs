@@ -47,7 +47,7 @@ use rsk_sdk::Confirm;
 use rsk_ui::{
     ALLOW_RECT, AccountRow, AdjustKey, BRIGHTNESS_LEVELS, Button, ConfirmPrompt, HomeView, Label,
     NavTab, PinCaption, PinKey, PinPad, RootEntry, RpRow, Screen, SecurityEntry, SettingsPage,
-    SettingsView, StatusKind,
+    SettingsView, StatusKind, SuccessKind,
 };
 
 use crate::handler::Store;
@@ -945,6 +945,46 @@ impl Ui {
         note_activity();
     }
 
+    /// Paint one of the design's success "pop" screens (approve / delete / wipe) and
+    /// dismiss it. The circle pops in over static chrome (the 0.6 → 1.06 → 1.0 scale),
+    /// painted once and never repainted so it can't flicker. With `hold_ms = None` the
+    /// screen carries a **Done** button and waits for a tap — or a queued host command /
+    /// the inactivity timeout, so an unattended success screen never starves the worker.
+    /// With `Some(ms)` it auto-dismisses after the pop plus `ms` (used where there is no
+    /// one to tap Done: the approve pop, which the host ceremony is waiting behind, and
+    /// the wipe pop, which is followed by a reboot).
+    fn show_success(&mut self, kind: SuccessKind, hold_ms: Option<u64>) {
+        let wait_done = hold_ms.is_none();
+        let _ = rsk_ui::render_success(&mut self.panel, kind, wait_done);
+        for pct in [55u16, 85, 106, 100] {
+            let _ = rsk_ui::render_success_circle(&mut self.panel, kind, pct);
+            block_for(Duration::from_millis(70));
+        }
+        self.shown = None;
+        note_activity();
+        match hold_ms {
+            Some(ms) => block_for(Duration::from_millis(ms)),
+            None => {
+                let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
+                self.touch.wait_release(Instant::now(), idle_limit);
+                let mut last = Instant::now();
+                loop {
+                    if let Some(p) = self.touch.read() {
+                        if rsk_ui::hit_success_done(p) {
+                            break;
+                        }
+                        last = Instant::now();
+                    }
+                    if crate::worker::host_request_pending() || last.elapsed() >= idle_limit {
+                        break;
+                    }
+                    block_for(Duration::from_millis(TOUCH_POLL_MS));
+                }
+                note_activity();
+            }
+        }
+    }
+
     /// The Confirm-Delete flow for one resident passkey (mockup screens 6 → 10): gate on
     /// the device PIN (if set), then paint the trusted confirm screen naming the rp +
     /// account and require a deliberate **hold** on the delete button before removing the
@@ -967,7 +1007,10 @@ impl Ui {
         self.touch.wait_release(Instant::now(), idle_limit);
 
         if self.hold_to_confirm("Hold to delete") {
-            let _ = rsk_fido::passkeys::delete_cred(&mut self.fs.borrow_mut(), fid);
+            let removed = rsk_fido::passkeys::delete_cred(&mut self.fs.borrow_mut(), fid);
+            if removed {
+                self.show_success(SuccessKind::Deleted, None);
+            }
         }
         self.end_modal();
     }
@@ -1059,6 +1102,9 @@ impl Ui {
                 .fs
                 .borrow_mut()
                 .factory_wipe(rsk_fido::survives_factory_reset);
+            // Confirm the wipe on the trusted screen before the reboot re-provisions a
+            // fresh device (the grey rotate pop reads as "erased / restarting").
+            self.show_success(SuccessKind::Wiped, Some(1100));
             cortex_m::peripheral::SCB::sys_reset();
         }
         self.end_modal();
@@ -1418,7 +1464,18 @@ impl TouchPresence {
 impl rsk_fido::UserPresence for TouchPresence {
     fn request(&mut self, confirm: rsk_fido::Confirm<'_>) -> rsk_fido::Presence {
         match self.confirm_wait(confirm) {
-            Outcome::Confirmed => rsk_fido::Presence::Confirmed,
+            Outcome::Confirmed => {
+                // A granted WebAuthn approval gets the design's brief "Approved" pop.
+                // Scoped to the FIDO ceremony path (one request per make/getAssertion),
+                // NOT the shared `confirm_wait`: OpenPGP/PIV touch policies call request()
+                // once per signature, so flashing this — and paying its ~0.4 s — on every
+                // PGP/PIV op would be both wrong-worded and a latency regression. The
+                // `confirm_wait` borrow is already released, so this re-borrow is safe.
+                self.ui
+                    .borrow_mut()
+                    .show_success(SuccessKind::Approved, Some(150));
+                rsk_fido::Presence::Confirmed
+            }
             Outcome::Declined => rsk_fido::Presence::Declined,
             Outcome::Timeout => rsk_fido::Presence::Timeout,
             Outcome::Cancelled => rsk_fido::Presence::Cancelled,
