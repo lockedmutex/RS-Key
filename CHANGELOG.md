@@ -15,6 +15,22 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Added
 
+- **List paging on the trusted display (experimental).** The Passkeys list, a relying
+  party's accounts, and the audit log now **page** through long sets instead of silently
+  showing only the first few rows: a `‹` Prev / `›` Next bar with a "page / pages"
+  indicator appears whenever a list spans more than one page (the end arrow dims when
+  there is no further page). One reusable pager drives all three screens; the single-page
+  case is unchanged (the item-count footer). Display flavor only. bcdDevice 0x07A6 →
+  0x07A7.
+- **On-device audit log (trusted display, experimental).** A new **Settings → Security →
+  Audit log** screen shows the most recent device journal events — sign-ins, passkeys
+  added, PIN changes, lockouts, lock changes, config changes, backups, factory resets and
+  power cycles — newest first, each with a colour-coded status dot and, for events in the
+  current power cycle, a compact "time ago" (the device has no wall clock, so entries from
+  earlier boots show no time). Read-only: the full tamper-evident journal, with
+  attestation, is still exported and verified host-side over `authenticatorVendor`. The
+  reader is a lean visitor over the journal ring (no alloc, no CBOR), mirroring the
+  passkeys browser. Display flavor only. bcdDevice 0x07A5 → 0x07A6.
 - **On-device success screens (trusted display, experimental).** The three device-driven
   ceremonies that previously snapped straight back to the prior screen now end on a
   brief confirmation, matching the design's "pop" moments: a granted **Approve** shows
@@ -295,6 +311,14 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   (or `rsk hw --touch-timeout <secs>`) sets how long the device waits for a touch.
   Absent / `0` keeps the built-in 30 s default; existing phy records never carried
   a meaningful `0x08`, so the realignment is safe. bcdDevice 0x0783 → 0x0784.
+
+### Fixed
+
+- **Trusted display: the device now locks from the audit-log screen.** The power/wake
+  button now sleeps and locks the on-device UI from inside the audit log too — previously
+  it was ignored there, so a PIN-set device could not be locked from that screen — and the
+  settings menu unwinds cleanly afterwards without repainting over the blanked panel.
+  Display flavor only.
 
 ## [0.2.8] — 2026-06-21
 

@@ -23,7 +23,7 @@ pub mod theme;
 pub mod touch;
 pub use glyph::Glyph;
 pub use render::{
-    render, render_confirm_delete, render_confirm_factory_reset, render_erasing,
+    render, render_audit_log, render_confirm_delete, render_confirm_factory_reset, render_erasing,
     render_hold_button, render_hold_fill, render_passkeys_list, render_pin_blocked,
     render_pin_dots, render_service, render_success, render_success_circle,
 };
@@ -432,6 +432,8 @@ pub enum SecurityEntry {
     /// Set the device PIN (when none is set) or change it (verifying the current PIN
     /// first) — the on-device create/confirm-PIN flow.
     ChangePin,
+    /// Open the read-only on-device audit log (the recent journal events).
+    AuditLog,
     /// Erase every applet's data and return to a fresh device (danger-styled, gated by a
     /// hold-to-confirm and the device PIN if one is set).
     FactoryReset,
@@ -476,16 +478,17 @@ pub const fn settings_row_entry(i: u16) -> RootEntry {
     }
 }
 
-/// Number of Security sub-page rows (Change/Set PIN, Factory reset). They reuse the
-/// first [`settings_row_rect`] slots, so they inherit the Root list's proven-disjoint
-/// geometry (a const-assert keeps them within the Root row count).
-pub const SECURITY_ROWS: u16 = 2;
+/// Number of Security sub-page rows (Change/Set PIN, Audit log, Factory reset). They
+/// reuse the first [`settings_row_rect`] slots, so they inherit the Root list's
+/// proven-disjoint geometry (a const-assert keeps them within the Root row count).
+pub const SECURITY_ROWS: u16 = 3;
 const _: () = assert!(SECURITY_ROWS <= SETTINGS_ROWS);
 
-/// The Security entry on row `i`, in list order.
+/// The Security entry on row `i`, in list order (the danger Factory reset stays last).
 pub const fn security_row_entry(i: u16) -> SecurityEntry {
     match i {
         0 => SecurityEntry::ChangePin,
+        1 => SecurityEntry::AuditLog,
         _ => SecurityEntry::FactoryReset,
     }
 }
@@ -771,9 +774,11 @@ pub struct HomeView {
 
 // --- Passkeys list + service detail ----------------------------------------
 
-/// Max passkey rows painted on the list / detail. No scroll yet — the footer shows
-/// the true total, so a longer set is summarised honestly, never silently cut.
-pub const PK_ROWS_MAX: usize = 6;
+/// Rows shown per page on a scrollable list (Passkeys, accounts, audit log). A longer
+/// set is paged — the [pager band](PAGER_PREV_RECT) sits in the row slot just below
+/// these, so the count must leave room for it above the nav bar. The footer shows the
+/// true total on a single page; the pager shows "page / pages" when there is more.
+pub const PK_ROWS_MAX: usize = 5;
 /// Top of the first passkey row — below the status + title bars, clear of the nav bar
 /// and footer.
 pub const PK_LIST_TOP: u16 = CONTENT_TOP + 4;
@@ -799,11 +804,62 @@ pub struct AccountRow {
 pub const PK_BACK_RECT: Rect = Rect::new(0, 0, 40, HEADER_H);
 
 // Compile-time: the back chevron sits in the header above the first row, and the
-// visible rows fit between the list top and the nav bar.
+// visible rows *plus the pager band* (one more slot) fit between the list top and the
+// nav bar.
 const _: () = {
     assert!(PK_BACK_RECT.y + PK_BACK_RECT.h <= PK_LIST_TOP);
-    assert!(PK_LIST_TOP + (PK_ROWS_MAX as u16) * (LIST_ROW_H + LIST_ROW_GAP) <= NAV_TOP);
+    assert!(PK_LIST_TOP + (PK_ROWS_MAX as u16 + 1) * (LIST_ROW_H + LIST_ROW_GAP) <= NAV_TOP);
 };
+
+// --- List pager (Prev / Next, for any list longer than one page) -----------
+
+/// The pager band: the row slot directly below the last list row ([`PK_ROWS_MAX`]), so
+/// a paged list keeps its row geometry and the band still clears the nav bar.
+const PAGER_BAND: Rect = row_rect(PK_LIST_TOP, PK_ROWS_MAX as u16);
+/// Width of each pager arrow tap target (the centre is the non-tappable page indicator).
+const PAGER_BTN_W: u16 = 64;
+/// Previous-page tap target (left end of the band).
+pub const PAGER_PREV_RECT: Rect = Rect::new(PAGER_BAND.x, PAGER_BAND.y, PAGER_BTN_W, PAGER_BAND.h);
+/// Next-page tap target (right end of the band).
+pub const PAGER_NEXT_RECT: Rect = Rect::new(
+    PAGER_BAND.x + PAGER_BAND.w - PAGER_BTN_W,
+    PAGER_BAND.y,
+    PAGER_BTN_W,
+    PAGER_BAND.h,
+);
+
+// Compile-time: the two arrows are disjoint with a real gap (the indicator) between
+// them, and the whole band clears the nav bar.
+const _: () = {
+    assert!(PAGER_PREV_RECT.x + PAGER_PREV_RECT.w < PAGER_NEXT_RECT.x);
+    assert!(PAGER_BAND.y + PAGER_BAND.h <= NAV_TOP);
+};
+
+/// A pager arrow.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PagerKey {
+    Prev,
+    Next,
+}
+
+/// Which pager arrow, if any, a tap at `p` selects. The firmware clamps the resulting
+/// page to `0..page_count`, so a tap on a dimmed end-arrow is a harmless no-op.
+pub fn hit_pager(p: Point) -> Option<PagerKey> {
+    if PAGER_PREV_RECT.contains(p) {
+        Some(PagerKey::Prev)
+    } else if PAGER_NEXT_RECT.contains(p) {
+        Some(PagerKey::Next)
+    } else {
+        None
+    }
+}
+
+/// Number of pages for `total` items at [`PK_ROWS_MAX`] per page — always ≥ 1, so an
+/// empty list is "page 1 / 1". Single source of truth for the renderer and the firmware
+/// modals, so a Next tap and the painted indicator can never disagree.
+pub fn page_count(total: u16) -> u16 {
+    total.max(1).div_ceil(PK_ROWS_MAX as u16)
+}
 
 /// Did a tap at `p` hit the service-detail back chevron?
 pub fn hit_pk_back(p: Point) -> bool {
@@ -855,6 +911,66 @@ pub enum SuccessKind {
 /// introduced — the same disjointness invariants apply.
 pub fn hit_success_done(p: Point) -> bool {
     DEL_HOLD_RECT.contains(p)
+}
+
+// --- Audit log (read-only journal viewer) ----------------------------------
+
+/// The class of a journal event, for the on-device audit log — it sets the row's
+/// status-dot colour and label. The firmware maps each `rsk_fido::journal::EV_*` code
+/// onto one of these at the boundary (rsk-ui has no dependency on rsk-fido), the way it
+/// clamps an rpId into a [`Label`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum AuditKind {
+    /// A credential was used to sign in (FIDO getAssertion / U2F auth) — green dot.
+    Login,
+    /// A credential was created (FIDO makeCredential / U2F register) — blue dot.
+    Register,
+    /// The device PIN was set or changed — grey dot.
+    Pin,
+    /// A PIN lockout: too many wrong PINs — red dot.
+    Denied,
+    /// A power-cycle boundary (the first entry of each boot) — grey dot.
+    Boot,
+    /// A factory reset — red dot.
+    Reset,
+    /// The operation-lock was engaged or released — grey dot.
+    Lock,
+    /// A configuration change (minPINLength, alwaysUv, enterprise attestation) — grey dot.
+    Config,
+    /// A seed-backup export / load / finalize — blue dot.
+    Backup,
+    /// Any other recorded event — grey dot.
+    #[default]
+    Other,
+}
+
+impl AuditKind {
+    /// The row label — static, so it is decided (and host-tested) here, not in the
+    /// firmware glue.
+    pub const fn label(self) -> &'static str {
+        match self {
+            AuditKind::Login => "Signed in",
+            AuditKind::Register => "Passkey added",
+            AuditKind::Pin => "PIN changed",
+            AuditKind::Denied => "PIN blocked",
+            AuditKind::Boot => "Powered on",
+            AuditKind::Reset => "Factory reset",
+            AuditKind::Lock => "Lock changed",
+            AuditKind::Config => "Setting changed",
+            AuditKind::Backup => "Backup",
+            AuditKind::Other => "Event",
+        }
+    }
+}
+
+/// One row of the on-device audit log: the event class (its dot colour + label) and how
+/// long ago it happened, if known. `secs_ago` is `None` for entries from an earlier
+/// power cycle — there is no wall clock, so cross-boot deltas are not computed and the
+/// row then shows no time. Firmware builds these from `rsk_fido::journal::EventView`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct AuditRow {
+    pub kind: AuditKind,
+    pub secs_ago: Option<u32>,
 }
 
 /// Top-level screen the display task renders. The three top-level **tabs** (Home,
@@ -993,6 +1109,18 @@ mod proofs {
     fn del_hold_clear_of_back() {
         let p = Point::new(kani::any(), kani::any());
         assert!(!(hit_del_hold(p) && hit_pk_back(p)));
+    }
+
+    /// The pager arrows are mutually exclusive and never collide with a list row or the
+    /// nav bar, so paging can't be mistaken for selecting a row or switching tabs.
+    #[kani::proof]
+    fn pager_clear_of_rows_and_nav() {
+        let p = Point::new(kani::any(), kani::any());
+        let i: u16 = kani::any();
+        kani::assume((i as usize) < PK_ROWS_MAX);
+        assert!(!(PAGER_PREV_RECT.contains(p) && PAGER_NEXT_RECT.contains(p)));
+        assert!(!(hit_pager(p).is_some() && row_rect(PK_LIST_TOP, i).contains(p)));
+        assert!(!(hit_pager(p).is_some() && p.y >= NAV_TOP));
     }
 }
 
@@ -1146,7 +1274,11 @@ mod tests {
 
     #[test]
     fn security_rows_map_in_order() {
-        let want = [SecurityEntry::ChangePin, SecurityEntry::FactoryReset];
+        let want = [
+            SecurityEntry::ChangePin,
+            SecurityEntry::AuditLog,
+            SecurityEntry::FactoryReset,
+        ];
         for (i, &e) in want.iter().enumerate() {
             let r = settings_row_rect(i as u16);
             let c = Point::new(r.x + r.w / 2, r.y + r.h / 2);
@@ -1272,5 +1404,26 @@ mod tests {
             hit_list(Point::new(r0.x + 2, row_rect(y0, 6).y + 2), y0, 5),
             None
         );
+    }
+
+    #[test]
+    fn pager_hits_and_page_count() {
+        let center = |r: Rect| Point::new(r.x + r.w / 2, r.y + r.h / 2);
+        assert_eq!(hit_pager(center(PAGER_PREV_RECT)), Some(PagerKey::Prev));
+        assert_eq!(hit_pager(center(PAGER_NEXT_RECT)), Some(PagerKey::Next));
+        // The indicator gap between the two arrows selects nothing.
+        assert_eq!(
+            hit_pager(Point::new(
+                PANEL_W / 2,
+                PAGER_PREV_RECT.y + PAGER_PREV_RECT.h / 2
+            )),
+            None
+        );
+        // ceil(total / PK_ROWS_MAX), never zero.
+        assert_eq!(page_count(0), 1);
+        assert_eq!(page_count(1), 1);
+        assert_eq!(page_count(PK_ROWS_MAX as u16), 1);
+        assert_eq!(page_count(PK_ROWS_MAX as u16 + 1), 2);
+        assert_eq!(page_count(62), 13);
     }
 }

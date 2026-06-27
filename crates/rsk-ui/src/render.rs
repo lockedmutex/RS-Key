@@ -23,12 +23,13 @@ use embedded_graphics::{
 };
 
 use crate::{
-    ADJ_MINUS_RECT, ADJ_PLUS_RECT, ALLOW_RECT, AccountRow, BACK_RECT, BRIGHTNESS_LEVELS,
-    ConfirmPrompt, DEL_HOLD_RECT, DENY_RECT, Glyph, HomeView, Label, NAV_H, NAV_TABS, NAV_TOP,
-    NavTab, PANEL_H, PANEL_W, PIN_CANCEL_RECT, PIN_COLS, PIN_ROWS, PK_LIST_TOP, PinCaption, PinKey,
-    PinPad, Point, Rect, RpRow, STATUS_BAR_H, Screen, SettingsPage, SettingsView, StatusKind,
-    SuccessKind, TITLE_BACK_RECT, TITLE_BAR_H, font, font::Role, glyph, hex_u16, hex_u64,
-    nav_tab_rect, pin_grid_key, pin_key_rect, settings_row_rect, theme,
+    ADJ_MINUS_RECT, ADJ_PLUS_RECT, ALLOW_RECT, AccountRow, AuditKind, AuditRow, BACK_RECT,
+    BRIGHTNESS_LEVELS, ConfirmPrompt, DEL_HOLD_RECT, DENY_RECT, Glyph, HomeView, Label, NAV_H,
+    NAV_TABS, NAV_TOP, NavTab, PAGER_NEXT_RECT, PAGER_PREV_RECT, PANEL_H, PANEL_W, PIN_CANCEL_RECT,
+    PIN_COLS, PIN_ROWS, PK_LIST_TOP, PinCaption, PinKey, PinPad, Point, Rect, RpRow, STATUS_BAR_H,
+    Screen, SettingsPage, SettingsView, StatusKind, SuccessKind, TITLE_BACK_RECT, TITLE_BAR_H,
+    font, font::Role, glyph, hex_u16, hex_u64, nav_tab_rect, page_count, pin_grid_key,
+    pin_key_rect, settings_row_rect, theme,
 };
 
 // Local semantic aliases, all sourced from `theme` so the whole renderer speaks one
@@ -156,11 +157,17 @@ fn home<D: DrawTarget<Color = Rgb565>>(t: &mut D, v: &HomeView) -> Result<(), D:
 }
 
 /// The Passkeys tab: header, one row per relying party (generic globe + sanitized
-/// rpId + account count + drill-in chevron), an "N items" footer, and the nav bar.
-/// `total` is the true RP count even when `rows` holds only the first `PK_ROWS_MAX`.
-/// A full-frame paint (the list is static once shown), so it clears first. Standalone
-/// rather than a `Screen` variant — the list data is too large for the `Copy` enum.
-pub fn render_passkeys_list<D>(t: &mut D, rows: &[RpRow], total: u16) -> Result<(), D::Error>
+/// rpId + account count + drill-in chevron), the list tail (pager when it spans more
+/// than one page, else an "N items" footer), and the nav bar. `rows` is the current
+/// page's slice; `page` is its 0-based index; `total` is the true RP count. A full-frame
+/// paint, so it clears first. Standalone rather than a `Screen` variant — too large for
+/// the `Copy` enum.
+pub fn render_passkeys_list<D>(
+    t: &mut D,
+    rows: &[RpRow],
+    page: u16,
+    total: u16,
+) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb565>,
 {
@@ -194,7 +201,7 @@ where
                 true,
             )?;
         }
-        footer_count(t, total, if total == 1 { "item" } else { "items" })?;
+        list_tail(t, page, total, "item", "items")?;
     }
     render_nav(t, NavTab::Passkeys)
 }
@@ -207,6 +214,7 @@ pub fn render_service<D>(
     t: &mut D,
     title: &Label,
     accounts: &[AccountRow],
+    page: u16,
     total: u16,
 ) -> Result<(), D::Error>
 where
@@ -230,8 +238,99 @@ where
             false,
         )?;
     }
-    footer_count(t, total, if total == 1 { "account" } else { "accounts" })?;
+    list_tail(t, page, total, "account", "accounts")?;
     render_nav(t, NavTab::Passkeys)
+}
+
+/// The read-only on-device audit log (Settings → Security → Audit log): the most recent
+/// journal events, newest first — a status dot coloured by [`AuditKind`], the event
+/// label, and a compact "time ago" for current-power-cycle entries. The back chevron
+/// returns to Security. Standalone full-frame like [`render_passkeys_list`] but without
+/// the nav bar (a settings sub-screen, not a tab). `rows` is the current page's slice,
+/// `page` its 0-based index, `total` the live journal depth — so the tail shows the pager
+/// ("page / pages") when the log spans more than one page, else a true "N events" count.
+pub fn render_audit_log<D>(
+    t: &mut D,
+    rows: &[AuditRow],
+    page: u16,
+    total: u16,
+) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    t.clear(BG)?;
+    status_bar(t)?;
+    title_bar(t, "Audit log", theme::ACCENT, true)?;
+    if rows.is_empty() {
+        glyph::draw(t, Glyph::Clock, Point::new(MIDX as u16 - 18, 96), 36, MUTED)?;
+        text(
+            t,
+            "No activity yet",
+            EgPoint::new(MIDX, 160),
+            Role::Body,
+            MUTED,
+        )?;
+    } else {
+        for (i, r) in rows.iter().enumerate() {
+            audit_row(t, crate::row_rect(PK_LIST_TOP, i as u16), r)?;
+        }
+        list_tail(t, page, total, "event", "events")?;
+    }
+    Ok(())
+}
+
+/// One audit row: a status dot (its colour the at-a-glance signal), the event label, and
+/// a right-aligned "time ago". Mirrors [`render_row`]'s card + clip metrics, but leads
+/// with a coloured dot instead of a muted glyph.
+fn audit_row<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    rect: Rect,
+    r: &AuditRow,
+) -> Result<(), D::Error> {
+    RoundedRectangle::with_equal_corners(eg_rect(rect), Size::new(6, 6))
+        .into_styled(PrimitiveStyle::with_fill(theme::ROW_BG))
+        .draw(t)?;
+    let cy = rect.y as i32 + rect.h as i32 / 2;
+    let dot: u32 = 12;
+    Circle::new(EgPoint::new(rect.x as i32 + 9, cy - dot as i32 / 2), dot)
+        .into_styled(PrimitiveStyle::with_fill(audit_dot(r.kind)))
+        .draw(t)?;
+    // Trailing time first (right), then the label clipped to end before it.
+    let right_x = rect.x as i32 + rect.w as i32 - 8;
+    let label_x = rect.x as i32 + 30;
+    let label_right = if let Some(secs) = r.secs_ago {
+        let mut buf = [0u8; 8];
+        let s = fmt_ago(secs, &mut buf);
+        text_right(t, s, EgPoint::new(right_x, cy), Role::Mono, MUTED)?;
+        right_x - font::width(s, Role::Mono).unwrap_or(0) as i32 - ROW_TRAILING_GAP
+    } else {
+        right_x - ROW_TRAILING_GAP
+    };
+    let clip = Rect::new(
+        label_x as u16,
+        rect.y,
+        (label_right - label_x).max(0) as u16,
+        rect.h,
+    );
+    text_left_clipped(
+        t,
+        r.kind.label(),
+        EgPoint::new(label_x, cy),
+        Role::Body,
+        FG,
+        clip,
+    )
+}
+
+/// The status-dot colour for an audit event class (green = sign-in, blue = add/backup,
+/// red = lockout/reset, grey = everything else).
+fn audit_dot(kind: AuditKind) -> Rgb565 {
+    match kind {
+        AuditKind::Login => theme::SUCCESS,
+        AuditKind::Register | AuditKind::Backup => theme::ACCENT,
+        AuditKind::Denied | AuditKind::Reset => theme::DANGER,
+        _ => theme::GREY,
+    }
 }
 
 /// A right-aligned `"<n> <unit>"` footer just above the nav bar (the list / detail
@@ -250,6 +349,97 @@ fn footer_count<D: DrawTarget<Color = Rgb565>>(
         Role::Mono,
         MUTED,
     )
+}
+
+/// The bottom of a scrollable list: the [pager](render_pager) when it spans more than
+/// one page, else the item-count footer. Keeps the three list screens consistent.
+fn list_tail<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    page: u16,
+    total: u16,
+    one: &str,
+    many: &str,
+) -> Result<(), D::Error> {
+    let pages = page_count(total);
+    if pages > 1 {
+        render_pager(t, page, pages)
+    } else {
+        footer_count(t, total, if total == 1 { one } else { many })
+    }
+}
+
+/// Paint the pager band: a `‹` prev arrow (dimmed on the first page), a centred
+/// "page / pages" indicator, and a `›` next arrow (dimmed on the last page). The arrows
+/// land in [`PAGER_PREV_RECT`] / [`PAGER_NEXT_RECT`] — exactly where [`crate::hit_pager`]
+/// maps a tap — so a painted arrow and its hit target can never disagree.
+fn render_pager<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    page: u16,
+    pages: u16,
+) -> Result<(), D::Error> {
+    let cy = PAGER_PREV_RECT.y as i32 + PAGER_PREV_RECT.h as i32 / 2;
+    let prev_col = if page > 0 {
+        theme::ACCENT
+    } else {
+        theme::CAPTION
+    };
+    let next_col = if page + 1 < pages {
+        theme::ACCENT
+    } else {
+        theme::CAPTION
+    };
+    glyph::draw(
+        t,
+        Glyph::Back,
+        Point::new(
+            PAGER_PREV_RECT.x + PAGER_PREV_RECT.w / 2 - 8,
+            (cy - 8) as u16,
+        ),
+        16,
+        prev_col,
+    )?;
+    glyph::draw(
+        t,
+        Glyph::Chevron,
+        Point::new(
+            PAGER_NEXT_RECT.x + PAGER_NEXT_RECT.w / 2 - 8,
+            (cy - 8) as u16,
+        ),
+        16,
+        next_col,
+    )?;
+    let mut buf = [0u8; 13];
+    text(
+        t,
+        fmt_pages(page + 1, pages, &mut buf),
+        EgPoint::new(MIDX, cy),
+        Role::Mono,
+        MUTED,
+    )
+}
+
+/// Format `"P / N"` (current / total pages) into `buf`, no alloc. Sized for the full u16
+/// domain: 5 digits + " / " + 5 digits = 13 bytes (page counts never reach that, but the
+/// buffer matches `fmt_u16`'s range so it can't index out of bounds).
+fn fmt_pages(p: u16, n: u16, buf: &mut [u8; 13]) -> &str {
+    let mut a = [0u8; 5];
+    let ps = fmt_u16(p, &mut a);
+    let mut b = [0u8; 5];
+    let ns = fmt_u16(n, &mut b);
+    let mut i = 0;
+    for &c in ps.as_bytes() {
+        buf[i] = c;
+        i += 1;
+    }
+    for &c in b" / " {
+        buf[i] = c;
+        i += 1;
+    }
+    for &c in ns.as_bytes() {
+        buf[i] = c;
+        i += 1;
+    }
+    str8(&buf[..i])
 }
 
 /// The trusted Confirm-Delete screen for a resident passkey: the back (cancel)
@@ -1261,7 +1451,15 @@ fn settings_security<D: DrawTarget<Color = Rgb565>>(
         None,
         true,
     )?;
-    danger_row(t, settings_row_rect(1), "Factory reset")
+    render_row(
+        t,
+        settings_row_rect(1),
+        Glyph::Clock,
+        "Audit log",
+        None,
+        true,
+    )?;
+    danger_row(t, settings_row_rect(2), "Factory reset")
 }
 
 /// A destructive option row: the [`render_row`] card, but with a warning glyph,
@@ -1453,6 +1651,30 @@ fn fmt_count<'a>(n: u16, unit: &str, buf: &'a mut [u8]) -> &'a str {
     str8(&buf[..end])
 }
 
+/// Format a "time ago" as a compact mono token (`"now"`, `"5m"`, `"3h"`, `"2d"`, `"1w"`)
+/// into `buf`. Boot-relative, so only meaningful within the current power cycle — the
+/// firmware passes the elapsed seconds only for current-session entries. The numeric
+/// part is always < 60, so it fits two digits.
+fn fmt_ago(secs: u32, buf: &mut [u8; 8]) -> &str {
+    let (n, unit) = if secs < 60 {
+        return "now";
+    } else if secs < 3_600 {
+        (secs / 60, b'm')
+    } else if secs < 86_400 {
+        (secs / 3_600, b'h')
+    } else if secs < 604_800 {
+        (secs / 86_400, b'd')
+    } else {
+        (secs / 604_800, b'w')
+    };
+    let mut tmp = [0u8; 5];
+    let num = fmt_u16(n as u16, &mut tmp);
+    let len = num.len();
+    buf[..len].copy_from_slice(num.as_bytes());
+    buf[len] = unit;
+    str8(&buf[..len + 1])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1583,7 +1805,7 @@ mod tests {
             },
         ];
         let mut d = Rec::new();
-        render_passkeys_list(&mut d, &rows, 2).unwrap();
+        render_passkeys_list(&mut d, &rows, 0, 2).unwrap();
         assert!(!d.oob, "list drew outside the panel");
         // Each RP row is a card in the exact rect hit_list maps a tap to.
         for i in 0..rows.len() as u16 {
@@ -1598,7 +1820,7 @@ mod tests {
     #[test]
     fn passkeys_list_empty_state_draws() {
         let mut d = Rec::new();
-        render_passkeys_list(&mut d, &[], 0).unwrap();
+        render_passkeys_list(&mut d, &[], 0, 0).unwrap();
         assert!(!d.oob && d.drew_anything());
         assert!(has_color(&d, crate::nav_tab_rect(1), theme::ACCENT));
     }
@@ -1617,7 +1839,7 @@ mod tests {
         ];
         let title = Label::clamp(b"github.com");
         let mut d = Rec::new();
-        render_service(&mut d, &title, &accounts, 2).unwrap();
+        render_service(&mut d, &title, &accounts, 0, 2).unwrap();
         assert!(!d.oob, "detail drew outside the panel");
         // The back chevron paints in TITLE_BACK_RECT — where hit_title_back maps a tap.
         assert!(
@@ -1866,7 +2088,7 @@ mod tests {
     }
 
     #[test]
-    fn security_page_paints_both_rows_under_either_pin_state() {
+    fn security_page_paints_every_row_under_either_pin_state() {
         for pin_set in [false, true] {
             let mut v = view(SettingsPage::Security);
             v.pin_set = pin_set;
@@ -1876,16 +2098,134 @@ mod tests {
                 !d.oob,
                 "security (pin_set={pin_set}) drew outside the panel"
             );
-            // Both Security rows are painted in the rects `hit_security` maps taps to.
+            // Every Security row (PIN, Audit log, Factory reset) is painted in the rect
+            // `hit_security` maps its tap to.
+            for i in 0..crate::SECURITY_ROWS {
+                assert!(
+                    d.any_non_bg_in(settings_row_rect(i)),
+                    "security row {i} unpainted (pin_set={pin_set})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn audit_log_paints_rows_with_kind_coloured_dots() {
+        let rows = [
+            AuditRow {
+                kind: AuditKind::Login,
+                secs_ago: Some(120),
+            },
+            AuditRow {
+                kind: AuditKind::Register,
+                secs_ago: Some(3600),
+            },
+            AuditRow {
+                kind: AuditKind::Denied,
+                secs_ago: None,
+            },
+        ];
+        let mut d = Rec::new();
+        render_audit_log(&mut d, &rows, 0, 3).unwrap();
+        assert!(!d.oob, "audit log drew outside the panel");
+        // Each row's status dot is painted in its kind colour, inside its row rect.
+        for (i, c) in [theme::SUCCESS, theme::ACCENT, theme::DANGER]
+            .into_iter()
+            .enumerate()
+        {
             assert!(
-                d.any_non_bg_in(settings_row_rect(0)),
-                "PIN row unpainted (pin_set={pin_set})"
-            );
-            assert!(
-                d.any_non_bg_in(settings_row_rect(1)),
-                "Factory reset row unpainted (pin_set={pin_set})"
+                has_color(&d, crate::row_rect(crate::PK_LIST_TOP, i as u16), c),
+                "row {i} status-dot colour missing"
             );
         }
+    }
+
+    #[test]
+    fn audit_log_empty_shows_placeholder_and_no_rows() {
+        let mut d = Rec::new();
+        render_audit_log(&mut d, &[], 0, 0).unwrap();
+        assert!(!d.oob, "empty audit log drew outside the panel");
+        assert!(d.drew_anything(), "empty audit log drew nothing");
+        // No row card is painted when there are no events.
+        assert!(
+            !d.any_non_bg_in(crate::row_rect(crate::PK_LIST_TOP, 0)),
+            "empty audit log painted a row card"
+        );
+    }
+
+    #[test]
+    fn multi_page_list_shows_pager_in_its_hit_rects() {
+        // A full page of a 3-page list (13 events): mid-list, so both arrows are active.
+        let rows = [AuditRow {
+            kind: AuditKind::Login,
+            secs_ago: Some(60),
+        }; crate::PK_ROWS_MAX];
+        let mut d = Rec::new();
+        render_audit_log(&mut d, &rows, 1, 13).unwrap();
+        assert!(!d.oob, "paged audit log drew outside the panel");
+        assert!(
+            has_color(&d, crate::PAGER_PREV_RECT, theme::ACCENT),
+            "prev arrow missing from its hit rect"
+        );
+        assert!(
+            has_color(&d, crate::PAGER_NEXT_RECT, theme::ACCENT),
+            "next arrow missing from its hit rect"
+        );
+    }
+
+    #[test]
+    fn pager_dims_the_unavailable_end_arrow() {
+        let rows = [AuditRow {
+            kind: AuditKind::Login,
+            secs_ago: Some(60),
+        }; crate::PK_ROWS_MAX];
+        // First page of 3: prev is dimmed, next is active.
+        let mut d = Rec::new();
+        render_audit_log(&mut d, &rows, 0, 13).unwrap();
+        assert!(
+            has_color(&d, crate::PAGER_PREV_RECT, theme::CAPTION),
+            "prev not dimmed on the first page"
+        );
+        assert!(
+            has_color(&d, crate::PAGER_NEXT_RECT, theme::ACCENT),
+            "next not active on the first page"
+        );
+        // Last page (2 of 3): next is dimmed.
+        let mut d2 = Rec::new();
+        render_audit_log(&mut d2, &rows[..3], 2, 13).unwrap();
+        assert!(
+            has_color(&d2, crate::PAGER_NEXT_RECT, theme::CAPTION),
+            "next not dimmed on the last page"
+        );
+    }
+
+    #[test]
+    fn single_page_list_shows_footer_not_pager() {
+        let rows = [AuditRow {
+            kind: AuditKind::Login,
+            secs_ago: Some(60),
+        }; 3];
+        let mut d = Rec::new();
+        render_audit_log(&mut d, &rows, 0, 3).unwrap();
+        // One page → no pager: the prev-arrow region (left, clear of the right-aligned
+        // item-count footer) stays background.
+        assert!(
+            !d.any_non_bg_in(crate::PAGER_PREV_RECT),
+            "single-page list painted a pager arrow"
+        );
+    }
+
+    #[test]
+    fn fmt_ago_buckets_units() {
+        let mut b = [0u8; 8];
+        assert_eq!(fmt_ago(0, &mut b), "now");
+        assert_eq!(fmt_ago(59, &mut b), "now");
+        assert_eq!(fmt_ago(60, &mut b), "1m");
+        assert_eq!(fmt_ago(125, &mut b), "2m");
+        assert_eq!(fmt_ago(3_600, &mut b), "1h");
+        assert_eq!(fmt_ago(86_400, &mut b), "1d");
+        assert_eq!(fmt_ago(6 * 86_400, &mut b), "6d");
+        assert_eq!(fmt_ago(604_800, &mut b), "1w");
     }
 
     #[test]

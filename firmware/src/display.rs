@@ -45,9 +45,9 @@ use mipidsi::{Builder, Display};
 use rsk_crypto::Device;
 use rsk_sdk::Confirm;
 use rsk_ui::{
-    ALLOW_RECT, AccountRow, AdjustKey, BRIGHTNESS_LEVELS, Button, ConfirmPrompt, HomeView, Label,
-    NavTab, PinCaption, PinKey, PinPad, RootEntry, RpRow, Screen, SecurityEntry, SettingsPage,
-    SettingsView, StatusKind, SuccessKind,
+    ALLOW_RECT, AccountRow, AdjustKey, AuditRow, BRIGHTNESS_LEVELS, Button, ConfirmPrompt,
+    HomeView, Label, NavTab, PinCaption, PinKey, PinPad, RootEntry, RpRow, Screen, SecurityEntry,
+    SettingsPage, SettingsView, StatusKind, SuccessKind,
 };
 
 use crate::handler::Store;
@@ -533,6 +533,10 @@ impl Ui {
                                     self.run_set_pin();
                                     last = Instant::now();
                                 }
+                                Some(SecurityEntry::AuditLog) => {
+                                    self.run_auditlog();
+                                    last = Instant::now();
+                                }
                                 // A confirmed reset reboots and never returns; on cancel,
                                 // fall back to this page (repaint below) with a fresh timeout.
                                 Some(SecurityEntry::FactoryReset) => {
@@ -569,6 +573,12 @@ impl Ui {
                         Some(AdjustKey::Back) => page = SettingsPage::Root,
                         _ => repaint = false,
                     },
+                }
+                // A sub-modal (e.g. the audit log) may have slept + locked via the power
+                // button; if so, unwind without repainting over the now-blanked panel —
+                // status_task owns the asleep/Locked state from here.
+                if self.asleep {
+                    break;
                 }
                 // One tap = one action: wait for release (bounded) before the next.
                 self.touch.wait_release(last, idle_limit);
@@ -608,8 +618,9 @@ impl Ui {
         // rpIdHash) so a drilled-in RP can enumerate its own credentials.
         let mut rows = [RpRow::default(); rsk_ui::PK_ROWS_MAX];
         let mut hashes = [[0u8; 32]; rsk_ui::PK_ROWS_MAX];
-        let (n, total) = self.load_rps(&mut rows, &mut hashes);
-        self.render_list(&rows[..n], total);
+        let mut page: u16 = 0;
+        let (mut n, mut total) = self.load_rps(&mut rows, &mut hashes, page);
+        self.render_list(&rows[..n], page, total);
         self.touch
             .wait_release(Instant::now(), Duration::from_millis(MENU_INACTIVITY_MS));
 
@@ -622,10 +633,32 @@ impl Ui {
             }
             if let Some(p) = self.touch.read() {
                 last = Instant::now();
+                if let Some(k) = rsk_ui::hit_pager(p) {
+                    page = paged(page, total, k);
+                    let r = self.load_rps(&mut rows, &mut hashes, page);
+                    n = r.0;
+                    total = r.1;
+                    self.render_list(&rows[..n], page, total);
+                    self.touch.wait_release(last, idle_limit);
+                    last = Instant::now();
+                    continue;
+                }
                 if let Some(i) = rsk_ui::hit_list(p, rsk_ui::PK_LIST_TOP, n as u16) {
                     match self.run_service(&rows[i as usize].id, &hashes[i as usize]) {
                         ServiceResult::Back => {
-                            self.render_list(&rows[..n], total);
+                            // A deleted last-account removes its RP, so the total can shrink —
+                            // reload this page and clamp it if it scrolled off the end.
+                            let r = self.load_rps(&mut rows, &mut hashes, page);
+                            n = r.0;
+                            total = r.1;
+                            let clamped = page.min(rsk_ui::page_count(total).saturating_sub(1));
+                            if clamped != page {
+                                page = clamped;
+                                let r = self.load_rps(&mut rows, &mut hashes, page);
+                                n = r.0;
+                                total = r.1;
+                            }
+                            self.render_list(&rows[..n], page, total);
                             self.touch.wait_release(Instant::now(), idle_limit);
                             last = Instant::now();
                             continue;
@@ -663,8 +696,9 @@ impl Ui {
         let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
         let mut accts = [AccountRow::default(); rsk_ui::PK_ROWS_MAX];
         let mut fids = [0u16; rsk_ui::PK_ROWS_MAX];
-        let (mut n, mut total) = self.load_accts(hash, &mut accts, &mut fids);
-        let _ = rsk_ui::render_service(&mut self.panel, title, &accts[..n], total);
+        let mut page: u16 = 0;
+        let (mut n, mut total) = self.load_accts(hash, &mut accts, &mut fids, page);
+        let _ = rsk_ui::render_service(&mut self.panel, title, &accts[..n], page, total);
         self.shown = None;
         self.touch.wait_release(Instant::now(), idle_limit);
 
@@ -687,15 +721,36 @@ impl Ui {
                         NavTab::Settings => ServiceResult::Leave(Some(NavTab::Settings)),
                     };
                 }
-                if let Some(i) = rsk_ui::hit_list(p, rsk_ui::PK_LIST_TOP, n as u16) {
-                    self.run_delete(title, &accts[i as usize].name, fids[i as usize]);
-                    let r = self.load_accts(hash, &mut accts, &mut fids);
+                if let Some(k) = rsk_ui::hit_pager(p) {
+                    page = paged(page, total, k);
+                    let r = self.load_accts(hash, &mut accts, &mut fids, page);
                     n = r.0;
                     total = r.1;
-                    if n == 0 {
-                        return ServiceResult::Back;
+                    let _ =
+                        rsk_ui::render_service(&mut self.panel, title, &accts[..n], page, total);
+                    self.shown = None;
+                    self.touch.wait_release(last, idle_limit);
+                    last = Instant::now();
+                    continue;
+                }
+                if let Some(i) = rsk_ui::hit_list(p, rsk_ui::PK_LIST_TOP, n as u16) {
+                    self.run_delete(title, &accts[i as usize].name, fids[i as usize]);
+                    let r = self.load_accts(hash, &mut accts, &mut fids, page);
+                    n = r.0;
+                    total = r.1;
+                    if total == 0 {
+                        return ServiceResult::Back; // last account gone — this RP vanished
                     }
-                    let _ = rsk_ui::render_service(&mut self.panel, title, &accts[..n], total);
+                    // Clamp the page if the delete scrolled it off the end, then repaint.
+                    let clamped = page.min(rsk_ui::page_count(total).saturating_sub(1));
+                    if clamped != page {
+                        page = clamped;
+                        let r = self.load_accts(hash, &mut accts, &mut fids, page);
+                        n = r.0;
+                        total = r.1;
+                    }
+                    let _ =
+                        rsk_ui::render_service(&mut self.panel, title, &accts[..n], page, total);
                     self.shown = None;
                     self.touch.wait_release(Instant::now(), idle_limit);
                     last = Instant::now();
@@ -714,20 +769,22 @@ impl Ui {
 
     /// Repaint the Passkeys list (a full-frame paint) and mark the panel for the ambient
     /// loop to refresh once the tab closes.
-    fn render_list(&mut self, rows: &[RpRow], total: u16) {
-        let _ = rsk_ui::render_passkeys_list(&mut self.panel, rows, total);
+    fn render_list(&mut self, rows: &[RpRow], page: u16, total: u16) {
+        let _ = rsk_ui::render_passkeys_list(&mut self.panel, rows, page, total);
         self.shown = None;
     }
 
     /// Enumerate resident RPs into `rows` (+ their rpIdHashes into `hashes`), returning
     /// the kept count and the true total. Reads + decrypts from the shared store; the
     /// seed is loaded and zeroized inside the enumerator (the display never holds it).
-    fn load_rps(&self, rows: &mut [RpRow], hashes: &mut [[u8; 32]]) -> (usize, u16) {
+    fn load_rps(&self, rows: &mut [RpRow], hashes: &mut [[u8; 32]], page: u16) -> (usize, u16) {
         let dev = self.keys.device();
+        let offset = page as usize * rsk_ui::PK_ROWS_MAX;
         let mut store = self.fs.borrow_mut();
+        let mut idx = 0usize;
         let mut n = 0usize;
         let total = rsk_fido::passkeys::for_each_rp(&dev, &mut *store, |rp| {
-            if n < rows.len() {
+            if idx >= offset && n < rows.len() {
                 rows[n] = RpRow {
                     id: Label::clamp(rp.rp_id.as_bytes()),
                     accounts: rp.count,
@@ -735,8 +792,97 @@ impl Ui {
                 hashes[n] = rp.rp_id_hash;
                 n += 1;
             }
+            idx += 1;
         });
         (n, total.min(u16::MAX as usize) as u16)
+    }
+
+    /// Snapshot the most recent journal events for the audit log, newest first. Each
+    /// `EV_*` code maps to its display [`rsk_ui::AuditKind`], and an entry from the
+    /// **current** power cycle also carries how long ago it happened — the journal's
+    /// uptime is the same monotonic clock as `Instant::now()` but resets each boot, so a
+    /// boot entry marks the session boundary and older rows show no time (no wall clock).
+    /// Borrow-safe like [`Self::load_rps`] (the worker is parked while this modal runs).
+    fn load_events(&self, rows: &mut [AuditRow], page: u16) -> (usize, u16) {
+        let dev = self.keys.device();
+        // Cap the live clock at the journal's own resolution: `build_entry` saturates the
+        // stored `uptime_ms` to `u32::MAX`, so after ~49.7 days of continuous uptime both
+        // sides saturate together and a just-logged event still reads "now" rather than a
+        // delta measured from the saturation point.
+        let now_ms = Instant::now().as_millis().min(u32::MAX as u64);
+        let offset = page as usize * rsk_ui::PK_ROWS_MAX;
+        let mut store = self.fs.borrow_mut();
+        let mut idx = 0usize;
+        let mut n = 0usize;
+        let mut current_session = true;
+        let total = rsk_fido::journal::for_each_event(&dev, &mut *store, |e| {
+            if idx >= offset && n < rows.len() {
+                let secs_ago = if current_session && (e.uptime_ms as u64) <= now_ms {
+                    Some(((now_ms - e.uptime_ms as u64) / 1000) as u32)
+                } else {
+                    None
+                };
+                rows[n] = AuditRow {
+                    kind: audit_kind(e.event),
+                    secs_ago,
+                };
+                n += 1;
+            }
+            // Track the boot boundary for EVERY visited entry (including newer ones skipped
+            // before the page window), so the current-session flag is correct by the time we
+            // reach the page.
+            if e.event == rsk_fido::journal::EV_BOOT {
+                current_session = false; // everything older is a prior power cycle
+            }
+            idx += 1;
+            n < rows.len() // stop once the page is full (older entries needn't be visited)
+        });
+        (n, total.min(u16::MAX as u32) as u16)
+    }
+
+    /// The read-only on-device audit log (Settings → Security → Audit log): snapshot the
+    /// current page of journal events and show them until the back chevron, the power
+    /// button (sleeps + locks), a queued host command, or the inactivity timeout. The
+    /// pager arrows page through a longer log. Synchronous like the other browse modals
+    /// (the worker is parked); read-only, so no tap mutates anything. After a power-button
+    /// sleep the caller ([`Self::run_settings`]) sees `asleep` and unwinds without
+    /// repainting over the blanked panel.
+    fn run_auditlog(&mut self) {
+        let mut rows = [AuditRow::default(); rsk_ui::PK_ROWS_MAX];
+        let mut page: u16 = 0;
+        let (mut n, mut total) = self.load_events(&mut rows, page);
+        let _ = rsk_ui::render_audit_log(&mut self.panel, &rows[..n], page, total);
+        self.shown = None;
+        let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
+        self.touch.wait_release(Instant::now(), idle_limit);
+        let mut last = Instant::now();
+        loop {
+            if self.sleep_button_pressed() {
+                return;
+            }
+            if let Some(p) = self.touch.read() {
+                last = Instant::now();
+                if rsk_ui::hit_title_back(p) {
+                    return;
+                }
+                if let Some(k) = rsk_ui::hit_pager(p) {
+                    page = paged(page, total, k);
+                    let r = self.load_events(&mut rows, page);
+                    n = r.0;
+                    total = r.1;
+                    let _ = rsk_ui::render_audit_log(&mut self.panel, &rows[..n], page, total);
+                    self.shown = None;
+                    self.touch.wait_release(last, idle_limit);
+                    last = Instant::now();
+                    continue;
+                }
+                self.touch.wait_release(last, idle_limit);
+            }
+            if crate::worker::host_request_pending() || last.elapsed() >= idle_limit {
+                return;
+            }
+            block_for(Duration::from_millis(TOUCH_POLL_MS));
+        }
     }
 
     /// Enumerate the resident accounts under `hash` into `accts`, recording each one's
@@ -748,12 +894,15 @@ impl Ui {
         hash: &[u8; 32],
         accts: &mut [AccountRow],
         fids: &mut [u16],
+        page: u16,
     ) -> (usize, u16) {
         let dev = self.keys.device();
+        let offset = page as usize * rsk_ui::PK_ROWS_MAX;
         let mut store = self.fs.borrow_mut();
+        let mut idx = 0usize;
         let mut n = 0usize;
         let total = rsk_fido::passkeys::for_each_cred(&dev, &mut *store, hash, |a| {
-            if n < accts.len() {
+            if idx >= offset && n < accts.len() {
                 let name = if !a.user_name.is_empty() {
                     Label::clamp(a.user_name.as_bytes())
                 } else if !a.user_display_name.is_empty() {
@@ -768,6 +917,7 @@ impl Ui {
                 fids[n] = a.ef_cred_fid;
                 n += 1;
             }
+            idx += 1;
         });
         (n, total.min(u16::MAX as usize) as u16)
     }
@@ -1190,6 +1340,35 @@ fn status_to_kind(s: u8) -> StatusKind {
         led::STATUS_PROCESSING => StatusKind::Processing,
         led::STATUS_TOUCH => StatusKind::Touch,
         _ => StatusKind::Boot,
+    }
+}
+
+/// Apply a pager tap to the current page, clamped to `0..page_count(total)` — a Prev on
+/// page 0 or a Next on the last page is a harmless no-op (the arrow is drawn dimmed).
+fn paged(page: u16, total: u16, k: rsk_ui::PagerKey) -> u16 {
+    let last = rsk_ui::page_count(total).saturating_sub(1);
+    match k {
+        rsk_ui::PagerKey::Prev => page.saturating_sub(1),
+        rsk_ui::PagerKey::Next => (page + 1).min(last),
+    }
+}
+
+/// Map a journal event code to its on-device audit-log display class (the boundary
+/// translation, the way an rpId is clamped into a `Label` — rsk-ui has no rsk-fido dep).
+fn audit_kind(ev: u8) -> rsk_ui::AuditKind {
+    use rsk_fido::journal as j;
+    use rsk_ui::AuditKind as K;
+    match ev {
+        j::EV_GET_ASSERT | j::EV_U2F_AUTH => K::Login,
+        j::EV_MAKE_CRED | j::EV_U2F_REGISTER => K::Register,
+        j::EV_PIN_SET | j::EV_PIN_CHANGE => K::Pin,
+        j::EV_PIN_LOCKOUT => K::Denied,
+        j::EV_BOOT => K::Boot,
+        j::EV_RESET => K::Reset,
+        j::EV_LOCK_ENGAGE | j::EV_LOCK_RELEASE => K::Lock,
+        j::EV_CFG_MIN_PIN | j::EV_CFG_EA | j::EV_CFG_ALWAYS_UV => K::Config,
+        j::EV_BACKUP_EXPORT | j::EV_BACKUP_LOAD | j::EV_BACKUP_FINALIZE => K::Backup,
+        _ => K::Other,
     }
 }
 

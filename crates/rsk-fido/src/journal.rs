@@ -207,6 +207,44 @@ pub fn chain_head<S: Storage>(dev: &Device, fs: &mut Fs<S>) -> ([u8; 32], Meta) 
     (h, m)
 }
 
+/// A decoded journal entry for the read-only on-device audit log. The host export
+/// path ([`vendor_read`]) carries the raw bytes + attestation for real verification;
+/// this is the lean in-device view (no CBOR, no signature) the trusted display walks.
+pub struct EventView {
+    /// Monotonic boot-relative timestamp (ms) — only comparable within a power cycle.
+    pub uptime_ms: u32,
+    /// The event code (one of the `EV_*` constants).
+    pub event: u8,
+}
+
+/// Visit the live journal window **newest first**, calling `f` for each decoded entry
+/// until it returns `false` (the display keeps only the few most recent) or the window
+/// is exhausted. Returns the total number of live entries, so a caller that keeps a
+/// subset can still show a true count — mirrors [`crate::passkeys::for_each_rp`].
+pub fn for_each_event<S: Storage, F: FnMut(&EventView) -> bool>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    mut f: F,
+) -> u32 {
+    let m = load_meta(dev, fs);
+    let total = m.seq_next.wrapping_sub(m.start);
+    let mut seq = m.seq_next;
+    let mut e = [0u8; ENTRY_LEN];
+    while seq != m.start {
+        seq = seq.wrapping_sub(1);
+        if read_slot(fs, seq, &mut e).is_some() {
+            let view = EventView {
+                uptime_ms: u32::from_le_bytes(e[4..8].try_into().unwrap()),
+                event: e[8],
+            };
+            if !f(&view) {
+                break;
+            }
+        }
+    }
+    total
+}
+
 /// The checkpoint signing key: HKDF(salt = serial_hash, ikm = DEVK) → P-256
 /// scalar. Deterministic and reset-stable; the counter byte retries the
 /// (cosmically unlikely) out-of-range scalar.
@@ -539,5 +577,37 @@ mod tests {
         }
         let (head, _) = chain_head(&dev(), &mut fs);
         assert_eq!(epoch, head);
+    }
+
+    #[test]
+    fn for_each_event_visits_newest_first_and_counts() {
+        let mut fs = Fs::new(RamStorage::new(), &[]);
+        let mut state = FidoState::new();
+        run_ctx(&mut fs, &mut state, |ctx| {
+            // EV_BOOT is auto-logged first, then these three.
+            append(ctx, EV_MAKE_CRED, 0, &[]);
+            append(ctx, EV_GET_ASSERT, 0, &[]);
+            append(ctx, EV_PIN_SET, 0, &[]);
+        });
+
+        let mut seen = std::vec::Vec::new();
+        let total = for_each_event(&dev(), &mut fs, |e| {
+            seen.push(e.event);
+            true
+        });
+        assert_eq!(total, 4);
+        assert_eq!(
+            seen,
+            std::vec![EV_PIN_SET, EV_GET_ASSERT, EV_MAKE_CRED, EV_BOOT]
+        );
+
+        // A visitor that keeps only the first two still reports the true total.
+        let mut kept = 0u32;
+        let total2 = for_each_event(&dev(), &mut fs, |_| {
+            kept += 1;
+            kept < 2
+        });
+        assert_eq!(total2, 4);
+        assert_eq!(kept, 2);
     }
 }
