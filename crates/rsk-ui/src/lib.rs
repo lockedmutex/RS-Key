@@ -16,6 +16,7 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod font;
 pub mod glyph;
 pub mod render;
 pub mod theme;
@@ -319,12 +320,16 @@ pub fn hit_pin(p: Point) -> Option<PinKey> {
 /// Which settings page is on screen.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SettingsPage {
-    /// The top-level list: Brightness / Touch timeout / Info / Close.
+    /// The top-level list: Brightness / Touch timeout / Display sleep / Info / Lock now /
+    /// Factory reset (the title-bar back chevron exits — there is no "Close" row).
     Root,
     /// Backlight-level adjust (−/+/Back).
     Brightness,
     /// Touch-timeout adjust (−/+/Back).
     Timeout,
+    /// Display-sleep timeout adjust (−/+/Back) — blanks the panel after inactivity to
+    /// stop image retention on the IPS glass.
+    Sleep,
     /// Read-only device info (Back only).
     Info,
 }
@@ -334,6 +339,10 @@ pub enum SettingsPage {
 pub const BRIGHTNESS_LEVELS: u8 = 5;
 /// Touch-timeout choices in seconds the timeout page steps between.
 pub const TIMEOUT_CHOICES: [u16; 5] = [10, 20, 30, 60, 120];
+/// Display-sleep choices in seconds the sleep page steps between; the final `0` is the
+/// "Off" sentinel (never blank). Kept ascending by wake-awake time so `+` lengthens it
+/// up to Off.
+pub const SLEEP_CHOICES: [u16; 6] = [15, 30, 60, 120, 300, 0];
 
 /// The settings view model: the current page plus the live values its pages show.
 /// Carried in [`Screen::Settings`] so the renderer paints the current brightness
@@ -345,6 +354,8 @@ pub struct SettingsView {
     pub brightness: u8,
     /// Current presence/touch timeout, seconds.
     pub timeout_secs: u16,
+    /// Current display-sleep timeout, seconds (`0` = Off, never blanks).
+    pub sleep_secs: u16,
     /// bcdDevice firmware build counter, shown in hex on the Info page.
     pub version: u16,
     /// RP2350 chip serial, shown in hex on the Info page.
@@ -356,11 +367,15 @@ pub struct SettingsView {
 pub enum RootEntry {
     Brightness,
     Timeout,
+    /// Display-sleep timeout — blank the panel after inactivity (image-retention guard).
+    Sleep,
     Info,
+    /// Lock the on-device UI now — show the [`Screen::Locked`] screen so the passkeys
+    /// browser and settings need the device PIN to reopen (no-op if no PIN is set).
+    LockNow,
     /// Erase every applet's data and return to a fresh device (danger-styled,
     /// gated by a hold-to-confirm and the device PIN if one is set).
     FactoryReset,
-    Close,
 }
 
 /// A control on an adjust page (brightness / timeout). The Info page uses only
@@ -372,15 +387,17 @@ pub enum AdjustKey {
     Back,
 }
 
-/// Root list: five full-width rows (Brightness / Timeout / Info / Factory reset /
-/// Close) — sized to fit all five above the panel bottom.
+/// Root list: six full-width rows (Brightness / Touch timeout / Display sleep / Info /
+/// Lock now / Factory reset) — the title-bar back chevron exits the menu, so there is no
+/// "Close" row. Sized so all six fit below the chrome and above the panel bottom (a
+/// const-assert validates it) at a touch-comfortable row height.
 const ROW_X: u16 = 16;
 const ROW_W: u16 = PANEL_W - 2 * ROW_X;
-const ROW_H: u16 = 40;
-const ROW_GAP: u16 = 10;
-const ROW_Y0: u16 = 66;
+const ROW_H: u16 = 38;
+const ROW_GAP: u16 = 6;
+const ROW_Y0: u16 = CONTENT_TOP + 2;
 /// Number of Root list rows.
-pub const SETTINGS_ROWS: u16 = 5;
+pub const SETTINGS_ROWS: u16 = 6;
 
 /// The rectangle of Root list row `i` — single source of truth for the renderer and
 /// [`hit_settings_root`].
@@ -393,9 +410,10 @@ pub const fn settings_row_entry(i: u16) -> RootEntry {
     match i {
         0 => RootEntry::Brightness,
         1 => RootEntry::Timeout,
-        2 => RootEntry::Info,
-        3 => RootEntry::FactoryReset,
-        _ => RootEntry::Close,
+        2 => RootEntry::Sleep,
+        3 => RootEntry::Info,
+        4 => RootEntry::LockNow,
+        _ => RootEntry::FactoryReset,
     }
 }
 
@@ -412,7 +430,9 @@ pub const BACK_RECT: Rect = Rect::new(16, 262, PANEL_W - 32, 46);
 
 // Compile-time layout invariants (paint and hit-test share these rects): the Root
 // rows fit on-panel with a real gap; the −/+ controls are disjoint with a gap and
-// sit above Back. A bad geometry edit fails the build.
+// sit above Back. A bad geometry edit fails the build. NB the Root page intentionally
+// paints no bottom nav bar (its title-bar back chevron is the exit), so the rows are
+// allowed to extend past `NAV_TOP` — the bound here is `PANEL_H`, not `NAV_TOP`.
 const _: () = {
     assert!(ROW_GAP > 0);
     // At least one brightness step (the level-bar math would underflow at 0).
@@ -477,6 +497,32 @@ pub fn step_timeout(cur_secs: u16, delta: i8) -> u16 {
     TIMEOUT_CHOICES[ni]
 }
 
+/// Step the display-sleep timeout to the next/previous [`SLEEP_CHOICES`] entry by
+/// `delta` (+1/−1). The trailing `0` ("Off") sentinel sits at the top, so `+` from the
+/// longest duration reaches Off and `−` from Off returns to the longest; a current value
+/// not in the list snaps to the nearest real duration first. Returns seconds (`0` = Off).
+pub fn step_sleep(cur_secs: u16, delta: i8) -> u16 {
+    let real = SLEEP_CHOICES.len() - 1; // index of the "Off" sentinel
+    let idx = if cur_secs == 0 {
+        real
+    } else {
+        let mut best = u16::MAX;
+        let mut bi = 0;
+        let mut i = 0;
+        while i < real {
+            let d = cur_secs.abs_diff(SLEEP_CHOICES[i]);
+            if d < best {
+                best = d;
+                bi = i;
+            }
+            i += 1;
+        }
+        bi
+    };
+    let ni = (idx as i32 + delta as i32).clamp(0, SLEEP_CHOICES.len() as i32 - 1) as usize;
+    SLEEP_CHOICES[ni]
+}
+
 /// Lowercase-hex nibble (`0-9a-f`).
 const fn hex_nibble(n: u8) -> u8 {
     if n < 10 { b'0' + n } else { b'a' + (n - 10) }
@@ -507,8 +553,30 @@ pub fn hex_u64(v: u64) -> [u8; 16] {
 
 // --- Design-system widgets (the re-skin layout) ----------------------------
 
-/// Header-bar height (title + a status glyph live in this top strip).
+/// Legacy single-strip header height — still used by the full-screen approve modal
+/// ([`Screen::Confirm`]); the tab screens use the two-tier chrome below instead.
 pub const HEADER_H: u16 = 30;
+
+/// The persistent top **status bar**: a mono "RS-Key" wordmark at the left and the USB
+/// power indicator at the right. Present on every tab screen (the design's framing
+/// chrome).
+pub const STATUS_BAR_H: u16 = 24;
+/// The **title bar** below the status bar: an optional back chevron plus the screen
+/// title.
+pub const TITLE_BAR_H: u16 = 30;
+/// Top of a tab screen's content, below both chrome strips.
+pub const CONTENT_TOP: u16 = STATUS_BAR_H + TITLE_BAR_H;
+
+/// The title-bar back affordance (a pushed screen's "return to parent" chevron), in the
+/// title bar below the status bar. Distinct from [`PK_BACK_RECT`] — the chrome-less
+/// destructive modals keep their chevron in the very top-left, but a tab screen's status
+/// bar occupies that corner, so its back moves one strip down.
+pub const TITLE_BACK_RECT: Rect = Rect::new(4, STATUS_BAR_H, 44, TITLE_BAR_H);
+
+/// Did a tap at `p` hit the title-bar back chevron?
+pub fn hit_title_back(p: Point) -> bool {
+    TITLE_BACK_RECT.contains(p)
+}
 
 /// Bottom navigation-bar height.
 pub const NAV_H: u16 = 38;
@@ -574,11 +642,16 @@ pub fn hit_list(p: Point, y0: u16, n: u16) -> Option<u16> {
     None
 }
 
-// Compile-time: the nav tiles the width and sits on-panel; rows keep a real gap.
+// Compile-time: the nav tiles the width and sits on-panel; rows keep a real gap; the
+// two chrome strips stack inside the top of the panel and the title-bar back chevron
+// sits entirely within the title strip, clear of (above) any content.
 const _: () = {
     assert!(NAV_CELL_W * 3 <= PANEL_W);
     assert!(NAV_TOP + NAV_H <= PANEL_H);
     assert!(LIST_ROW_GAP > 0 && LIST_ROW_X > 0 && HEADER_H < NAV_TOP);
+    assert!(TITLE_BACK_RECT.y >= STATUS_BAR_H);
+    assert!(TITLE_BACK_RECT.y + TITLE_BACK_RECT.h <= CONTENT_TOP);
+    assert!(CONTENT_TOP <= PK_LIST_TOP && CONTENT_TOP <= ROW_Y0);
 };
 
 /// The device's current status, mirrored from the LED status engine so the panel
@@ -615,8 +688,9 @@ pub struct HomeView {
 /// Max passkey rows painted on the list / detail. No scroll yet — the footer shows
 /// the true total, so a longer set is summarised honestly, never silently cut.
 pub const PK_ROWS_MAX: usize = 6;
-/// Top of the first passkey row — below the header, clear of the nav bar + footer.
-pub const PK_LIST_TOP: u16 = 40;
+/// Top of the first passkey row — below the status + title bars, clear of the nav bar
+/// and footer.
+pub const PK_LIST_TOP: u16 = CONTENT_TOP + 4;
 
 /// One relying-party row on the Passkeys list: a sanitized rpId and how many resident
 /// credentials it holds. The firmware fills these from `rsk_fido::passkeys`.
@@ -680,6 +754,10 @@ pub fn hit_del_hold(p: Point) -> bool {
 pub enum Screen {
     /// One-time boot splash.
     Splash,
+    /// The device-locked screen: a padlock, "Locked", and a "touch to unlock" hint. The
+    /// whole screen is the unlock affordance (any tap starts the on-screen PIN entry).
+    /// Gates only the on-device UI — host CTAP ceremonies are unaffected.
+    Locked,
     /// The Home tab — status indicator + bottom nav.
     Home(HomeView),
     /// A pending trusted Deny / Hold-to-approve decision.
@@ -785,6 +863,18 @@ mod proofs {
         kani::assume((i as usize) < PK_ROWS_MAX);
         assert!(!(hit_pk_back(p) && row_rect(PK_LIST_TOP, i).contains(p)));
         assert!(!(hit_pk_back(p) && p.y >= NAV_TOP));
+    }
+
+    /// The title-bar back chevron (a pushed tab screen's "return" affordance) can't be
+    /// confused with a content row tap or a nav-bar tap, so returning to the parent
+    /// screen never collides with selecting a row or switching tabs.
+    #[kani::proof]
+    fn title_back_clear_of_rows_and_nav() {
+        let p = Point::new(kani::any(), kani::any());
+        let i: u16 = kani::any();
+        kani::assume((i as usize) < PK_ROWS_MAX);
+        assert!(!(hit_title_back(p) && row_rect(PK_LIST_TOP, i).contains(p)));
+        assert!(!(hit_title_back(p) && p.y >= NAV_TOP));
     }
 
     /// On the Confirm-Delete screen the destructive hold button and the cancel
@@ -923,9 +1013,10 @@ mod tests {
         let want = [
             RootEntry::Brightness,
             RootEntry::Timeout,
+            RootEntry::Sleep,
             RootEntry::Info,
+            RootEntry::LockNow,
             RootEntry::FactoryReset,
-            RootEntry::Close,
         ];
         for (i, &e) in want.iter().enumerate() {
             let r = settings_row_rect(i as u16);
@@ -1003,6 +1094,23 @@ mod tests {
         // before stepping.
         assert_eq!(step_timeout(5, -1), 10);
         assert_eq!(step_timeout(5, 1), 20);
+    }
+
+    #[test]
+    fn step_sleep_walks_durations_and_off() {
+        // Steps between adjacent durations.
+        assert_eq!(step_sleep(30, 1), 60);
+        assert_eq!(step_sleep(60, -1), 30);
+        // The longest real duration (300) steps up to Off (0), and Off steps back down.
+        assert_eq!(step_sleep(300, 1), 0);
+        assert_eq!(step_sleep(0, -1), 300);
+        // Clamps at both ends.
+        assert_eq!(step_sleep(15, -1), 15);
+        assert_eq!(step_sleep(0, 1), 0);
+        // A non-listed value snaps to the nearest real duration before stepping (and
+        // never mis-snaps to the Off sentinel).
+        assert_eq!(step_sleep(20, 1), 30);
+        assert_eq!(step_sleep(20, -1), 15);
     }
 
     #[test]

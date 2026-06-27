@@ -18,3 +18,6 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
 # lives here, host-tested against a recording target — exactly like `rsk-led`'s
 # codec. The firmware's `display.rs` only supplies the real ST7789 draw target.
 embedded-graphics = { workspace = true }
+# Proportional 1-bit fonts for the high-fidelity redesign (see `font.rs`). Same
+# `DrawTarget` vocabulary as embedded-graphics; only ever linked into the display flavor.
+u8g2-fonts = { workspace = true }

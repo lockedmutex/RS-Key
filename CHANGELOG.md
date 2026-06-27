@@ -15,6 +15,32 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Added
 
+- **Trusted-display lock / unlock (on-device UI lock, experimental).** The panel can
+  now be **locked** so the on-device UI — the passkeys browser and Settings — needs the
+  device PIN to reopen, showing a "Locked / Touch to unlock" screen; a tap opens the
+  on-screen PIN pad and a correct PIN (verified against the same `EF_PIN` retry ladder
+  as every other on-device gate) unlocks it. It locks **at boot**, on a new **Settings →
+  Lock now** action, and automatically when the display sleeps on inactivity — all when a
+  PIN is set, so a security key comes up requiring the PIN to reach its on-device UI. This
+  gates **only** the on-device UI: host CTAP / WebAuthn ceremonies are unaffected (they
+  paint their own trusted Approve / built-in-UV prompts and have their own verification),
+  so a locked key still works as a security key. Display flavor only; no-op when no device
+  PIN is set (nothing to unlock with). bcdDevice 0x079E → 0x07A1.
+- **Trusted-display sleep (image-retention guard, experimental).** The panel now
+  blanks itself — backlight off and the glass cleared — after an inactivity timeout,
+  so a static screen can't burn a ghost into the IPS panel. A touch anywhere or the
+  **sleep/wake button** restores it (the first touch/press only wakes; it isn't read
+  as a tap), and an incoming host ceremony wakes it so the trusted prompt is always
+  visible. The button is a power-button-style toggle — pressing it while the screen is
+  on blanks it immediately, and it works from **any** on-device screen (Home, Passkeys,
+  Settings, the per-RP detail, and the Locked screen), not just Home. The timeout is set
+  on-device under **Settings → Display
+  sleep** (15 s … 5 min, or Off; runtime, reseeds to 1 min on reboot). The button is
+  the board's **BAT_PWR** button (GPIO25) by default and is build-configurable —
+  `WAKE_PIN=<gpio>` picks another, `WAKE_PIN=none` makes it touch-only, and
+  `WAKE_ACTIVE_HIGH=1` flips the polarity; a `WAKE_PIN` that collides with an
+  LCD/touch GPIO is rejected at compile time. Display flavor only. bcdDevice 0x079A →
+  0x079C.
 - **Configurable multi-LED effects engine.** Boards with a chain of addressable
   WS2812 LEDs now light the whole strip with per-status animated effects —
   `vapor` (breathing), `bounce`, `flow`, `sparkle`, or `legacy` (the classic
@@ -213,6 +239,28 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Changed
 
+- **Trusted-display visual redesign — typography and palette (experimental).** The
+  on-device screens move to the high-fidelity design language: proportional 1-bit
+  text (Helvetica-style `helvR`/`helvB` and `profont` for mono labels, via the new
+  `u8g2-fonts` dependency) in place of the monospace built-in fonts, and a blue
+  accent over a near-black blue-grey background with calm danger / warning / success
+  tiers. This is the design-system foundation; individual screen layouts are
+  re-skinned onto it wave by wave. Display-flavor only — the new dependency never
+  reaches a standard (screenless) key (the build still asserts `rsk-ui` absent from
+  the default image). The proportional faces also harden two layout spots against
+  the wider, variable text: the PIN screen's cancel is a back chevron (not a "Cancel"
+  word that overran its box into the title), and list-row labels are clipped clear of
+  their trailing value (a long rp name no longer touches its account count).
+  bcdDevice 0x0798 → 0x079A.
+- **Trusted-display redesign — status/title-bar chrome (experimental).** The tab
+  screens (Home, Passkeys, Settings, and per-RP detail) now wear the design's two-tier
+  chrome: a persistent top **status bar** (a mono "RS-Key" wordmark at the left and the
+  USB power indicator at the right — this is a bus-powered device, so always USB, never
+  a battery) and, below it, a **title bar** carrying the screen title and, on a pushed
+  screen, a back chevron. Content shifts down to clear both strips. The geometry is the
+  single source of truth shared by paint and hit-test (a new `hit_title_back`, proven
+  disjoint from the rows and nav under Kani). Display-flavor only. bcdDevice 0x079D →
+  0x079E.
 - **Touch timeout is configurable; phy tag `0x08` now follows pico-fido.** RS-Key
   read tag `0x08` as a user-presence button GPIO, but the button is always BOOTSEL
   so the field was never used. It now means `PresenceTimeout` — the touch-wait

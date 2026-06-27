@@ -153,6 +153,25 @@ const _: () = assert!(
     "PRESENCE_PIN has no effect on a `display` build (presence is the touchscreen); \
      drop PRESENCE_PIN, or build without --features display"
 );
+
+// Display-sleep wake button (the `display` build only): build.rs bakes the GPIO
+// (default 25 = the BAT_PWR / KEY_BAT button on the Waveshare RP2350-Touch-LCD-2.8),
+// whether it is enabled (`WAKE_PIN=none` disables it for touch-only wake) and its
+// polarity. `main` claims the pin and hands an `Input` to `display::Ui::build`.
+#[cfg(feature = "display")]
+const BUILD_WAKE_ENABLED: bool = env_u16(env!("PK_WAKE_ENABLED")) != 0;
+#[cfg(feature = "display")]
+const BUILD_WAKE_PIN: u8 = env_u16(env!("PK_WAKE_PIN")) as u8;
+#[cfg(feature = "display")]
+const BUILD_WAKE_ACTIVE_HIGH: bool = env_u16(env!("PK_WAKE_ACTIVE_HIGH")) != 0;
+
+// The wake button must not collide with the LCD/touch GPIOs (10..=18) the display build
+// already drives — catch a bad `WAKE_PIN` at compile time rather than double-claim a pad.
+#[cfg(feature = "display")]
+const _: () = assert!(
+    !BUILD_WAKE_ENABLED || BUILD_WAKE_PIN < 10 || BUILD_WAKE_PIN > 18,
+    "WAKE_PIN collides with an LCD/touch GPIO (10..=18) owned by the display build"
+);
 #[cfg(led_kind = "ws2812")]
 const BUILD_DRIVER: u8 = 3;
 #[cfg(led_kind = "gpio")]
@@ -360,7 +379,7 @@ async fn main(spawner: Spawner) {
     config.max_power = 100;
     config.max_packet_size_0 = 64;
     // bcdDevice build counter; also surfaced on the trusted-display Info page.
-    let device_release: u16 = 0x0798;
+    let device_release: u16 = 0x07A1;
     config.device_release = device_release;
 
     let mut builder = Builder::new(
@@ -605,6 +624,25 @@ async fn main(spawner: Spawner) {
         let cs = Output::new(p.PIN_13, Level::High);
         let dc = Output::new(p.PIN_14, Level::Low);
         let rst = Output::new(p.PIN_15, Level::High);
+        // Display-sleep wake button (default the BAT_PWR / KEY_BAT button on GPIO25).
+        // Active-low with an internal pull-up by default (`WAKE_ACTIVE_HIGH` flips it);
+        // `WAKE_PIN=none` leaves it unwired so only a touch wakes. Stealing the pin is
+        // sound: it is never handed to another driver, and a compile-time assert rejects
+        // a `WAKE_PIN` in the LCD/touch range.
+        let wake_btn = if BUILD_WAKE_ENABLED {
+            use embassy_rp::gpio::{AnyPin, Input, Pull};
+            let pull = if BUILD_WAKE_ACTIVE_HIGH {
+                Pull::Down
+            } else {
+                Pull::Up
+            };
+            Some((
+                Input::new(unsafe { AnyPin::steal(BUILD_WAKE_PIN) }, pull),
+                BUILD_WAKE_ACTIVE_HIGH,
+            ))
+        } else {
+            None
+        };
         // Backlight on GPIO16 as PWM (slice 0, channel A) at zero duty — dark until
         // `Ui::build` raises it to full after the first render (no white flash).
         let bl = Pwm::new_output_a(p.PWM_SLICE0, p.PIN_16, display::backlight_cfg(0));
@@ -637,7 +675,7 @@ async fn main(spawner: Spawner) {
         // reference is `Copy`; the `RefCell` provides the interior mutability). The
         // panel also shares the worker's `fs_ref` to enumerate resident credentials.
         let ui: &'static RefCell<display::Ui> = UI.init(RefCell::new(display::Ui::build(
-            panel, touch, info, fs_ref, keys,
+            panel, touch, info, fs_ref, keys, wake_btn,
         )));
         spawner.spawn(display::status_task(ui).unwrap());
         ui

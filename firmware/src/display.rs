@@ -28,12 +28,13 @@
 use core::cell::RefCell;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use embassy_rp::gpio::Output;
+use embassy_rp::gpio::{Input, Output};
 use embassy_rp::i2c::{Blocking as I2cBlocking, I2c};
 use embassy_rp::peripherals::{I2C1, SPI1};
 use embassy_rp::pwm::{Config as PwmConfig, Pwm};
 use embassy_rp::spi::{Blocking as SpiBlocking, Spi};
 use embassy_time::{Delay, Duration, Instant, Timer, block_for};
+use embedded_graphics::{draw_target::DrawTarget, pixelcolor::Rgb565, prelude::RgbColor};
 use embedded_hal_bus::spi::ExclusiveDevice;
 use zeroize::Zeroize;
 
@@ -86,6 +87,23 @@ const HOLD_MS: u64 = 800;
 /// Backlight PWM `top` (8-bit, like the LED): a brightness level maps to a compare
 /// value `0..=BL_TOP`.
 const BL_TOP: u16 = 255;
+
+/// Built-in display-sleep timeout (ms): blank the panel after this long idle to stop
+/// image retention on the IPS glass. Runtime-adjustable from the Settings → Display
+/// sleep page ([`SLEEP_TIMEOUT_MS`]); `0` there means never sleep.
+const DEFAULT_SLEEP_MS: u32 = 60_000;
+/// Display-sleep timeout in ms, edited live by the menu. `0` = Off (never blanks).
+/// Read each tick by the ambient loop; reboot reseeds the default.
+static SLEEP_TIMEOUT_MS: AtomicU32 = AtomicU32::new(DEFAULT_SLEEP_MS);
+
+/// ms-since-boot of the last user interaction (touch / wake button) or host ceremony —
+/// the display-sleep countdown is measured from here. Bumped by [`note_activity`].
+static LAST_ACTIVITY_MS: AtomicU32 = AtomicU32::new(0);
+
+/// Mark "the user (or host) just did something", resetting the display-sleep countdown.
+fn note_activity() {
+    LAST_ACTIVITY_MS.store(Instant::now().as_millis() as u32, Ordering::Relaxed);
+}
 
 /// Device identity shown read-only on the settings Info page.
 pub struct DeviceInfo {
@@ -225,6 +243,19 @@ pub struct Ui {
     info: DeviceInfo,
     /// Current backlight level (`1..=BRIGHTNESS_LEVELS`), edited from the menu.
     brightness: u8,
+    /// Whether the panel is blanked (backlight off + cleared) by the display-sleep
+    /// timeout. A touch or the wake button restores it; a host ceremony wakes it too.
+    asleep: bool,
+    /// The display-sleep wake button (the board's BAT_PWR / a `WAKE_PIN` GPIO) paired
+    /// with its `active_high` polarity, or `None` when `WAKE_PIN=none` (touch-only
+    /// wake). Polled while asleep.
+    wake_btn: Option<(Input<'static>, bool)>,
+    /// Whether the on-device UI is locked (passkeys browser + settings need the device
+    /// PIN to reopen). Set at boot, on a manual "Lock now", or on auto-sleep — all only
+    /// when a PIN is set; cleared by a correct on-screen PIN. Gates only the panel UI —
+    /// host CTAP ceremonies (confirm / built-in-UV) are unaffected and paint their own
+    /// prompts over it.
+    locked: bool,
     /// The shared flash store — the same `RefCell` the worker uses. The Passkeys tab
     /// borrows it to enumerate resident credentials; safe because the worker is parked
     /// (it never holds the borrow across an `.await`) while this thread-executor task
@@ -246,6 +277,7 @@ impl Ui {
         info: DeviceInfo,
         fs: &'static RefCell<Store>,
         keys: DeviceKeys,
+        wake_btn: Option<(Input<'static>, bool)>,
     ) -> Ui {
         let PanelHw {
             spi,
@@ -290,6 +322,11 @@ impl Ui {
         let mut touch = Touch { i2c };
         touch.normal_mode();
 
+        // Boot locked when a device PIN is set: a security key should come up requiring
+        // the PIN to reach its on-device UI, not open. Without a PIN there is nothing to
+        // unlock with, so it boots open (the lock is a no-op then anyway).
+        let locked = rsk_fido::passkeys::pin_is_set(&mut fs.borrow_mut());
+
         Ui {
             panel,
             touch,
@@ -298,6 +335,9 @@ impl Ui {
             shown: None,
             info,
             brightness: BRIGHTNESS_LEVELS,
+            asleep: false,
+            wake_btn,
+            locked,
             fs,
             keys,
         }
@@ -311,6 +351,110 @@ impl Ui {
             .set_config(&backlight_cfg(level_duty(self.brightness)));
     }
 
+    /// Blank the panel after the inactivity timeout: backlight off, then clear the
+    /// glass to black. A *static* image is what burns into the IPS panel, so dropping
+    /// it entirely (not just dimming) is the retention guard. Idempotent.
+    fn sleep(&mut self) {
+        if self.asleep {
+            return;
+        }
+        self.bl.set_config(&backlight_cfg(0));
+        let _ = self.panel.clear(Rgb565::BLACK);
+        self.shown = None;
+        self.asleep = true;
+    }
+
+    /// Restore the panel from sleep: backlight back to the saved brightness; the caller
+    /// (the ambient loop, or a host ceremony) repaints. Idempotent.
+    fn wake(&mut self) {
+        if !self.asleep {
+            return;
+        }
+        self.bl
+            .set_config(&backlight_cfg(level_duty(self.brightness)));
+        self.asleep = false;
+        self.shown = None;
+    }
+
+    /// One non-blocking sample of the wake button (if wired), honouring its polarity.
+    fn wake_pressed(&self) -> bool {
+        match &self.wake_btn {
+            Some((btn, active_high)) => {
+                if *active_high {
+                    btn.is_high()
+                } else {
+                    btn.is_low()
+                }
+            }
+            None => false,
+        }
+    }
+
+    /// Enter display sleep, additionally locking the on-device UI when a device PIN is
+    /// set — so a walked-away device requires the PIN to browse passkeys / settings on
+    /// wake. Without a PIN there is nothing to unlock with, so it only blanks.
+    fn enter_sleep(&mut self) {
+        if rsk_fido::passkeys::pin_is_set(&mut self.fs.borrow_mut()) {
+            self.locked = true;
+        }
+        self.sleep();
+    }
+
+    /// Lock the on-device UI now (the Settings "Lock now" action): the panel stays awake
+    /// and [`status_task`] paints the Locked screen. A no-op without a device PIN
+    /// (nothing to unlock with).
+    fn lock_now(&mut self) {
+        if rsk_fido::passkeys::pin_is_set(&mut self.fs.borrow_mut()) {
+            self.locked = true;
+        }
+    }
+
+    /// The on-screen unlock flow, reached by a tap on the Locked screen. Reuses the
+    /// device-PIN gate (the same `EF_PIN` retry ladder as the destructive-action gate):
+    /// a correct PIN drops the lock, a wrong one re-prompts until the right PIN, a
+    /// cancel / timeout, or the counter is spent — all of which leave it locked. Returns
+    /// the panel to [`status_task`], which then paints Home (unlocked) or Locked again.
+    fn run_unlock(&mut self) {
+        // Let the unlock tap's finger lift before the pad starts reading digits.
+        self.touch
+            .wait_release(Instant::now(), Duration::from_millis(MENU_INACTIVITY_MS));
+        // `local_pin_gate` returns true with no PIN set; that can only happen here if the
+        // PIN vanished after the lock — and EF_PIN can only vanish via a factory reset,
+        // which reboots into the unlocked state, so "no PIN ⇒ unlock" is never reachable
+        // as a bypass (and is the correct behaviour: nothing to verify against).
+        if self.local_pin_gate() {
+            self.locked = false;
+        }
+        self.end_modal();
+    }
+
+    /// Block until the wake button is released (bounded), so a single press toggles
+    /// sleep exactly once rather than oscillating while the button is held down.
+    fn wait_wake_release(&self) {
+        let start = Instant::now();
+        while self.wake_pressed() {
+            if start.elapsed() >= Duration::from_millis(2000) {
+                break;
+            }
+            block_for(Duration::from_millis(TOUCH_POLL_MS));
+        }
+    }
+
+    /// Poll the sleep/wake button from inside a browse modal: if pressed, sleep now
+    /// (auto-locking like any sleep), wait for release, and return `true` so the modal
+    /// exits to the now-asleep [`status_task`]. `status_task` polls the button itself on
+    /// Home / Locked, so calling this in the tab modals makes the power button sleep the
+    /// device from *any* on-device screen, not just Home.
+    fn sleep_button_pressed(&mut self) -> bool {
+        if self.wake_pressed() {
+            self.enter_sleep();
+            self.wait_wake_release();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Paint a settings page, snapshotting the live brightness/timeout/identity into
     /// the view. Clears `shown` so the ambient loop repaints once the menu releases
     /// the panel.
@@ -319,6 +463,7 @@ impl Ui {
             page,
             brightness: self.brightness,
             timeout_secs: (PRESENCE_TIMEOUT_MS.load(Ordering::Relaxed) / 1000) as u16,
+            sleep_secs: (SLEEP_TIMEOUT_MS.load(Ordering::Relaxed) / 1000) as u16,
             version: self.info.version,
             chipid: self.info.chipid,
         };
@@ -345,23 +490,40 @@ impl Ui {
         let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
 
         loop {
+            // The power button sleeps from inside the menu too, not just on Home.
+            if self.sleep_button_pressed() {
+                break;
+            }
             if let Some(p) = self.touch.read() {
                 last = Instant::now();
                 let mut repaint = true;
                 match page {
-                    SettingsPage::Root => match rsk_ui::hit_settings_root(p) {
-                        Some(RootEntry::Brightness) => page = SettingsPage::Brightness,
-                        Some(RootEntry::Timeout) => page = SettingsPage::Timeout,
-                        Some(RootEntry::Info) => page = SettingsPage::Info,
-                        // A confirmed reset reboots and never returns; on cancel, fall
-                        // back to the Root list (repaint below) with a fresh timeout.
-                        Some(RootEntry::FactoryReset) => {
-                            self.run_factory_reset();
-                            last = Instant::now();
+                    SettingsPage::Root => {
+                        // The title-bar back chevron exits the menu (the design's
+                        // settings → back-to-Home flow; there is no "Close" row).
+                        if rsk_ui::hit_title_back(p) {
+                            break;
                         }
-                        Some(RootEntry::Close) => break,
-                        None => repaint = false,
-                    },
+                        match rsk_ui::hit_settings_root(p) {
+                            Some(RootEntry::Brightness) => page = SettingsPage::Brightness,
+                            Some(RootEntry::Timeout) => page = SettingsPage::Timeout,
+                            Some(RootEntry::Sleep) => page = SettingsPage::Sleep,
+                            Some(RootEntry::Info) => page = SettingsPage::Info,
+                            // Lock now: lock the UI (if a PIN is set) and close the menu —
+                            // status_task then paints the Locked screen.
+                            Some(RootEntry::LockNow) => {
+                                self.lock_now();
+                                break;
+                            }
+                            // A confirmed reset reboots and never returns; on cancel, fall
+                            // back to the Root list (repaint below) with a fresh timeout.
+                            Some(RootEntry::FactoryReset) => {
+                                self.run_factory_reset();
+                                last = Instant::now();
+                            }
+                            None => repaint = false,
+                        }
+                    }
                     SettingsPage::Brightness => match rsk_ui::hit_adjust(p) {
                         Some(AdjustKey::Minus) => {
                             self.set_brightness(rsk_ui::step_brightness(self.brightness, -1))
@@ -375,6 +537,12 @@ impl Ui {
                     SettingsPage::Timeout => match rsk_ui::hit_adjust(p) {
                         Some(AdjustKey::Minus) => adjust_timeout(-1),
                         Some(AdjustKey::Plus) => adjust_timeout(1),
+                        Some(AdjustKey::Back) => page = SettingsPage::Root,
+                        None => repaint = false,
+                    },
+                    SettingsPage::Sleep => match rsk_ui::hit_adjust(p) {
+                        Some(AdjustKey::Minus) => adjust_sleep(-1),
+                        Some(AdjustKey::Plus) => adjust_sleep(1),
                         Some(AdjustKey::Back) => page = SettingsPage::Root,
                         None => repaint = false,
                     },
@@ -429,6 +597,10 @@ impl Ui {
         let mut last = Instant::now();
         let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
         let next = loop {
+            // The power button sleeps from the list too, not just on Home.
+            if self.sleep_button_pressed() {
+                break None;
+            }
             if let Some(p) = self.touch.read() {
                 last = Instant::now();
                 if let Some(i) = rsk_ui::hit_list(p, rsk_ui::PK_LIST_TOP, n as u16) {
@@ -479,9 +651,13 @@ impl Ui {
 
         let mut last = Instant::now();
         loop {
+            // The power button sleeps from the detail view too, not just on Home.
+            if self.sleep_button_pressed() {
+                return ServiceResult::Leave(None);
+            }
             if let Some(p) = self.touch.read() {
                 last = Instant::now();
-                if rsk_ui::hit_pk_back(p) {
+                if rsk_ui::hit_title_back(p) {
                     return ServiceResult::Back;
                 }
                 if let Some(tab) = rsk_ui::hit_nav(p) {
@@ -582,10 +758,22 @@ impl Ui {
     /// honours the same UP_PENDING / CANCEL_REQUESTED / timeout contract as the confirm
     /// wait. Owns the panel via `&mut self` (single thread executor → the worker is
     /// parked), so both the host built-in-UV path ([`TouchPresence::collect_pin`]) and a
-    /// display-initiated gate ([`run_delete`]) share one pad. Each key debounces to
+    /// display-initiated gate ([`local_pin_gate`]) share one pad. Each key debounces to
     /// release; OK commits only at/above `min_len`, Del backspaces, Cancel declines. The
     /// entered digits are the caller's to zeroize after verifying.
-    fn collect_pin(&mut self, min_len: usize, out: &mut [u8]) -> rsk_fido::PinEntry {
+    ///
+    /// `yield_to_host`: on a *local* gate (delete / factory-reset / unlock) no host is
+    /// waiting on this PIN, so a queued host command must not be starved while the user
+    /// types — set it `true` to abandon entry ([`PinEntry::Cancelled`], no retry burned)
+    /// the instant a command arrives, mirroring the browse modals. The host built-in-UV
+    /// path sets it `false`: there the host *is* waiting on this exact PIN (its `REQ` is
+    /// already consumed), so it blocks to the presence timeout as before.
+    fn collect_pin(
+        &mut self,
+        min_len: usize,
+        out: &mut [u8],
+        yield_to_host: bool,
+    ) -> rsk_fido::PinEntry {
         let saved = led::status();
         led::set_status(led::STATUS_TOUCH);
         CANCEL_REQUESTED.store(false, Ordering::Relaxed);
@@ -595,6 +783,9 @@ impl Ui {
         let timeout = Duration::from_millis(PRESENCE_TIMEOUT_MS.load(Ordering::Relaxed) as u64);
         let mut entered = 0usize;
 
+        // A built-in-UV PIN entry can arrive while the panel slept — restore it first.
+        self.wake();
+        note_activity();
         let _ = rsk_ui::render(&mut self.panel, &Screen::Pin(PinPad::new(entered)));
         self.shown = None; // force the status loop to repaint once we release it
         let outcome = loop {
@@ -632,6 +823,12 @@ impl Ui {
             if CANCEL_REQUESTED.load(Ordering::Relaxed) {
                 break rsk_fido::PinEntry::Cancelled;
             }
+            // A local gate must not starve the parked worker: abandon the moment a host
+            // command queues (no host awaits this PIN). The host built-in-UV path keeps
+            // `yield_to_host=false` and blocks to the timeout (the host awaits it).
+            if yield_to_host && crate::worker::host_request_pending() {
+                break rsk_fido::PinEntry::Cancelled;
+            }
             if start.elapsed() >= timeout {
                 break rsk_fido::PinEntry::Timeout;
             }
@@ -644,6 +841,7 @@ impl Ui {
             (Instant::now().as_millis() as u32).wrapping_add(AMBIENT_QUIET_MS),
             Ordering::Relaxed,
         );
+        note_activity(); // a long ceremony shouldn't immediately fall asleep on return
         led::set_status(saved);
         outcome
     }
@@ -661,7 +859,7 @@ impl Ui {
         let proceed = loop {
             // CTAP's 4-digit floor; `verify_local_pin` checks the exact PIN regardless,
             // so a higher `minPINLength` policy is still satisfied by typing it in full.
-            match self.collect_pin(4, &mut pin) {
+            match self.collect_pin(4, &mut pin, true) {
                 rsk_fido::PinEntry::Entered(len) => {
                     let dev = self.keys.device();
                     let verdict = rsk_fido::passkeys::verify_local_pin(
@@ -684,22 +882,23 @@ impl Ui {
         proceed
     }
 
-    /// The Confirm-Delete flow for one resident passkey (mockup screens 6 → 10): paint
-    /// the trusted confirm screen naming the rp + account, gate on the device PIN (if
-    /// set), then require a deliberate **hold** on the delete button before removing the
+    /// The Confirm-Delete flow for one resident passkey (mockup screens 6 → 10): gate on
+    /// the device PIN (if set), then paint the trusted confirm screen naming the rp +
+    /// account and require a deliberate **hold** on the delete button before removing the
     /// credential. The header back chevron, a slid-off finger, or the inactivity timeout
     /// all abandon it without a write. Synchronous like the other modals (the worker is
     /// parked), so the `self.fs` borrows can't race.
     fn run_delete(&mut self, rp: &Label, account: &Label, fid: u16) {
         let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
-        let _ = rsk_ui::render_confirm_delete(&mut self.panel, rp, account);
-        self.shown = None;
+        // Let the account-row tap's finger lift before the next touch is read.
         self.touch.wait_release(Instant::now(), idle_limit);
-
+        // Gate on the device PIN first: when one is set the pad is shown straight away,
+        // so the confirm screen below doesn't flash for a frame behind it. With no PIN,
+        // `local_pin_gate` returns at once and the confirm screen is the first thing seen.
         if !self.local_pin_gate() {
             return; // no PIN, wrong PIN, or declined — nothing removed
         }
-        // The pad (if shown) overwrote the confirm screen; repaint it for the hold.
+        // The destructive-action screen: name the rp + account, then require the hold.
         let _ = rsk_ui::render_confirm_delete(&mut self.panel, rp, account);
         self.shown = None;
         self.touch.wait_release(Instant::now(), idle_limit);
@@ -776,14 +975,14 @@ impl Ui {
     /// on confirm; returns only when cancelled.
     fn run_factory_reset(&mut self) {
         let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
-        let _ = rsk_ui::render_confirm_factory_reset(&mut self.panel);
-        self.shown = None;
+        // Let the Settings-row tap's finger lift before the next touch is read.
         self.touch.wait_release(Instant::now(), idle_limit);
-
+        // PIN gate first (when set) so the pad doesn't flash the confirm screen behind it;
+        // no PIN returns at once and the confirm screen below is shown directly.
         if !self.local_pin_gate() {
             return; // no PIN set is fine; a wrong PIN or decline aborts — nothing erased
         }
-        // The pad (if shown) overwrote the confirm screen; repaint it for the hold.
+        // The destructive-action screen, then a deliberate hold to commit.
         let _ = rsk_ui::render_confirm_factory_reset(&mut self.panel);
         self.shown = None;
         self.touch.wait_release(Instant::now(), idle_limit);
@@ -812,6 +1011,13 @@ fn adjust_timeout(delta: i8) {
     PRESENCE_TIMEOUT_MS.store(next as u32 * 1000, Ordering::Relaxed);
 }
 
+/// Step the display-sleep timeout from the menu (−/+). `0` seconds = Off (never blanks).
+fn adjust_sleep(delta: i8) {
+    let cur = (SLEEP_TIMEOUT_MS.load(Ordering::Relaxed) / 1000) as u16;
+    let next = rsk_ui::step_sleep(cur, delta);
+    SLEEP_TIMEOUT_MS.store(next as u32 * 1000, Ordering::Relaxed);
+}
+
 /// Map the LED status engine's index ([`led::status`]) onto the on-screen status,
 /// so the panel shows the same idle/working/touch state the LED would.
 fn status_to_kind(s: u8) -> StatusKind {
@@ -831,47 +1037,132 @@ fn status_to_kind(s: u8) -> StatusKind {
 #[embassy_executor::task]
 pub async fn status_task(ui: &'static RefCell<Ui>) {
     Timer::after_millis(600).await; // let the boot splash linger
+    note_activity(); // the fresh boot counts as activity, so the sleep clock starts now
     loop {
-        // Skip the ambient repaint while a modal hand-off is in flight, so the
-        // status screen never flickers between the pad and the confirm prompt.
-        // Wrap-safe deadline check (millis truncated to u32 wrap every ~49 days).
+        // Wrap-safe deadline checks (millis truncated to u32 wrap every ~49 days).
         let now = Instant::now().as_millis() as u32;
-        let quiet_over =
-            now.wrapping_sub(AMBIENT_QUIET_UNTIL_MS.load(Ordering::Relaxed)) as i32 >= 0;
-        if quiet_over && let Ok(mut u) = ui.try_borrow_mut() {
-            let kind = status_to_kind(led::status());
-            let screen = Screen::Home(HomeView { status: kind });
-            if u.shown != Some(screen) {
-                let _ = rsk_ui::render(&mut u.panel, &screen);
-                u.shown = Some(screen);
-            }
-            // Interactive idle: a tap on the bottom nav opens a tab. Only while idle —
-            // a confirm/PIN modal owns this executor synchronously, so this loop can't
-            // even run mid-ceremony to begin with. Each tab modal returns the next nav
-            // destination, so the user can switch tab→tab directly (e.g. Passkeys →
-            // Settings) without first dropping back to Home.
-            if kind == StatusKind::Idle
-                && let Some(p) = u.touch.read()
-            {
-                let mut target = rsk_ui::hit_nav(p);
-                let opened_tab = matches!(target, Some(NavTab::Settings | NavTab::Passkeys));
-                while let Some(tab) = target {
-                    target = match tab {
-                        // Home is the idle ambient screen — end the nav session.
-                        NavTab::Home => None,
-                        NavTab::Settings => u.run_settings(),
-                        NavTab::Passkeys => u.run_passkeys(),
+        if let Ok(mut u) = ui.try_borrow_mut() {
+            if u.asleep {
+                // Blanked for retention: poll only the wake sources. A touch anywhere or
+                // the wake button restores the panel — repainted right away so waking
+                // shows Home, not the black sleep frame — and the gesture is consumed
+                // (wait for release) so it isn't read as a tap / an instant re-sleep.
+                if u.touch.read().is_some() || u.wake_pressed() {
+                    u.wake();
+                    note_activity();
+                    // Wake to the Locked screen if the device locked on sleep; the wake
+                    // gesture only wakes (it isn't read as the unlock tap — that comes
+                    // after release). Otherwise wake straight to Home.
+                    let screen = if u.locked {
+                        Screen::Locked
+                    } else {
+                        Screen::Home(HomeView {
+                            status: status_to_kind(led::status()),
+                        })
                     };
-                }
-                // A tab session just closed back to idle: repaint Home now instead of
-                // waiting out the next poll, so closing a tab feels instant. Skip it if a
-                // host command is now queued — the worker paints next (no stale flash).
-                if opened_tab && !crate::worker::host_request_pending() {
-                    let screen = Screen::Home(HomeView {
-                        status: status_to_kind(led::status()),
-                    });
                     let _ = rsk_ui::render(&mut u.panel, &screen);
                     u.shown = Some(screen);
+                    u.touch
+                        .wait_release(Instant::now(), Duration::from_millis(1000));
+                    u.wait_wake_release();
+                }
+            } else {
+                // Skip the ambient repaint while a modal hand-off is in flight, so the
+                // status screen never flickers between the pad and the confirm prompt.
+                let quiet_over =
+                    now.wrapping_sub(AMBIENT_QUIET_UNTIL_MS.load(Ordering::Relaxed)) as i32 >= 0;
+                if quiet_over {
+                    let kind = status_to_kind(led::status());
+                    // Working / awaiting-touch is activity — never sleep mid-operation.
+                    if kind != StatusKind::Idle {
+                        note_activity();
+                    }
+                    // When the on-device UI is locked, the Locked screen stands in for
+                    // Home; a tap there starts the unlock PIN flow instead of nav. Host
+                    // ceremonies still paint their own prompts over this (they don't
+                    // consult `locked`).
+                    let screen = if u.locked {
+                        Screen::Locked
+                    } else {
+                        Screen::Home(HomeView { status: kind })
+                    };
+                    if u.shown != Some(screen) {
+                        let _ = rsk_ui::render(&mut u.panel, &screen);
+                        u.shown = Some(screen);
+                    }
+                    if kind == StatusKind::Idle {
+                        if u.wake_pressed() {
+                            // The wake button doubles as a manual "sleep now" while awake
+                            // (also locks, like any sleep, when a PIN is set).
+                            u.enter_sleep();
+                            u.wait_wake_release();
+                        } else if let Some(p) = u.touch.read() {
+                            note_activity();
+                            if u.locked {
+                                // Locked: any tap opens the unlock pad. Repaint the result
+                                // at once — Home if the correct PIN dropped the lock, else
+                                // the Locked screen — so the pad's last frame never lingers
+                                // through collect_pin's ambient-quiet window.
+                                u.run_unlock();
+                                note_activity();
+                                let screen = if u.locked {
+                                    Screen::Locked
+                                } else {
+                                    Screen::Home(HomeView {
+                                        status: status_to_kind(led::status()),
+                                    })
+                                };
+                                let _ = rsk_ui::render(&mut u.panel, &screen);
+                                u.shown = Some(screen);
+                            } else {
+                                // A tap on the bottom nav opens a tab. Each tab modal returns
+                                // the next nav destination, so the user switches tab→tab
+                                // directly (e.g. Passkeys → Settings) without a Home detour.
+                                let mut target = rsk_ui::hit_nav(p);
+                                let opened_tab =
+                                    matches!(target, Some(NavTab::Settings | NavTab::Passkeys));
+                                while let Some(tab) = target {
+                                    target = match tab {
+                                        NavTab::Home => None,
+                                        NavTab::Settings => u.run_settings(),
+                                        NavTab::Passkeys => u.run_passkeys(),
+                                    };
+                                }
+                                note_activity(); // a browse session just ended — restart clock
+                                // "Lock now" inside Settings closes the menu with the lock set;
+                                // repaint the Locked screen at once so the menu doesn't linger.
+                                if u.locked {
+                                    let screen = Screen::Locked;
+                                    let _ = rsk_ui::render(&mut u.panel, &screen);
+                                    u.shown = Some(screen);
+                                } else if opened_tab && !crate::worker::host_request_pending() {
+                                    // Closing a tab back to idle repaints Home now (not next
+                                    // poll) so it feels instant. Skip if a host command is
+                                    // queued — the worker paints next (no stale flash).
+                                    let screen = Screen::Home(HomeView {
+                                        status: status_to_kind(led::status()),
+                                    });
+                                    let _ = rsk_ui::render(&mut u.panel, &screen);
+                                    u.shown = Some(screen);
+                                }
+                            }
+                        } else {
+                            // Idle this tick (no tap, no button): blank once past the
+                            // (runtime) sleep timeout — `0` disables sleep. Auto-lock rides
+                            // on sleep (enter_sleep), so a manually-locked-but-awake device
+                            // still blanks here. Re-read the clock: a tab/menu modal *above*
+                            // can run for many seconds, so the top-of-loop `now` would be
+                            // stale and underflow against the freshly-bumped activity stamp.
+                            let now = Instant::now().as_millis() as u32;
+                            let sleep_ms = SLEEP_TIMEOUT_MS.load(Ordering::Relaxed);
+                            if sleep_ms != 0
+                                && now.wrapping_sub(LAST_ACTIVITY_MS.load(Ordering::Relaxed))
+                                    >= sleep_ms
+                            {
+                                u.enter_sleep();
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -926,6 +1217,10 @@ impl TouchPresence {
             // Held across the whole wait. The wait is synchronous, so the status
             // loop can't run (let alone borrow) until we return the panel.
             let mut u = self.ui.borrow_mut();
+            // A host ceremony can arrive while the panel slept — restore it so the
+            // trusted prompt is actually visible, and count it as activity.
+            u.wake();
+            note_activity();
             let _ = rsk_ui::render(&mut u.panel, &Screen::Confirm(prompt));
             u.shown = None; // force the status loop to repaint once we release it
             // Deny is a single tap; Approve is a deliberate hold that fills the button
@@ -986,6 +1281,7 @@ impl TouchPresence {
             (Instant::now().as_millis() as u32).wrapping_add(AMBIENT_QUIET_MS),
             Ordering::Relaxed,
         );
+        note_activity(); // a long ceremony shouldn't immediately fall asleep on return
         led::set_status(saved);
         outcome
     }
@@ -995,7 +1291,7 @@ impl TouchPresence {
     /// `Ui` and run it there, so the host path and a display-initiated gate
     /// ([`Ui::run_delete`]) share one implementation.
     fn collect_pin_impl(&mut self, min_len: usize, out: &mut [u8]) -> rsk_fido::PinEntry {
-        self.ui.borrow_mut().collect_pin(min_len, out)
+        self.ui.borrow_mut().collect_pin(min_len, out, false)
     }
 }
 

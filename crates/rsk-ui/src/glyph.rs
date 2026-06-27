@@ -15,9 +15,11 @@
 use embedded_graphics::{
     Drawable,
     draw_target::DrawTarget,
-    geometry::{Point as EgPoint, Size},
+    geometry::{Angle, Point as EgPoint, Size},
     pixelcolor::Rgb565,
-    primitives::{Circle, Ellipse, Line, Polyline, Primitive, PrimitiveStyle, Rectangle, Triangle},
+    primitives::{
+        Arc, Circle, Ellipse, Line, Polyline, Primitive, PrimitiveStyle, Rectangle, Triangle,
+    },
 };
 
 use crate::Point;
@@ -56,6 +58,8 @@ pub enum Glyph {
     Sun,
     /// A clock — the touch-timeout setting.
     Clock,
+    /// A crescent moon — the display-sleep setting.
+    Moon,
     /// An "i" in a ring — the device-info setting.
     Info,
 }
@@ -212,6 +216,18 @@ pub fn draw<D: DrawTarget<Color = Rgb565>>(
             Line::new(gp(8, 8), gp(8, 4)).into_styled(stroke).draw(t)?;
             Line::new(gp(8, 8), gp(11, 9)).into_styled(stroke).draw(t)
         }
+        Glyph::Moon => {
+            // A crescent: a C-shaped arc with a wide opening to the right — clearly a
+            // moon, not the full-circle Clock above it in the settings list.
+            Arc::new(
+                gp(2, 2),
+                glen(12),
+                Angle::from_degrees(80.0),
+                Angle::from_degrees(200.0),
+            )
+            .into_styled(stroke)
+            .draw(t)
+        }
         Glyph::Info => {
             circ(8, 8, 6).into_styled(stroke).draw(t)?;
             circ(8, 5, 1).into_styled(fill).draw(t)?;
@@ -258,7 +274,7 @@ mod tests {
         }
     }
 
-    const ALL: [Glyph; 16] = [
+    const ALL: [Glyph; 17] = [
         Glyph::Usb,
         Glyph::Check,
         Glyph::Backspace,
@@ -274,6 +290,7 @@ mod tests {
         Glyph::Warn,
         Glyph::Sun,
         Glyph::Clock,
+        Glyph::Moon,
         Glyph::Info,
     ];
 

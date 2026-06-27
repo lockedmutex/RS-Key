@@ -14,25 +14,21 @@ use embedded_graphics::{
     Drawable,
     draw_target::{DrawTarget, DrawTargetExt},
     geometry::{Point as EgPoint, Size},
-    mono_font::{
-        MonoFont, MonoTextStyle,
-        ascii::{FONT_6X13, FONT_9X15_BOLD, FONT_10X20},
-    },
     pixelcolor::Rgb565,
     prelude::{RgbColor, WebColors},
     primitives::{
         Circle, Line, Primitive, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle,
         RoundedRectangle, StrokeAlignment,
     },
-    text::{Alignment, Baseline, Text, TextStyle, TextStyleBuilder},
 };
 
 use crate::{
     ADJ_MINUS_RECT, ADJ_PLUS_RECT, ALLOW_RECT, AccountRow, BACK_RECT, BRIGHTNESS_LEVELS,
     ConfirmPrompt, DEL_HOLD_RECT, DENY_RECT, Glyph, HomeView, Label, NAV_H, NAV_TABS, NAV_TOP,
     NavTab, PANEL_W, PIN_CANCEL_RECT, PIN_COLS, PIN_ROWS, PK_LIST_TOP, PinKey, PinPad, Point, Rect,
-    RpRow, Screen, SettingsPage, SettingsView, StatusKind, glyph, hex_u16, hex_u64, nav_tab_rect,
-    pin_grid_key, pin_key_rect, settings_row_rect, theme,
+    RpRow, STATUS_BAR_H, Screen, SettingsPage, SettingsView, StatusKind, TITLE_BACK_RECT,
+    TITLE_BAR_H, font, font::Role, glyph, hex_u16, hex_u64, nav_tab_rect, pin_grid_key,
+    pin_key_rect, settings_row_rect, theme,
 };
 
 // Local semantic aliases, all sourced from `theme` so the whole renderer speaks one
@@ -64,6 +60,7 @@ where
     target.clear(BG)?;
     match screen {
         Screen::Splash => splash(target),
+        Screen::Locked => locked(target),
         Screen::Home(v) => home(target, v),
         Screen::Confirm(prompt) => confirm(target, prompt),
         Screen::Pin(pad) => pin(target, pad),
@@ -71,13 +68,45 @@ where
     }
 }
 
+/// The device-locked screen: a padlock in a calm surface circle, the "Locked" heading,
+/// and a muted "Touch to unlock" hint. The whole screen is the unlock affordance (the
+/// firmware treats any tap as "start PIN entry"), so there is no per-control hit rect.
+/// Gates only the on-device UI — host CTAP ceremonies paint their own prompts over this.
+fn locked<D: DrawTarget<Color = Rgb565>>(t: &mut D) -> Result<(), D::Error> {
+    const DIA: u32 = 70;
+    let cx = MIDX;
+    let circle_top = 96;
+    Circle::new(EgPoint::new(cx - DIA as i32 / 2, circle_top), DIA)
+        .into_styled(PrimitiveStyle::with_fill(theme::SURFACE))
+        .draw(t)?;
+    let cyc = circle_top + DIA as i32 / 2;
+    glyph::draw(
+        t,
+        Glyph::Lock,
+        Point::new((cx - 17) as u16, (cyc - 17) as u16),
+        34,
+        theme::ACCENT,
+    )?;
+    text(t, "Locked", EgPoint::new(cx, 200), Role::Heading, FG)?;
+    // The design breathes this hint (opacity 0.5↔1); we paint it static — the locked
+    // screen is event-driven (no animation loop) and there is no retained framebuffer to
+    // pulse cheaply, so a static muted line is the faithful no-framebuffer rendering.
+    text(
+        t,
+        "Touch to unlock",
+        EgPoint::new(cx, 228),
+        Role::Body,
+        MUTED,
+    )
+}
+
 fn splash<D: DrawTarget<Color = Rgb565>>(t: &mut D) -> Result<(), D::Error> {
-    text(t, "RS-Key", EgPoint::new(MIDX, 140), &FONT_10X20, FG)?;
+    text(t, "RS-Key", EgPoint::new(MIDX, 140), Role::Heading, FG)?;
     text(
         t,
         "trusted display",
         EgPoint::new(MIDX, 175),
-        &FONT_6X13,
+        Role::Body,
         MUTED,
     )
 }
@@ -86,7 +115,7 @@ fn splash<D: DrawTarget<Color = Rgb565>>(t: &mut D) -> Result<(), D::Error> {
 /// and the bottom nav. The old MENU affordance is gone — the nav bar is the way into
 /// Passkeys / Settings now.
 fn home<D: DrawTarget<Color = Rgb565>>(t: &mut D, v: &HomeView) -> Result<(), D::Error> {
-    render_header(t, "RS-Key", false, Some(Glyph::Usb))?;
+    status_bar(t)?;
     if matches!(v.status, StatusKind::Idle) {
         glyph::draw(
             t,
@@ -99,7 +128,7 @@ fn home<D: DrawTarget<Color = Rgb565>>(t: &mut D, v: &HomeView) -> Result<(), D:
             t,
             "Ready",
             EgPoint::new(MIDX, 140),
-            &FONT_10X20,
+            Role::Ready,
             theme::ACCENT,
         )?;
     } else {
@@ -107,7 +136,13 @@ fn home<D: DrawTarget<Color = Rgb565>>(t: &mut D, v: &HomeView) -> Result<(), D:
         Circle::new(EgPoint::new(MIDX - 18, 70), 36)
             .into_styled(PrimitiveStyle::with_fill(c))
             .draw(t)?;
-        text(t, v.status.label(), EgPoint::new(MIDX, 140), &FONT_10X20, c)?;
+        text(
+            t,
+            v.status.label(),
+            EgPoint::new(MIDX, 140),
+            Role::Heading,
+            c,
+        )?;
     }
     render_row(
         t,
@@ -130,14 +165,15 @@ where
     D: DrawTarget<Color = Rgb565>,
 {
     t.clear(BG)?;
-    render_header(t, "Passkeys", true, None)?;
+    status_bar(t)?;
+    title_bar(t, "Passkeys", theme::ACCENT, false)?;
     if rows.is_empty() {
         glyph::draw(t, Glyph::Key, Point::new(MIDX as u16 - 18, 96), 36, MUTED)?;
         text(
             t,
             "No passkeys yet",
             EgPoint::new(MIDX, 160),
-            &FONT_6X13,
+            Role::Body,
             MUTED,
         )?;
     } else {
@@ -177,14 +213,8 @@ where
     D: DrawTarget<Color = Rgb565>,
 {
     t.clear(BG)?;
-    glyph::draw(t, Glyph::Back, Point::new(8, 7), 16, theme::ACCENT)?;
-    text_left(
-        t,
-        title.as_str(),
-        EgPoint::new(44, 15),
-        &FONT_9X15_BOLD,
-        theme::ACCENT,
-    )?;
+    status_bar(t)?;
+    title_bar(t, title.as_str(), theme::ACCENT, true)?;
     for (i, a) in accounts.iter().enumerate() {
         let trailing = if a.protected {
             Some(("UV", theme::ACCENT))
@@ -217,7 +247,7 @@ fn footer_count<D: DrawTarget<Color = Rgb565>>(
         t,
         s,
         EgPoint::new(PANEL_W as i32 - 12, NAV_TOP as i32 - 10),
-        &FONT_6X13,
+        Role::Mono,
         MUTED,
     )
 }
@@ -238,7 +268,7 @@ where
         t,
         "Delete passkey",
         EgPoint::new(44, 15),
-        &FONT_9X15_BOLD,
+        Role::Heading,
         theme::DENY,
     )?;
     // Card naming exactly what is about to be removed: relying party + account.
@@ -258,14 +288,14 @@ where
         t,
         rp.as_str(),
         EgPoint::new(tx, card.y as i32 + 16),
-        &FONT_6X13,
+        Role::Body,
         theme::TEXT,
     )?;
     text_left(
         t,
         account.as_str(),
         EgPoint::new(tx, card.y as i32 + 32),
-        &FONT_6X13,
+        Role::Body,
         theme::MUTED,
     )?;
     // Plain-language warning — including the honest caveat that the site is not told.
@@ -273,21 +303,21 @@ where
         t,
         "This removes the passkey",
         EgPoint::new(16, 124),
-        &FONT_6X13,
+        Role::Body,
         theme::WARN,
     )?;
     text_left(
         t,
         "from RS-Key. The site may",
         EgPoint::new(16, 142),
-        &FONT_6X13,
+        Role::Body,
         theme::WARN,
     )?;
     text_left(
         t,
         "still expect it.",
         EgPoint::new(16, 160),
-        &FONT_6X13,
+        Role::Body,
         theme::WARN,
     )?;
     render_hold_button(t, DEL_HOLD_RECT, "Hold to delete", theme::DENY)
@@ -308,7 +338,7 @@ where
         t,
         "Factory reset",
         EgPoint::new(44, 15),
-        &FONT_9X15_BOLD,
+        Role::Heading,
         theme::DENY,
     )?;
     // Large centred warning triangle marks this as the destructive screen.
@@ -323,21 +353,21 @@ where
         t,
         "Erases ALL passkeys, keys,",
         EgPoint::new(16, 122),
-        &FONT_6X13,
+        Role::Body,
         theme::WARN,
     )?;
     text_left(
         t,
         "and the device PIN. This",
         EgPoint::new(16, 140),
-        &FONT_6X13,
+        Role::Body,
         theme::WARN,
     )?;
     text_left(
         t,
         "cannot be undone.",
         EgPoint::new(16, 158),
-        &FONT_6X13,
+        Role::Body,
         theme::WARN,
     )?;
     render_hold_button(t, DEL_HOLD_RECT, "Hold to reset", theme::DENY)
@@ -363,14 +393,14 @@ where
         t,
         "Erasing...",
         EgPoint::new(MIDX, 168),
-        &FONT_10X20,
+        Role::Heading,
         theme::TEXT,
     )?;
     text(
         t,
         "Do not unplug",
         EgPoint::new(MIDX, 196),
-        &FONT_6X13,
+        Role::Body,
         MUTED,
     )?;
     Ok(())
@@ -383,7 +413,7 @@ where
 fn confirm<D: DrawTarget<Color = Rgb565>>(t: &mut D, p: &ConfirmPrompt) -> Result<(), D::Error> {
     render_header(t, "RS-Key", false, Some(Glyph::Shield))?;
     glyph::draw(t, Glyph::Shield, Point::new(20, 42), 22, theme::ACCENT)?;
-    text_left(t, p.title, EgPoint::new(50, 53), &FONT_10X20, theme::TEXT)?;
+    text_left(t, p.title, EgPoint::new(50, 53), Role::Heading, theme::TEXT)?;
     // Relying-party card, only when the request carries rp text.
     if !p.primary.is_empty() {
         let card = Rect::new(14, 80, PANEL_W - 28, 46);
@@ -403,7 +433,7 @@ fn confirm<D: DrawTarget<Color = Rgb565>>(t: &mut D, p: &ConfirmPrompt) -> Resul
                 t,
                 p.primary.as_str(),
                 EgPoint::new(tx, card.y as i32 + 23),
-                &FONT_6X13,
+                Role::Body,
                 theme::TEXT,
             )?;
         } else {
@@ -411,14 +441,14 @@ fn confirm<D: DrawTarget<Color = Rgb565>>(t: &mut D, p: &ConfirmPrompt) -> Resul
                 t,
                 p.primary.as_str(),
                 EgPoint::new(tx, card.y as i32 + 16),
-                &FONT_6X13,
+                Role::Body,
                 theme::TEXT,
             )?;
             text_left(
                 t,
                 p.secondary.as_str(),
                 EgPoint::new(tx, card.y as i32 + 32),
-                &FONT_6X13,
+                Role::Body,
                 theme::MUTED,
             )?;
         }
@@ -429,14 +459,14 @@ fn confirm<D: DrawTarget<Color = Rgb565>>(t: &mut D, p: &ConfirmPrompt) -> Resul
         t,
         "Approve only if you",
         EgPoint::new(38, 148),
-        &FONT_6X13,
+        Role::Body,
         theme::WARN,
     )?;
     text_left(
         t,
         "started this",
         EgPoint::new(38, 164),
-        &FONT_6X13,
+        Role::Body,
         theme::WARN,
     )?;
     // Deny is a single tap (low emphasis); Approve is a deliberate hold that fills.
@@ -462,7 +492,7 @@ fn outline_button<D: DrawTarget<Color = Rgb565>>(
                 .build(),
         )
         .draw(t)?;
-    text(t, label, center(r), &FONT_9X15_BOLD, color)
+    text(t, label, center(r), Role::Strong, color)
 }
 
 /// Fill a rounded floating button and center its caption — the fill and the
@@ -478,7 +508,7 @@ fn button<D: DrawTarget<Color = Rgb565>>(
     RoundedRectangle::with_equal_corners(eg_rect(r), Size::new(BTN_RADIUS, BTN_RADIUS))
         .into_styled(PrimitiveStyle::with_fill(fill))
         .draw(t)?;
-    text(t, label, center(r), &FONT_9X15_BOLD, FG)
+    text(t, label, center(r), Role::Strong, FG)
 }
 
 /// Paint a rounded key surface at `r`: a `fill`, plus (when `bordered`) a subtle
@@ -533,7 +563,7 @@ fn pin<D: DrawTarget<Color = Rgb565>>(t: &mut D, pad: &PinPad) -> Result<(), D::
     // Custom header (not `render_header`): Cancel keeps its top-left hit rect — clear
     // of the digit grid, so a digit tap can never abandon entry — so the title is
     // centred between it and a Lock that marks this as the secure-entry screen.
-    text(t, "Enter PIN", EgPoint::new(MIDX, 20), &FONT_9X15_BOLD, FG)?;
+    text(t, "Enter PIN", EgPoint::new(MIDX, 20), Role::Heading, FG)?;
     glyph::draw(
         t,
         Glyph::Lock,
@@ -541,7 +571,15 @@ fn pin<D: DrawTarget<Color = Rgb565>>(t: &mut D, pad: &PinPad) -> Result<(), D::
         18,
         theme::ACCENT,
     )?;
-    outline_button(t, PIN_CANCEL_RECT, "Cancel", theme::DENY)?;
+    // Cancel is a back chevron (not a wide "Cancel" word that would collide with the
+    // centred title) in the decline colour, painted inside its PIN_CANCEL_RECT hit area.
+    glyph::draw(
+        t,
+        Glyph::Back,
+        Point::new(PIN_CANCEL_RECT.x, 7),
+        16,
+        theme::DENY,
+    )?;
     masked_entry(t, pad.entered)?;
     let mut row = 0;
     while row < PIN_ROWS {
@@ -561,7 +599,7 @@ fn pin<D: DrawTarget<Color = Rgb565>>(t: &mut D, pad: &PinPad) -> Result<(), D::
                 }
                 key => {
                     key_surface(t, r, KEY_FILL, true)?;
-                    text(t, key_label(key), center(r), &FONT_9X15_BOLD, FG)?;
+                    text(t, key_label(key), center(r), Role::Strong, FG)?;
                 }
             }
             col += 1;
@@ -635,18 +673,10 @@ fn text<D: DrawTarget<Color = Rgb565>>(
     t: &mut D,
     s: &str,
     at: EgPoint,
-    font: &'static MonoFont<'static>,
+    role: Role,
     color: Rgb565,
 ) -> Result<(), D::Error> {
-    Text::with_text_style(s, at, MonoTextStyle::new(font, color), centered()).draw(t)?;
-    Ok(())
-}
-
-fn centered() -> TextStyle {
-    TextStyleBuilder::new()
-        .alignment(Alignment::Center)
-        .baseline(Baseline::Middle)
-        .build()
+    font::centered(t, s, at, role, color)
 }
 
 fn center(r: Rect) -> EgPoint {
@@ -662,30 +692,15 @@ fn eg_rect(r: Rect) -> Rectangle {
 
 // --- Design-system widgets (the re-skin layout) ----------------------------
 
-fn left_mid() -> TextStyle {
-    TextStyleBuilder::new()
-        .alignment(Alignment::Left)
-        .baseline(Baseline::Middle)
-        .build()
-}
-
-fn right_mid() -> TextStyle {
-    TextStyleBuilder::new()
-        .alignment(Alignment::Right)
-        .baseline(Baseline::Middle)
-        .build()
-}
-
 /// Left-aligned, vertically-centred text (list-row labels, header titles).
 fn text_left<D: DrawTarget<Color = Rgb565>>(
     t: &mut D,
     s: &str,
     at: EgPoint,
-    font: &'static MonoFont<'static>,
+    role: Role,
     color: Rgb565,
 ) -> Result<(), D::Error> {
-    Text::with_text_style(s, at, MonoTextStyle::new(font, color), left_mid()).draw(t)?;
-    Ok(())
+    font::left(t, s, at, role, color)
 }
 
 /// Right-aligned, vertically-centred text (trailing row status / values).
@@ -693,11 +708,82 @@ fn text_right<D: DrawTarget<Color = Rgb565>>(
     t: &mut D,
     s: &str,
     at: EgPoint,
-    font: &'static MonoFont<'static>,
+    role: Role,
     color: Rgb565,
 ) -> Result<(), D::Error> {
-    Text::with_text_style(s, at, MonoTextStyle::new(font, color), right_mid()).draw(t)?;
-    Ok(())
+    font::right(t, s, at, role, color)
+}
+
+/// Left-aligned text hard-clipped to `clip`, so a label too long for its slot is cut at
+/// the boundary rather than overrunning a trailing value — proportional faces make long,
+/// variable rp names a real risk.
+fn text_left_clipped<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    s: &str,
+    at: EgPoint,
+    role: Role,
+    color: Rgb565,
+    clip: Rect,
+) -> Result<(), D::Error> {
+    font::left(&mut t.clipped(&eg_rect(clip)), s, at, role, color)
+}
+
+/// The persistent top **status bar** (the design's framing chrome): a mono "RS-Key"
+/// wordmark at the left and the USB power indicator at the right. Faint, so it frames
+/// the screen without competing with content. This is a bus-powered device, so the power
+/// indicator is always the USB plug + "USB" label — never a battery.
+pub fn status_bar<D: DrawTarget<Color = Rgb565>>(t: &mut D) -> Result<(), D::Error> {
+    let cy = STATUS_BAR_H as i32 / 2 + 1;
+    text_left(
+        t,
+        "RS-Key",
+        EgPoint::new(13, cy),
+        Role::MonoSmall,
+        theme::FAINT,
+    )?;
+    // USB indicator: the "USB" label flush to the right edge, the plug glyph just left
+    // of it (measured so they sit together regardless of the label's width).
+    let label_right = PANEL_W as i32 - 13;
+    text_right(
+        t,
+        "USB",
+        EgPoint::new(label_right, cy),
+        Role::MonoSmall,
+        theme::FAINT,
+    )?;
+    let label_w = font::width("USB", Role::MonoSmall).unwrap_or(20) as i32;
+    glyph::draw(
+        t,
+        Glyph::Usb,
+        Point::new((label_right - label_w - 16).max(0) as u16, (cy - 7) as u16),
+        14,
+        theme::GREY,
+    )
+}
+
+/// The **title bar** below the status bar: an optional back chevron (painted in
+/// [`TITLE_BACK_RECT`], the region [`crate::hit_title_back`] maps a tap to) and the
+/// screen `title`. The chevron tints with the title (both `color`), per the design.
+pub fn title_bar<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    title: &str,
+    color: Rgb565,
+    back: bool,
+) -> Result<(), D::Error> {
+    let cy = STATUS_BAR_H as i32 + TITLE_BAR_H as i32 / 2;
+    let tx = if back {
+        glyph::draw(
+            t,
+            Glyph::Back,
+            Point::new(TITLE_BACK_RECT.x + 6, (cy - 8) as u16),
+            16,
+            color,
+        )?;
+        TITLE_BACK_RECT.x as i32 + TITLE_BACK_RECT.w as i32
+    } else {
+        13
+    };
+    text_left(t, title, EgPoint::new(tx, cy), Role::Heading, color)
 }
 
 /// The top header strip: a title (accent or muted) at the left, an optional status
@@ -709,7 +795,7 @@ pub fn render_header<D: DrawTarget<Color = Rgb565>>(
     right: Option<Glyph>,
 ) -> Result<(), D::Error> {
     let color = if accent { theme::ACCENT } else { theme::MUTED };
-    text_left(t, title, EgPoint::new(12, 15), &FONT_9X15_BOLD, color)?;
+    text_left(t, title, EgPoint::new(12, 15), Role::Heading, color)?;
     if let Some(g) = right {
         glyph::draw(t, g, Point::new(PANEL_W - 26, 6), 18, theme::MUTED)?;
     }
@@ -738,13 +824,8 @@ pub fn render_row<D: DrawTarget<Color = Rgb565>>(
         14,
         theme::MUTED,
     )?;
-    text_left(
-        t,
-        label,
-        EgPoint::new(rect.x as i32 + 28, cy),
-        &FONT_6X13,
-        theme::TEXT,
-    )?;
+    // Lay the trailing block (chevron, then the value flush against it) first, tracking
+    // the leftmost x it occupies — the label is then clipped to end before it.
     let mut right_x = rect.x as i32 + rect.w as i32 - 8;
     if chevron {
         right_x -= 12;
@@ -756,11 +837,33 @@ pub fn render_row<D: DrawTarget<Color = Rgb565>>(
             theme::MUTED,
         )?;
     }
-    if let Some((txt, col)) = trailing {
-        text_right(t, txt, EgPoint::new(right_x - 4, cy), &FONT_6X13, col)?;
-    }
-    Ok(())
+    let label_x = rect.x as i32 + 28;
+    let label_right = if let Some((txt, col)) = trailing {
+        let tx = right_x - 4;
+        text_right(t, txt, EgPoint::new(tx, cy), Role::Body, col)?;
+        tx - font::width(txt, Role::Body).unwrap_or(0) as i32 - ROW_TRAILING_GAP
+    } else {
+        right_x - ROW_TRAILING_GAP
+    };
+    let clip = Rect::new(
+        label_x as u16,
+        rect.y,
+        (label_right - label_x).max(0) as u16,
+        rect.h,
+    );
+    text_left_clipped(
+        t,
+        label,
+        EgPoint::new(label_x, cy),
+        Role::Body,
+        theme::TEXT,
+        clip,
+    )
 }
+
+/// The gap kept between a row's (clipped) label and its trailing value / chevron, so the
+/// two never touch even when the label fills its slot.
+const ROW_TRAILING_GAP: i32 = 8;
 
 /// The bottom nav bar: a surface + hairline, the `active` tab in accent and the rest
 /// dimmed. Glyphs sit in the exact [`nav_tab_rect`] cells [`crate::hit_nav`] maps.
@@ -821,7 +924,7 @@ fn hold_outline_and_label<D: DrawTarget<Color = Rgb565>>(
         )
         .draw(t)?;
     // Small caption so longer labels ("Hold to approve") fit the button width.
-    text(t, label, center(rect), &FONT_6X13, theme::TEXT)
+    text(t, label, center(rect), Role::Body, theme::TEXT)
 }
 
 /// The **static base** of a hold-to-confirm button: a dark card, the `fill`-coloured
@@ -884,6 +987,7 @@ fn settings<D: DrawTarget<Color = Rgb565>>(t: &mut D, v: &SettingsView) -> Resul
         SettingsPage::Root => settings_root(t),
         SettingsPage::Brightness => settings_brightness(t, v.brightness),
         SettingsPage::Timeout => settings_timeout(t, v.timeout_secs),
+        SettingsPage::Sleep => settings_sleep(t, v.sleep_secs),
         SettingsPage::Info => settings_info(t, v.version, v.chipid),
     }
 }
@@ -891,7 +995,10 @@ fn settings<D: DrawTarget<Color = Rgb565>>(t: &mut D, v: &SettingsView) -> Resul
 /// The Root list: a header and the option rows, each in its `settings_row_rect` —
 /// the new list look, with leading glyphs and a drill-in chevron.
 fn settings_root<D: DrawTarget<Color = Rgb565>>(t: &mut D) -> Result<(), D::Error> {
-    render_header(t, "Settings", true, None)?;
+    status_bar(t)?;
+    // Back chevron exits to Home (the design's settings → back flow), so the list needs
+    // no "Close" row — freeing a row keeps all six at a touch-comfortable height.
+    title_bar(t, "Settings", theme::ACCENT, true)?;
     render_row(
         t,
         settings_row_rect(0),
@@ -911,15 +1018,32 @@ fn settings_root<D: DrawTarget<Color = Rgb565>>(t: &mut D) -> Result<(), D::Erro
     render_row(
         t,
         settings_row_rect(2),
+        Glyph::Moon,
+        "Display sleep",
+        None,
+        true,
+    )?;
+    render_row(
+        t,
+        settings_row_rect(3),
         Glyph::Info,
         "Device info",
         None,
         true,
     )?;
+    // Lock now: a plain action row (no chevron — it locks immediately rather than
+    // drilling in) with the padlock glyph.
+    render_row(
+        t,
+        settings_row_rect(4),
+        Glyph::Lock,
+        "Lock now",
+        None,
+        false,
+    )?;
     // Factory reset is destructive, so it's drawn in the decline colour (warning
     // glyph + red label) instead of the neutral row style — see the mockup.
-    danger_row(t, settings_row_rect(3), "Factory reset")?;
-    render_row(t, settings_row_rect(4), Glyph::Home, "Close", None, false)
+    danger_row(t, settings_row_rect(5), "Factory reset")
 }
 
 /// A destructive option row: the [`render_row`] card, but with a warning glyph,
@@ -944,7 +1068,7 @@ fn danger_row<D: DrawTarget<Color = Rgb565>>(
         t,
         label,
         EgPoint::new(rect.x as i32 + 28, cy),
-        &FONT_6X13,
+        Role::Body,
         theme::DENY,
     )?;
     glyph::draw(
@@ -961,22 +1085,49 @@ fn settings_brightness<D: DrawTarget<Color = Rgb565>>(
     t: &mut D,
     level: u8,
 ) -> Result<(), D::Error> {
-    render_header(t, "Brightness", true, None)?;
+    status_bar(t)?;
+    title_bar(t, "Brightness", theme::ACCENT, false)?;
     level_bar(t, level)?;
     adjust_controls(t)
 }
 
 /// Touch-timeout adjust: the current value in seconds plus −/+/Back.
 fn settings_timeout<D: DrawTarget<Color = Rgb565>>(t: &mut D, secs: u16) -> Result<(), D::Error> {
-    render_header(t, "Touch timeout", true, None)?;
+    status_bar(t)?;
+    title_bar(t, "Touch timeout", theme::ACCENT, false)?;
     let mut buf = [0u8; 8];
     text(
         t,
         fmt_secs(secs, &mut buf),
         EgPoint::new(MIDX, 104),
-        &FONT_10X20,
+        Role::Heading,
         theme::TEXT,
     )?;
+    adjust_controls(t)
+}
+
+/// Display-sleep adjust: the current timeout (or "Off") plus the shared −/+/Back.
+fn settings_sleep<D: DrawTarget<Color = Rgb565>>(t: &mut D, secs: u16) -> Result<(), D::Error> {
+    status_bar(t)?;
+    title_bar(t, "Display sleep", theme::ACCENT, false)?;
+    if secs == 0 {
+        text(
+            t,
+            "Off",
+            EgPoint::new(MIDX, 104),
+            Role::Heading,
+            theme::TEXT,
+        )?;
+    } else {
+        let mut buf = [0u8; 8];
+        text(
+            t,
+            fmt_secs(secs, &mut buf),
+            EgPoint::new(MIDX, 104),
+            Role::Heading,
+            theme::TEXT,
+        )?;
+    }
     adjust_controls(t)
 }
 
@@ -987,30 +1138,31 @@ fn settings_info<D: DrawTarget<Color = Rgb565>>(
     version: u16,
     chipid: u64,
 ) -> Result<(), D::Error> {
-    render_header(t, "Device info", true, None)?;
+    status_bar(t)?;
+    title_bar(t, "Device info", theme::ACCENT, false)?;
     text(
         t,
         "RS-Key trusted display",
         EgPoint::new(MIDX, 72),
-        &FONT_6X13,
+        Role::Body,
         MUTED,
     )?;
-    text(t, "Version", EgPoint::new(MIDX, 108), &FONT_6X13, MUTED)?;
+    text(t, "Version", EgPoint::new(MIDX, 108), Role::Mono, MUTED)?;
     let mut vbuf = [b'0', b'x', 0, 0, 0, 0];
     vbuf[2..].copy_from_slice(&hex_u16(version));
-    text(t, str8(&vbuf), EgPoint::new(MIDX, 130), &FONT_10X20, FG)?;
-    text(t, "Serial", EgPoint::new(MIDX, 170), &FONT_6X13, MUTED)?;
+    text(t, str8(&vbuf), EgPoint::new(MIDX, 130), Role::Heading, FG)?;
+    text(t, "Serial", EgPoint::new(MIDX, 170), Role::Mono, MUTED)?;
     let sh = hex_u64(chipid);
-    text(t, str8(&sh), EgPoint::new(MIDX, 192), &FONT_6X13, FG)?;
+    text(t, str8(&sh), EgPoint::new(MIDX, 192), Role::Mono, FG)?;
     button(t, BACK_RECT, "Back", MUTED)
 }
 
 /// The −/+/Back controls shared by both adjust pages, painted in their hit rects.
 fn adjust_controls<D: DrawTarget<Color = Rgb565>>(t: &mut D) -> Result<(), D::Error> {
     key_surface(t, ADJ_MINUS_RECT, KEY_FILL, true)?;
-    text(t, "-", center(ADJ_MINUS_RECT), &FONT_9X15_BOLD, FG)?;
+    text(t, "-", center(ADJ_MINUS_RECT), Role::Strong, FG)?;
     key_surface(t, ADJ_PLUS_RECT, KEY_FILL, true)?;
-    text(t, "+", center(ADJ_PLUS_RECT), &FONT_9X15_BOLD, FG)?;
+    text(t, "+", center(ADJ_PLUS_RECT), Role::Strong, FG)?;
     button(t, BACK_RECT, "Back", MUTED)
 }
 
@@ -1156,6 +1308,19 @@ mod tests {
     }
 
     #[test]
+    fn locked_screen_fits_and_draws() {
+        let mut d = Rec::new();
+        render(&mut d, &Screen::Locked).unwrap();
+        assert!(!d.oob, "locked screen drew outside the panel");
+        assert!(d.drew_anything());
+        // The lock circle (surface fill) + accent glyph sit in the upper-middle band.
+        assert!(
+            d.any_non_bg_in(Rect::new(0, 96, PANEL_W, 80)),
+            "lock circle / glyph missing"
+        );
+    }
+
+    #[test]
     fn every_home_status_fits_and_draws_with_nav() {
         for status in [
             StatusKind::Boot,
@@ -1224,10 +1389,10 @@ mod tests {
         let mut d = Rec::new();
         render_service(&mut d, &title, &accounts, 2).unwrap();
         assert!(!d.oob, "detail drew outside the panel");
-        // The back chevron paints in PK_BACK_RECT — where hit_pk_back maps a tap.
+        // The back chevron paints in TITLE_BACK_RECT — where hit_title_back maps a tap.
         assert!(
-            has_color(&d, crate::PK_BACK_RECT, theme::ACCENT),
-            "back chevron missing from its hit rect"
+            has_color(&d, crate::TITLE_BACK_RECT, theme::ACCENT),
+            "back chevron missing from its title-bar hit rect"
         );
         for i in 0..accounts.len() as u16 {
             assert!(d.any_non_bg_in(crate::row_rect(PK_LIST_TOP, i)));
@@ -1349,6 +1514,7 @@ mod tests {
             page,
             brightness: 3,
             timeout_secs: 30,
+            sleep_secs: 60,
             version: 0x078A,
             chipid: 0x0123_4567_89ab_cdef,
         }
@@ -1360,6 +1526,7 @@ mod tests {
             SettingsPage::Root,
             SettingsPage::Brightness,
             SettingsPage::Timeout,
+            SettingsPage::Sleep,
             SettingsPage::Info,
         ] {
             let mut d = Rec::new();
@@ -1383,7 +1550,11 @@ mod tests {
 
     #[test]
     fn adjust_pages_paint_controls_in_their_hit_rects() {
-        for page in [SettingsPage::Brightness, SettingsPage::Timeout] {
+        for page in [
+            SettingsPage::Brightness,
+            SettingsPage::Timeout,
+            SettingsPage::Sleep,
+        ] {
             let mut d = Rec::new();
             render(&mut d, &Screen::Settings(view(page))).unwrap();
             assert!(d.any_non_bg_in(ADJ_MINUS_RECT), "{page:?} minus unpainted");
@@ -1421,6 +1592,58 @@ mod tests {
         assert!(!d.oob, "design-system widgets drew outside the panel");
         // The list-row card fills its rect (sampled on the flat top span).
         assert_eq!(d.at(r.x + r.w / 2, r.y + 3), theme::ROW_BG);
+    }
+
+    /// A row label far too long for its slot is clipped clear of the trailing value —
+    /// the proportional-font regression that made "webauthn.io" touch "4 accounts".
+    #[test]
+    fn long_row_label_is_clipped_clear_of_the_trailing_value() {
+        let r = crate::row_rect(40, 0);
+        let txt = "4 accounts";
+        let mut d = Rec::new();
+        render_row(
+            &mut d,
+            r,
+            Glyph::Globe,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            Some((txt, theme::MUTED)),
+            true,
+        )
+        .unwrap();
+        assert!(!d.oob);
+        // Reconstruct the trailing value's left edge; the ROW_TRAILING_GAP-wide seam to
+        // its left must be free of the (white) label text.
+        let right_x = r.x as i32 + r.w as i32 - 8 - 12;
+        let value_left = (right_x - 4) - font::width(txt, Role::Body).unwrap() as i32;
+        for x in (value_left - ROW_TRAILING_GAP).max(0)..value_left {
+            for y in r.y..r.y + r.h {
+                assert_ne!(
+                    d.at(x as u16, y),
+                    theme::TEXT,
+                    "label not clipped clear of the trailing value at x={x}"
+                );
+            }
+        }
+    }
+
+    /// The two-tier chrome paints within its strips and, with `back`, the title-bar
+    /// chevron lands in `TITLE_BACK_RECT` (where `hit_title_back` maps a tap).
+    #[test]
+    fn chrome_bars_draw_in_their_strips() {
+        let mut d = Rec::new();
+        status_bar(&mut d).unwrap();
+        title_bar(&mut d, "Passkeys", theme::ACCENT, true).unwrap();
+        assert!(!d.oob, "chrome drew outside the panel");
+        // The status strip carries the RS-Key wordmark + USB indicator.
+        assert!(
+            d.any_non_bg_in(Rect::new(0, 0, PANEL_W, STATUS_BAR_H)),
+            "status bar painted nothing"
+        );
+        // The back chevron lands in its title-bar hit rect.
+        assert!(
+            has_color(&d, crate::TITLE_BACK_RECT, theme::ACCENT),
+            "back chevron not in TITLE_BACK_RECT"
+        );
     }
 
     #[test]
