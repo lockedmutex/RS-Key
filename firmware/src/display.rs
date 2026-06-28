@@ -45,9 +45,9 @@ use mipidsi::{Builder, Display};
 use rsk_crypto::Device;
 use rsk_sdk::Confirm;
 use rsk_ui::{
-    ALLOW_RECT, AccountRow, AdjustKey, AuditRow, BRIGHTNESS_LEVELS, Button, ConfirmPrompt,
-    HomeView, Label, NavTab, PinCaption, PinKey, PinPad, RootEntry, RpRow, Screen, SecurityEntry,
-    SettingsPage, SettingsView, StatusKind, SuccessKind,
+    ALLOW_RECT, AccountRow, AdjustKey, AuditRow, BRIGHTNESS_LEVELS, BackupView, Button,
+    ConfirmPrompt, HomeView, Label, NavTab, PinCaption, PinKey, PinPad, RootEntry, RpRow, Screen,
+    SecurityEntry, SettingsPage, SettingsView, StatusKind, SuccessKind,
 };
 
 use crate::handler::Store;
@@ -476,14 +476,15 @@ impl Ui {
     /// the view. Clears `shown` so the ambient loop repaints once the menu releases
     /// the panel.
     fn render_settings(&mut self, page: SettingsPage) {
-        // Read both PIN-set flags under ONE borrow: two `self.fs.borrow_mut()` temporaries
-        // in a single expression both live to the end of the statement, so a second one
-        // would panic the RefCell (`already borrowed`).
-        let (device_pin_set, fido_pin_set) = {
+        // Read every store-backed flag under ONE borrow: multiple `self.fs.borrow_mut()`
+        // temporaries in a single expression all live to the end of the statement, so a
+        // second one would panic the RefCell (`already borrowed`).
+        let (device_pin_set, fido_pin_set, backup_sealed) = {
             let mut fs = self.fs.borrow_mut();
             (
                 rsk_fido::passkeys::device_pin_is_set(&mut fs),
                 rsk_fido::passkeys::pin_is_set(&mut fs),
+                rsk_fido::passkeys::backup_sealed(&mut fs),
             )
         };
         let view = SettingsView {
@@ -495,6 +496,7 @@ impl Ui {
             chipid: self.info.chipid,
             device_pin_set,
             fido_pin_set,
+            backup_sealed,
         };
         let _ = rsk_ui::render(&mut self.panel, &Screen::Settings(view));
         self.shown = None;
@@ -566,6 +568,10 @@ impl Ui {
                                 }
                                 Some(SecurityEntry::AuditLog) => {
                                     self.run_auditlog();
+                                    last = Instant::now();
+                                }
+                                Some(SecurityEntry::Backup) => {
+                                    self.run_backup();
                                     last = Instant::now();
                                 }
                                 // A confirmed reset reboots and never returns; on cancel,
@@ -1034,6 +1040,180 @@ impl Ui {
             }
             block_for(Duration::from_millis(TOUCH_POLL_MS));
         }
+    }
+
+    /// The read-only on-device backup status (Settings → Security → Backup): snapshot the
+    /// seed-backup flags and show them until the back chevron, the power button (sleeps +
+    /// locks), a queued host command, or the inactivity timeout. Synchronous like the other
+    /// browse modals (the worker is parked); read-only — no tap mutates anything and it
+    /// shows no secret, only whether a recovery seed is present and its export window sealed.
+    /// Snapshot the seed-backup status into the view model. `can_reveal` decides whether the
+    /// on-device recovery-phrase + seal actions are offered: only while the window is open and
+    /// the seed is actually readable (present, exportable build, not soft-locked).
+    fn load_backup(&self) -> BackupView {
+        // Both reads under ONE borrow (multiple `borrow_mut()` in one statement would panic).
+        let (st, device_pin_set) = {
+            let mut fs = self.fs.borrow_mut();
+            (
+                rsk_fido::passkeys::backup_status(&mut fs),
+                rsk_fido::passkeys::device_pin_is_set(&mut fs),
+            )
+        };
+        BackupView {
+            sealed: st.sealed,
+            has_seed: st.has_seed,
+            exportable: st.exportable,
+            // The reveal exposes the master secret, so it requires a device PIN to be set (the
+            // hold is the second factor, not the only one); the seal shares the gate. Without a
+            // device PIN the device never locks, so a bare hold would let anyone with physical
+            // access read the seed.
+            can_reveal: st.has_seed && st.exportable && !st.sealed && !st.locked && device_pin_set,
+        }
+    }
+
+    /// The Backup screen (Settings → Security → Backup): the seed-backup status, plus — while
+    /// the window is open — the on-device **Show recovery phrase** and **Seal backup** actions.
+    /// The phrase is shown on the trusted panel and never crosses USB. Reloads the status after
+    /// each action so a seal flips the screen to sealed. Synchronous (worker parked); the back
+    /// chevron, power button, a queued host command, or the inactivity timeout exit.
+    fn run_backup(&mut self) {
+        let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
+        'screen: loop {
+            let view = self.load_backup();
+            let _ = rsk_ui::render_backup(&mut self.panel, &view);
+            self.shown = None;
+            self.touch.wait_release(Instant::now(), idle_limit);
+            let mut last = Instant::now();
+            loop {
+                if self.sleep_button_pressed() {
+                    return;
+                }
+                if let Some(p) = self.touch.read() {
+                    last = Instant::now();
+                    if rsk_ui::hit_title_back(p) {
+                        return;
+                    }
+                    if view.can_reveal
+                        && let Some(k) = rsk_ui::hit_backup(p)
+                    {
+                        match k {
+                            rsk_ui::BackupKey::Reveal => self.run_show_seed(),
+                            rsk_ui::BackupKey::Seal => self.run_seal_backup(),
+                        }
+                        if self.asleep {
+                            return; // a sub-modal slept + locked via the power button
+                        }
+                        continue 'screen; // reload status (a seal flips it) and repaint
+                    }
+                    self.touch.wait_release(last, idle_limit);
+                }
+                if crate::worker::host_request_pending() || last.elapsed() >= idle_limit {
+                    return;
+                }
+                block_for(Duration::from_millis(TOUCH_POLL_MS));
+            }
+        }
+    }
+
+    /// Show the 24-word BIP-39 recovery phrase on the trusted display — the seed is read,
+    /// converted to words **on-device**, and never crosses USB. Gated by the device PIN
+    /// (re-auth before exposing the master secret) then a deliberate hold. The seed is
+    /// zeroized the instant the words are derived; the word indices (also secret) are zeroized
+    /// on exit, and the screen auto-clears on the inactivity timeout (walked-away guard).
+    fn run_show_seed(&mut self) {
+        let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
+        self.touch.wait_release(Instant::now(), idle_limit);
+        // Re-authenticate with the device PIN before the secret is shown (no PIN set returns
+        // true at once; a wrong PIN / decline / timeout aborts with nothing revealed).
+        if !self.local_pin_gate("Enter PIN", PinScope::Device) {
+            return;
+        }
+        // A second, deliberate gesture over the warning.
+        let _ = rsk_ui::render_reveal_warning(&mut self.panel);
+        self.shown = None;
+        self.touch.wait_release(Instant::now(), idle_limit);
+        if !self.hold_to_confirm("Hold to reveal") {
+            return;
+        }
+        // Read + derive. The seed lives only long enough to compute the indices, then is wiped.
+        let dev = self.keys.device();
+        let mut seed_opt = {
+            let mut fs = self.fs.borrow_mut();
+            rsk_fido::passkeys::load_keydev(&dev, &mut fs)
+        };
+        let mut indices = match seed_opt {
+            // `Option<[u8;32]>` is `Copy`, so this copies the seed out — derive, then wipe BOTH
+            // the copy here and the original `seed_opt` below, or a seed remnant lingers.
+            Some(mut seed) => {
+                let idx = rsk_bip39::entropy_to_indices(&seed);
+                seed.zeroize();
+                idx
+            }
+            None => return, // no seed / soft-locked — nothing to show
+        };
+        seed_opt.zeroize();
+        let mut words: [&str; rsk_bip39::WORD_COUNT] = [""; rsk_bip39::WORD_COUNT];
+        for (w, &i) in words.iter_mut().zip(indices.iter()) {
+            *w = rsk_bip39::word(i);
+        }
+        let pages: u16 = 2;
+        let mut page: u16 = 0;
+        let _ = rsk_ui::render_seed_phrase(&mut self.panel, &words, page, pages);
+        self.shown = None;
+        self.touch.wait_release(Instant::now(), idle_limit);
+        let mut last = Instant::now();
+        loop {
+            if self.sleep_button_pressed() {
+                break;
+            }
+            if let Some(p) = self.touch.read() {
+                last = Instant::now();
+                if rsk_ui::hit_title_back(p) {
+                    break;
+                }
+                if let Some(k) = rsk_ui::hit_pager(p) {
+                    page = match k {
+                        rsk_ui::PagerKey::Prev => page.saturating_sub(1),
+                        rsk_ui::PagerKey::Next => (page + 1).min(pages - 1),
+                    };
+                    let _ = rsk_ui::render_seed_phrase(&mut self.panel, &words, page, pages);
+                    self.shown = None;
+                    self.touch.wait_release(last, idle_limit);
+                    last = Instant::now();
+                    continue;
+                }
+                self.touch.wait_release(last, idle_limit);
+            }
+            // A queued host command or the idle timeout exits + wipes — the master secret must
+            // never linger on a walked-away panel.
+            if crate::worker::host_request_pending() || last.elapsed() >= idle_limit {
+                break;
+            }
+            block_for(Duration::from_millis(TOUCH_POLL_MS));
+        }
+        // Wipe both secrets from RAM: the indices (the canonical secret) via `Zeroize`, and the
+        // word slots (which also encode the order) via a black-boxed fill so it isn't elided.
+        indices.zeroize();
+        words.fill("");
+        let _ = core::hint::black_box(&words);
+        note_activity();
+        self.end_modal();
+    }
+
+    /// Seal the backup window on-device (Settings → Security → Backup → Seal backup): a
+    /// deliberate hold, then write the seal marker so the seed can no longer be shown or
+    /// exported until a factory reset. Exposes no secret, so a hold (not the PIN) gates it;
+    /// Settings access is already device-PIN-locked.
+    fn run_seal_backup(&mut self) {
+        let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
+        self.touch.wait_release(Instant::now(), idle_limit);
+        let _ = rsk_ui::render_seal_confirm(&mut self.panel);
+        self.shown = None;
+        self.touch.wait_release(Instant::now(), idle_limit);
+        if self.hold_to_confirm("Hold to seal") {
+            let _ = rsk_fido::passkeys::mark_backup_sealed(&mut self.fs.borrow_mut());
+        }
+        self.end_modal();
     }
 
     /// Enumerate the resident accounts under `hash` into `accts`, recording each one's

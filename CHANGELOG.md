@@ -15,6 +15,34 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Added
 
+- **On-device recovery-phrase display — the seed never crosses USB (experimental).** The
+  trusted display can now show the device's **24-word BIP-39 recovery phrase on its own
+  screen**, derived **on the device** from the master seed, so the seed is never exported to
+  a host to be backed up. From Settings → Security → Backup (while the backup window is open
+  and **a device PIN is set** — the master secret is never surrendered on a bare gesture),
+  **Show recovery phrase** re-enters the device PIN, takes a deliberate hold over a "no one
+  watching?" warning, then paints the 24 words (two numbered pages). The seed is
+  zeroized the instant the words are derived; the word indices are zeroized on exit and the
+  screen auto-clears on idle (walked-away guard). A **Seal backup** action closes the one-time
+  window on-device (hold-gated) so the phrase can no longer be shown or exported until a
+  factory reset — mirroring the host `BACKUP_FINALIZE`. The existing USB seed-export path is
+  unchanged (it coexists). The on-device BIP-39 encode lives in a new host-tested `rsk-bip39`
+  crate whose embedded English wordlist is checksum-pinned to the canonical BIP-39 list and
+  whose output is verified against the host `mnemonic` library bit-for-bit (so on-device
+  encode == host `rsk backup restore`); a Kani proof bounds the word indices. Display flavor
+  only; disabled on a `fips-profile` device (non-exportable seed). bcdDevice 0x07B3 → 0x07B4.
+- **Seed-backup status screen on the trusted display (experimental).** Settings → Security
+  now has a read-only **Backup** page showing the seed-backup state the device genuinely
+  tracks: whether a recovery seed is present and whether the one-time export window has been
+  **sealed**. A colour-coded status plate reads **Review needed** (export window still open),
+  **Export sealed** (window closed), **No recovery seed**, or **Restore-only** (a
+  `fips-profile` device, where the seed is non-exportable), over two fact rows and a hint that
+  the host app drives the backup over USB. It is honest about the real backend — there is
+  **no** fictional "N of M recovery shares" state, and the screen states only the export
+  **window** state, never claiming a recovery copy exists (the device cannot verify an export
+  happened): backup is a one-time seed export over the host MSE channel, then sealed.
+  Read-only (no on-device action, shows no secret). The Security row reflects the window state
+  as "Sealed" / "Review". Display flavor only. bcdDevice 0x07B2 → 0x07B3.
 - **Dedicated device PIN, separate from the FIDO clientPIN (experimental, display flavor).**
   The trusted display now has its own **device PIN** (`EF_DEVICE_PIN`, device-sealed, its
   own retry counter) that gates **local control** — unlocking the on-device UI, deleting a

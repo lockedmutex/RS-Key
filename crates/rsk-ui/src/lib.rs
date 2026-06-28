@@ -23,10 +23,11 @@ pub mod theme;
 pub mod touch;
 pub use glyph::Glyph;
 pub use render::{
-    render, render_add_passkey, render_audit_log, render_confirm_delete,
+    render, render_add_passkey, render_audit_log, render_backup, render_confirm_delete,
     render_confirm_factory_reset, render_erasing, render_hold_button, render_hold_fill,
-    render_passkeys_list, render_pin_blocked, render_pin_dots, render_rename, render_service,
-    render_success, render_success_circle,
+    render_passkeys_list, render_pin_blocked, render_pin_dots, render_rename,
+    render_reveal_warning, render_seal_confirm, render_seed_phrase, render_service, render_success,
+    render_success_circle,
 };
 
 /// Panel geometry (Waveshare RP2350-Touch-LCD-2.8, ST7789T3, portrait).
@@ -424,8 +425,9 @@ pub enum SettingsPage {
     Sleep,
     /// Read-only device info (Back only).
     Info,
-    /// The Security sub-page: Set / Change PIN and the (danger) Factory reset. Reached
-    /// from the Root "Security" row; the title-bar back chevron returns to Root.
+    /// The Security sub-page: device + FIDO PIN, the audit log, the backup status, and the
+    /// (danger) Factory reset. Reached from the Root "Security" row; the title-bar back
+    /// chevron returns to Root.
     Security,
 }
 
@@ -461,6 +463,9 @@ pub struct SettingsView {
     pub device_pin_set: bool,
     /// Whether the FIDO clientPIN is set — the Security page's FIDO-PIN row label.
     pub fido_pin_set: bool,
+    /// Whether the seed-backup export window is sealed — the Security page's Backup row
+    /// shows "Sealed" (the seed is backed up) or "Review" (the window is still open).
+    pub backup_sealed: bool,
 }
 
 /// An entry on the settings Root list.
@@ -474,8 +479,8 @@ pub enum RootEntry {
     /// Lock the on-device UI now — show the [`Screen::Locked`] screen so the passkeys
     /// browser and settings need the device PIN to reopen (no-op if no PIN is set).
     LockNow,
-    /// Drill into the Security sub-page ([`SettingsPage::Security`]) — Set / Change PIN
-    /// and Factory reset.
+    /// Drill into the Security sub-page ([`SettingsPage::Security`]) — device + FIDO PIN,
+    /// the audit log, the backup status, and the (danger) Factory reset.
     Security,
 }
 
@@ -490,6 +495,9 @@ pub enum SecurityEntry {
     FidoPin,
     /// Open the read-only on-device audit log (the recent journal events).
     AuditLog,
+    /// Open the read-only seed-backup status screen (whether the recovery seed is present
+    /// and the export window has been sealed).
+    Backup,
     /// Erase every applet's data and return to a fresh device (danger-styled, gated by a
     /// hold-to-confirm and the device PIN if one is set).
     FactoryReset,
@@ -534,10 +542,10 @@ pub const fn settings_row_entry(i: u16) -> RootEntry {
     }
 }
 
-/// Number of Security sub-page rows (Change/Set PIN, Audit log, Factory reset). They
-/// reuse the first [`settings_row_rect`] slots, so they inherit the Root list's
-/// proven-disjoint geometry (a const-assert keeps them within the Root row count).
-pub const SECURITY_ROWS: u16 = 4;
+/// Number of Security sub-page rows (Device PIN, FIDO PIN, Audit log, Backup, Factory
+/// reset). They reuse the first [`settings_row_rect`] slots, so they inherit the Root
+/// list's proven-disjoint geometry (a const-assert keeps them within the Root row count).
+pub const SECURITY_ROWS: u16 = 5;
 const _: () = assert!(SECURITY_ROWS <= SETTINGS_ROWS);
 
 /// The Security entry on row `i`, in list order (the danger Factory reset stays last).
@@ -546,6 +554,7 @@ pub const fn security_row_entry(i: u16) -> SecurityEntry {
         0 => SecurityEntry::DevicePin,
         1 => SecurityEntry::FidoPin,
         2 => SecurityEntry::AuditLog,
+        3 => SecurityEntry::Backup,
         _ => SecurityEntry::FactoryReset,
     }
 }
@@ -1133,6 +1142,66 @@ pub struct AuditRow {
     pub secs_ago: Option<u32>,
 }
 
+/// The seed-backup status the read-only Backup screen ([`render_backup`]) paints —
+/// the bits the device genuinely tracks, mirroring `rsk_fido`'s `BackupStatus`. There
+/// is no fictional "N of M shares" state: backup is a one-time seed export over USB,
+/// then sealed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BackupView {
+    /// The one-time export *window* has been sealed (a `BACKUP_FINALIZE` closed it). This is
+    /// a window-state fact, **not** proof a recovery copy exists — the device cannot verify an
+    /// export happened — so the screen states the window state, not "backed up". A factory
+    /// reset / host authenticatorReset reopens it.
+    pub sealed: bool,
+    /// A device master seed is present (something to back up / recover).
+    pub has_seed: bool,
+    /// This build can export the seed at all — `false` on a `fips-profile` device, where
+    /// the seed is non-exportable and recovery is restore-only.
+    pub exportable: bool,
+    /// The on-device recovery-phrase reveal + seal actions are offered — true only while the
+    /// backup window is open and the seed is readable (`has_seed && exportable && !sealed &&
+    /// !locked`). When false the screen is status-only.
+    pub can_reveal: bool,
+}
+
+/// A tappable action on the Backup screen, present only when [`BackupView::can_reveal`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BackupKey {
+    /// Show the 24-word recovery phrase on the trusted display (device-PIN + hold gated).
+    Reveal,
+    /// Seal the backup window — close it so the seed can no longer be exported or shown
+    /// (hold gated). A factory reset reopens it.
+    Seal,
+}
+
+/// The primary "Show recovery phrase" button on the Backup screen (shown only when
+/// [`BackupView::can_reveal`]).
+pub const BACKUP_REVEAL_RECT: Rect = Rect::new(16, 224, PANEL_W - 32, 40);
+/// The "Seal backup" button below it.
+pub const BACKUP_SEAL_RECT: Rect = Rect::new(16, 268, PANEL_W - 32, 40);
+
+const _: () = {
+    // Both action buttons sit in the content area, below the fact rows, disjoint, on-panel.
+    assert!(BACKUP_REVEAL_RECT.y > CONTENT_TOP);
+    assert!(BACKUP_REVEAL_RECT.y + BACKUP_REVEAL_RECT.h <= BACKUP_SEAL_RECT.y);
+    assert!(BACKUP_SEAL_RECT.y + BACKUP_SEAL_RECT.h <= PANEL_H);
+    assert!(BACKUP_REVEAL_RECT.x + BACKUP_REVEAL_RECT.w <= PANEL_W);
+    // Clear of the title-bar back chevron (the screen's other tap target).
+    assert!(BACKUP_REVEAL_RECT.y > TITLE_BACK_RECT.y + TITLE_BACK_RECT.h);
+};
+
+/// Which Backup action, if any, a tap at `p` selects. Only meaningful when the screen was
+/// drawn with [`BackupView::can_reveal`]; the caller gates on that.
+pub fn hit_backup(p: Point) -> Option<BackupKey> {
+    if BACKUP_REVEAL_RECT.contains(p) {
+        Some(BackupKey::Reveal)
+    } else if BACKUP_SEAL_RECT.contains(p) {
+        Some(BackupKey::Seal)
+    } else {
+        None
+    }
+}
+
 /// Top-level screen the display task renders. The three top-level **tabs** (Home,
 /// Passkeys, Settings) carry the bottom nav bar and are shown by the idle loop; the
 /// **modals** (Splash, Confirm, Pin) are full-screen and shown by the worker.
@@ -1467,6 +1536,7 @@ mod tests {
             SecurityEntry::DevicePin,
             SecurityEntry::FidoPin,
             SecurityEntry::AuditLog,
+            SecurityEntry::Backup,
             SecurityEntry::FactoryReset,
         ];
         for (i, &e) in want.iter().enumerate() {

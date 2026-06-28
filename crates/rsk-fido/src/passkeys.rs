@@ -41,6 +41,11 @@ pub use crate::consts::MIN_PIN_LENGTH;
 /// The on-device nickname length cap, re-exported here so the display sizes its rename
 /// buffer from the same constant the store enforces.
 pub use crate::consts::RP_NICK_MAX_LEN;
+/// Seed-backup status for the trusted-display Backup screen — the same bits the host
+/// reads over `BACKUP_STATE`, exposed `Ctx`-free for the display task, plus the on-device
+/// seal action and the seed read the recovery-phrase reveal needs.
+pub use crate::seed::load_keydev;
+pub use crate::vendor::{BackupStatus, backup_sealed, backup_status, mark_backup_sealed};
 
 /// Largest EF_RP record (count + rpIdHash + boxed domain); domains are short.
 const RP_REC_MAX: usize = 256;

@@ -1054,6 +1054,7 @@ dependencies = [
  "mipidsi",
  "panic-halt",
  "rp-pac",
+ "rsk-bip39",
  "rsk-crypto",
  "rsk-fido",
  "rsk-fs",
@@ -2051,6 +2052,13 @@ dependencies = [
  "spki",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "rsk-bip39"
+version = "0.1.0"
+dependencies = [
+ "rsk-crypto",
 ]
 
 [[package]]

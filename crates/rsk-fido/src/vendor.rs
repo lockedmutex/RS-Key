@@ -562,6 +562,53 @@ fn backup_state<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, out: &mut [u8]) -> Ctap
     })
 }
 
+/// The seed-backup status for the trusted-display Backup screen — the same
+/// `sealed` / `has_seed` bits [`backup_state`] reports to the host, plus whether
+/// this build can export at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BackupStatus {
+    /// The one-time export window is sealed: the seed has been backed up (or a
+    /// `BACKUP_FINALIZE` closed the window). A factory reset / authenticatorReset
+    /// reopens it.
+    pub sealed: bool,
+    /// A device master seed (`EF_KEY_DEV`) is present.
+    pub has_seed: bool,
+    /// The MSE export channel exists on this build — `false` under `fips-profile`,
+    /// where the seed is non-exportable and recovery is restore-only.
+    pub exportable: bool,
+    /// The seed is soft-locked (the stored copy is wrapped) — it can't be read for an
+    /// on-device recovery-phrase reveal until a host vendor `UNLOCK` this power cycle.
+    pub locked: bool,
+}
+
+/// Read the seed-backup status from the store for the on-device Backup screen
+/// (Settings → Security → Backup). A lean, `Ctx`-free mirror of [`backup_state`]'s
+/// flags — no CBOR — so the display task can read it directly while the worker is parked.
+pub fn backup_status<S: Storage>(fs: &mut rsk_fs::Fs<S>) -> BackupStatus {
+    BackupStatus {
+        sealed: fs.has_data(EF_BACKUP_SEALED),
+        has_seed: fs.has_key(EF_KEY_DEV),
+        exportable: !cfg!(feature = "fips-profile"),
+        locked: lock_engaged(fs),
+    }
+}
+
+/// Seal the one-time backup window on-device (Settings → Security → Backup → Seal),
+/// mirroring host [`BACKUP_FINALIZE`](backup_finalize) without the `Ctx` / journal:
+/// write the `EF_BACKUP_SEALED` marker so the seed can no longer be exported **or**
+/// shown as a recovery phrase until a factory reset reopens the window. The display
+/// task gates this behind the device PIN and a deliberate hold.
+pub fn mark_backup_sealed<S: Storage>(fs: &mut rsk_fs::Fs<S>) -> bool {
+    fs.put(EF_BACKUP_SEALED, &[1]).is_ok()
+}
+
+/// Whether the seed-backup export window is sealed — the cheap `has_data` probe the
+/// Security list row uses for its "Sealed / Review" status, without the `has_seed`
+/// key lookup [`backup_status`] also does.
+pub fn backup_sealed<S: Storage>(fs: &mut rsk_fs::Fs<S>) -> bool {
+    fs.has_data(EF_BACKUP_SEALED)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1238,6 +1285,22 @@ mod tests {
             state_flags(&mut fs, &mut rng, &mut st),
             (false, true, false, false) // not sealed, has seed, not locked, not unlocked
         );
+    }
+
+    #[test]
+    fn backup_status_mirrors_the_host_flags() {
+        let (mut fs, _rng, _st) = setup();
+        // Fresh: a seed is present, the export window is open (not sealed), not locked.
+        let s = backup_status(&mut fs);
+        assert!(s.has_seed && !s.sealed && !s.locked);
+        assert!(!backup_sealed(&mut fs));
+        // `exportable` tracks the build profile, not the store.
+        assert_eq!(s.exportable, !cfg!(feature = "fips-profile"));
+        // Sealing on-device flips the flag, exactly like host finalize.
+        assert!(mark_backup_sealed(&mut fs));
+        let s = backup_status(&mut fs);
+        assert!(s.has_seed && s.sealed);
+        assert!(backup_sealed(&mut fs));
     }
 
     // ---- soft-lock ----

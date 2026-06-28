@@ -177,6 +177,17 @@ necessarily sees the seed plaintext — do it on a machine you trust.
 Scope: the deterministic identity only (resident passkeys, OpenPGP, PIV are
 not covered).
 
+On the **trusted-display flavor** the host need not be in that trust path: the
+device can render its BIP-39 recovery phrase **on its own screen** (the seed is
+turned into words on-device and never crosses USB), so a backup can be taken
+without trusting any host. That trades the host-observation surface for a
+physical/visual one — the words are briefly on the panel (shoulder-surf, camera).
+It is gated to keep that surface small: it requires a **device PIN** set and
+re-entered, a deliberate hold past an explicit "no one watching" warning, runs
+only inside the same one-time window (and seal closes it), is disabled on the
+`fips-profile` (non-exportable) build, zeroizes the seed/words from RAM on exit,
+and auto-clears the panel after a short idle.
+
 ```mermaid
 sequenceDiagram
     participant U as You

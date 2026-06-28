@@ -69,6 +69,9 @@ pub enum Glyph {
     Edit,
     /// An eye (lens outline + pupil) — the confirm-delete "reveal PIN" toggle.
     Eye,
+    /// A lifebuoy (outer ring + inner hub + four diagonal spokes) — the seed-backup /
+    /// recovery marker on the Backup screen.
+    Lifebuoy,
 }
 
 /// Draw `g` into the square box at `at` (top-left) of side `s` pixels, stroked in
@@ -270,6 +273,22 @@ pub fn draw<D: DrawTarget<Color = Rgb565>>(
                 .draw(t)?;
             circ(8, 8, 2).into_styled(fill).draw(t)
         }
+        Glyph::Lifebuoy => {
+            // A big outer ring + a smaller hub, joined by four diagonal spokes — the
+            // classic life-ring, distinct from the Gear/Sun by its dominant outer ring.
+            circ(8, 8, 7).into_styled(stroke).draw(t)?;
+            circ(8, 8, 3).into_styled(stroke).draw(t)?;
+            Line::new(gp(4, 4), gp(6, 6)).into_styled(stroke).draw(t)?;
+            Line::new(gp(12, 4), gp(10, 6))
+                .into_styled(stroke)
+                .draw(t)?;
+            Line::new(gp(4, 12), gp(6, 10))
+                .into_styled(stroke)
+                .draw(t)?;
+            Line::new(gp(12, 12), gp(10, 10))
+                .into_styled(stroke)
+                .draw(t)
+        }
     }
 }
 
@@ -311,7 +330,7 @@ mod tests {
         }
     }
 
-    const ALL: [Glyph; 20] = [
+    const ALL: [Glyph; 21] = [
         Glyph::Usb,
         Glyph::Check,
         Glyph::Backspace,
@@ -332,6 +351,7 @@ mod tests {
         Glyph::Rotate,
         Glyph::Edit,
         Glyph::Eye,
+        Glyph::Lifebuoy,
     ];
 
     #[test]

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["firmware", "rsk-wipe", "crates/rsk-sdk", "crates/rsk-fs", "crates/rsk-usb", "crates/rsk-crypto", "crates/rsk-fido", "crates/rsk-openpgp", "crates/rsk-rsa-asm", "crates/rsk-mgmt", "crates/rsk-oath", "crates/rsk-otp", "crates/rsk-piv", "crates/rsk-rescue", "crates/rsk-led", "crates/rsk-ui"]
+members = ["firmware", "rsk-wipe", "crates/rsk-sdk", "crates/rsk-fs", "crates/rsk-usb", "crates/rsk-crypto", "crates/rsk-fido", "crates/rsk-openpgp", "crates/rsk-rsa-asm", "crates/rsk-mgmt", "crates/rsk-oath", "crates/rsk-otp", "crates/rsk-piv", "crates/rsk-rescue", "crates/rsk-led", "crates/rsk-ui", "crates/rsk-bip39"]
 
 # Embassy crates are versioned together; pin them all to the same git source so
 # they stay mutually compatible. We track `branch = "main"`, not a crates.io
@@ -36,6 +36,8 @@ rsk-piv = { path = "crates/rsk-piv" }
 rsk-rescue = { path = "crates/rsk-rescue" }
 rsk-led = { path = "crates/rsk-led" }
 rsk-ui = { path = "crates/rsk-ui" }
+# On-device BIP-39 encode for the trusted-display recovery-phrase screen (display-gated).
+rsk-bip39 = { path = "crates/rsk-bip39" }
 # Trusted-display driver stack — compiled ONLY into the `display` firmware flavor
 # (and rsk-ui's host tests), never the standard key (all `dep:`-gated). embedded-
 # graphics: no_std 2D text/primitives + the `DrawTarget` trait the renderer is

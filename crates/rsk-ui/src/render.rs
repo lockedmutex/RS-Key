@@ -24,13 +24,14 @@ use embedded_graphics::{
 
 use crate::{
     ADJ_MINUS_RECT, ADJ_PLUS_RECT, ALLOW_RECT, AccountRow, AuditKind, AuditRow, BACK_RECT,
-    BRIGHTNESS_LEVELS, CONTENT_TOP, ConfirmPrompt, DEL_HOLD_RECT, DENY_RECT, Glyph, HomeView,
-    Label, NAV_H, NAV_TABS, NAV_TOP, NavTab, PAGER_NEXT_RECT, PAGER_PREV_RECT, PANEL_H, PANEL_W,
-    PIN_CANCEL_RECT, PIN_COLS, PIN_EYE_RECT, PIN_ROWS, PK_BACK_RECT, PK_LIST_TOP, PinCaption,
-    PinKey, PinPad, Point, RN_BKSP_RECT, RN_DOWN_RECT, RN_FIELD_RECT, RN_INS_RECT, RN_SAVE_RECT,
-    RN_UP_RECT, Rect, RpRow, STATUS_BAR_H, Screen, SettingsPage, SettingsView, StatusKind,
-    SuccessKind, TITLE_BACK_RECT, TITLE_BAR_H, TITLE_EDIT_RECT, font, font::Role, glyph, hex_u16,
-    hex_u64, nav_tab_rect, page_count, pin_grid_key, pin_key_rect, settings_row_rect, theme,
+    BACKUP_REVEAL_RECT, BACKUP_SEAL_RECT, BRIGHTNESS_LEVELS, BackupView, CONTENT_TOP,
+    ConfirmPrompt, DEL_HOLD_RECT, DENY_RECT, Glyph, HomeView, Label, NAV_H, NAV_TABS, NAV_TOP,
+    NavTab, PAGER_NEXT_RECT, PAGER_PREV_RECT, PANEL_H, PANEL_W, PIN_CANCEL_RECT, PIN_COLS,
+    PIN_EYE_RECT, PIN_ROWS, PK_BACK_RECT, PK_LIST_TOP, PinCaption, PinKey, PinPad, Point,
+    RN_BKSP_RECT, RN_DOWN_RECT, RN_FIELD_RECT, RN_INS_RECT, RN_SAVE_RECT, RN_UP_RECT, Rect, RpRow,
+    STATUS_BAR_H, Screen, SettingsPage, SettingsView, StatusKind, SuccessKind, TITLE_BACK_RECT,
+    TITLE_BAR_H, TITLE_EDIT_RECT, font, font::Role, glyph, hex_u16, hex_u64, nav_tab_rect,
+    page_count, pin_grid_key, pin_key_rect, settings_row_rect, theme,
 };
 
 // Local semantic aliases, all sourced from `theme` so the whole renderer speaks one
@@ -404,6 +405,314 @@ where
         list_tail(t, page, total, "event", "events")?;
     }
     Ok(())
+}
+
+/// The read-only **Backup** screen (Settings → Security → Backup). It paints the seed-
+/// backup status the device genuinely tracks — *not* the static mockup's fictional "N of M
+/// recovery shares": backup here is a one-time seed export over the USB host channel, then
+/// sealed. A colour-coded status plate (review needed / backed up / no seed / restore-only)
+/// sits over two fact rows (recovery seed present, export window sealed) and a muted hint
+/// that the host app drives the backup — there is no on-device action. The title-bar back
+/// chevron exits.
+pub fn render_backup<D>(t: &mut D, v: &BackupView) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    t.clear(BG)?;
+    status_bar(t)?;
+    title_bar(t, "Backup", theme::ACCENT, true)?;
+
+    // The status plate + hint. State only what the device actually knows — the export
+    // *window* state — never "a backup exists": the device cannot verify an export ever
+    // happened (`sealed` is set by `BACKUP_FINALIZE`, which merely closes the window), so the
+    // trusted headline must not vouch for a recovery copy it can't see. The fact rows below
+    // restate the same window state.
+    let (icon, l1, l2, fill, border, fg, h1, h2) = if !v.has_seed {
+        (
+            Glyph::Warn,
+            "No recovery seed",
+            "Nothing to back up yet.",
+            theme::DANGER_BG,
+            theme::DANGER_BORDER,
+            theme::DANGER,
+            "Set up the device first.",
+            "",
+        )
+    } else if !v.exportable {
+        (
+            Glyph::Lock,
+            "Restore-only",
+            "Seed export disabled.",
+            theme::TINT_BLUE,
+            theme::BORDER_UPDATE,
+            theme::ACCENT_TEXT,
+            "Recovery is restore-only",
+            "on this device.",
+        )
+    } else if v.sealed {
+        (
+            Glyph::Lock,
+            "Export sealed",
+            "Seed export is closed.",
+            theme::TINT_BLUE,
+            theme::BORDER_UPDATE,
+            theme::ACCENT_TEXT,
+            "Reset the device to",
+            "export again.",
+        )
+    } else {
+        (
+            Glyph::Warn,
+            "Review needed",
+            "Seed export still open.",
+            theme::WARN_BG,
+            theme::WARN_BORDER,
+            theme::WARN,
+            "Back up the seed using",
+            "the RS-Key app over USB.",
+        )
+    };
+    let plate = Rect::new(14, CONTENT_TOP + 8, PANEL_W - 28, 54);
+    RoundedRectangle::with_equal_corners(eg_rect(plate), Size::new(11, 11))
+        .into_styled(PrimitiveStyle::with_fill(fill))
+        .draw(t)?;
+    RoundedRectangle::with_equal_corners(eg_rect(plate), Size::new(11, 11))
+        .into_styled(
+            PrimitiveStyleBuilder::new()
+                .stroke_color(border)
+                .stroke_width(1)
+                .stroke_alignment(StrokeAlignment::Inside)
+                .build(),
+        )
+        .draw(t)?;
+    glyph::draw(t, icon, Point::new(plate.x + 12, plate.y + 18), 18, fg)?;
+    let tx = plate.x as i32 + 42;
+    // Clip the two lines to the plate interior so a wider face never overruns the panel.
+    let clip = Rect::new(
+        tx as u16,
+        plate.y,
+        (plate.x + plate.w).saturating_sub(6 + tx as u16),
+        plate.h,
+    );
+    text_left_clipped(
+        t,
+        l1,
+        EgPoint::new(tx, plate.y as i32 + 20),
+        Role::Strong,
+        fg,
+        clip,
+    )?;
+    text_left_clipped(
+        t,
+        l2,
+        EgPoint::new(tx, plate.y as i32 + 38),
+        Role::Body,
+        MUTED,
+        clip,
+    )?;
+
+    // The honest facts, as a small group below the plate.
+    text_left(
+        t,
+        "RECOVERY",
+        EgPoint::new(14, plate.y as i32 + plate.h as i32 + 14),
+        Role::Mono,
+        theme::CAPTION,
+    )?;
+    let row0 = Rect::new(16, 138, PANEL_W - 32, 34);
+    let row1 = Rect::new(16, 176, PANEL_W - 32, 34);
+    let seed = if v.has_seed {
+        ("Present", theme::OK)
+    } else {
+        ("Missing", theme::DANGER)
+    };
+    render_row(t, row0, Glyph::Lifebuoy, "Recovery seed", Some(seed), false)?;
+    let window = if v.sealed {
+        ("Sealed", theme::OK)
+    } else if v.exportable {
+        ("Open", theme::WARN)
+    } else {
+        ("Disabled", MUTED)
+    };
+    render_row(t, row1, Glyph::Lock, "Backup window", Some(window), false)?;
+
+    if v.can_reveal {
+        // Window open + seed readable: the on-device actions. The phrase is shown ON the
+        // device (it never crosses USB); sealing closes the window when the user is done.
+        button(
+            t,
+            BACKUP_REVEAL_RECT,
+            "Show recovery phrase",
+            theme::ACCENT_FILL,
+        )?;
+        button(t, BACKUP_SEAL_RECT, "Seal backup", theme::KEY_BG)
+    } else {
+        // No on-device action available — a per-state hint points at the next step. A blank
+        // `h2` draws nothing (the `!has_seed` state has a single line).
+        text(t, h1, EgPoint::new(MIDX, 270), Role::Body, MUTED)?;
+        text(t, h2, EgPoint::new(MIDX, 288), Role::Body, MUTED)
+    }
+}
+
+/// The deliberate **reveal gate** before showing the recovery phrase: a warning that the
+/// next screen prints the master secret, over a [hold button](render_hold_button) the
+/// firmware drives with [`crate::DEL_HOLD_RECT`] / [`crate::PK_BACK_RECT`] (cancel). The
+/// device PIN is checked *before* this screen; the hold is the second, deliberate gesture.
+pub fn render_reveal_warning<D>(t: &mut D) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    t.clear(BG)?;
+    back_button(t, PK_BACK_RECT, theme::ACCENT)?;
+    text_left(
+        t,
+        "Reveal phrase",
+        EgPoint::new(PK_BACK_RECT.x as i32 + PK_BACK_RECT.w as i32 + 8, 22),
+        Role::Heading,
+        theme::TEXT,
+    )?;
+    glyph::draw(
+        t,
+        Glyph::Warn,
+        Point::new(PANEL_W / 2 - 16, 56),
+        32,
+        theme::WARN,
+    )?;
+    text_left(
+        t,
+        "Showing 24 secret words",
+        EgPoint::new(16, 118),
+        Role::Body,
+        theme::WARN,
+    )?;
+    text_left(
+        t,
+        "that restore everything.",
+        EgPoint::new(16, 136),
+        Role::Body,
+        theme::WARN,
+    )?;
+    text_left(
+        t,
+        "Make sure no person or",
+        EgPoint::new(16, 160),
+        Role::Body,
+        MUTED,
+    )?;
+    text_left(
+        t,
+        "camera can see the screen.",
+        EgPoint::new(16, 178),
+        Role::Body,
+        MUTED,
+    )?;
+    render_hold_button(t, DEL_HOLD_RECT, "Hold to reveal", theme::DENY)
+}
+
+/// The **seal confirmation**: closing the backup window is one-way (until a factory reset),
+/// so it takes a deliberate hold. Same chrome-less layout / hold mechanics as the reveal
+/// gate; the firmware drives [`crate::DEL_HOLD_RECT`] / [`crate::PK_BACK_RECT`].
+pub fn render_seal_confirm<D>(t: &mut D) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    t.clear(BG)?;
+    back_button(t, PK_BACK_RECT, theme::ACCENT)?;
+    text_left(
+        t,
+        "Seal backup",
+        EgPoint::new(PK_BACK_RECT.x as i32 + PK_BACK_RECT.w as i32 + 8, 22),
+        Role::Heading,
+        theme::TEXT,
+    )?;
+    glyph::draw(
+        t,
+        Glyph::Lock,
+        Point::new(PANEL_W / 2 - 16, 56),
+        32,
+        theme::WARN,
+    )?;
+    text_left(
+        t,
+        "Closes the backup window.",
+        EgPoint::new(16, 118),
+        Role::Body,
+        theme::WARN,
+    )?;
+    text_left(
+        t,
+        "You can't show or export the",
+        EgPoint::new(16, 142),
+        Role::Body,
+        MUTED,
+    )?;
+    text_left(
+        t,
+        "phrase again until a reset.",
+        EgPoint::new(16, 160),
+        Role::Body,
+        MUTED,
+    )?;
+    render_hold_button(t, DEL_HOLD_RECT, "Hold to seal", theme::DENY)
+}
+
+/// The **recovery phrase** itself: the 24 BIP-39 words rendered on the trusted display so
+/// the seed never crosses USB. Twelve words per page in two numbered columns; the
+/// [pager](render_pager) walks the pages, the title-bar back chevron exits. `words` is the
+/// full ordered list (held transiently by the firmware, never stored), `page` the 0-based
+/// page. The words are drawn bright with a dim index so a transcription error is unlikely.
+pub fn render_seed_phrase<D>(
+    t: &mut D,
+    words: &[&str],
+    page: u16,
+    pages: u16,
+) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    t.clear(BG)?;
+    status_bar(t)?;
+    title_bar(t, "Recovery phrase", theme::ACCENT, true)?;
+    let per_page = 12usize;
+    let start = page as usize * per_page;
+    for c in 0..per_page {
+        let gi = start + c;
+        if gi >= words.len() {
+            break;
+        }
+        let col = c / 6;
+        let row = c % 6;
+        let base_x = if col == 0 { 16 } else { 126 };
+        let cy = 76 + row as i32 * 27;
+        // "N." — the 1-based word number, right-aligned just left of the word and dimmed.
+        let n = (gi + 1) as u8;
+        let mut nb = [0u8; 4];
+        let mut k = 0;
+        if n >= 10 {
+            nb[k] = b'0' + n / 10;
+            k += 1;
+        }
+        nb[k] = b'0' + n % 10;
+        k += 1;
+        nb[k] = b'.';
+        k += 1;
+        let ns = core::str::from_utf8(&nb[..k]).unwrap_or(".");
+        text_right(
+            t,
+            ns,
+            EgPoint::new(base_x + 22, cy),
+            Role::Mono,
+            theme::CAPTION,
+        )?;
+        text_left(
+            t,
+            words[gi],
+            EgPoint::new(base_x + 27, cy),
+            Role::BodyStrong,
+            FG,
+        )?;
+    }
+    render_pager(t, page, pages)
 }
 
 /// One audit row: a status dot (its colour the at-a-glance signal), the event label, and
@@ -1808,7 +2117,9 @@ fn settings<D: DrawTarget<Color = Rgb565>>(t: &mut D, v: &SettingsView) -> Resul
         SettingsPage::Timeout => settings_timeout(t, v.timeout_secs),
         SettingsPage::Sleep => settings_sleep(t, v.sleep_secs),
         SettingsPage::Info => settings_info(t, v.version, v.chipid),
-        SettingsPage::Security => settings_security(t, v.device_pin_set, v.fido_pin_set),
+        SettingsPage::Security => {
+            settings_security(t, v.device_pin_set, v.fido_pin_set, v.backup_sealed)
+        }
     }
 }
 
@@ -1880,11 +2191,14 @@ fn settings_security<D: DrawTarget<Color = Rgb565>>(
     t: &mut D,
     device_pin_set: bool,
     fido_pin_set: bool,
+    backup_sealed: bool,
 ) -> Result<(), D::Error> {
     status_bar(t)?;
     title_bar(t, "Security", theme::ACCENT, true)?;
-    // Two independent PINs: the device PIN (lock glyph) gates the on-device UI; the FIDO
-    // clientPIN (key glyph) is WebAuthn's. Each row sets or changes only its own.
+    // Row order here must match [`crate::security_row_entry`] — the paint and the tap-dispatch
+    // share `settings_row_rect(i)` but not a single table, so the danger Factory reset stays
+    // last on both. Two independent PINs: the device PIN (lock glyph) gates the on-device UI;
+    // the FIDO clientPIN (key glyph) is WebAuthn's. Each row sets or changes only its own.
     render_row(
         t,
         settings_row_rect(0),
@@ -1917,7 +2231,22 @@ fn settings_security<D: DrawTarget<Color = Rgb565>>(
         None,
         true,
     )?;
-    danger_row(t, settings_row_rect(3), "Factory reset")
+    // The row shows the cheap export-*window* bit only ("Sealed" / "Review"); the full
+    // 4-way state (no-seed / restore-only / sealed / review) lives on the Backup page, which
+    // also reads `has_seed` + the build profile. The row deliberately skips that extra lookup.
+    render_row(
+        t,
+        settings_row_rect(3),
+        Glyph::Lifebuoy,
+        "Backup",
+        Some(if backup_sealed {
+            ("Sealed", theme::OK)
+        } else {
+            ("Review", theme::WARN)
+        }),
+        true,
+    )?;
+    danger_row(t, settings_row_rect(4), "Factory reset")
 }
 
 /// A destructive option row: the [`render_row`] card, but with a warning glyph,
@@ -2750,6 +3079,7 @@ mod tests {
             chipid: 0x0123_4567_89ab_cdef,
             device_pin_set: true,
             fido_pin_set: true,
+            backup_sealed: true,
         }
     }
 
@@ -2782,8 +3112,8 @@ mod tests {
                 !d.oob,
                 "security (pin_set={pin_set}) drew outside the panel"
             );
-            // Every Security row (Device PIN, FIDO PIN, Audit log, Factory reset) is painted
-            // in the rect `hit_security` maps its tap to.
+            // Every Security row (Device PIN, FIDO PIN, Audit log, Backup, Factory reset) is
+            // painted in the rect `hit_security` maps its tap to.
             for i in 0..crate::SECURITY_ROWS {
                 assert!(
                     d.any_non_bg_in(settings_row_rect(i)),
@@ -2791,6 +3121,77 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn backup_screen_paints_every_state_inside_the_panel() {
+        // (sealed, has_seed, exportable, can_reveal): the status states plus the
+        // window-open state that shows the on-device action buttons.
+        let states = [
+            BackupView {
+                sealed: false,
+                has_seed: true,
+                exportable: true,
+                can_reveal: true,
+            },
+            BackupView {
+                sealed: true,
+                has_seed: true,
+                exportable: true,
+                can_reveal: false,
+            },
+            BackupView {
+                sealed: false,
+                has_seed: false,
+                exportable: true,
+                can_reveal: false,
+            },
+            BackupView {
+                sealed: true,
+                has_seed: true,
+                exportable: false,
+                can_reveal: false,
+            },
+        ];
+        for v in states {
+            let mut d = Rec::new();
+            render_backup(&mut d, &v).unwrap();
+            assert!(!d.oob, "backup {v:?} drew outside the panel");
+            assert!(d.drew_anything(), "backup {v:?} painted nothing");
+            // When the actions are offered, both buttons are painted in their hit rects.
+            if v.can_reveal {
+                assert!(
+                    d.any_non_bg_in(crate::BACKUP_REVEAL_RECT),
+                    "reveal button unpainted"
+                );
+                assert!(
+                    d.any_non_bg_in(crate::BACKUP_SEAL_RECT),
+                    "seal button unpainted"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn seed_phrase_and_gates_paint_inside_the_panel() {
+        // A full 24-word phrase, both pages, plus the reveal/seal gate screens.
+        let words: [&str; 24] = [
+            "abandon", "ability", "able", "about", "above", "absent", "absorb", "abstract",
+            "absurd", "abuse", "access", "accident", "zoo", "zone", "zero", "youth", "yellow",
+            "wrist", "write", "wrong", "yard", "year", "wealth", "weapon",
+        ];
+        for page in 0..2u16 {
+            let mut d = Rec::new();
+            render_seed_phrase(&mut d, &words, page, 2).unwrap();
+            assert!(!d.oob, "seed phrase page {page} drew outside the panel");
+            assert!(d.drew_anything(), "seed phrase page {page} painted nothing");
+        }
+        let mut d = Rec::new();
+        render_reveal_warning(&mut d).unwrap();
+        assert!(!d.oob && d.drew_anything());
+        let mut d = Rec::new();
+        render_seal_confirm(&mut d).unwrap();
+        assert!(!d.oob && d.drew_anything());
     }
 
     #[test]
