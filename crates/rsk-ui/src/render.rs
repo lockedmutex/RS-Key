@@ -2328,11 +2328,10 @@ pub fn render_hold_fill<D: DrawTarget<Color = Rgb565>>(
 /// extended to the menu).
 fn settings<D: DrawTarget<Color = Rgb565>>(t: &mut D, v: &SettingsView) -> Result<(), D::Error> {
     match v.page {
-        SettingsPage::Root => settings_root(t),
+        SettingsPage::Root => settings_root(t, v.version),
         SettingsPage::Brightness => settings_brightness(t, v.brightness),
         SettingsPage::Timeout => settings_timeout(t, v.timeout_secs),
         SettingsPage::Sleep => settings_sleep(t, v.sleep_secs),
-        SettingsPage::Info => settings_info(t, v.version, v.chipid),
         SettingsPage::Security => {
             settings_security(t, v.device_pin_set, v.fido_pin_set, v.backup_sealed)
         }
@@ -2341,7 +2340,7 @@ fn settings<D: DrawTarget<Color = Rgb565>>(t: &mut D, v: &SettingsView) -> Resul
 
 /// The Root list: a header and the option rows, each in its `settings_row_rect` —
 /// the new list look, with leading glyphs and a drill-in chevron.
-fn settings_root<D: DrawTarget<Color = Rgb565>>(t: &mut D) -> Result<(), D::Error> {
+fn settings_root<D: DrawTarget<Color = Rgb565>>(t: &mut D, version: u16) -> Result<(), D::Error> {
     status_bar(t)?;
     // Back chevron exits to Home (the design's settings → back flow), so the list needs
     // no "Close" row — freeing a row keeps all six at a touch-comfortable height.
@@ -2370,12 +2369,16 @@ fn settings_root<D: DrawTarget<Color = Rgb565>>(t: &mut D) -> Result<(), D::Erro
         None,
         true,
     )?;
+    // Firmware: the installed build (bcdDevice) inline, drilling into the
+    // reboot-to-update-over-USB screen.
+    let mut vbuf = [b'0', b'x', 0, 0, 0, 0];
+    vbuf[2..].copy_from_slice(&hex_u16(version));
     render_row(
         t,
         settings_row_rect(3),
-        Glyph::Info,
-        "Device info",
-        None,
+        Glyph::Cpu,
+        "Firmware",
+        Some((str8(&vbuf), theme::FAINT)),
         true,
     )?;
     // Lock now: a plain action row (no chevron — it locks immediately rather than
@@ -2550,30 +2553,131 @@ fn settings_sleep<D: DrawTarget<Color = Rgb565>>(t: &mut D, secs: u16) -> Result
     adjust_controls(t)
 }
 
-/// Read-only device info: model, firmware version (bcdDevice) and chip serial, plus
-/// Back. The numbers are hex-formatted with no alloc.
-fn settings_info<D: DrawTarget<Color = Rgb565>>(
+/// The **Firmware** screen (Settings → Firmware): the installed build (bcdDevice) above the
+/// honest update story and the device serial. This authenticator can't discover updates on
+/// its own — the RS-Key host app delivers a signed image over USB, and a deliberate hold
+/// reboots into the BOOTSEL bootloader so the host can flash. `secure_boot` is the device's
+/// *real* OTP fuse state: only when it is set does the RP2350 boot ROM verify the image
+/// signature, so the screen states the verification as fact only then — on an un-fused board
+/// it warns the update is unverified instead (the trusted display must not vouch for a check
+/// the silicon isn't doing, mirroring the honest Backup-status screen). Same chrome-less
+/// layout / hold mechanics as the reveal / seal gates, but the hold is the blue primary
+/// action; the firmware drives [`crate::DEL_HOLD_RECT`] (hold) / [`crate::PK_BACK_RECT`] (cancel).
+pub fn render_firmware<D>(
     t: &mut D,
     version: u16,
     chipid: u64,
-) -> Result<(), D::Error> {
-    status_bar(t)?;
-    title_bar(t, "Device info", theme::ACCENT, false)?;
+    secure_boot: bool,
+) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    t.clear(BG)?;
+    back_button(t, PK_BACK_RECT, theme::ACCENT)?;
+    text_left(
+        t,
+        "Firmware",
+        EgPoint::new(PK_BACK_RECT.x as i32 + PK_BACK_RECT.w as i32 + 8, 22),
+        Role::Heading,
+        theme::TEXT,
+    )?;
+    glyph::draw(
+        t,
+        Glyph::Cpu,
+        Point::new(PANEL_W / 2 - 14, 48),
+        28,
+        theme::ACCENT,
+    )?;
     text(
         t,
-        "RS-Key trusted display",
-        EgPoint::new(MIDX, 72),
+        "INSTALLED",
+        EgPoint::new(MIDX, 96),
+        Role::Mono,
+        theme::CAPTION,
+    )?;
+    let mut vbuf = [b'0', b'x', 0, 0, 0, 0];
+    vbuf[2..].copy_from_slice(&hex_u16(version));
+    text(t, str8(&vbuf), EgPoint::new(MIDX, 118), Role::Heading, FG)?;
+    text(
+        t,
+        "Updates arrive over USB.",
+        EgPoint::new(MIDX, 150),
         Role::Body,
         MUTED,
     )?;
-    text(t, "Version", EgPoint::new(MIDX, 108), Role::Mono, MUTED)?;
-    let mut vbuf = [b'0', b'x', 0, 0, 0, 0];
-    vbuf[2..].copy_from_slice(&hex_u16(version));
-    text(t, str8(&vbuf), EgPoint::new(MIDX, 130), Role::Heading, FG)?;
-    text(t, "Serial", EgPoint::new(MIDX, 170), Role::Mono, MUTED)?;
+    // Only claim a signature check when secure boot is actually fused; otherwise the
+    // bootloader takes any image, so say so rather than vouch for a check that isn't run.
+    if secure_boot {
+        text(
+            t,
+            "Secure boot checks the",
+            EgPoint::new(MIDX, 170),
+            Role::Body,
+            MUTED,
+        )?;
+        text(
+            t,
+            "signature before it runs.",
+            EgPoint::new(MIDX, 188),
+            Role::Body,
+            MUTED,
+        )?;
+    } else {
+        text(
+            t,
+            "Secure boot is off —",
+            EgPoint::new(MIDX, 170),
+            Role::Body,
+            theme::WARN,
+        )?;
+        text(
+            t,
+            "updates are NOT verified.",
+            EgPoint::new(MIDX, 188),
+            Role::Body,
+            theme::WARN,
+        )?;
+    }
     let sh = hex_u64(chipid);
-    text(t, str8(&sh), EgPoint::new(MIDX, 192), Role::Mono, FG)?;
-    button(t, BACK_RECT, "Back", MUTED)
+    text(
+        t,
+        str8(&sh),
+        EgPoint::new(MIDX, 222),
+        Role::Mono,
+        theme::CAPTION,
+    )?;
+    render_hold_button(t, DEL_HOLD_RECT, "Hold to update", theme::ACCENT_FILL)
+}
+
+/// The brief notice painted the instant a [`render_firmware`] hold commits, before the
+/// secure reboot into BOOTSEL drops the panel — it tells the user to finish the flash from
+/// the host. The reboot follows within a worker tick, so this shows only momentarily.
+pub fn render_rebooting<D>(t: &mut D) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    t.clear(BG)?;
+    glyph::draw(
+        t,
+        Glyph::Usb,
+        Point::new(PANEL_W / 2 - 16, 110),
+        32,
+        theme::ACCENT,
+    )?;
+    text(
+        t,
+        "Rebooting to update",
+        EgPoint::new(MIDX, 176),
+        Role::Strong,
+        FG,
+    )?;
+    text(
+        t,
+        "Flash from the RS-Key app.",
+        EgPoint::new(MIDX, 200),
+        Role::Body,
+        MUTED,
+    )
 }
 
 /// The −/+/Back controls shared by both adjust pages, painted in their hit rects.
@@ -3306,7 +3410,6 @@ mod tests {
             SettingsPage::Brightness,
             SettingsPage::Timeout,
             SettingsPage::Sleep,
-            SettingsPage::Info,
             SettingsPage::Security,
         ] {
             let mut d = Rec::new();
@@ -3314,6 +3417,30 @@ mod tests {
             assert!(!d.oob, "settings {page:?} drew outside the panel");
             assert!(d.drew_anything(), "settings {page:?} drew nothing");
         }
+    }
+
+    #[test]
+    fn firmware_screen_fits_and_draws() {
+        // The Firmware screen is a hold sub-flow (rendered directly, not via the settings
+        // dispatch); it must paint its version + serial + hold button inside the panel under
+        // both secure-boot states (the copy branches on the real fuse).
+        for secure_boot in [true, false] {
+            let mut d = Rec::new();
+            render_firmware(&mut d, 0x07B6, 0x8e0f_f6ae_ae0b_c470, secure_boot).unwrap();
+            assert!(
+                !d.oob,
+                "firmware screen (sb={secure_boot}) drew outside the panel"
+            );
+            assert!(
+                d.drew_anything(),
+                "firmware screen (sb={secure_boot}) drew nothing"
+            );
+        }
+        // The notice shown the instant the hold commits must also fit.
+        let mut n = Rec::new();
+        render_rebooting(&mut n).unwrap();
+        assert!(!n.oob, "rebooting notice drew outside the panel");
+        assert!(n.drew_anything(), "rebooting notice drew nothing");
     }
 
     #[test]

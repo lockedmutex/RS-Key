@@ -24,10 +24,11 @@ pub mod touch;
 pub use glyph::Glyph;
 pub use render::{
     render, render_add_passkey, render_audit_log, render_backup, render_backup_format,
-    render_confirm_delete, render_confirm_factory_reset, render_erasing, render_hold_button,
-    render_hold_fill, render_passkeys_list, render_pin_blocked, render_pin_dots, render_rename,
-    render_reveal_warning, render_seal_confirm, render_seed_phrase, render_service,
-    render_share_picker, render_slip39_share, render_success, render_success_circle,
+    render_confirm_delete, render_confirm_factory_reset, render_erasing, render_firmware,
+    render_hold_button, render_hold_fill, render_passkeys_list, render_pin_blocked,
+    render_pin_dots, render_rebooting, render_rename, render_reveal_warning, render_seal_confirm,
+    render_seed_phrase, render_service, render_share_picker, render_slip39_share, render_success,
+    render_success_circle,
 };
 
 /// Panel geometry (Waveshare RP2350-Touch-LCD-2.8, ST7789T3, portrait).
@@ -413,7 +414,7 @@ pub fn hit_pin(p: Point) -> Option<PinKey> {
 /// Which settings page is on screen.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SettingsPage {
-    /// The top-level list: Brightness / Touch timeout / Display sleep / Info / Lock now /
+    /// The top-level list: Brightness / Touch timeout / Display sleep / Firmware / Lock now /
     /// Security (the title-bar back chevron exits — there is no "Close" row).
     Root,
     /// Backlight-level adjust (−/+/Back).
@@ -423,8 +424,6 @@ pub enum SettingsPage {
     /// Display-sleep timeout adjust (−/+/Back) — blanks the panel after inactivity to
     /// stop image retention on the IPS glass.
     Sleep,
-    /// Read-only device info (Back only).
-    Info,
     /// The Security sub-page: device + FIDO PIN, the audit log, the backup status, and the
     /// (danger) Factory reset. Reached from the Root "Security" row; the title-bar back
     /// chevron returns to Root.
@@ -453,9 +452,9 @@ pub struct SettingsView {
     pub timeout_secs: u16,
     /// Current display-sleep timeout, seconds (`0` = Off, never blanks).
     pub sleep_secs: u16,
-    /// bcdDevice firmware build counter, shown in hex on the Info page.
+    /// bcdDevice firmware build counter, shown in hex on the Firmware row + screen.
     pub version: u16,
-    /// RP2350 chip serial, shown in hex on the Info page.
+    /// RP2350 chip serial, shown in hex on the Firmware screen.
     pub chipid: u64,
     /// Whether the device PIN is set — the Security page's Device-PIN row shows "Change
     /// PIN" if so, else "Set PIN". The device PIN gates the on-device UI (lock, delete,
@@ -475,7 +474,9 @@ pub enum RootEntry {
     Timeout,
     /// Display-sleep timeout — blank the panel after inactivity (image-retention guard).
     Sleep,
-    Info,
+    /// The Firmware screen: the installed build version and the (hold-to-confirm)
+    /// reboot-to-update-over-USB action. A drill-in that runs its own hold sub-flow.
+    Firmware,
     /// Lock the on-device UI now — show the [`Screen::Locked`] screen so the passkeys
     /// browser and settings need the device PIN to reopen (no-op if no PIN is set).
     LockNow,
@@ -503,8 +504,7 @@ pub enum SecurityEntry {
     FactoryReset,
 }
 
-/// A control on an adjust page (brightness / timeout). The Info page uses only
-/// [`AdjustKey::Back`].
+/// A control on an adjust page (brightness / timeout / sleep).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AdjustKey {
     Minus,
@@ -536,7 +536,7 @@ pub const fn settings_row_entry(i: u16) -> RootEntry {
         0 => RootEntry::Brightness,
         1 => RootEntry::Timeout,
         2 => RootEntry::Sleep,
-        3 => RootEntry::Info,
+        3 => RootEntry::Firmware,
         4 => RootEntry::LockNow,
         _ => RootEntry::Security,
     }
@@ -613,8 +613,8 @@ pub fn hit_settings_root(p: Point) -> Option<RootEntry> {
     None
 }
 
-/// Which adjust control, if any, a tap at `p` selects (brightness/timeout pages; the
-/// Info page acts only on [`AdjustKey::Back`]). Disjoint by construction.
+/// Which adjust control, if any, a tap at `p` selects on the brightness / timeout / sleep
+/// adjust pages (−/+/Back). Disjoint by construction.
 pub fn hit_adjust(p: Point) -> Option<AdjustKey> {
     if ADJ_MINUS_RECT.contains(p) {
         Some(AdjustKey::Minus)
@@ -1653,7 +1653,7 @@ mod tests {
             RootEntry::Brightness,
             RootEntry::Timeout,
             RootEntry::Sleep,
-            RootEntry::Info,
+            RootEntry::Firmware,
             RootEntry::LockNow,
             RootEntry::Security,
         ];

@@ -111,7 +111,7 @@ fn note_activity() {
     LAST_ACTIVITY_MS.store(Instant::now().as_millis() as u32, Ordering::Relaxed);
 }
 
-/// Device identity shown read-only on the settings Info page.
+/// Device identity shown read-only on the settings Firmware screen + its list row.
 pub struct DeviceInfo {
     /// bcdDevice firmware build counter.
     pub version: u16,
@@ -255,7 +255,7 @@ pub struct Ui {
     tp_rst: Output<'static>,
     /// What is currently on screen, so the status loop only repaints on a change.
     shown: Option<Screen>,
-    /// Read-only identity shown on the settings Info page.
+    /// Read-only identity shown on the settings Firmware screen.
     info: DeviceInfo,
     /// Current backlight level (`1..=BRIGHTNESS_LEVELS`), edited from the menu.
     brightness: u8,
@@ -545,7 +545,17 @@ impl Ui {
                             Some(RootEntry::Brightness) => page = SettingsPage::Brightness,
                             Some(RootEntry::Timeout) => page = SettingsPage::Timeout,
                             Some(RootEntry::Sleep) => page = SettingsPage::Sleep,
-                            Some(RootEntry::Info) => page = SettingsPage::Info,
+                            // Firmware: drill into the installed-version + reboot-to-update
+                            // sub-flow. A completed update hold queues a reboot and returns
+                            // `true` — break out of the menu so the ambient loop can park and
+                            // hand the executor to the worker, which scrubs + resets. A cancel
+                            // falls back to this list.
+                            Some(RootEntry::Firmware) => {
+                                if self.run_firmware() {
+                                    break;
+                                }
+                                last = Instant::now();
+                            }
                             // Lock now: lock the UI (if a PIN is set) and close the menu —
                             // status_task then paints the Locked screen.
                             Some(RootEntry::LockNow) => {
@@ -611,10 +621,6 @@ impl Ui {
                         Some(AdjustKey::Plus) => adjust_sleep(1),
                         Some(AdjustKey::Back) => page = SettingsPage::Root,
                         None => repaint = false,
-                    },
-                    SettingsPage::Info => match rsk_ui::hit_adjust(p) {
-                        Some(AdjustKey::Back) => page = SettingsPage::Root,
-                        _ => repaint = false,
                     },
                 }
                 // A sub-modal (e.g. the audit log) may have slept + locked via the power
@@ -1178,7 +1184,7 @@ impl Ui {
         let _ = rsk_ui::render_reveal_warning(&mut self.panel, rsk_ui::RevealKind::Phrase);
         self.shown = None;
         self.touch.wait_release(Instant::now(), idle_limit);
-        if !self.hold_to_confirm("Hold to reveal") {
+        if !self.hold_to_confirm("Hold to reveal", rsk_ui::theme::DENY) {
             return;
         }
         // Read + derive. The seed lives only long enough to compute the indices, then is wiped.
@@ -1291,7 +1297,7 @@ impl Ui {
         let _ = rsk_ui::render_reveal_warning(&mut self.panel, rsk_ui::RevealKind::Shares);
         self.shown = None;
         self.touch.wait_release(Instant::now(), idle_limit);
-        if !self.hold_to_confirm("Hold to reveal") {
+        if !self.hold_to_confirm("Hold to reveal", rsk_ui::theme::DENY) {
             return;
         }
 
@@ -1393,10 +1399,47 @@ impl Ui {
         let _ = rsk_ui::render_seal_confirm(&mut self.panel);
         self.shown = None;
         self.touch.wait_release(Instant::now(), idle_limit);
-        if self.hold_to_confirm("Hold to seal") {
+        if self.hold_to_confirm("Hold to seal", rsk_ui::theme::DENY) {
             let _ = rsk_fido::passkeys::mark_backup_sealed(&mut self.fs.borrow_mut());
         }
         self.end_modal();
+    }
+
+    /// The on-device Firmware flow (Settings → Firmware): show the installed build and the
+    /// honest update story, then take a deliberate (blue) hold to reboot into the BOOTSEL
+    /// bootloader so the RS-Key host app can flash a new signed image. The signature is only
+    /// verified by the boot ROM when secure boot is fused, so the screen reads the *real* OTP
+    /// state and states the check as fact only then. The back chevron, a slid-off finger, or
+    /// the inactivity timeout abandon it without rebooting. On a completed hold it *queues* a
+    /// secure reboot rather than calling the ROM directly: the worker owns the live RAM
+    /// secrets (FIDO auth state, the DRBG), so only it can scrub them before dropping to
+    /// BOOTSEL. Returns `true` once a reboot is queued so the caller exits the menu — the
+    /// worker shares this thread-mode executor and only runs once this busy-waiting UI yields,
+    /// so the ambient loop must park (on `reboot_pending`) and hand the executor over to it.
+    fn run_firmware(&mut self) -> bool {
+        use rsk_rescue::Platform as _;
+        let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
+        self.touch.wait_release(Instant::now(), idle_limit);
+        // A pure OTP read (no flash / no shared borrow) — true only on a fused, secure-boot
+        // device, where the boot ROM actually verifies the image signature on next boot.
+        let secure_boot = crate::rescue_platform::RescuePlatform
+            .secure_boot_status()
+            .enabled;
+        let _ = rsk_ui::render_firmware(
+            &mut self.panel,
+            self.info.version,
+            self.info.chipid,
+            secure_boot,
+        );
+        self.shown = None;
+        self.touch.wait_release(Instant::now(), idle_limit);
+        if self.hold_to_confirm("Hold to update", rsk_ui::theme::ACCENT_FILL) {
+            let _ = rsk_ui::render_rebooting(&mut self.panel);
+            crate::vendor::request_reboot(true);
+            return true;
+        }
+        self.end_modal();
+        false
     }
 
     /// Enumerate the resident accounts under `hash` into `accts`, recording each one's
@@ -1724,7 +1767,7 @@ impl Ui {
         self.shown = None;
         self.touch.wait_release(Instant::now(), idle_limit);
 
-        if self.hold_to_confirm("Hold to delete") {
+        if self.hold_to_confirm("Hold to delete", rsk_ui::theme::DENY) {
             let removed = rsk_fido::passkeys::delete_cred(&mut self.fs.borrow_mut(), fid);
             if removed {
                 self.show_success(SuccessKind::Deleted, None);
@@ -1738,8 +1781,9 @@ impl Ui {
     /// [`HOLD_MS`] (so a brush can't commit). The header back chevron, a lifted or
     /// slid-off finger then the inactivity timeout, or a queued host command all
     /// return `false`. The caller paints the surrounding screen first; `label` is
-    /// the button caption. Used by both the delete and factory-reset confirms.
-    fn hold_to_confirm(&mut self, label: &str) -> bool {
+    /// the button caption and `fill` its progress colour (red [`rsk_ui::theme::DENY`] for the
+    /// destructive / reveal holds, blue [`rsk_ui::theme::ACCENT_FILL`] for the firmware update).
+    fn hold_to_confirm(&mut self, label: &str, fill: Rgb565) -> bool {
         let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
         let mut hold_start: Option<Instant> = None;
         let mut last_num: u16 = 0;
@@ -1762,7 +1806,7 @@ impl Ui {
                         last_num,
                         num,
                         HOLD_MS as u16,
-                        rsk_ui::theme::DENY,
+                        fill,
                     );
                     last_num = num;
                     if held >= Duration::from_millis(HOLD_MS) {
@@ -1772,12 +1816,8 @@ impl Ui {
             }
             // Finger lifted or slid off the button: reset a building hold.
             if !on_hold && hold_start.take().is_some() {
-                let _ = rsk_ui::render_hold_button(
-                    &mut self.panel,
-                    rsk_ui::DEL_HOLD_RECT,
-                    label,
-                    rsk_ui::theme::DENY,
-                );
+                let _ =
+                    rsk_ui::render_hold_button(&mut self.panel, rsk_ui::DEL_HOLD_RECT, label, fill);
                 last_num = 0;
             }
             // A queued host command aborts the (uncommitted) confirm so the worker can
@@ -1811,7 +1851,7 @@ impl Ui {
         self.shown = None;
         self.touch.wait_release(Instant::now(), idle_limit);
 
-        if self.hold_to_confirm("Hold to reset") {
+        if self.hold_to_confirm("Hold to reset", rsk_ui::theme::DENY) {
             // The scrub blocks the panel for seconds, so paint the notice first, then
             // wipe everything but the attestation and reboot into a fresh device. The
             // reboot clears RAM and re-seeds at boot, so no rng/state is needed here.
@@ -1977,6 +2017,14 @@ pub async fn status_task(ui: &'static RefCell<Ui>) {
     Timer::after_millis(600).await; // let the boot splash linger
     note_activity(); // the fresh boot counts as activity, so the sleep clock starts now
     loop {
+        // A Settings → Firmware update queued a reboot: stop driving the panel and just yield
+        // so the worker (same thread-mode executor) gets scheduled to scrub the live secrets
+        // and reset to BOOTSEL on its next tick. Parking here — before any repaint — keeps the
+        // "Rebooting" notice on screen instead of flashing Home over it.
+        if crate::vendor::reboot_pending() {
+            Timer::after_millis(10).await;
+            continue;
+        }
         // Wrap-safe deadline checks (millis truncated to u32 wrap every ~49 days).
         let now = Instant::now().as_millis() as u32;
         if let Ok(mut u) = ui.try_borrow_mut() {

@@ -15,6 +15,22 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Added
 
+- **On-device Firmware screen with reboot-to-update over USB (experimental).** The trusted
+  display's Settings list now opens a **Firmware** screen (replacing the read-only device-info
+  page): the installed `bcdDevice` build shown inline on the row and as a headline, the chip
+  serial, and an honest update story. This authenticator can't discover firmware updates on its
+  own, so the screen does not fabricate a "newer version available" — it states the real
+  mechanism: the RS-Key host app delivers an image **over USB**, and — **when secure boot is
+  fused** — the RP2350 boot ROM **verifies its signature before it runs**. The screen reads the
+  device's real OTP secure-boot state and only claims that check when it is on, otherwise
+  warning that updates are unverified (the trusted display never vouches for a check the
+  silicon isn't doing). A deliberate (blue) **Hold to update** queues a
+  secure reboot into the BOOTSEL bootloader so the host can flash; the reboot routes through the
+  worker (not a raw ROM call from the display task) so the live RAM secrets — the FIDO auth
+  state and the DRBG — are scrubbed before the device drops to BOOTSEL, and the worker services
+  the request on its idle button-poll tick so it lands without waiting on a host command. New
+  `Glyph::Cpu`, `render_firmware`/`render_rebooting`, and a `run_firmware` hold sub-flow.
+  bcdDevice 0x07B5 → 0x07B6.
 - **On-device SLIP-39 Shamir share display — split the seed on the screen (experimental).**
   The trusted-display recovery reveal now offers a **format chooser**: a single BIP-39 phrase
   (as before), or **`T`-of-`N` SLIP-39 Shamir shares** rendered **on the device** so no share

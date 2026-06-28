@@ -60,8 +60,6 @@ pub enum Glyph {
     Clock,
     /// A crescent moon — the display-sleep setting.
     Moon,
-    /// An "i" in a ring — the device-info setting.
-    Info,
     /// A counter-clockwise refresh ring — the post-factory-reset "erased / restarting"
     /// indicator (the design's grey rotate icon, distinct from the green success check).
     Rotate,
@@ -72,6 +70,9 @@ pub enum Glyph {
     /// A lifebuoy (outer ring + inner hub + four diagonal spokes) — the seed-backup /
     /// recovery marker on the Backup screen.
     Lifebuoy,
+    /// A microchip — a square die with a smaller core and two pins per side. The
+    /// installed-firmware marker on the Firmware screen / its settings row.
+    Cpu,
 }
 
 /// Draw `g` into the square box at `at` (top-left) of side `s` pixels, stroked in
@@ -238,11 +239,6 @@ pub fn draw<D: DrawTarget<Color = Rgb565>>(
             .into_styled(stroke)
             .draw(t)
         }
-        Glyph::Info => {
-            circ(8, 8, 6).into_styled(stroke).draw(t)?;
-            circ(8, 5, 1).into_styled(fill).draw(t)?;
-            Line::new(gp(8, 7), gp(8, 11)).into_styled(stroke).draw(t)
-        }
         Glyph::Rotate => {
             // A near-full ring with a gap at the top, plus an arrowhead at the gap —
             // the universal "reset / restart" mark for the wiped screen.
@@ -286,6 +282,36 @@ pub fn draw<D: DrawTarget<Color = Rgb565>>(
                 .into_styled(stroke)
                 .draw(t)?;
             Line::new(gp(12, 12), gp(10, 10))
+                .into_styled(stroke)
+                .draw(t)
+        }
+        Glyph::Cpu => {
+            // The die (outer square) with a smaller inner core, and two short pins on
+            // each side — a chip die, the installed-firmware marker.
+            Rectangle::new(gp(4, 4), Size::new(glen(8), glen(8)))
+                .into_styled(stroke)
+                .draw(t)?;
+            Rectangle::new(gp(6, 6), Size::new(glen(4), glen(4)))
+                .into_styled(stroke)
+                .draw(t)?;
+            Line::new(gp(6, 2), gp(6, 4)).into_styled(stroke).draw(t)?;
+            Line::new(gp(10, 2), gp(10, 4))
+                .into_styled(stroke)
+                .draw(t)?;
+            Line::new(gp(6, 12), gp(6, 14))
+                .into_styled(stroke)
+                .draw(t)?;
+            Line::new(gp(10, 12), gp(10, 14))
+                .into_styled(stroke)
+                .draw(t)?;
+            Line::new(gp(2, 6), gp(4, 6)).into_styled(stroke).draw(t)?;
+            Line::new(gp(2, 10), gp(4, 10))
+                .into_styled(stroke)
+                .draw(t)?;
+            Line::new(gp(12, 6), gp(14, 6))
+                .into_styled(stroke)
+                .draw(t)?;
+            Line::new(gp(12, 10), gp(14, 10))
                 .into_styled(stroke)
                 .draw(t)
         }
@@ -347,11 +373,11 @@ mod tests {
         Glyph::Sun,
         Glyph::Clock,
         Glyph::Moon,
-        Glyph::Info,
         Glyph::Rotate,
         Glyph::Edit,
         Glyph::Eye,
         Glyph::Lifebuoy,
+        Glyph::Cpu,
     ];
 
     #[test]

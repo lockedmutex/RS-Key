@@ -65,6 +65,16 @@ pub fn request_reboot(bootsel: bool) {
     REBOOT.store(if bootsel { 2 } else { 1 }, Ordering::Relaxed);
 }
 
+/// Whether a reboot is queued but not yet serviced (peek, does not clear). The display's
+/// ambient loop reads this to park itself once a Settings → Firmware update is requested —
+/// it must stop busy-waiting and yield so the worker (same thread-mode executor) gets
+/// scheduled to scrub the live secrets and reset. Display-only: the standard key never
+/// queues a reboot off-transport (the worker services those inline after the SW_OK).
+#[cfg(feature = "display")]
+pub fn reboot_pending() -> bool {
+    REBOOT.load(Ordering::Relaxed) != 0
+}
+
 pub struct VendorApplet;
 
 impl<S: Storage> Applet<Fs<S>> for VendorApplet {
