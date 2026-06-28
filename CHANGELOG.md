@@ -15,6 +15,28 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Added
 
+- **Dedicated device PIN, separate from the FIDO clientPIN (experimental, display flavor).**
+  The trusted display now has its own **device PIN** (`EF_DEVICE_PIN`, device-sealed, its
+  own retry counter) that gates **local control** — unlocking the on-device UI, deleting a
+  passkey on-device, and factory reset — independent of the FIDO clientPIN. Settings →
+  Security now offers **two** set/change flows: **device PIN** and **FIDO PIN** (each
+  verifies its own current PIN first). The built-in-UV WebAuthn pad stays the FIDO clientPIN
+  (CTAP requires it). The device boot-locks when a device PIN is set. A forgotten device PIN
+  is recoverable by a host `authenticatorReset` (touch-only), which now also clears
+  `EF_DEVICE_PIN` — mirroring how the FIDO PIN is recovered, since the lock gates on-device
+  Settings. The FIDO clientPIN storage/verify path is byte-unchanged (the verify/store cores
+  were parameterized by record FID; the standard screenless key is unaffected). bcdDevice
+  0x07B0 → 0x07B2 (0x07B2 fixes a RefCell double-borrow panic when opening the Settings
+  page — the two PIN-set flags are now read under one borrow).
+- **PIN-entry reveal (eye) toggle on the trusted-display pad (experimental).** The
+  on-screen PIN pad now carries an **eye toggle** beside the masked entry: tapping it shows
+  the digits you have typed (and tapping again re-hides them), so you can check the PIN
+  before committing — on **every** PIN screen, since the pad is shared by built-in UV, the
+  unlock / delete / factory-reset gates, and set/change PIN. A revealed PIN **auto re-masks
+  after a short idle** so a device left mid-entry doesn't keep the digits lit, and a PIN
+  longer than the field shows a "+" overflow marker. The digits are only ever held in the
+  firmware's buffer and painted transiently while revealed — never stored in the UI crate,
+  never sent to the host. Display flavor only. bcdDevice 0x07AD → 0x07B0.
 - **Add-passkey registration screen on the trusted display (experimental).** A WebAuthn
   **registration** (`makeCredential`) now shows the design's **"Save new passkey?"** card
   — a placeholder tile, the relying party + account being enrolled, and **Cancel** / **Save**

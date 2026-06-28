@@ -9,8 +9,8 @@ use rsk_fs::Storage;
 
 use crate::consts::{
     EF_ALWAYS_UV, EF_ATT_CHAIN, EF_ATT_KEY, EF_AUTHTOKEN, EF_BACKUP_SEALED, EF_COUNTER, EF_CRED,
-    EF_EA_ENABLED, EF_EE_DEV, EF_KEY_DEV, EF_KEY_DEV_ENC, EF_LARGEBLOB, EF_MINPINLEN,
-    EF_PAUTHTOKEN, EF_PIN, EF_RP, EF_RPNICK, MAX_RESIDENT_CREDENTIALS,
+    EF_DEVICE_PIN, EF_EA_ENABLED, EF_EE_DEV, EF_KEY_DEV, EF_KEY_DEV_ENC, EF_LARGEBLOB,
+    EF_MINPINLEN, EF_PAUTHTOKEN, EF_PIN, EF_RP, EF_RPNICK, MAX_RESIDENT_CREDENTIALS,
 };
 use crate::error::{CtapError, CtapResult};
 use crate::journal;
@@ -56,10 +56,10 @@ pub fn reset<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>) -> CtapResult {
     Ok(0)
 }
 
-/// Whether `fid` is a FIDO-owned flash file. `authenticatorReset` deletes only
-/// these, never the OpenPGP applet's files (0x1081-0x10d6 / 0x00xx / 0x5fxx /
-/// 0x1f2x) or the vendor counter (0xCC01). FIDO and OpenPGP interleave in the
-/// 0x10xx range (FIDO `EF_PIN` 0x1080 vs OpenPGP PW1 0x1081), so this is an
+/// Whether `fid` is cleared by `authenticatorReset` — every FIDO-owned flash file plus
+/// the trusted-display device PIN. Never the OpenPGP applet's files (0x1081-0x10d6 /
+/// 0x00xx / 0x5fxx / 0x1f2x) or the vendor counter (0xCC01). FIDO and OpenPGP interleave
+/// in the 0x10xx range (FIDO `EF_PIN` 0x1080 vs OpenPGP PW1 0x1081), so this is an
 /// explicit set plus the resident-credential ranges, not a range test.
 fn is_fido_fid(fid: u16) -> bool {
     // EF_KEY_DEV / EF_KEY_DEV_ENC are `KeyFid`s (sealed seed slots), so they
@@ -78,6 +78,10 @@ fn is_fido_fid(fid: u16) -> bool {
                 | EF_LARGEBLOB
                 | EF_EA_ENABLED
                 | EF_ALWAYS_UV
+                // The trusted-display device PIN: a host reset clears it too, so a
+                // forgotten device PIN is recoverable (the lock gates on-device Settings,
+                // so on-device factory reset can't be reached when locked).
+                | EF_DEVICE_PIN
         )
         || (EF_CRED..EF_CRED + MAX_RESIDENT_CREDENTIALS).contains(&fid)
         || (EF_RP..EF_RP + MAX_RESIDENT_CREDENTIALS).contains(&fid)
@@ -132,6 +136,8 @@ mod tests {
         fs.put(EF_PIN, &[8, 4, 1, 0, 0]).unwrap();
         fs.put(EF_CRED, &[0u8; 100]).unwrap();
         fs.put(EF_LARGEBLOB, &[0xAB; 50]).unwrap();
+        // The trusted-display device PIN: a host reset must clear it too (recovery path).
+        fs.put(EF_DEVICE_PIN, &[8, 4, 1, 0, 0]).unwrap();
         // An OpenPGP file (EF_PW3 = 0x1083) shares the Fs and must survive a FIDO
         // reset — it sits in the 0x10xx range right next to FIDO's own files.
         fs.put(0x1083, &[0xAB; 34]).unwrap();
@@ -158,6 +164,8 @@ mod tests {
         // Files wiped, counter reset, seed regenerated and PIN-free again.
         assert!(!fs.has_data(EF_PIN));
         assert!(!fs.has_data(EF_CRED));
+        // The device PIN is cleared by the reset (so a forgotten one is recoverable).
+        assert!(!fs.has_data(EF_DEVICE_PIN));
         // The OpenPGP file is untouched by the FIDO reset.
         assert!(
             fs.has_data(0x1083),

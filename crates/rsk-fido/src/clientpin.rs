@@ -21,7 +21,7 @@ use rsk_crypto::{Device, sha256};
 use rsk_fs::{Fs, Storage};
 
 use crate::cbordec::{cbor, def_map};
-use crate::consts::{EF_MINPINLEN, EF_PIN, MAX_PIN_RETRIES, MIN_PIN_LENGTH};
+use crate::consts::{EF_DEVICE_PIN, EF_MINPINLEN, EF_PIN, MAX_PIN_RETRIES, MIN_PIN_LENGTH};
 use crate::cose::cose_key_ecdh;
 use crate::error::{CtapError, CtapResult};
 use crate::journal;
@@ -602,6 +602,7 @@ fn verify_pin_hash<S: Storage, R: Rng>(
 /// policy and touches no CTAP session state; the callers do. The seed is not touched —
 /// it stays kbase-only so UP-only operations keep working.
 fn write_pin_verifier<S: Storage>(
+    fid: u16,
     dev: &Device,
     fs: &mut Fs<S>,
     pin: &[u8],
@@ -613,7 +614,7 @@ fn write_pin_verifier<S: Storage>(
     pin_data[2] = 1; // verifier format 1
     pin_data[3..].copy_from_slice(&dev.pin_derive_verifier(&dhash[..16]));
     dhash.zeroize();
-    fs.put(EF_PIN, &pin_data).map_err(|_| CtapError::Other)
+    fs.put(fid, &pin_data).map_err(|_| CtapError::Other)
 }
 
 /// Validate the padded new PIN and store the EF_PIN verifier (the host setPIN/changePIN
@@ -633,7 +634,7 @@ fn store_new_pin<S: Storage, R: Rng>(
     if (pin_len as u8) < min_pin {
         return Err(CtapError::PinPolicyViolation);
     }
-    write_pin_verifier(&ctx.dev, ctx.fs, &padded[..pin_len])?;
+    write_pin_verifier(EF_PIN, &ctx.dev, ctx.fs, &padded[..pin_len])?;
     ctx.state.needs_power_cycle = false;
     Ok(())
 }
@@ -709,8 +710,24 @@ pub fn pin_is_set<S: Storage>(fs: &mut Fs<S>) -> bool {
 /// display can show "N tries remaining" up front on the unlock pad without spending a
 /// try. It is the same persistent counter the host clientPIN path enforces.
 pub fn pin_retries_left<S: Storage>(fs: &mut Fs<S>) -> Option<u8> {
+    retries_left_at(EF_PIN, fs)
+}
+
+/// Whether the trusted-display **device PIN** ([`EF_DEVICE_PIN`]) is set. The display
+/// boot-locks and gates its destructive on-device actions on this, not the FIDO clientPIN.
+pub fn device_pin_is_set<S: Storage>(fs: &mut Fs<S>) -> bool {
+    fs.has_data(EF_DEVICE_PIN)
+}
+
+/// The device PIN's remaining retry budget (read-only, like [`pin_retries_left`]).
+pub fn device_pin_retries_left<S: Storage>(fs: &mut Fs<S>) -> Option<u8> {
+    retries_left_at(EF_DEVICE_PIN, fs)
+}
+
+/// Read the retry counter from a PIN record (`fid`'s byte 0) without decrementing it.
+fn retries_left_at<S: Storage>(fid: u16, fs: &mut Fs<S>) -> Option<u8> {
     let mut pin_data = [0u8; PIN_FILE_LEN];
-    let out = match fs.read(EF_PIN, &mut pin_data) {
+    let out = match fs.read(fid, &mut pin_data) {
         Some(PIN_FILE_LEN) => Some(pin_data[0]),
         _ => None,
     };
@@ -730,22 +747,45 @@ pub fn pin_retries_left<S: Storage>(fs: &mut Fs<S>) -> Option<u8> {
 /// opens no faster path to grind the PIN than USB already does. The caller
 /// zeroizes `pin`.
 pub fn verify_local_pin<S: Storage>(dev: &Device, fs: &mut Fs<S>, pin: &[u8]) -> LocalPin {
+    verify_pin_at(EF_PIN, dev, fs, pin, true)
+}
+
+/// Verify the trusted-display **device PIN** ([`EF_DEVICE_PIN`]) — the same fail-closed
+/// retry-counter gate as [`verify_local_pin`], but against the device PIN's own record and
+/// **without** the seed migration (the device PIN never wraps the seed; that is the FIDO
+/// clientPIN's job). Used by the display lock / on-device delete / factory-reset gates.
+pub fn verify_device_pin<S: Storage>(dev: &Device, fs: &mut Fs<S>, pin: &[u8]) -> LocalPin {
+    verify_pin_at(EF_DEVICE_PIN, dev, fs, pin, false)
+}
+
+/// Shared core for the device-local PIN verifies. Reads `fid`'s `[retries, len, format,
+/// verifier]` record, decrements the counter **before** the compare and reads it back
+/// fail-closed, resets it on a match, and (only when `migrate_seed`) migrates a legacy
+/// PIN-wrapped seed — the EF_PIN path keeps that; the device PIN does not. The caller
+/// zeroizes `pin`.
+fn verify_pin_at<S: Storage>(
+    fid: u16,
+    dev: &Device,
+    fs: &mut Fs<S>,
+    pin: &[u8],
+    migrate_seed: bool,
+) -> LocalPin {
     let mut pin_data = [0u8; PIN_FILE_LEN];
-    let Some(n) = fs.read(EF_PIN, &mut pin_data) else {
+    let Some(n) = fs.read(fid, &mut pin_data) else {
         return LocalPin::Blocked;
     };
     if n != PIN_FILE_LEN || pin_data[0] == 0 {
         return LocalPin::Blocked;
     }
     pin_data[0] -= 1;
-    if fs.put(EF_PIN, &pin_data).is_err() {
+    if fs.put(fid, &pin_data).is_err() {
         return LocalPin::Blocked;
     }
     // Trust the decremented counter only after reading it back — the same
     // fail-closed anti-glitch gate `verify_pin_hash` applies (a torn program could
     // otherwise persist the old, higher count while RAM marched on).
     let mut readback = [0u8; PIN_FILE_LEN];
-    match fs.read(EF_PIN, &mut readback) {
+    match fs.read(fid, &mut readback) {
         Some(PIN_FILE_LEN) if readback[0] == pin_data[0] => {}
         _ => return LocalPin::Blocked,
     }
@@ -772,15 +812,20 @@ pub fn verify_local_pin<S: Storage>(dev: &Device, fs: &mut Fs<S>, pin: &[u8]) ->
         };
     }
 
-    // Correct PIN: migrate a legacy PIN-wrapped seed (only openable now), then
-    // reset the counter. Fail closed if either flash write fails.
-    let migrated = migrate_keydev_pin(dev, fs, &pin_hash[..16]).is_ok();
-    pin_hash.zeroize();
-    if !migrated {
-        return LocalPin::Blocked;
+    // Correct PIN: for the FIDO clientPIN, migrate a legacy PIN-wrapped seed (only
+    // openable now) before resetting the counter; the device PIN has no seed to migrate.
+    // Fail closed if a required flash write fails.
+    if migrate_seed {
+        let migrated = migrate_keydev_pin(dev, fs, &pin_hash[..16]).is_ok();
+        pin_hash.zeroize();
+        if !migrated {
+            return LocalPin::Blocked;
+        }
+    } else {
+        pin_hash.zeroize();
     }
     pin_data[0] = MAX_PIN_RETRIES;
-    if fs.put(EF_PIN, &pin_data).is_err() {
+    if fs.put(fid, &pin_data).is_err() {
         return LocalPin::Blocked;
     }
     LocalPin::Ok
@@ -811,12 +856,35 @@ pub fn store_local_pin<S: Storage>(
             max: MAX_PIN_LENGTH as u8,
         });
     }
-    write_pin_verifier(dev, fs, pin).map_err(|_| SetPinError::Storage)?;
+    write_pin_verifier(EF_PIN, dev, fs, pin).map_err(|_| SetPinError::Storage)?;
     // The new PIN meets the policy, so drop any pending forced-change marker. The PIN is
     // already stored, so a flash hiccup here is benign (a stale flag only re-prompts a
     // change on the host) — don't fail the set over it.
     let _ = clear_force_change(fs);
     Ok(())
+}
+
+/// Set or replace the trusted-display **device PIN** ([`EF_DEVICE_PIN`]) — the same
+/// device-sealed, format-1 verifier with a fresh retry budget as the FIDO clientPIN, but
+/// in its own record and **independent** of it (no `minPINLength` policy, no forced-change
+/// flag — those are FIDO-side; the device PIN's floor is the fixed [`MIN_PIN_LENGTH`]).
+/// The caller verifies the *current* device PIN first when one is set, and zeroizes `pin`.
+pub fn store_device_pin<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    pin: &[u8],
+) -> Result<(), SetPinError> {
+    if (pin.len() as u8) < MIN_PIN_LENGTH {
+        return Err(SetPinError::TooShort {
+            min: MIN_PIN_LENGTH,
+        });
+    }
+    if pin.len() > MAX_PIN_LENGTH {
+        return Err(SetPinError::TooLong {
+            max: MAX_PIN_LENGTH as u8,
+        });
+    }
+    write_pin_verifier(EF_DEVICE_PIN, dev, fs, pin).map_err(|_| SetPinError::Storage)
 }
 
 fn encode<F>(out: &mut [u8], f: F) -> Result<usize, CtapError>
@@ -1322,6 +1390,57 @@ mod tests {
             verify_local_pin(&dev(), &mut fs, b"246810"),
             LocalPin::Ok
         ));
+    }
+
+    /// The trusted-display **device PIN** is fully independent of the FIDO clientPIN: it has
+    /// its own record (`EF_DEVICE_PIN`) and counter, setting one never sets the other, and
+    /// neither PIN's value opens the other.
+    #[test]
+    fn device_pin_is_independent_of_fido_pin() {
+        let (mut fs, _rng) = setup();
+        // No device PIN yet → not set; a verify is Blocked (the caller gates on is_set).
+        assert!(!device_pin_is_set(&mut fs));
+        assert_eq!(device_pin_retries_left(&mut fs), None);
+        assert!(matches!(
+            verify_device_pin(&dev(), &mut fs, b"1234"),
+            LocalPin::Blocked
+        ));
+        // Set the device PIN: it is set, the FIDO clientPIN stays unset.
+        store_device_pin(&dev(), &mut fs, b"4321").unwrap();
+        assert!(device_pin_is_set(&mut fs));
+        assert!(
+            !pin_is_set(&mut fs),
+            "device PIN must not set the FIDO clientPIN"
+        );
+        // Correct device PIN verifies; a wrong one spends only its own counter.
+        assert!(matches!(
+            verify_device_pin(&dev(), &mut fs, b"4321"),
+            LocalPin::Ok
+        ));
+        assert!(matches!(
+            verify_device_pin(&dev(), &mut fs, b"0000"),
+            LocalPin::Wrong { .. }
+        ));
+        assert_eq!(device_pin_retries_left(&mut fs), Some(MAX_PIN_RETRIES - 1));
+        assert_eq!(pin_retries_left(&mut fs), None, "FIDO counter untouched");
+        // Add a different FIDO clientPIN: both coexist, each opened only by its own value.
+        store_local_pin(&dev(), &mut fs, b"246810").unwrap();
+        assert!(pin_is_set(&mut fs) && device_pin_is_set(&mut fs));
+        assert!(matches!(
+            verify_local_pin(&dev(), &mut fs, b"246810"),
+            LocalPin::Ok
+        ));
+        assert!(matches!(
+            verify_device_pin(&dev(), &mut fs, b"4321"),
+            LocalPin::Ok
+        ));
+        assert!(
+            matches!(
+                verify_device_pin(&dev(), &mut fs, b"246810"),
+                LocalPin::Wrong { .. }
+            ),
+            "the FIDO PIN value must not open the device PIN"
+        );
     }
 
     /// The set flow enforces `minPINLength`: the CTAP-default floor of 4, then a stricter

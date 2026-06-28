@@ -232,6 +232,9 @@ pub enum PinKey {
     Ok,
     /// Abandon entry — a deliberate decline.
     Cancel,
+    /// Toggle the entry between masked dots and the typed digits — so the user can check
+    /// what they typed before committing.
+    Reveal,
 }
 
 /// The line shown under the pad: either a danger-coloured rejection (a wrong PIN is not
@@ -335,6 +338,13 @@ const PIN_GAP_Y: u16 = 8;
 /// digit tap can never abandon entry.
 pub const PIN_CANCEL_RECT: Rect = Rect::new(8, 6, 40, 34);
 
+/// The reveal (eye) toggle, at the right of the masked-entry band — between the header
+/// and the grid, so it can never be confused with a digit, Cancel, or OK. Tapping it
+/// flips the entry between dots and the typed digits, on every PIN screen (the entry pad
+/// is shared by built-in UV, the unlock/delete/factory-reset gates, and set/change PIN).
+/// `y` is chosen so the glyph centres on the dot row (centre y 60), not 2px below it.
+pub const PIN_EYE_RECT: Rect = Rect::new(204, 42, 36, 36);
+
 /// The rectangle of the key at grid position `(col, row)` — the single source of
 /// truth shared by the renderer and [`hit_pin`], so paint and hit-test can never
 /// disagree (the Allow/Deny contract, extended to the pad).
@@ -367,6 +377,10 @@ const _: () = {
     assert!(last.x + last.w <= PANEL_W && last.y + last.h <= PANEL_H);
     assert!(PIN_CANCEL_RECT.y + PIN_CANCEL_RECT.h <= PIN_GRID_Y0);
     assert!(PIN_CANCEL_RECT.x + PIN_CANCEL_RECT.w <= PANEL_W);
+    // The eye toggle sits in the band between the header and the grid, inside the panel.
+    assert!(PIN_EYE_RECT.x + PIN_EYE_RECT.w <= PANEL_W);
+    assert!(PIN_EYE_RECT.y >= PIN_CANCEL_RECT.y + PIN_CANCEL_RECT.h);
+    assert!(PIN_EYE_RECT.y + PIN_EYE_RECT.h <= PIN_GRID_Y0);
 };
 
 /// Which PIN-pad key, if any, a tap at `p` selects. Cancel (header) is tested first,
@@ -375,6 +389,9 @@ const _: () = {
 pub fn hit_pin(p: Point) -> Option<PinKey> {
     if PIN_CANCEL_RECT.contains(p) {
         return Some(PinKey::Cancel);
+    }
+    if PIN_EYE_RECT.contains(p) {
+        return Some(PinKey::Reveal);
     }
     let mut row = 0;
     while row < PIN_ROWS {
@@ -438,9 +455,12 @@ pub struct SettingsView {
     pub version: u16,
     /// RP2350 chip serial, shown in hex on the Info page.
     pub chipid: u64,
-    /// Whether a device PIN is set — the Security page shows "Change PIN" if so, else
-    /// "Set PIN".
-    pub pin_set: bool,
+    /// Whether the device PIN is set — the Security page's Device-PIN row shows "Change
+    /// PIN" if so, else "Set PIN". The device PIN gates the on-device UI (lock, delete,
+    /// factory reset), independent of the FIDO clientPIN.
+    pub device_pin_set: bool,
+    /// Whether the FIDO clientPIN is set — the Security page's FIDO-PIN row label.
+    pub fido_pin_set: bool,
 }
 
 /// An entry on the settings Root list.
@@ -462,9 +482,12 @@ pub enum RootEntry {
 /// An entry on the Security sub-page list.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SecurityEntry {
-    /// Set the device PIN (when none is set) or change it (verifying the current PIN
-    /// first) — the on-device create/confirm-PIN flow.
-    ChangePin,
+    /// Set / change the **device PIN** — gates the on-device UI (unlock, delete, factory
+    /// reset). A change verifies the current device PIN first.
+    DevicePin,
+    /// Set / change the **FIDO clientPIN** — the WebAuthn/built-in-UV PIN, independent of
+    /// the device PIN. A change verifies the current FIDO PIN first.
+    FidoPin,
     /// Open the read-only on-device audit log (the recent journal events).
     AuditLog,
     /// Erase every applet's data and return to a fresh device (danger-styled, gated by a
@@ -514,14 +537,15 @@ pub const fn settings_row_entry(i: u16) -> RootEntry {
 /// Number of Security sub-page rows (Change/Set PIN, Audit log, Factory reset). They
 /// reuse the first [`settings_row_rect`] slots, so they inherit the Root list's
 /// proven-disjoint geometry (a const-assert keeps them within the Root row count).
-pub const SECURITY_ROWS: u16 = 3;
+pub const SECURITY_ROWS: u16 = 4;
 const _: () = assert!(SECURITY_ROWS <= SETTINGS_ROWS);
 
 /// The Security entry on row `i`, in list order (the danger Factory reset stays last).
 pub const fn security_row_entry(i: u16) -> SecurityEntry {
     match i {
-        0 => SecurityEntry::ChangePin,
-        1 => SecurityEntry::AuditLog,
+        0 => SecurityEntry::DevicePin,
+        1 => SecurityEntry::FidoPin,
+        2 => SecurityEntry::AuditLog,
         _ => SecurityEntry::FactoryReset,
     }
 }
@@ -1184,6 +1208,12 @@ mod proofs {
         kani::assume(c1 < PIN_COLS && r1 < PIN_ROWS && c2 < PIN_COLS && r2 < PIN_ROWS);
         kani::assume((c1, r1) != (c2, r2));
         assert!(!(pin_key_rect(c1, r1).contains(p) && pin_key_rect(c2, r2).contains(p)));
+        // The reveal (eye) toggle never overlaps Cancel or any grid key, so peeking at the
+        // PIN can't enter a digit, commit, or cancel.
+        assert!(!(PIN_EYE_RECT.contains(p) && PIN_CANCEL_RECT.contains(p)));
+        let (c, r): (u16, u16) = (kani::any(), kani::any());
+        kani::assume(c < PIN_COLS && r < PIN_ROWS);
+        assert!(!(PIN_EYE_RECT.contains(p) && pin_key_rect(c, r).contains(p)));
     }
 
     /// No tap selects two settings controls at once: any two distinct Root rows are
@@ -1397,6 +1427,12 @@ mod tests {
         assert_eq!(hit_pin(Point::new(k.x + PIN_KEY_W + 1, k.y + 2)), None);
         // Below the grid (bottom-left margin) selects nothing.
         assert_eq!(hit_pin(Point::new(0, PANEL_H - 1)), None);
+        // The eye toggle, between the header and the grid, maps to Reveal.
+        let e = PIN_EYE_RECT;
+        assert_eq!(
+            hit_pin(Point::new(e.x + e.w / 2, e.y + e.h / 2)),
+            Some(PinKey::Reveal)
+        );
     }
 
     #[test]
@@ -1428,7 +1464,8 @@ mod tests {
     #[test]
     fn security_rows_map_in_order() {
         let want = [
-            SecurityEntry::ChangePin,
+            SecurityEntry::DevicePin,
+            SecurityEntry::FidoPin,
             SecurityEntry::AuditLog,
             SecurityEntry::FactoryReset,
         ];

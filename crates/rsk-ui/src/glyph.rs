@@ -67,6 +67,8 @@ pub enum Glyph {
     Rotate,
     /// A pencil — the service-detail "rename" affordance (sets a device-local nickname).
     Edit,
+    /// An eye (lens outline + pupil) — the confirm-delete "reveal PIN" toggle.
+    Eye,
 }
 
 /// Draw `g` into the square box at `at` (top-left) of side `s` pixels, stroked in
@@ -261,6 +263,13 @@ pub fn draw<D: DrawTarget<Color = Rgb565>>(
                 .draw(t)?;
             Line::new(gp(6, 11), gp(8, 13)).into_styled(stroke).draw(t)
         }
+        Glyph::Eye => {
+            // A horizontal lens outline with a round pupil — the reveal toggle.
+            Ellipse::new(gp(1, 4), Size::new(glen(14), glen(8)))
+                .into_styled(stroke)
+                .draw(t)?;
+            circ(8, 8, 2).into_styled(fill).draw(t)
+        }
     }
 }
 
@@ -302,7 +311,7 @@ mod tests {
         }
     }
 
-    const ALL: [Glyph; 19] = [
+    const ALL: [Glyph; 20] = [
         Glyph::Usb,
         Glyph::Check,
         Glyph::Backspace,
@@ -322,6 +331,7 @@ mod tests {
         Glyph::Info,
         Glyph::Rotate,
         Glyph::Edit,
+        Glyph::Eye,
     ];
 
     #[test]

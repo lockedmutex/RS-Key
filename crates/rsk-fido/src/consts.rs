@@ -193,6 +193,12 @@ pub const EF_ALWAYS_UV: u16 = 0xCE13;
 /// This marker gates that lap to the first OTP boot and makes it crash-safe
 /// (absent ⇒ re-run; the lap is idempotent). See `boot`/`main` wiring.
 pub const EF_HARDENED: u16 = 0xCE14;
+/// Trusted-display **device PIN** — gates the on-device UI (unlock, delete, factory
+/// reset), independent of the FIDO clientPIN (`EF_PIN`). Same record format
+/// `[retries, len, format, verifier(32)]`, device-sealed. Wiped by `authenticatorReset`
+/// (so a forgotten device PIN is recoverable by a host reset) and by factory reset. NOT
+/// in the OpenPGP 0x10xx range — kept in FIDO's 0xCExx block to avoid an applet clash.
+pub const EF_DEVICE_PIN: u16 = 0xCE20;
 pub const EF_COUNTER: u16 = 0xC000; // global signature counter
 pub const EF_CRED: u16 = 0xCF00; // resident credentials, 0xCF00..0xCFFF
 pub const EF_RP: u16 = 0xD000; // relying-party metadata, 0xD000..0xD0FF

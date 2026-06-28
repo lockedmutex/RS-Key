@@ -26,11 +26,11 @@ use crate::{
     ADJ_MINUS_RECT, ADJ_PLUS_RECT, ALLOW_RECT, AccountRow, AuditKind, AuditRow, BACK_RECT,
     BRIGHTNESS_LEVELS, CONTENT_TOP, ConfirmPrompt, DEL_HOLD_RECT, DENY_RECT, Glyph, HomeView,
     Label, NAV_H, NAV_TABS, NAV_TOP, NavTab, PAGER_NEXT_RECT, PAGER_PREV_RECT, PANEL_H, PANEL_W,
-    PIN_CANCEL_RECT, PIN_COLS, PIN_ROWS, PK_BACK_RECT, PK_LIST_TOP, PinCaption, PinKey, PinPad,
-    Point, RN_BKSP_RECT, RN_DOWN_RECT, RN_FIELD_RECT, RN_INS_RECT, RN_SAVE_RECT, RN_UP_RECT, Rect,
-    RpRow, STATUS_BAR_H, Screen, SettingsPage, SettingsView, StatusKind, SuccessKind,
-    TITLE_BACK_RECT, TITLE_BAR_H, TITLE_EDIT_RECT, font, font::Role, glyph, hex_u16, hex_u64,
-    nav_tab_rect, page_count, pin_grid_key, pin_key_rect, settings_row_rect, theme,
+    PIN_CANCEL_RECT, PIN_COLS, PIN_EYE_RECT, PIN_ROWS, PK_BACK_RECT, PK_LIST_TOP, PinCaption,
+    PinKey, PinPad, Point, RN_BKSP_RECT, RN_DOWN_RECT, RN_FIELD_RECT, RN_INS_RECT, RN_SAVE_RECT,
+    RN_UP_RECT, Rect, RpRow, STATUS_BAR_H, Screen, SettingsPage, SettingsView, StatusKind,
+    SuccessKind, TITLE_BACK_RECT, TITLE_BAR_H, TITLE_EDIT_RECT, font, font::Role, glyph, hex_u16,
+    hex_u64, nav_tab_rect, page_count, pin_grid_key, pin_key_rect, settings_row_rect, theme,
 };
 
 // Local semantic aliases, all sourced from `theme` so the whole renderer speaks one
@@ -1273,7 +1273,8 @@ fn pin<D: DrawTarget<Color = Rgb565>>(t: &mut D, pad: &PinPad) -> Result<(), D::
     // Cancel is an outlined back button (not a wide "Cancel" word that would collide
     // with the centred title) in the decline colour, filling its PIN_CANCEL_RECT hit area.
     back_button(t, PIN_CANCEL_RECT, theme::DENY)?;
-    masked_entry(t, pad.entered, pad.expected)?;
+    // Entry starts masked; the reveal eye (drawn by `masked_entry`) toggles it live.
+    masked_entry(t, pad.entered, pad.expected, None)?;
     let mut row = 0;
     while row < PIN_ROWS {
         let mut col = 0;
@@ -1357,44 +1358,97 @@ fn pin_caption_text(c: PinCaption) -> &'static str {
     }
 }
 
-/// The masked entry row: a filled accent dot per entered digit, over `expected` dim
-/// placeholder outlines (the design's fixed indicator) — so an empty pad already shows
-/// how many digits are wanted, and each keystroke fills one. The row sizes to the larger
-/// of the two so a PIN longer than the minimum grows past the outlines. The PIN itself is
-/// never rendered, only its length.
+/// Pixels: the entry row's left margin, dot diameter, dot pitch, and vertical centre. The
+/// row is left-aligned (not centred) so the reveal eye has a fixed home on the right.
+const ENTRY_X0: i32 = 24;
+const ENTRY_DIA: u32 = 12;
+const ENTRY_STEP: i32 = 16;
+const ENTRY_CY: i32 = 60;
+/// The most dots/digits the entry row shows before a "+" overflow marker (it fits left of
+/// the eye); a longer PIN is still entered and verified in full.
+const ENTRY_MAX_SHOWN: usize = 10;
+
+/// The masked entry row plus the reveal (eye) toggle. Masked (`reveal = None`): a filled
+/// accent dot per entered digit over `expected` dim placeholder outlines (the design's
+/// fixed indicator), so an empty pad already shows how many digits are wanted. Revealed
+/// (`reveal = Some(digits)`): the typed digits themselves, so the user can check them
+/// before committing. Either way at most [`ENTRY_MAX_SHOWN`] symbols show, then a "+"; the
+/// eye is always drawn at [`PIN_EYE_RECT`]. The PIN is only painted while revealed, and
+/// only ever lives in the firmware's buffer — `masked_entry` is handed it transiently.
 fn masked_entry<D: DrawTarget<Color = Rgb565>>(
     t: &mut D,
     entered: usize,
     expected: u8,
+    reveal: Option<&[u8]>,
 ) -> Result<(), D::Error> {
-    const MAX_DOTS: usize = 10;
-    const DIA: u32 = 12;
-    const STEP: i32 = 20;
-    let total = (expected as usize).max(entered).min(MAX_DOTS);
-    let start = MIDX - (total as i32 * STEP) / 2 + (STEP - DIA as i32) / 2;
+    // The reveal toggle, always present at the right of the band.
+    glyph_centered(t, Glyph::Eye, PIN_EYE_RECT, 18, theme::FAINT)?;
+    if let Some(digits) = reveal {
+        // Build "<digits>[+]" in a small buffer (ASCII digits, device-internal → trusted).
+        let shown = digits.len().min(ENTRY_MAX_SHOWN);
+        let mut buf = [0u8; ENTRY_MAX_SHOWN + 1];
+        buf[..shown].copy_from_slice(&digits[..shown]);
+        let mut n = shown;
+        if digits.len() > ENTRY_MAX_SHOWN {
+            buf[n] = b'+';
+            n += 1;
+        }
+        let s = core::str::from_utf8(&buf[..n]).unwrap_or("");
+        text_left(
+            t,
+            s,
+            EgPoint::new(ENTRY_X0, ENTRY_CY),
+            Role::Body,
+            theme::TEXT_2,
+        )?;
+        return Ok(());
+    }
+    let total = (expected as usize).max(entered).min(ENTRY_MAX_SHOWN);
     for i in 0..total {
-        let at = EgPoint::new(start + i as i32 * STEP, 54);
+        let at = EgPoint::new(
+            ENTRY_X0 + i as i32 * ENTRY_STEP,
+            ENTRY_CY - ENTRY_DIA as i32 / 2,
+        );
         let style = if i < entered {
             PrimitiveStyle::with_fill(theme::ACCENT)
         } else {
             PrimitiveStyle::with_stroke(theme::CAPTION, 1)
         };
-        Circle::new(at, DIA).into_styled(style).draw(t)?;
+        Circle::new(at, ENTRY_DIA).into_styled(style).draw(t)?;
+    }
+    // A PIN longer than the row marks the extra digits with a "+", so the dot count never
+    // reads as the whole PIN (the full PIN is still entered and verified).
+    if entered > ENTRY_MAX_SHOWN {
+        let mx = ENTRY_X0 + total as i32 * ENTRY_STEP;
+        text_left(
+            t,
+            "+",
+            EgPoint::new(mx, ENTRY_CY),
+            Role::Body,
+            theme::CAPTION,
+        )?;
     }
     Ok(())
 }
 
 /// Top and height of the masked-entry band — the strip [`render_pin_dots`] repaints
-/// on its own. Must cover the dot row `masked_entry` draws (y 54, dia 12).
-const PIN_ENTRY_TOP: i32 = 48;
-const PIN_ENTRY_H: u32 = 24;
+/// on its own. Must cover the dot row (centre y 60, dia 12) and the eye toggle.
+const PIN_ENTRY_TOP: i32 = 44;
+const PIN_ENTRY_H: u32 = 32;
 
-/// Repaint **only** the masked-entry band (clear the strip, redraw the dots),
-/// leaving the static keys untouched. The pad is painted in full once via
-/// `render(&Screen::Pin(..))`; each keystroke then calls this, so adding or removing
-/// a digit is a tiny partial update with no full-screen clear — and thus no flicker,
-/// unlike repainting the whole 240×320 frame per tap.
-pub fn render_pin_dots<D>(target: &mut D, entered: usize, expected: u8) -> Result<(), D::Error>
+/// Repaint **only** the masked-entry band (clear the strip, redraw the dots/digits and the
+/// eye), leaving the static keys untouched. The pad is painted in full once via
+/// `render(&Screen::Pin(..))`; each keystroke — and each reveal toggle — then calls this,
+/// so a change is a tiny partial update with no full-screen clear (no flicker), unlike
+/// repainting the whole 240×320 frame per tap. `reveal` matches [`masked_entry`]: `None`
+/// shows masked dots, `Some(digits)` the typed digits (passed transiently by the firmware
+/// when the user taps the eye — never stored here).
+pub fn render_pin_dots<D>(
+    target: &mut D,
+    entered: usize,
+    expected: u8,
+    reveal: Option<&[u8]>,
+) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb565>,
 {
@@ -1404,7 +1458,7 @@ where
     )
     .into_styled(PrimitiveStyle::with_fill(BG))
     .draw(target)?;
-    masked_entry(target, entered, expected)
+    masked_entry(target, entered, expected, reveal)
 }
 
 /// A static caption for a pad key — no alloc: digits index a fixed table.
@@ -1415,6 +1469,8 @@ fn key_label(k: PinKey) -> &'static str {
         PinKey::Del => "Del",
         PinKey::Ok => "OK",
         PinKey::Cancel => "Cancel",
+        // Not a grid key — the eye toggle is drawn by `masked_entry`, never labelled here.
+        PinKey::Reveal => "",
     }
 }
 
@@ -1752,7 +1808,7 @@ fn settings<D: DrawTarget<Color = Rgb565>>(t: &mut D, v: &SettingsView) -> Resul
         SettingsPage::Timeout => settings_timeout(t, v.timeout_secs),
         SettingsPage::Sleep => settings_sleep(t, v.sleep_secs),
         SettingsPage::Info => settings_info(t, v.version, v.chipid),
-        SettingsPage::Security => settings_security(t, v.pin_set),
+        SettingsPage::Security => settings_security(t, v.device_pin_set, v.fido_pin_set),
     }
 }
 
@@ -1822,27 +1878,46 @@ fn settings_root<D: DrawTarget<Color = Rgb565>>(t: &mut D) -> Result<(), D::Erro
 /// back chevron returns to the Root list.
 fn settings_security<D: DrawTarget<Color = Rgb565>>(
     t: &mut D,
-    pin_set: bool,
+    device_pin_set: bool,
+    fido_pin_set: bool,
 ) -> Result<(), D::Error> {
     status_bar(t)?;
     title_bar(t, "Security", theme::ACCENT, true)?;
+    // Two independent PINs: the device PIN (lock glyph) gates the on-device UI; the FIDO
+    // clientPIN (key glyph) is WebAuthn's. Each row sets or changes only its own.
     render_row(
         t,
         settings_row_rect(0),
         Glyph::Lock,
-        if pin_set { "Change PIN" } else { "Set PIN" },
+        if device_pin_set {
+            "Change device PIN"
+        } else {
+            "Set device PIN"
+        },
         None,
         true,
     )?;
     render_row(
         t,
         settings_row_rect(1),
+        Glyph::Key,
+        if fido_pin_set {
+            "Change FIDO PIN"
+        } else {
+            "Set FIDO PIN"
+        },
+        None,
+        true,
+    )?;
+    render_row(
+        t,
+        settings_row_rect(2),
         Glyph::Clock,
         "Audit log",
         None,
         true,
     )?;
-    danger_row(t, settings_row_rect(2), "Factory reset")
+    danger_row(t, settings_row_rect(3), "Factory reset")
 }
 
 /// A destructive option row: the [`render_row`] card, but with a warning glyph,
@@ -2511,6 +2586,58 @@ mod tests {
         assert!(has_color(&d, PIN_CANCEL_RECT, theme::DENY));
         // Four entered digits paint cyan masked dots in the band above the grid.
         assert!(has_color(&d, Rect::new(0, 48, PANEL_W, 24), theme::ACCENT));
+        // The reveal (eye) toggle is painted in its hit rect.
+        assert!(
+            has_color(&d, crate::PIN_EYE_RECT, theme::FAINT),
+            "reveal eye not drawn on the pad"
+        );
+    }
+
+    #[test]
+    fn pin_reveal_shows_digits_not_dots() {
+        // The full masked-entry band (covers the dot row and the eye).
+        let band = Rect::new(0, 44, PANEL_W, 32);
+        // Masked: accent dots, no revealed digits.
+        let mut masked = Rec::new();
+        render_pin_dots(&mut masked, 4, 0, None).unwrap();
+        assert!(!masked.oob);
+        assert!(
+            has_color(&masked, band, theme::ACCENT),
+            "masked entry must show accent dots"
+        );
+        // Revealed: the typed digits in the secondary text colour, and no accent dots.
+        let mut shown = Rec::new();
+        render_pin_dots(&mut shown, 4, 0, Some(b"1234")).unwrap();
+        assert!(!shown.oob);
+        assert!(
+            has_color(&shown, band, theme::TEXT_2),
+            "revealed entry must show the typed digits"
+        );
+        assert!(
+            !has_color(&shown, band, theme::ACCENT),
+            "revealed entry must not also show masked dots"
+        );
+    }
+
+    #[test]
+    fn pin_long_entry_marks_overflow() {
+        let band = Rect::new(0, 44, PANEL_W, 32);
+        // A PIN within the row draws no overflow marker.
+        let mut short = Rec::new();
+        render_pin_dots(&mut short, 4, 0, None).unwrap();
+        assert!(
+            !has_color(&short, band, theme::CAPTION),
+            "no overflow marker for a short PIN"
+        );
+        // A PIN longer than the row (e.g. the 63-digit CTAP max) caps the dots and marks
+        // the rest with a "+" (caption colour) — and never draws outside the panel.
+        let mut long = Rec::new();
+        render_pin_dots(&mut long, 63, 0, None).unwrap();
+        assert!(!long.oob, "a long PIN must not draw outside the panel");
+        assert!(
+            has_color(&long, band, theme::CAPTION),
+            "overflow marker missing for a long PIN"
+        );
     }
 
     #[test]
@@ -2549,7 +2676,7 @@ mod tests {
         let ok = pin_key_rect(2, 3);
         let key_px = d.at(ok.x + crate::PIN_KEY_W / 2, ok.y + 3);
         // A partial dots update touches only the entry band, never the keys.
-        render_pin_dots(&mut d, 5, 0).unwrap();
+        render_pin_dots(&mut d, 5, 0, None).unwrap();
         assert!(!d.oob);
         assert_eq!(
             d.at(ok.x + crate::PIN_KEY_W / 2, ok.y + 3),
@@ -2621,7 +2748,8 @@ mod tests {
             sleep_secs: 60,
             version: 0x078A,
             chipid: 0x0123_4567_89ab_cdef,
-            pin_set: true,
+            device_pin_set: true,
+            fido_pin_set: true,
         }
     }
 
@@ -2646,15 +2774,16 @@ mod tests {
     fn security_page_paints_every_row_under_either_pin_state() {
         for pin_set in [false, true] {
             let mut v = view(SettingsPage::Security);
-            v.pin_set = pin_set;
+            v.device_pin_set = pin_set;
+            v.fido_pin_set = !pin_set;
             let mut d = Rec::new();
             render(&mut d, &Screen::Settings(v)).unwrap();
             assert!(
                 !d.oob,
                 "security (pin_set={pin_set}) drew outside the panel"
             );
-            // Every Security row (PIN, Audit log, Factory reset) is painted in the rect
-            // `hit_security` maps its tap to.
+            // Every Security row (Device PIN, FIDO PIN, Audit log, Factory reset) is painted
+            // in the rect `hit_security` maps its tap to.
             for i in 0..crate::SECURITY_ROWS {
                 assert!(
                     d.any_non_bg_in(settings_row_rect(i)),
