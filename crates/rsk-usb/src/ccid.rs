@@ -30,6 +30,7 @@ const CCID_SLOT_STATUS: u8 = 0x65;
 const CCID_GET_PARAMS: u8 = 0x6C;
 const CCID_RESET_PARAMS: u8 = 0x6D;
 const CCID_XFR_BLOCK: u8 = 0x6F;
+const CCID_SECURE: u8 = 0x69;
 const CCID_SET_RATE: u8 = 0x73;
 
 // CCID bulk-IN message types (Bulk-IN, reader → PC).
@@ -45,6 +46,17 @@ const STATUS_ACTIVE: u8 = 0;
 /// `bStatus` for a time-extension `RDR_to_PC_DataBlock` (bmCommandStatus = "time
 /// extension requested").
 const STATUS_TIMEEXT: u8 = 0x80;
+/// `bStatus` the secure-PIN path reports when the card actually ran the VERIFY
+/// (even a wrong-PIN status word is a *successful* command — the card answered).
+/// The transport substitutes the live slot status for this value.
+pub const SECURE_STATUS_OK: u8 = STATUS_ACTIVE;
+/// `bStatus` with `bmCommandStatus = failed` (ICC active): the secure-PIN entry
+/// did not produce a card response (the user cancelled or it timed out).
+pub const SECURE_STATUS_FAILED: u8 = 0x40;
+/// CCID `bError`: the user cancelled PIN entry on the pad → `SCARD_W_CANCELLED_BY_USER`.
+pub const SECURE_ERR_CANCELLED: u8 = 0xEF;
+/// CCID `bError`: PIN entry on the pad timed out → `SCARD_E_TIMEOUT`.
+pub const SECURE_ERR_TIMEOUT: u8 = 0xF0;
 /// Time-extension cadence while a long op runs — well under the T=1 block waiting
 /// time, so the host's transaction never times out.
 const WTX_INTERVAL_MS: u64 = 200;
@@ -114,11 +126,45 @@ pub trait ApduHandler {
     /// Process a command APDU, writing the response APDU (body + SW1 SW2) into
     /// `out`; returns its length.
     async fn handle_apdu(&mut self, apdu: &[u8], out: &mut [u8]) -> usize;
+
+    /// Process a `PC_to_RDR_Secure` `abPINDataStructure` (CCID pinpad): the PIN is
+    /// collected on the device's own UI — never present in `data` — the VERIFY runs
+    /// internally, and only the resulting status word is written to `out`. Defaults
+    /// to "unsupported" (no on-device pad), so a standard button build needs no
+    /// implementation; a display build overrides it.
+    async fn handle_secure(&mut self, _data: &[u8], _out: &mut [u8]) -> SecureResult {
+        SecureResult {
+            len: 0,
+            status: SECURE_STATUS_FAILED,
+            error: 0,
+        }
+    }
+}
+
+/// Outcome of [`ApduHandler::handle_secure`]. The transport frames it as an
+/// `RDR_to_PC_DataBlock`: `len` body bytes (the card's VERIFY response — the
+/// status word) with `status`/`error` driving `bStatus`/`bError`, so a pad
+/// cancel/timeout surfaces as the right PC/SC error while a wrong PIN surfaces as
+/// the card's own status word in a *successful* command.
+pub struct SecureResult {
+    pub len: usize,
+    pub status: u8,
+    pub error: u8,
 }
 
 /// If `msg` is an `XfrBlock`, the `(start, end)` byte range of its APDU payload.
 fn xfr_apdu(msg: &[u8]) -> Option<(usize, usize)> {
     if msg.len() < HEADER || msg[0] != CCID_XFR_BLOCK {
+        return None;
+    }
+    let dw = u32::from_le_bytes([msg[1], msg[2], msg[3], msg[4]]) as usize;
+    Some((HEADER, HEADER + dw.min(msg.len() - HEADER)))
+}
+
+/// If `msg` is a `PC_to_RDR_Secure`, the `(start, end)` byte range of its
+/// `abPINDataStructure` payload (the CCID pinpad VERIFY request).
+fn secure_apdu(msg: &[u8]) -> Option<(usize, usize)> {
+    if msg.len() < HEADER || msg[0] != CCID_SECURE {
         return None;
     }
     let dw = u32::from_le_bytes([msg[1], msg[2], msg[3], msg[4]]) as usize;
@@ -196,12 +242,27 @@ pub struct Ccid<'d, D: Driver<'d>, H: ApduHandler> {
 impl<'d, D: Driver<'d>, H: ApduHandler> Ccid<'d, D, H> {
     /// Allocate the CCID interface (class 0x0B, 3 endpoints: bulk OUT, bulk IN,
     /// interrupt IN) on `builder` and build the transport. `atr` is the card's
-    /// answer-to-reset (e.g. [`ATR_FIDO`]).
-    pub fn new(builder: &mut Builder<'d, D>, handler: H, atr: &'static [u8]) -> Self {
+    /// answer-to-reset (e.g. [`ATR_FIDO`]). `pin_support` sets the descriptor's
+    /// `bPINSupport` byte: `0x00` (no pinpad) on a standard build, `0x01` (VERIFY)
+    /// on a display build so a host driver drives on-device PIN entry. Every host
+    /// CCID stack reads this byte straight from the descriptor; it is the single
+    /// switch that lights up secure PIN entry.
+    pub fn new(
+        builder: &mut Builder<'d, D>,
+        handler: H,
+        atr: &'static [u8],
+        pin_support: u8,
+    ) -> Self {
         let mut func = builder.function(USB_CLASS_SMART_CARD, 0, 0);
         let mut iface = func.interface();
         let mut alt = iface.alt_setting(USB_CLASS_SMART_CARD, 0, 0, None);
-        alt.descriptor(CCID_DESC_TYPE, CCID_FUNCTIONAL_DESC);
+        // `bPINSupport` is body byte 50 (full descriptor byte 52, the offset every
+        // host CCID driver reads). Patch a stack copy — embassy copies the bytes
+        // into the config descriptor during this call, so it needn't be `'static`.
+        let mut desc = [0u8; CCID_FUNCTIONAL_DESC.len()];
+        desc.copy_from_slice(CCID_FUNCTIONAL_DESC);
+        desc[50] = pin_support;
+        alt.descriptor(CCID_DESC_TYPE, &desc);
         let read_ep = alt.endpoint_bulk_out(None, 64);
         let write_ep = alt.endpoint_bulk_in(None, 64);
         let int_ep = alt.endpoint_interrupt_in(None, 64, 10);
@@ -239,6 +300,8 @@ impl<'d, D: Driver<'d>, H: ApduHandler> Ccid<'d, D, H> {
                     // are pure and answered inline.
                     if let Some((a, b)) = xfr_apdu(&self.rx[..total]) {
                         self.run_xfr(a, b).await;
+                    } else if let Some((a, b)) = secure_apdu(&self.rx[..total]) {
+                        self.run_secure(a, b).await;
                     } else {
                         let n = process_message(
                             &self.rx[..total],
@@ -318,6 +381,64 @@ impl<'d, D: Driver<'d>, H: ApduHandler> Ccid<'d, D, H> {
         .await;
         // The APDU can carry an imported private key; the response a deciphered
         // session key. Wipe both once the transfer is on the wire.
+        use zeroize::Zeroize;
+        rx[a..b].zeroize();
+        tx[..total].zeroize();
+    }
+
+    /// Run a `PC_to_RDR_Secure` (`self.rx[a..b]` = the `abPINDataStructure`) via the
+    /// handler — which collects the PIN on the device's screen and runs the VERIFY —
+    /// streaming a CCID time-extension every [`WTX_INTERVAL_MS`] while the user
+    /// types (the same keepalive that covers a slow keygen), then frame the reply.
+    /// The handler chooses `bStatus`/`bError`: a card result (`SECURE_STATUS_OK`)
+    /// frames a normal DataBlock with the live slot status; a pad cancel/timeout
+    /// frames a failed DataBlock with the matching `bError`.
+    async fn run_secure(&mut self, a: usize, b: usize) {
+        let Self {
+            handler,
+            write_ep,
+            rx,
+            tx,
+            status,
+            ..
+        } = self;
+        let seq = rx[6];
+        let result = {
+            let mut fut = core::pin::pin!(handler.handle_secure(&rx[a..b], &mut tx[HEADER..]));
+            loop {
+                match select(fut.as_mut(), Timer::after_millis(WTX_INTERVAL_MS)).await {
+                    Either::First(r) => break r,
+                    Either::Second(_) => {
+                        let mut wtx = [0u8; HEADER];
+                        put_header(&mut wtx, CCID_DATA_BLOCK_RET, 0, seq, STATUS_TIMEEXT);
+                        let _ = select(
+                            write_ep.write_transfer(&wtx, false),
+                            Timer::after_millis(TX_TIMEOUT_MS),
+                        )
+                        .await;
+                    }
+                }
+            }
+        };
+        let n = result.len.min(tx.len() - HEADER);
+        // A card result reports SECURE_STATUS_OK → use the live slot status; a pad
+        // cancel/timeout carries its own failed status and bError.
+        let hdr_status = if result.status == SECURE_STATUS_OK {
+            *status
+        } else {
+            result.status
+        };
+        put_header(tx, CCID_DATA_BLOCK_RET, n as u32, seq, hdr_status);
+        tx[8] = result.error; // bError (put_header clears it; set the pad cancel/timeout code)
+        let total = HEADER + n;
+        let zlp = total.is_multiple_of(64);
+        let _ = select(
+            write_ep.write_transfer(&tx[..total], zlp),
+            Timer::after_millis(TX_TIMEOUT_MS),
+        )
+        .await;
+        // The request carries no PIN (collected on-device), but the response holds
+        // the card status; wipe both buffers once the reply is on the wire.
         use zeroize::Zeroize;
         rx[a..b].zeroize();
         tx[..total].zeroize();
@@ -480,5 +601,26 @@ mod tests {
     fn functional_descriptor_is_54_bytes() {
         // 52-byte body + bLength + bDescriptorType = the 54 bytes the host expects.
         assert_eq!(CCID_FUNCTIONAL_DESC.len() + 2, 54);
+    }
+
+    #[test]
+    fn pin_support_offset_is_pinned() {
+        // `bPINSupport` is body byte 50 (full descriptor byte 52, what every host
+        // CCID driver reads); `bMaxCCIDBusySlots` is the last body byte. `Ccid::new`
+        // patches index 50 — pin both so an off-by-one can't silently set the wrong
+        // field (clobbering the slot count instead of advertising the pinpad).
+        assert_eq!(CCID_FUNCTIONAL_DESC[50], 0x00); // bPINSupport, build-patched
+        assert_eq!(CCID_FUNCTIONAL_DESC[51], 0x01); // bMaxCCIDBusySlots
+    }
+
+    #[test]
+    fn secure_message_located() {
+        // PC_to_RDR_Secure (0x69) carrying an abPINDataStructure → its payload range;
+        // a non-secure message yields None.
+        let abdata = [0x00u8, 0x00, 0x82, 0x00, 0x00, 0x00, 0x00, 0x02];
+        let m = msg(CCID_SECURE, 9, &abdata);
+        let (a, b) = secure_apdu(&m).expect("secure range");
+        assert_eq!(&m[a..b], &abdata);
+        assert!(secure_apdu(&msg(CCID_XFR_BLOCK, 9, &abdata)).is_none());
     }
 }

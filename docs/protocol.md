@@ -58,6 +58,56 @@ continuation frames: `CID(4) | SEQ(1) | data[:59]`. `CTAPHID_INIT = 0x86`,
 `CTAPHID_CBOR = 0x90`, `CTAPHID_KEEPALIVE = 0xBB`. A CTAP2 message is
 `command_byte | CBOR_payload`. Reference: `tools/rsk/ctaphid.py`.
 
+### 1.3 CCID secure PIN entry (pinpad) — **display builds only**
+
+A trusted-display build advertises `bPINSupport = 0x01` (VERIFY) in its CCID class
+descriptor (body byte 50 / full descriptor byte 52), so a host driver treats it as
+a **pinpad reader** and sends `PC_to_RDR_Secure` (`0x69`) instead of a plaintext
+VERIFY; the PIN is then typed **on the device's own screen**. A standard (no-screen)
+build leaves `bPINSupport = 0x00` and rejects `0x69`. No control transfer is
+involved — the host CCID driver reads `bPINSupport` straight from the descriptor;
+the device only has to handle `0x69`. The validated trigger is **GnuPG's internal
+CCID** driver (keys solely off `bPINSupport`); PC/SC + libccid and macOS
+CryptoTokenKit also expose pinpad from the descriptor, but their `FEATURE_VERIFY_PIN_DIRECT`
+coverage varies, so treat the GnuPG-internal path as the reliable one.
+
+**Scope (honest):** this keeps the PIN off the wire **only when the host uses
+pinpad mode**. The device still accepts a normal plaintext `XfrBlock` VERIFY
+(`00 20 P1 P2 Lc <PIN>`), so a host that chooses to send one puts the PIN on the
+wire — standard pinpad *enables* on-device entry, it does not *enforce* it (a
+device-enforced mode is a planned opt-in follow-up).
+
+Whatever the host driver, the bytes on the wire follow the **CCID** structure
+below, not the PC/SC v2 Part 10 IOCTL structure (the driver drops that structure's
+`bTimeOut2` and `ulDataLength` when it builds the `0x69`), so the VERIFY template is
+always at abData offset 15. The `0x69` payload is the CCID `abPINDataStructure` for
+VERIFY:
+
+```text
+bPINOperation(1)=0x00 verify | bTimeOut(1) | bmFormatString(1) | bmPINBlockString(1) |
+bmPINLengthFormat(1) | wPINMaxExtraDigit(2 LE) | bEntryValidationCondition(1) |
+bNumberMessage(1) | wLangId(2 LE) | bMsgIndex(1) | bTeoPrologue(3) |
+abPINApdu = CLA INS=0x20 P1 P2 …   (the VERIFY template, at offset 15)
+```
+
+The device reads the template's `P2` (OpenPGP `0x81`/`0x82`/`0x83` = PW1-sign /
+PW1-other / PW3-admin; PIV `0x80` = application PIN), collects the PIN on the pad,
+builds the real VERIFY APDU (`00 20 P1 P2 Lc <ASCII PIN>`; PIV pads with `0xFF` to
+8 bytes), runs it through the selected applet, and replies with a normal
+`RDR_to_PC_DataBlock` (`0x80`) carrying only the status word:
+
+- **success** → `90 00`, `bStatus = 0`, `bError = 0`.
+- **wrong PIN** → the card's real `63 Cx` (tries left) / `69 83` (blocked),
+  `bStatus = 0`, `bError = 0` (the command succeeded; the card said wrong).
+- **user cancel** → `bStatus = 0x40` (failed), `bError = 0xEF` → `SCARD_W_CANCELLED_BY_USER`.
+- **pad timeout** → `bStatus = 0x40`, `bError = 0xF0` → `SCARD_E_TIMEOUT`.
+
+The transport streams T=1 time-extensions for the whole on-screen entry, so the host
+transaction does not time out. The device ignores the host's format/offset bits and
+builds the APDU from its own buffers, so a crafted `0x69` can't index out of bounds.
+Trigger from GnuPG: `gpg-connect-agent "scd checkpin OPENPGP.1" /bye` (internal CCID,
+no host config). PIN parse + APDU assembly: `crates/rsk-usb/src/secure_pin.rs`.
+
 ---
 
 ## 2. Status words & error codes

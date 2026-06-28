@@ -34,7 +34,14 @@ use embassy_rp::peripherals::{I2C1, SPI1};
 use embassy_rp::pwm::{Config as PwmConfig, Pwm};
 use embassy_rp::spi::{Blocking as SpiBlocking, Spi};
 use embassy_time::{Delay, Duration, Instant, Timer, block_for};
-use embedded_graphics::{draw_target::DrawTarget, pixelcolor::Rgb565, prelude::RgbColor};
+use embedded_graphics::{
+    Pixel,
+    draw_target::DrawTarget,
+    geometry::{Dimensions, Point as EgPoint, Size},
+    pixelcolor::Rgb565,
+    prelude::RgbColor,
+    primitives::Rectangle,
+};
 use embedded_hal_bus::spi::ExclusiveDevice;
 use zeroize::Zeroize;
 
@@ -89,6 +96,18 @@ const HOLD_MS: u64 = 800;
 /// re-masks, so a device left mid-entry with the PIN revealed doesn't keep the cleartext
 /// digits lit for the whole presence timeout.
 const REVEAL_MASK_MS: u64 = 4_000;
+
+/// PIN-title marquee: hold the head of an overflowing title visible this long, then scroll
+/// one pixel per [`MARQUEE_MS_PER_PX`] ms (≈45 px/s) so a long title like "OpenPGP Sign
+/// PIN" reads in full without colliding with the back chevron.
+const MARQUEE_PAUSE_MS: u64 = 800;
+const MARQUEE_MS_PER_PX: u64 = 22;
+/// Bytes for the 1-bit off-screen mask the marquee composites into (one bit per band
+/// pixel: set = title glyph, clear = background). The whole band then blits in a single
+/// `fill_contiguous` transaction, so the panel never shows the cleared-then-redrawn flash
+/// that a direct per-frame clear+draw produces (the reported flicker).
+const MARQUEE_MASK_BYTES: usize =
+    (rsk_ui::PIN_TITLE_BAND.w as usize * rsk_ui::PIN_TITLE_BAND.h as usize).div_ceil(8);
 
 /// Backlight PWM `top` (8-bit, like the LED): a brightness level maps to a compare
 /// value `0..=BL_TOP`.
@@ -177,6 +196,64 @@ fn level_duty(level: u8) -> u16 {
 type Panel = Display<SpiInterface<'static, PanelSpi, Output<'static>>, ST7789, Output<'static>>;
 /// The SPI bus + CS presented as one `SpiDevice` for mipidsi.
 type PanelSpi = ExclusiveDevice<Spi<'static, SPI1, SpiBlocking>, Output<'static>, Delay>;
+
+/// A 1-bit off-screen `DrawTarget` over the PIN title band: rsk-ui's `render_pin_title`
+/// composites into it (one bit per band pixel — set = a title glyph, clear = background),
+/// then the firmware blits the whole band in a single `fill_contiguous`. Because our text
+/// is 1-bit (no anti-aliasing) the band is exactly two colours, so a mask captures it
+/// losslessly, and the single-transaction blit removes the per-frame clear→draw flash that
+/// made the marquee flicker. Coordinates are absolute (panel space) so the generic
+/// `render_pin_title` — which draws at the band's real position — lands correctly.
+struct BandMask<'a> {
+    bits: &'a mut [u8],
+    band: Rectangle,
+}
+
+impl<'a> BandMask<'a> {
+    fn new(bits: &'a mut [u8], band: rsk_ui::Rect) -> Self {
+        bits.fill(0);
+        Self {
+            bits,
+            band: Rectangle::new(
+                EgPoint::new(band.x as i32, band.y as i32),
+                Size::new(band.w as u32, band.h as u32),
+            ),
+        }
+    }
+}
+
+impl Dimensions for BandMask<'_> {
+    fn bounding_box(&self) -> Rectangle {
+        self.band
+    }
+}
+
+impl DrawTarget for BandMask<'_> {
+    type Color = Rgb565;
+    type Error = core::convert::Infallible;
+
+    fn draw_iter<I: IntoIterator<Item = Pixel<Rgb565>>>(
+        &mut self,
+        pixels: I,
+    ) -> Result<(), Self::Error> {
+        let w = self.band.size.width as i32;
+        for Pixel(p, c) in pixels {
+            let x = p.x - self.band.top_left.x;
+            let y = p.y - self.band.top_left.y;
+            if x >= 0 && y >= 0 && x < w && (y as u32) < self.band.size.height {
+                let idx = y as usize * w as usize + x as usize;
+                // The only colours drawn are the background fill and the FG glyph; any
+                // non-background pixel is a glyph → set its bit.
+                if c != rsk_ui::theme::PANEL_BG {
+                    self.bits[idx >> 3] |= 1 << (idx & 7);
+                } else {
+                    self.bits[idx >> 3] &= !(1 << (idx & 7));
+                }
+            }
+        }
+        Ok(())
+    }
+}
 
 /// The CST328 touch controller on I2C1. Owns only the bus; the reset pin is pulsed
 /// once during [`Ui::build`].
@@ -267,10 +344,9 @@ pub struct Ui {
     /// wake). Polled while asleep.
     wake_btn: Option<(Input<'static>, bool)>,
     /// Whether the on-device UI is locked (passkeys browser + settings need the device
-    /// PIN to reopen). Set at boot, on a manual "Lock now", or on auto-sleep — all only
-    /// when a PIN is set; cleared by a correct on-screen PIN. Gates only the panel UI —
-    /// host CTAP ceremonies (confirm / built-in-UV) are unaffected and paint their own
-    /// prompts over it.
+    /// PIN to reopen). Set at boot or on auto-sleep — both only when a PIN is set; cleared
+    /// by a correct on-screen PIN. Gates only the panel UI — host CTAP ceremonies (confirm
+    /// / built-in-UV) are unaffected and paint their own prompts over it.
     locked: bool,
     /// The shared flash store — the same `RefCell` the worker uses. The Passkeys tab
     /// borrows it to enumerate resident credentials; safe because the worker is parked
@@ -283,6 +359,8 @@ pub struct Ui {
     /// randomness an on-device SLIP-39 split needs (the share identifier + Shamir random
     /// shares); the worker is parked while this thread-executor task runs, so no race.
     rng: &'static RefCell<FidoRng>,
+    /// 1-bit scratch for the flicker-free PIN-title marquee blit ([`BandMask`]).
+    marquee_mask: [u8; MARQUEE_MASK_BYTES],
 }
 
 impl Ui {
@@ -362,7 +440,38 @@ impl Ui {
             fs,
             keys,
             rng,
+            marquee_mask: [0; MARQUEE_MASK_BYTES],
         }
+    }
+
+    /// Composite one marquee frame of `title` (scrolled by `off` px) into the 1-bit mask,
+    /// then blit the whole title band in a single `fill_contiguous` — no per-frame
+    /// clear→draw flash, so the scroll is flicker-free. Only called for titles that
+    /// overflow the band; a fitting title is drawn once, centred, by `render`.
+    fn render_marquee_frame(&mut self, title: &str, off: u32) {
+        let band = rsk_ui::PIN_TITLE_BAND;
+        let Self {
+            panel,
+            marquee_mask,
+            ..
+        } = self;
+        {
+            let mut mask = BandMask::new(marquee_mask, band);
+            let _ = rsk_ui::render_pin_title(&mut mask, title, off);
+        }
+        let area = Rectangle::new(
+            EgPoint::new(band.x as i32, band.y as i32),
+            Size::new(band.w as u32, band.h as u32),
+        );
+        let n = band.w as usize * band.h as usize;
+        let colors = (0..n).map(|i| {
+            if marquee_mask[i >> 3] & (1 << (i & 7)) != 0 {
+                rsk_ui::theme::TEXT
+            } else {
+                rsk_ui::theme::PANEL_BG
+            }
+        });
+        let _ = panel.fill_contiguous(&area, colors);
     }
 
     /// Apply a brightness level (`1..=BRIGHTNESS_LEVELS`) to the backlight PWM and
@@ -420,15 +529,6 @@ impl Ui {
             self.locked = true;
         }
         self.sleep();
-    }
-
-    /// Lock the on-device UI now (the Settings "Lock now" action): the panel stays awake
-    /// and [`status_task`] paints the Locked screen. A no-op without a device PIN
-    /// (nothing to unlock with).
-    fn lock_now(&mut self) {
-        if rsk_fido::passkeys::device_pin_is_set(&mut self.fs.borrow_mut()) {
-            self.locked = true;
-        }
     }
 
     /// The on-screen unlock flow, reached by a tap on the Locked screen. Reuses the
@@ -555,12 +655,6 @@ impl Ui {
                                     break;
                                 }
                                 last = Instant::now();
-                            }
-                            // Lock now: lock the UI (if a PIN is set) and close the menu —
-                            // status_task then paints the Locked screen.
-                            Some(RootEntry::LockNow) => {
-                                self.lock_now();
-                                break;
                             }
                             // Security drills into the Set/Change PIN + Factory reset
                             // sub-page (the destructive reset now lives one tap deeper).
@@ -1530,7 +1624,21 @@ impl Ui {
             &Screen::Pin(PinPad::with_caption(entered, title, caption).expecting(expected)),
         );
         self.shown = None; // force the status loop to repaint once we release it
+        // A title too wide for the band (e.g. "OpenPGP Sign PIN") scrolls as a marquee so
+        // it can't slide under the back chevron; a short one stays centred and static.
+        let scroll_title = rsk_ui::pin_title_overflows(title);
+        let mut last_off = u32::MAX; // != any real offset, so the first frame always draws
         let outcome = loop {
+            if scroll_title {
+                let ms = start.elapsed().as_millis();
+                let off = (ms.saturating_sub(MARQUEE_PAUSE_MS) / MARQUEE_MS_PER_PX) as u32;
+                // Redraw only when the scroll actually advances a pixel (the loop polls far
+                // faster than the marquee moves), so the blit — and SPI traffic — is minimal.
+                if off != last_off {
+                    self.render_marquee_frame(title, off);
+                    last_off = off;
+                }
+            }
             if let Some(p) = self.touch.read() {
                 last_input = Instant::now();
                 let mut repaint = true;
@@ -2115,8 +2223,9 @@ pub async fn status_task(ui: &'static RefCell<Ui>) {
                                     };
                                 }
                                 note_activity(); // a browse session just ended — restart clock
-                                // "Lock now" inside Settings closes the menu with the lock set;
-                                // repaint the Locked screen at once so the menu doesn't linger.
+                                // If the menu closed with the UI locked (the power button slept
+                                // + locked it from inside Settings), keep Locked as the shown
+                                // state so the menu can't linger.
                                 if u.locked {
                                     let screen = Screen::Locked;
                                     let _ = rsk_ui::render(&mut u.panel, &screen);
@@ -2135,8 +2244,7 @@ pub async fn status_task(ui: &'static RefCell<Ui>) {
                         } else {
                             // Idle this tick (no tap, no button): blank once past the
                             // (runtime) sleep timeout — `0` disables sleep. Auto-lock rides
-                            // on sleep (enter_sleep), so a manually-locked-but-awake device
-                            // still blanks here. Re-read the clock: a tab/menu modal *above*
+                            // on sleep (enter_sleep). Re-read the clock: a tab/menu modal *above*
                             // can run for many seconds, so the top-of-loop `now` would be
                             // stale and underflow against the freshly-bumped activity stamp.
                             let now = Instant::now().as_millis() as u32;
@@ -2331,6 +2439,26 @@ impl TouchPresence {
         self.ui
             .borrow_mut()
             .collect_pin("Enter PIN", None, min_len, expected, out, false)
+    }
+
+    /// Collect a PIN on the on-screen pad for a host CCID secure-PIN-entry request
+    /// (OpenPGP / PIV VERIFY over a pinpad reader). Like [`Self::collect_pin_impl`]
+    /// but with a per-PIN `title` so the trusted screen names which PIN is asked for.
+    /// The host is waiting on this exact PIN (its `PC_to_RDR_Secure` is in flight,
+    /// the CCID transport streaming time-extensions), so it blocks to the presence
+    /// timeout (`yield_to_host = false`), exactly like the FIDO built-in-UV path. The
+    /// worker holds `fs` borrowed across this call, so this — like `collect_pin_impl`
+    /// — must never read `fs` (it touches only the panel's `Ui` RefCell).
+    pub fn collect_pin_titled(
+        &mut self,
+        title: &'static str,
+        min_len: usize,
+        out: &mut [u8],
+    ) -> rsk_fido::PinEntry {
+        let expected = min_len.min(u8::MAX as usize) as u8;
+        self.ui
+            .borrow_mut()
+            .collect_pin(title, None, min_len, expected, out, false)
     }
 }
 

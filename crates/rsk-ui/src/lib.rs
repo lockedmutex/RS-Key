@@ -23,12 +23,12 @@ pub mod theme;
 pub mod touch;
 pub use glyph::Glyph;
 pub use render::{
-    render, render_add_passkey, render_audit_log, render_backup, render_backup_format,
-    render_confirm_delete, render_confirm_factory_reset, render_erasing, render_firmware,
-    render_hold_button, render_hold_fill, render_passkeys_list, render_pin_blocked,
-    render_pin_dots, render_rebooting, render_rename, render_reveal_warning, render_seal_confirm,
-    render_seed_phrase, render_service, render_share_picker, render_slip39_share, render_success,
-    render_success_circle,
+    PIN_TITLE_BAND, pin_title_overflows, render, render_add_passkey, render_audit_log,
+    render_backup, render_backup_format, render_confirm_delete, render_confirm_factory_reset,
+    render_erasing, render_firmware, render_hold_button, render_hold_fill, render_passkeys_list,
+    render_pin_blocked, render_pin_dots, render_pin_title, render_rebooting, render_rename,
+    render_reveal_warning, render_seal_confirm, render_seed_phrase, render_service,
+    render_share_picker, render_slip39_share, render_success, render_success_circle,
 };
 
 /// Panel geometry (Waveshare RP2350-Touch-LCD-2.8, ST7789T3, portrait).
@@ -414,7 +414,7 @@ pub fn hit_pin(p: Point) -> Option<PinKey> {
 /// Which settings page is on screen.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SettingsPage {
-    /// The top-level list: Brightness / Touch timeout / Display sleep / Firmware / Lock now /
+    /// The top-level list: Brightness / Touch timeout / Display sleep / Firmware /
     /// Security (the title-bar back chevron exits — there is no "Close" row).
     Root,
     /// Backlight-level adjust (−/+/Back).
@@ -477,9 +477,6 @@ pub enum RootEntry {
     /// The Firmware screen: the installed build version and the (hold-to-confirm)
     /// reboot-to-update-over-USB action. A drill-in that runs its own hold sub-flow.
     Firmware,
-    /// Lock the on-device UI now — show the [`Screen::Locked`] screen so the passkeys
-    /// browser and settings need the device PIN to reopen (no-op if no PIN is set).
-    LockNow,
     /// Drill into the Security sub-page ([`SettingsPage::Security`]) — device + FIDO PIN,
     /// the audit log, the backup status, and the (danger) Factory reset.
     Security,
@@ -512,17 +509,18 @@ pub enum AdjustKey {
     Back,
 }
 
-/// Root list: six full-width rows (Brightness / Touch timeout / Display sleep / Info /
-/// Lock now / Security) — the title-bar back chevron exits the menu, so there is no
-/// "Close" row. Sized so all six fit below the chrome and above the panel bottom (a
-/// const-assert validates it) at a touch-comfortable row height.
+/// Root list: five full-width rows (Brightness / Touch timeout / Display sleep / Firmware /
+/// Security) — the title-bar back chevron exits the menu, so there is no "Close" row. Sized
+/// so all five fit below the chrome and above the panel bottom (a const-assert validates it)
+/// at a touch-comfortable row height, with a clear gap below the title-bar back chevron so a
+/// stray reach for it can't land on the first row.
 const ROW_X: u16 = 16;
 const ROW_W: u16 = PANEL_W - 2 * ROW_X;
 const ROW_H: u16 = 38;
 const ROW_GAP: u16 = 6;
-const ROW_Y0: u16 = CONTENT_TOP + 2;
+const ROW_Y0: u16 = CONTENT_TOP + 14;
 /// Number of Root list rows.
-pub const SETTINGS_ROWS: u16 = 6;
+pub const SETTINGS_ROWS: u16 = 5;
 
 /// The rectangle of Root list row `i` — single source of truth for the renderer and
 /// [`hit_settings_root`].
@@ -537,7 +535,6 @@ pub const fn settings_row_entry(i: u16) -> RootEntry {
         1 => RootEntry::Timeout,
         2 => RootEntry::Sleep,
         3 => RootEntry::Firmware,
-        4 => RootEntry::LockNow,
         _ => RootEntry::Security,
     }
 }
@@ -1654,7 +1651,6 @@ mod tests {
             RootEntry::Timeout,
             RootEntry::Sleep,
             RootEntry::Firmware,
-            RootEntry::LockNow,
             RootEntry::Security,
         ];
         for (i, &e) in want.iter().enumerate() {

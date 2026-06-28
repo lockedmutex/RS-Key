@@ -15,6 +15,26 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Added
 
+- **On-device PIN entry for OpenPGP & PIV over CCID (secure pinpad, experimental; display builds).**
+  The trusted-display build now advertises itself as a **CCID pinpad reader** (`bPINSupport` =
+  VERIFY) and handles `PC_to_RDR_Secure` (`0x69`): when the host driver asks for a secure PIN
+  verify, the **PIN is typed on the device's own touchscreen** and the device assembles and runs
+  the VERIFY APDU itself, so the secret is never placed in a USB transfer. Works with **GnuPG**
+  scdaemon (OpenPGP PW1/PW2/PW3) and **OpenSC** (PIV application PIN). The pad shows which PIN it
+  is collecting; a wrong PIN returns the card's real status word (`63 Cx` tries left / `69 83`
+  blocked), and a cancel/timeout on the pad maps to the CCID `bError` the host surfaces as
+  cancelled/timed-out. The CCID transport streams time-extensions for the whole on-screen entry,
+  so the host transaction doesn't time out. Honest scope: this keeps the PIN off the wire **when
+  the host uses pinpad mode** — it does not, on its own, prevent a host that chooses to send a
+  plaintext VERIFY; an opt-in device-enforced mode is a planned follow-up. Host-tested
+  structure-parse + APDU-assembly logic lives in the new `rsk-usb` `secure_pin` module; the
+  firmware is the glue that collects the PIN and dispatches. The PIN pad's title now names
+  which PIN it is collecting ("OpenPGP Sign PIN" / "PIV PIN" …); a title too wide for the
+  header band **scrolls as a marquee** so it never collides with the back chevron (composited
+  into a 1-bit off-screen mask and blitted in one transaction, so the scroll is flicker-free).
+  The Settings list also drops its row below the title-bar back chevron (a clear gap so a reach
+  for back can't hit the first item) and removes the redundant **Lock now** row (the UI
+  auto-locks on sleep). bcdDevice 0x07B6 → 0x07BA.
 - **On-device Firmware screen with reboot-to-update over USB (experimental).** The trusted
   display's Settings list now opens a **Firmware** screen (replacing the read-only device-info
   page): the installed `bcdDevice` build shown inline on the row and as a headline, the chip

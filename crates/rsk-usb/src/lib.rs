@@ -7,3 +7,4 @@
 
 pub mod ccid;
 pub mod ctaphid;
+pub mod secure_pin;

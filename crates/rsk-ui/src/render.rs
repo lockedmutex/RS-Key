@@ -1780,20 +1780,86 @@ fn back_button<D: DrawTarget<Color = Rgb565>>(
 /// neutral key cards — Del a backspace glyph, OK a solid green check. Each key is
 /// painted in the exact [`pin_key_rect`] that [`crate::hit_pin`] maps a tap to, and
 /// only masked dots — never the digits — are shown.
-fn pin<D: DrawTarget<Color = Rgb565>>(t: &mut D, pad: &PinPad) -> Result<(), D::Error> {
-    // Custom header (not `render_header`): the Cancel back button keeps its top-left hit
-    // rect — clear of the digit grid, so a digit tap can never abandon entry. The title
-    // is centred in the gap *between* that button and the Lock (not on the panel midline),
-    // so a wide title like "Confirm PIN" can't slide under either.
-    let lock_x = PANEL_W - 26;
-    let title_cx = (PIN_CANCEL_RECT.x + PIN_CANCEL_RECT.w + lock_x) / 2;
-    text(
-        t,
-        pad.title,
-        EgPoint::new(title_cx as i32, 20),
+/// Vertical centre of the PIN-screen title row (matches the back button + Lock glyph).
+const PIN_TITLE_CY: i32 = 20;
+/// Gap (px) between the two looped copies of a scrolling (marquee) PIN title.
+const PIN_TITLE_GAP: u32 = 28;
+
+/// The PIN-screen title band: the gap between the top-left back button and the top-right
+/// Lock glyph, inset a few px so text never touches either. A title that fits is centred
+/// here; one too wide scrolls within it ([`render_pin_title`]). Public so the firmware can
+/// size + place the off-screen buffer it composites the marquee into for a flicker-free
+/// single-transaction blit.
+pub const PIN_TITLE_BAND: Rect = Rect::new(
+    PIN_CANCEL_RECT.x + PIN_CANCEL_RECT.w + 4,
+    6,
+    (PANEL_W - 26) - 4 - (PIN_CANCEL_RECT.x + PIN_CANCEL_RECT.w + 4),
+    28,
+);
+
+/// Whether `title` is too wide for the PIN title band — i.e. it needs the marquee.
+pub fn pin_title_overflows(title: &str) -> bool {
+    font::width(title, Role::Heading).is_some_and(|w| w > PIN_TITLE_BAND.w as u32)
+}
+
+/// Draw the PIN-screen title into its band (clearing it first). A title that fits is
+/// centred (static); one that overflows scrolls as a **marquee** — two copies a gap
+/// apart, shifted left by `offset` px (mod the loop period) and hard-clipped to the band,
+/// so a long title like "OpenPGP Sign PIN" reads in full without ever painting over the
+/// back chevron or the Lock glyph. The caller advances `offset` over time to animate it;
+/// `offset` is ignored when the title fits. (Same band a static [`pin`] frame uses, so a
+/// non-overflowing title looks identical whether or not the caller animates.)
+pub fn render_pin_title<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    title: &str,
+    offset: u32,
+) -> Result<(), D::Error> {
+    let band = PIN_TITLE_BAND;
+    Rectangle::new(
+        EgPoint::new(band.x as i32, band.y as i32),
+        Size::new(band.w as u32, band.h as u32),
+    )
+    .into_styled(PrimitiveStyle::with_fill(BG))
+    .draw(t)?;
+    let w = font::width(title, Role::Heading).unwrap_or(band.w as u32);
+    if w <= band.w as u32 {
+        return text(
+            t,
+            title,
+            EgPoint::new(band.x as i32 + band.w as i32 / 2, PIN_TITLE_CY),
+            Role::Heading,
+            FG,
+        );
+    }
+    // Two copies a `period` apart, clipped to the band, scrolled left by `offset` — when
+    // the first slides fully out the second has wrapped in, so the loop is seamless.
+    let period = w + PIN_TITLE_GAP;
+    let x0 = band.x as i32 - (offset % period) as i32;
+    let mut clip = t.clipped(&eg_rect(band));
+    font::left(
+        &mut clip,
+        title,
+        EgPoint::new(x0, PIN_TITLE_CY),
         Role::Heading,
         FG,
     )?;
+    font::left(
+        &mut clip,
+        title,
+        EgPoint::new(x0 + period as i32, PIN_TITLE_CY),
+        Role::Heading,
+        FG,
+    )
+}
+
+fn pin<D: DrawTarget<Color = Rgb565>>(t: &mut D, pad: &PinPad) -> Result<(), D::Error> {
+    // Custom header (not `render_header`): the Cancel back button keeps its top-left hit
+    // rect — clear of the digit grid, so a digit tap can never abandon entry. The title is
+    // drawn in the band *between* that button and the Lock — centred if it fits, else a
+    // marquee (here at offset 0 = head-first; `collect_pin` animates it) so a wide title
+    // like "OpenPGP Sign PIN" can't slide under either.
+    let lock_x = PANEL_W - 26;
+    render_pin_title(t, pad.title, 0)?;
     glyph::draw(t, Glyph::Lock, Point::new(lock_x, 6), 18, theme::ACCENT)?;
     // Cancel is an outlined back button (not a wide "Cancel" word that would collide
     // with the centred title) in the decline colour, filling its PIN_CANCEL_RECT hit area.
@@ -2343,7 +2409,8 @@ fn settings<D: DrawTarget<Color = Rgb565>>(t: &mut D, v: &SettingsView) -> Resul
 fn settings_root<D: DrawTarget<Color = Rgb565>>(t: &mut D, version: u16) -> Result<(), D::Error> {
     status_bar(t)?;
     // Back chevron exits to Home (the design's settings → back flow), so the list needs
-    // no "Close" row — freeing a row keeps all six at a touch-comfortable height.
+    // no "Close" row — keeping all five at a touch-comfortable height with a gap below
+    // the chevron.
     title_bar(t, "Settings", theme::ACCENT, true)?;
     render_row(
         t,
@@ -2381,21 +2448,11 @@ fn settings_root<D: DrawTarget<Color = Rgb565>>(t: &mut D, version: u16) -> Resu
         Some((str8(&vbuf), theme::FAINT)),
         true,
     )?;
-    // Lock now: a plain action row (no chevron — it locks immediately rather than
-    // drilling in) with the padlock glyph.
-    render_row(
-        t,
-        settings_row_rect(4),
-        Glyph::Lock,
-        "Lock now",
-        None,
-        false,
-    )?;
     // Security drills into the Set/Change PIN + Factory reset sub-page (the design's
     // settings → security flow), keeping the destructive reset one tap deeper.
     render_row(
         t,
-        settings_row_rect(5),
+        settings_row_rect(4),
         Glyph::Shield,
         "Security",
         None,
@@ -2852,6 +2909,60 @@ mod tests {
         render(&mut d, &Screen::Splash).unwrap();
         assert!(!d.oob, "splash drew outside the panel");
         assert!(d.drew_anything());
+    }
+
+    #[test]
+    fn pin_title_overflow_detection() {
+        // short, design titles fit the band; the long applet PIN titles overflow → marquee
+        assert!(!pin_title_overflows("Enter PIN"));
+        assert!(!pin_title_overflows("Confirm PIN"));
+        assert!(pin_title_overflows("OpenPGP Sign PIN"));
+        assert!(pin_title_overflows("OpenPGP Admin PIN"));
+    }
+
+    #[test]
+    fn pin_marquee_never_touches_chevron_or_lock() {
+        let mut d = Rec::new();
+        render_pin_title(&mut d, "OpenPGP Sign PIN", 0).unwrap();
+        assert!(!d.oob, "marquee drew outside the panel");
+        let band = PIN_TITLE_BAND;
+        assert!(d.any_non_bg_in(band), "marquee drew nothing in the band");
+        // the back-button column (left of the band) must stay clear — the long title can
+        // never slide onto the chevron (the reported bug), at any scroll offset.
+        let back = Rect::new(PIN_CANCEL_RECT.x, 6, PIN_CANCEL_RECT.w, 28);
+        let right = Rect::new(band.x + band.w, 6, PANEL_W - (band.x + band.w), 28);
+        for off in [0u32, 40, 120, 400] {
+            let mut e = Rec::new();
+            render_pin_title(&mut e, "OpenPGP Sign PIN", off).unwrap();
+            assert!(
+                !e.any_non_bg_in(back),
+                "title painted over the back button at off={off}"
+            );
+            assert!(
+                !e.any_non_bg_in(right),
+                "title painted past the band at off={off}"
+            );
+        }
+    }
+
+    #[test]
+    fn pin_marquee_scrolls_long_but_not_short() {
+        let band = PIN_TITLE_BAND;
+        let differs = |s: &str, o1: u32, o2: u32| {
+            let (mut a, mut b) = (Rec::new(), Rec::new());
+            render_pin_title(&mut a, s, o1).unwrap();
+            render_pin_title(&mut b, s, o2).unwrap();
+            (band.y..band.y + band.h)
+                .any(|y| (band.x..band.x + band.w).any(|x| a.at(x, y) != b.at(x, y)))
+        };
+        assert!(
+            differs("OpenPGP Sign PIN", 0, 60),
+            "marquee offset must move a long title"
+        );
+        assert!(
+            !differs("Enter PIN", 0, 500),
+            "a fitting title must stay static (centred)"
+        );
     }
 
     #[test]

@@ -379,7 +379,7 @@ async fn main(spawner: Spawner) {
     config.max_power = 100;
     config.max_packet_size_0 = 64;
     // bcdDevice build counter; also surfaced on the trusted-display Firmware screen.
-    let device_release: u16 = 0x07B6;
+    let device_release: u16 = 0x07BA;
     config.device_release = device_release;
 
     let mut builder = Builder::new(
@@ -406,8 +406,17 @@ async fn main(spawner: Spawner) {
         )
     });
 
+    // Advertise CCID secure PIN entry (bPINSupport = VERIFY) only on the display
+    // build, where the trusted touchscreen can collect the PIN; a button build has
+    // no pad and leaves it off. The byte is the single switch every host CCID stack
+    // reads to drive on-device PIN entry.
+    let ccid_pin_support: u8 = if cfg!(feature = "display") {
+        0x01
+    } else {
+        0x00
+    };
     let ccid = (usb_itf & rsk_rescue::phy::USB_ITF_CCID != 0)
-        .then(|| Ccid::new(&mut builder, ClientCcid, ATR_FIDO));
+        .then(|| Ccid::new(&mut builder, ClientCcid, ATR_FIDO, ccid_pin_support));
 
     let kbd = (usb_itf & rsk_rescue::phy::USB_ITF_KB != 0).then(|| {
         HidWriter::<_, 8>::new(
