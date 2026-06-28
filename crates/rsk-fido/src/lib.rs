@@ -43,7 +43,7 @@ pub use reset::survives_factory_reset;
 
 use rsk_crypto::Device;
 use rsk_fs::{Fs, Storage};
-pub use rsk_sdk::Confirm;
+pub use rsk_sdk::{Confirm, ConfirmKind};
 
 pub use state::FidoState;
 

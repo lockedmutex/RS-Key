@@ -1677,6 +1677,31 @@ enum Outcome {
     Cancelled,
 }
 
+/// Common entry for a touch ceremony: switch the LED to the touch indicator, drop any
+/// stale cancel left from an earlier wait, and arm `UP_PENDING` so the CTAPHID
+/// keepalive reports `UPNEEDED`. Returns the LED status [`ceremony_end`] restores.
+fn ceremony_begin() -> u8 {
+    let saved = led::status();
+    led::set_status(led::STATUS_TOUCH);
+    CANCEL_REQUESTED.store(false, Ordering::Relaxed);
+    UP_PENDING.store(true, Ordering::Relaxed);
+    saved
+}
+
+/// Common exit: clear the presence flags, briefly hold the ambient status screen back
+/// (so a hand-off to a following modal — pad, approve hold — doesn't flash idle), note
+/// activity so a long ceremony doesn't immediately sleep, and restore the LED.
+fn ceremony_end(saved_led: u8) {
+    UP_PENDING.store(false, Ordering::Relaxed);
+    CANCEL_REQUESTED.store(false, Ordering::Relaxed);
+    AMBIENT_QUIET_UNTIL_MS.store(
+        (Instant::now().as_millis() as u32).wrapping_add(AMBIENT_QUIET_MS),
+        Ordering::Relaxed,
+    );
+    note_activity();
+    led::set_status(saved_led);
+}
+
 impl TouchPresence {
     pub fn new(ui: &'static RefCell<Ui>) -> Self {
         Self { ui }
@@ -1694,12 +1719,7 @@ impl TouchPresence {
     /// `CANCEL_REQUESTED` each iteration — the same cross-executor contract the
     /// BOOTSEL wait honours.
     fn confirm_wait(&mut self, confirm: Confirm<'_>) -> Outcome {
-        let saved = led::status();
-        led::set_status(led::STATUS_TOUCH);
-        // Drop any cancel left from an earlier (finished) request so this wait
-        // starts clean.
-        CANCEL_REQUESTED.store(false, Ordering::Relaxed);
-        UP_PENDING.store(true, Ordering::Relaxed);
+        let saved = ceremony_begin();
 
         let prompt = ConfirmPrompt::new(confirm.title, confirm.primary, confirm.secondary);
         let start = Instant::now();
@@ -1764,16 +1784,41 @@ impl TouchPresence {
             }
         };
 
-        UP_PENDING.store(false, Ordering::Relaxed);
-        CANCEL_REQUESTED.store(false, Ordering::Relaxed);
-        // Hold the ambient status screen back briefly so this modal handing off to
-        // another (pad → Approve/Deny) doesn't flash the idle screen between them.
-        AMBIENT_QUIET_UNTIL_MS.store(
-            (Instant::now().as_millis() as u32).wrapping_add(AMBIENT_QUIET_MS),
-            Ordering::Relaxed,
-        );
-        note_activity(); // a long ceremony shouldn't immediately fall asleep on return
-        led::set_status(saved);
+        ceremony_end(saved);
+        outcome
+    }
+
+    /// The WebAuthn registration ceremony: the design's "Save new passkey?" card, with
+    /// Cancel / Save (a tap, not a hold — registration is the lower-stakes action; the
+    /// deliberate hold is reserved for the sign-in approve). Save confirms.
+    fn run_add_passkey(&mut self, confirm: Confirm<'_>) -> Outcome {
+        let rp = Label::clamp(confirm.primary);
+        let account = Label::clamp(confirm.secondary);
+        let saved = ceremony_begin();
+        let start = Instant::now();
+        let timeout = Duration::from_millis(PRESENCE_TIMEOUT_MS.load(Ordering::Relaxed) as u64);
+        let outcome = {
+            let mut u = self.ui.borrow_mut();
+            u.wake();
+            note_activity();
+            let _ = rsk_ui::render_add_passkey(&mut u.panel, &rp, &account);
+            u.shown = None;
+            loop {
+                match u.touch.read().and_then(rsk_ui::hit_confirm) {
+                    Some(Button::Allow) => break Outcome::Confirmed,
+                    Some(Button::Deny) => break Outcome::Declined,
+                    None => {}
+                }
+                if CANCEL_REQUESTED.load(Ordering::Relaxed) {
+                    break Outcome::Cancelled;
+                }
+                if start.elapsed() >= timeout {
+                    break Outcome::Timeout;
+                }
+                block_for(Duration::from_millis(TOUCH_POLL_MS));
+            }
+        };
+        ceremony_end(saved);
         outcome
     }
 
@@ -1796,14 +1841,21 @@ impl TouchPresence {
 
 impl rsk_fido::UserPresence for TouchPresence {
     fn request(&mut self, confirm: rsk_fido::Confirm<'_>) -> rsk_fido::Presence {
-        match self.confirm_wait(confirm) {
+        // The design's incoming ceremony, picked by the request kind:
+        //  - Register (makeCredential) → "Save new passkey?" card (Cancel/Save tap)
+        //  - Generic (sign-in / selection / probe) → the trusted Approve/Hold prompt
+        let outcome = match confirm.kind {
+            rsk_fido::ConfirmKind::Register => self.run_add_passkey(confirm),
+            rsk_fido::ConfirmKind::Generic => self.confirm_wait(confirm),
+        };
+        match outcome {
             Outcome::Confirmed => {
                 // A granted WebAuthn approval gets the design's brief "Approved" pop.
                 // Scoped to the FIDO ceremony path (one request per make/getAssertion),
                 // NOT the shared `confirm_wait`: OpenPGP/PIV touch policies call request()
                 // once per signature, so flashing this — and paying its ~0.4 s — on every
                 // PGP/PIV op would be both wrong-worded and a latency regression. The
-                // `confirm_wait` borrow is already released, so this re-borrow is safe.
+                // ceremony borrow is already released, so this re-borrow is safe.
                 self.ui
                     .borrow_mut()
                     .show_success(SuccessKind::Approved, Some(150));

@@ -15,6 +15,21 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Added
 
+- **Add-passkey registration screen on the trusted display (experimental).** A WebAuthn
+  **registration** (`makeCredential`) now shows the design's **"Save new passkey?"** card
+  — a placeholder tile, the relying party + account being enrolled, and **Cancel** / **Save**
+  (a tap; the deliberate hold stays reserved for sign-in) — instead of a bare Approve/Deny.
+  The untrusted rp / account are clipped to the panel (centred when they fit, else
+  left-clipped) so a long rp id can never overrun the trusted display. The **approve**
+  screen (FIDO sign-in plus the generic OpenPGP/PIV/OATH/OTP touch prompts) is re-skinned to
+  the status/title chrome — shield + operation title + relying-party header + amber caution —
+  and the hold button is widened so "Hold to approve" sits fully inside it. Routed by a typed
+  `ConfirmKind` (`Generic` / `Register`) on the shared `Confirm` context — a screenless key
+  ignores it and is byte-unaffected. The small **back / cancel** affordances (title bar,
+  the chrome-less modals, the PIN pad) are now drawn as **outlined buttons** with a larger
+  chevron, so the tappable bounds are visible rather than a lone glyph (the PIN pad's title
+  is re-centred between that button and the lock so a wide "Confirm PIN" can't slide under
+  either). Display flavor only. bcdDevice 0x07A9 → 0x07AD.
 - **PIN-entry indicator + "tries remaining" on the trusted display (experimental).** The
   on-device PIN pad now matches the design's `enterpin` / `createpin` / `confirmpin`
   screens: the entry row shows a row of **dim placeholder dots for the minimum length**

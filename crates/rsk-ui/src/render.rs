@@ -24,13 +24,13 @@ use embedded_graphics::{
 
 use crate::{
     ADJ_MINUS_RECT, ADJ_PLUS_RECT, ALLOW_RECT, AccountRow, AuditKind, AuditRow, BACK_RECT,
-    BRIGHTNESS_LEVELS, ConfirmPrompt, DEL_HOLD_RECT, DENY_RECT, Glyph, HomeView, Label, NAV_H,
-    NAV_TABS, NAV_TOP, NavTab, PAGER_NEXT_RECT, PAGER_PREV_RECT, PANEL_H, PANEL_W, PIN_CANCEL_RECT,
-    PIN_COLS, PIN_ROWS, PK_LIST_TOP, PinCaption, PinKey, PinPad, Point, RN_BKSP_RECT, RN_DOWN_RECT,
-    RN_FIELD_RECT, RN_INS_RECT, RN_SAVE_RECT, RN_UP_RECT, Rect, RpRow, STATUS_BAR_H, Screen,
-    SettingsPage, SettingsView, StatusKind, SuccessKind, TITLE_BACK_RECT, TITLE_BAR_H,
-    TITLE_EDIT_RECT, font, font::Role, glyph, hex_u16, hex_u64, nav_tab_rect, page_count,
-    pin_grid_key, pin_key_rect, settings_row_rect, theme,
+    BRIGHTNESS_LEVELS, CONTENT_TOP, ConfirmPrompt, DEL_HOLD_RECT, DENY_RECT, Glyph, HomeView,
+    Label, NAV_H, NAV_TABS, NAV_TOP, NavTab, PAGER_NEXT_RECT, PAGER_PREV_RECT, PANEL_H, PANEL_W,
+    PIN_CANCEL_RECT, PIN_COLS, PIN_ROWS, PK_BACK_RECT, PK_LIST_TOP, PinCaption, PinKey, PinPad,
+    Point, RN_BKSP_RECT, RN_DOWN_RECT, RN_FIELD_RECT, RN_INS_RECT, RN_SAVE_RECT, RN_UP_RECT, Rect,
+    RpRow, STATUS_BAR_H, Screen, SettingsPage, SettingsView, StatusKind, SuccessKind,
+    TITLE_BACK_RECT, TITLE_BAR_H, TITLE_EDIT_RECT, font, font::Role, glyph, hex_u16, hex_u64,
+    nav_tab_rect, page_count, pin_grid_key, pin_key_rect, settings_row_rect, theme,
 };
 
 // Local semantic aliases, all sourced from `theme` so the whole renderer speaks one
@@ -580,11 +580,11 @@ where
     D: DrawTarget<Color = Rgb565>,
 {
     t.clear(BG)?;
-    glyph::draw(t, Glyph::Back, Point::new(8, 7), 16, theme::DENY)?;
+    back_button(t, PK_BACK_RECT, theme::DENY)?;
     text_left(
         t,
         "Delete passkey",
-        EgPoint::new(44, 15),
+        EgPoint::new(PK_BACK_RECT.x as i32 + PK_BACK_RECT.w as i32 + 8, 22),
         Role::Heading,
         theme::DENY,
     )?;
@@ -650,11 +650,11 @@ where
     D: DrawTarget<Color = Rgb565>,
 {
     t.clear(BG)?;
-    glyph::draw(t, Glyph::Back, Point::new(8, 7), 16, theme::DENY)?;
+    back_button(t, PK_BACK_RECT, theme::DENY)?;
     text_left(
         t,
         "Factory reset",
-        EgPoint::new(44, 15),
+        EgPoint::new(PK_BACK_RECT.x as i32 + PK_BACK_RECT.w as i32 + 8, 22),
         Role::Heading,
         theme::DENY,
     )?;
@@ -880,72 +880,271 @@ where
     )
 }
 
-/// The trusted Approve prompt: header + shield, the operation title, the relying-
-/// party card (generic globe + sanitized rp id / account), a "did you start this?"
-/// caution, and the Deny / Hold-to-approve buttons. The hold button starts empty; the
-/// firmware fills it via [`render_hold_button`] as the user holds.
-fn confirm<D: DrawTarget<Color = Rgb565>>(t: &mut D, p: &ConfirmPrompt) -> Result<(), D::Error> {
-    render_header(t, "RS-Key", false, Some(Glyph::Shield))?;
-    glyph::draw(t, Glyph::Shield, Point::new(20, 42), 22, theme::ACCENT)?;
-    text_left(t, p.title, EgPoint::new(50, 53), Role::Heading, theme::TEXT)?;
-    // Relying-party card, only when the request carries rp text.
-    if !p.primary.is_empty() {
-        let card = Rect::new(14, 80, PANEL_W - 28, 46);
-        RoundedRectangle::with_equal_corners(eg_rect(card), Size::new(8, 8))
-            .into_styled(PrimitiveStyle::with_fill(theme::ROW_BG))
-            .draw(t)?;
-        glyph::draw(
-            t,
-            Glyph::Globe,
-            Point::new(card.x + 10, card.y + 13),
-            20,
-            theme::MUTED,
-        )?;
-        let tx = card.x as i32 + 40;
-        if p.secondary.is_empty() {
-            text_left(
-                t,
-                p.primary.as_str(),
-                EgPoint::new(tx, card.y as i32 + 23),
-                Role::Body,
-                theme::TEXT,
-            )?;
-        } else {
-            text_left(
-                t,
-                p.primary.as_str(),
-                EgPoint::new(tx, card.y as i32 + 16),
-                Role::Body,
-                theme::TEXT,
-            )?;
-            text_left(
-                t,
-                p.secondary.as_str(),
-                EgPoint::new(tx, card.y as i32 + 32),
-                Role::Body,
-                theme::MUTED,
-            )?;
-        }
+// --- Ceremony screens (request / approve / add-passkey) --------------------
+
+/// Left inset of the title-row leading icon (the approve shield).
+const CEREMONY_ICON_X: i32 = 13;
+/// Where the title text starts, after the 18px leading icon.
+const CEREMONY_TITLE_X: i32 = CEREMONY_ICON_X + 18 + 8;
+/// Vertical centre of the title row (matches [`title_bar`]).
+const CEREMONY_TITLE_CY: i32 = STATUS_BAR_H as i32 + TITLE_BAR_H as i32 / 2;
+/// The service header sits just under the chrome; the info / caution plate below it.
+const CEREMONY_HEAD_TOP: i32 = CONTENT_TOP as i32 + 6;
+const CEREMONY_PLATE_TOP: i32 = CONTENT_TOP as i32 + 54;
+const CEREMONY_PLATE_H: u16 = 46;
+
+/// Centred text that, when too wide to fit `clip`, falls back to left-aligned and is
+/// hard-clipped at the boundary. So a short relying party stays nicely centred (the
+/// design), but a long, attacker-influenced rp id can never overrun the panel and is
+/// cut from one side (head readable) rather than centred with both ends hidden.
+fn centered_clipped<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    s: &str,
+    cx: i32,
+    y: i32,
+    role: Role,
+    color: Rgb565,
+    clip: Rect,
+) -> Result<(), D::Error> {
+    let w = font::width(s, role).unwrap_or(clip.w as u32);
+    if w <= clip.w as u32 {
+        text(t, s, EgPoint::new(cx, y), role, color)
+    } else {
+        text_left_clipped(t, s, EgPoint::new(clip.x as i32, y), role, color, clip)
     }
-    // Caution — a deliberate, plain-language warning against phishing.
-    glyph::draw(t, Glyph::Warn, Point::new(16, 144), 15, theme::WARN)?;
-    text_left(
+}
+
+/// The service header shared by the request and approve ceremonies: a rounded chip
+/// with the generic relying-party globe (we ship no per-brand logos), then the
+/// relying party and — when present — the account beneath it. Both untrusted fields
+/// are clipped to the panel so a long rp id is cut, never overrun. Drawn from `y`
+/// (the chip's top); the caller lays content out below it.
+fn service_head<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    y: i32,
+    rp: &Label,
+    account: &Label,
+) -> Result<(), D::Error> {
+    let chip = Rect::new(14, y as u16, 38, 38);
+    RoundedRectangle::with_equal_corners(eg_rect(chip), Size::new(9, 9))
+        .into_styled(PrimitiveStyle::with_fill(theme::CHIP))
+        .draw(t)?;
+    glyph::draw(
         t,
-        "Approve only if you",
-        EgPoint::new(38, 148),
-        Role::Body,
-        theme::WARN,
+        Glyph::Globe,
+        Point::new(chip.x + 8, chip.y + 8),
+        22,
+        theme::TEXT,
+    )?;
+    let tx = chip.x as i32 + chip.w as i32 + 11;
+    let clip = Rect::new(tx as u16, y as u16, PANEL_W - 14 - tx as u16, 38);
+    if account.as_str().is_empty() {
+        text_left_clipped(
+            t,
+            rp.as_str(),
+            EgPoint::new(tx, y + 19),
+            Role::Strong,
+            theme::TEXT,
+            clip,
+        )
+    } else {
+        text_left_clipped(
+            t,
+            rp.as_str(),
+            EgPoint::new(tx, y + 12),
+            Role::Strong,
+            theme::TEXT,
+            clip,
+        )?;
+        text_left_clipped(
+            t,
+            account.as_str(),
+            EgPoint::new(tx, y + 28),
+            Role::Body,
+            theme::GREY,
+            clip,
+        )
+    }
+}
+
+/// A full-width info / caution plate (rounded, tinted) below the service header — the
+/// "Sign in with passkey" hint on the request screen, the amber "did you start this?"
+/// caution on the approve screen. Two short lines fit; the caller supplies them.
+fn ceremony_plate<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    icon: Glyph,
+    line1: &str,
+    line2: &str,
+    fill: Rgb565,
+    border: Rgb565,
+    text_color: Rgb565,
+) -> Result<(), D::Error> {
+    let plate = Rect::new(
+        14,
+        CEREMONY_PLATE_TOP as u16,
+        PANEL_W - 28,
+        CEREMONY_PLATE_H,
+    );
+    RoundedRectangle::with_equal_corners(eg_rect(plate), Size::new(11, 11))
+        .into_styled(PrimitiveStyle::with_fill(fill))
+        .draw(t)?;
+    RoundedRectangle::with_equal_corners(eg_rect(plate), Size::new(11, 11))
+        .into_styled(
+            PrimitiveStyleBuilder::new()
+                .stroke_color(border)
+                .stroke_width(1)
+                .stroke_alignment(StrokeAlignment::Inside)
+                .build(),
+        )
+        .draw(t)?;
+    glyph::draw(
+        t,
+        icon,
+        Point::new(plate.x + 12, plate.y + 13),
+        16,
+        text_color,
+    )?;
+    let tx = plate.x as i32 + 38;
+    if line2.is_empty() {
+        text_left(
+            t,
+            line1,
+            EgPoint::new(tx, plate.y as i32 + 23),
+            Role::Body,
+            text_color,
+        )
+    } else {
+        text_left(
+            t,
+            line1,
+            EgPoint::new(tx, plate.y as i32 + 16),
+            Role::Body,
+            text_color,
+        )?;
+        text_left(
+            t,
+            line2,
+            EgPoint::new(tx, plate.y as i32 + 32),
+            Role::Body,
+            text_color,
+        )
+    }
+}
+
+/// The trusted Approve prompt: the status/title chrome with a shield + the operation
+/// title, the relying-party header (chip + sanitized rp id / account), an amber "did
+/// you start this?" caution, and the Deny / Hold-to-approve buttons. The hold button
+/// starts empty; the firmware fills it via [`render_hold_button`] as the user holds.
+/// Shared by the FIDO sign-in approve and the generic OpenPGP/PIV/OATH/OTP touch
+/// policies — for those the title is the operation, and `primary` may be empty.
+fn confirm<D: DrawTarget<Color = Rgb565>>(t: &mut D, p: &ConfirmPrompt) -> Result<(), D::Error> {
+    t.clear(BG)?;
+    status_bar(t)?;
+    glyph::draw(
+        t,
+        Glyph::Shield,
+        Point::new(CEREMONY_ICON_X as u16, (CEREMONY_TITLE_CY - 9) as u16),
+        18,
+        theme::ACCENT,
     )?;
     text_left(
         t,
+        p.title,
+        EgPoint::new(CEREMONY_TITLE_X, CEREMONY_TITLE_CY),
+        Role::Heading,
+        theme::TEXT,
+    )?;
+    // Relying-party header, only when the request carries rp text (generic confirms
+    // such as an OpenPGP signature may not).
+    if !p.primary.is_empty() {
+        service_head(t, CEREMONY_HEAD_TOP, &p.primary, &p.secondary)?;
+    }
+    // Caution — a deliberate, plain-language warning against phishing.
+    ceremony_plate(
+        t,
+        Glyph::Warn,
+        "Approve only if you",
         "started this",
-        EgPoint::new(38, 164),
-        Role::Body,
+        theme::WARN_BG,
+        theme::WARN_BORDER,
         theme::WARN,
     )?;
     // Deny is a single tap (low emphasis); Approve is a deliberate hold that fills.
     outline_button(t, DENY_RECT, "Deny", theme::DENY)?;
     render_hold_button(t, ALLOW_RECT, "Hold to approve", theme::APPROVE)
+}
+
+/// The trusted **add-passkey** prompt (the design's `makeCredential` step): a dashed
+/// placeholder tile with the generic globe, the relying party + account being enrolled,
+/// "Save new passkey for this account?", and Cancel / Save. Save ([`ALLOW_RECT`])
+/// confirms the registration; Cancel ([`DENY_RECT`]) refuses. Standalone full-frame.
+/// The untrusted rp / account are clipped to the panel (centred when they fit, else
+/// left-clipped) so a long rp id cannot overrun the trusted display.
+pub fn render_add_passkey<D>(t: &mut D, rp: &Label, account: &Label) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    t.clear(BG)?;
+    status_bar(t)?;
+    title_bar(t, "Add passkey", theme::ACCENT, false)?;
+    // Placeholder tile for the (logo-less) relying party. embedded-graphics has no
+    // dashed stroke, so the border is solid — the tile still reads as "new / pending".
+    let tile = Rect::new((MIDX - 37) as u16, CONTENT_TOP + 16, 74, 74);
+    RoundedRectangle::with_equal_corners(eg_rect(tile), Size::new(16, 16))
+        .into_styled(
+            PrimitiveStyleBuilder::new()
+                .stroke_color(theme::BORDER_CARD)
+                .stroke_width(2)
+                .stroke_alignment(StrokeAlignment::Inside)
+                .build(),
+        )
+        .draw(t)?;
+    glyph::draw(
+        t,
+        Glyph::Globe,
+        Point::new(tile.x + 18, tile.y + 18),
+        38,
+        theme::TEXT,
+    )?;
+    // Untrusted fields, clipped to the panel (with side margins) so they cannot overrun.
+    let rp_y = tile.y as i32 + 90;
+    let acct_y = tile.y as i32 + 110;
+    centered_clipped(
+        t,
+        rp.as_str(),
+        MIDX,
+        rp_y,
+        Role::Strong,
+        theme::TEXT,
+        Rect::new(6, (rp_y - 11) as u16, PANEL_W - 12, 22),
+    )?;
+    if !account.as_str().is_empty() {
+        centered_clipped(
+            t,
+            account.as_str(),
+            MIDX,
+            acct_y,
+            Role::Body,
+            theme::GREY,
+            Rect::new(6, (acct_y - 11) as u16, PANEL_W - 12, 22),
+        )?;
+    }
+    text(
+        t,
+        "Save new passkey",
+        EgPoint::new(MIDX, tile.y as i32 + 134),
+        Role::Body,
+        theme::TEXT_2,
+    )?;
+    text(
+        t,
+        "for this account?",
+        EgPoint::new(MIDX, tile.y as i32 + 150),
+        Role::Body,
+        theme::TEXT_2,
+    )?;
+    outline_button(t, DENY_RECT, "Cancel", theme::DENY)?;
+    button(t, ALLOW_RECT, "Save", theme::ACCENT_FILL)
 }
 
 /// An outlined (not filled) rounded button — the low-emphasis action (Deny).
@@ -1028,32 +1227,52 @@ fn glyph_centered<D: DrawTarget<Color = Rgb565>>(
     )
 }
 
+/// A back / cancel affordance with a **visible bounded tap target**: a rounded outline
+/// drawn around the whole hit `rect` (so it is obvious how large the pressable area is)
+/// with a centred chevron inside. Used for every small back/cancel chevron — the title
+/// bar, the chrome-less modals, the PIN pad — so they all read as real buttons rather
+/// than a lone glyph. The outline tints with the action `color` (accent for a plain
+/// back, the decline colour for a cancel).
+fn back_button<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    rect: Rect,
+    color: Rgb565,
+) -> Result<(), D::Error> {
+    RoundedRectangle::with_equal_corners(eg_rect(rect), Size::new(9, 9))
+        .into_styled(
+            PrimitiveStyleBuilder::new()
+                .stroke_color(color)
+                .stroke_width(1)
+                .stroke_alignment(StrokeAlignment::Inside)
+                .build(),
+        )
+        .draw(t)?;
+    glyph_centered(t, Glyph::Back, rect, 18, color)
+}
+
 /// The built-in-UV PIN pad in the new design language: a lock-marked header with a
 /// low-emphasis outlined Cancel, the cyan masked entry, then the 3×4 grid of dark
 /// neutral key cards — Del a backspace glyph, OK a solid green check. Each key is
 /// painted in the exact [`pin_key_rect`] that [`crate::hit_pin`] maps a tap to, and
 /// only masked dots — never the digits — are shown.
 fn pin<D: DrawTarget<Color = Rgb565>>(t: &mut D, pad: &PinPad) -> Result<(), D::Error> {
-    // Custom header (not `render_header`): Cancel keeps its top-left hit rect — clear
-    // of the digit grid, so a digit tap can never abandon entry — so the title is
-    // centred between it and a Lock that marks this as the secure-entry screen.
-    text(t, pad.title, EgPoint::new(MIDX, 20), Role::Heading, FG)?;
-    glyph::draw(
+    // Custom header (not `render_header`): the Cancel back button keeps its top-left hit
+    // rect — clear of the digit grid, so a digit tap can never abandon entry. The title
+    // is centred in the gap *between* that button and the Lock (not on the panel midline),
+    // so a wide title like "Confirm PIN" can't slide under either.
+    let lock_x = PANEL_W - 26;
+    let title_cx = (PIN_CANCEL_RECT.x + PIN_CANCEL_RECT.w + lock_x) / 2;
+    text(
         t,
-        Glyph::Lock,
-        Point::new(PANEL_W - 26, 6),
-        18,
-        theme::ACCENT,
+        pad.title,
+        EgPoint::new(title_cx as i32, 20),
+        Role::Heading,
+        FG,
     )?;
-    // Cancel is a back chevron (not a wide "Cancel" word that would collide with the
-    // centred title) in the decline colour, painted inside its PIN_CANCEL_RECT hit area.
-    glyph::draw(
-        t,
-        Glyph::Back,
-        Point::new(PIN_CANCEL_RECT.x, 7),
-        16,
-        theme::DENY,
-    )?;
+    glyph::draw(t, Glyph::Lock, Point::new(lock_x, 6), 18, theme::ACCENT)?;
+    // Cancel is an outlined back button (not a wide "Cancel" word that would collide
+    // with the centred title) in the decline colour, filling its PIN_CANCEL_RECT hit area.
+    back_button(t, PIN_CANCEL_RECT, theme::DENY)?;
     masked_entry(t, pad.entered, pad.expected)?;
     let mut row = 0;
     while row < PIN_ROWS {
@@ -1315,14 +1534,8 @@ pub fn title_bar<D: DrawTarget<Color = Rgb565>>(
 ) -> Result<(), D::Error> {
     let cy = STATUS_BAR_H as i32 + TITLE_BAR_H as i32 / 2;
     let tx = if back {
-        glyph::draw(
-            t,
-            Glyph::Back,
-            Point::new(TITLE_BACK_RECT.x + 6, (cy - 8) as u16),
-            16,
-            color,
-        )?;
-        TITLE_BACK_RECT.x as i32 + TITLE_BACK_RECT.w as i32
+        back_button(t, TITLE_BACK_RECT, color)?;
+        TITLE_BACK_RECT.x as i32 + TITLE_BACK_RECT.w as i32 + 6
     } else {
         13
     };
@@ -2242,6 +2455,46 @@ mod tests {
             let c = d.at(x, row);
             c != theme::APPROVE && c != theme::DENY
         }));
+    }
+
+    /// The re-skinned approve screen must stay on-panel even with the empty rp a
+    /// generic OpenPGP/PIV touch confirm carries (no service header) — no panic, no OOB.
+    #[test]
+    fn confirm_with_empty_rp_stays_on_panel() {
+        let p = ConfirmPrompt::new("Sign with key?", b"", b"");
+        let mut d = Rec::new();
+        render(&mut d, &Screen::Confirm(p)).unwrap();
+        assert!(!d.oob, "empty-rp confirm drew outside the panel");
+    }
+
+    /// Add-passkey reuses the same band: Cancel in `DENY_RECT`, Save filled in
+    /// `ALLOW_RECT`.
+    #[test]
+    fn add_passkey_paints_cancel_and_save_in_their_hit_rects() {
+        let rp = Label::clamp(b"github.com");
+        let account = Label::clamp(b"alex@example.com");
+        let mut d = Rec::new();
+        render_add_passkey(&mut d, &rp, &account).unwrap();
+        assert!(!d.oob, "add-passkey drew outside the panel");
+        assert!(
+            has_color(&d, DENY_RECT, theme::DENY),
+            "Cancel not in its rect"
+        );
+        assert!(
+            has_color(&d, ALLOW_RECT, theme::ACCENT_FILL),
+            "Save not in its rect"
+        );
+    }
+
+    /// A long, attacker-influenced rp / account on the add-passkey screen must never
+    /// overrun the trusted panel — the `centered_clipped` fallback keeps it bounded.
+    #[test]
+    fn add_passkey_clips_a_wide_rp_and_account() {
+        let rp = Label::clamp(&[b'a'; 48]);
+        let account = Label::clamp(b"login.corp.example-company.com");
+        let mut d = Rec::new();
+        render_add_passkey(&mut d, &rp, &account).unwrap();
+        assert!(!d.oob, "wide add-passkey rp/account overran the panel");
     }
 
     #[test]

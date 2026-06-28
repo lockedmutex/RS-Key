@@ -451,9 +451,9 @@ fn make_credential_inner<S: Storage, R: Rng>(
     // pinUvAuthParam probe already took its own touch in `enforce_pin` and
     // returned early, so it never reaches here. No button → instant. A
     // CTAPHID_CANCEL during the wait surfaces as KEEPALIVE_CANCEL.
-    // The trusted screen (display build) names the relying party being registered.
-    ctx.require_presence(crate::Confirm::new(
-        "Register key?",
+    // The trusted screen (display build) names the relying party being registered;
+    // the `Register` kind picks the "Save new passkey?" layout.
+    ctx.require_presence(crate::Confirm::register(
         req.rp_id.as_bytes(),
         req.user_name.as_bytes(),
     ))?;

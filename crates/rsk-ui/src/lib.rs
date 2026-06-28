@@ -23,9 +23,10 @@ pub mod theme;
 pub mod touch;
 pub use glyph::Glyph;
 pub use render::{
-    render, render_audit_log, render_confirm_delete, render_confirm_factory_reset, render_erasing,
-    render_hold_button, render_hold_fill, render_passkeys_list, render_pin_blocked,
-    render_pin_dots, render_rename, render_service, render_success, render_success_circle,
+    render, render_add_passkey, render_audit_log, render_confirm_delete,
+    render_confirm_factory_reset, render_erasing, render_hold_button, render_hold_fill,
+    render_passkeys_list, render_pin_blocked, render_pin_dots, render_rename, render_service,
+    render_success, render_success_circle,
 };
 
 /// Panel geometry (Waveshare RP2350-Touch-LCD-2.8, ST7789T3, portrait).
@@ -182,8 +183,10 @@ const BTN_SIDE: u16 = 14;
 const BTN_GAP: u16 = 12;
 /// Float above the bottom panel edge.
 const BTN_BOTTOM: u16 = 16;
-/// Deny button width (narrow — the safe action needs no emphasis).
-const DENY_W: u16 = 84;
+/// Deny button width (narrow — the safe action needs no emphasis; the design makes
+/// the hold the wider of the two). Sized to fit "Cancel"; the rest of the row goes to
+/// the hold so "Hold to approve" sits comfortably inside it.
+const DENY_W: u16 = 72;
 /// Hold-to-approve width (the rest of the row — the wider, deliberate action).
 const ALLOW_W: u16 = PANEL_W - 2 * BTN_SIDE - DENY_W - BTN_GAP;
 /// Top of the button row; the trusted prompt fills the space above it.
@@ -330,7 +333,7 @@ const PIN_GAP_X: u16 = 12;
 const PIN_GAP_Y: u16 = 8;
 /// Cancel target, in the header above the grid — kept clear of the digit keys so a
 /// digit tap can never abandon entry.
-pub const PIN_CANCEL_RECT: Rect = Rect::new(8, 6, 64, 28);
+pub const PIN_CANCEL_RECT: Rect = Rect::new(8, 6, 40, 34);
 
 /// The rectangle of the key at grid position `(col, row)` — the single source of
 /// truth shared by the renderer and [`hit_pin`], so paint and hit-test can never
@@ -863,7 +866,7 @@ pub struct AccountRow {
 
 /// The service-detail back affordance: the header's top-left, so a tap there returns
 /// to the Passkeys list. In the header strip, clear of the rows and the nav bar.
-pub const PK_BACK_RECT: Rect = Rect::new(0, 0, 40, HEADER_H);
+pub const PK_BACK_RECT: Rect = Rect::new(8, 6, 42, 34);
 
 // Compile-time: the back chevron sits in the header above the first row, and the
 // visible rows *plus the pager band* (one more slot) fit between the list top and the

@@ -16,7 +16,7 @@ pub mod tlv;
 
 pub use apdu::Apdu;
 pub use applet::{Applet, Dispatcher, ResBuf};
-pub use confirm::Confirm;
+pub use confirm::{Confirm, ConfirmKind};
 pub use error::{Error, Result};
 pub use sw::Sw;
 
