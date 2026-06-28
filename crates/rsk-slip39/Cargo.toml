@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[package]
+name = "rsk-slip39"
+version = "0.1.0"
+license = "AGPL-3.0-only"
+edition = "2024"
+publish = false
+
+# `cfg(kani)` guards the proof harnesses (set by `cargo kani`, unknown to rustc).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
+[dependencies]
+# SHA-256 (share digest, wordlist pin) and HMAC-SHA256 (PBKDF2 round function, digest)
+# — reuse the in-tree wrapper rather than add `pbkdf2`/`hmac` crates to the trust base.
+rsk-crypto = { workspace = true }
+zeroize = { workspace = true }

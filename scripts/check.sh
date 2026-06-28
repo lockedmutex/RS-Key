@@ -23,7 +23,7 @@ lock_in_sync() {
 
 run "fmt"                      cargo fmt --all --check
 run "clippy (embedded)"        cargo clippy --workspace -- -D warnings
-run "clippy (host tests)"      cargo clippy -p rsk-sdk -p rsk-fs -p rsk-usb -p rsk-crypto -p rsk-fido -p rsk-openpgp -p rsk-rsa-asm -p rsk-mgmt -p rsk-oath -p rsk-otp -p rsk-piv -p rsk-rescue -p rsk-led -p rsk-ui -p rsk-bip39 --target "$HOST" --all-targets -- -D warnings
+run "clippy (host tests)"      cargo clippy -p rsk-sdk -p rsk-fs -p rsk-usb -p rsk-crypto -p rsk-fido -p rsk-openpgp -p rsk-rsa-asm -p rsk-mgmt -p rsk-oath -p rsk-otp -p rsk-piv -p rsk-rescue -p rsk-led -p rsk-ui -p rsk-bip39 -p rsk-slip39 --target "$HOST" --all-targets -- -D warnings
 # tools/tui is its own workspace (host-only), so the --all/--workspace runs
 # above never see it — gate it explicitly. Its lockfile was scanned by nobody
 # until Dependabot flagged a transitive advisory from the GitHub side.
@@ -34,7 +34,7 @@ run "clippy (tui)"             cargo clippy --manifest-path tools/tui/Cargo.toml
 # (deep-checks CI). Format fuzz/ with this same stable rustfmt — not the .#fuzz
 # nightly one, which lays imports out differently.
 run "fmt (fuzz)"               cargo fmt --manifest-path fuzz/Cargo.toml --check
-run "test (host)"              cargo test -p rsk-sdk -p rsk-fs -p rsk-usb -p rsk-crypto -p rsk-fido -p rsk-openpgp -p rsk-rsa-asm -p rsk-mgmt -p rsk-oath -p rsk-otp -p rsk-piv -p rsk-rescue -p rsk-led -p rsk-ui -p rsk-bip39 --target "$HOST"
+run "test (host)"              cargo test -p rsk-sdk -p rsk-fs -p rsk-usb -p rsk-crypto -p rsk-fido -p rsk-openpgp -p rsk-rsa-asm -p rsk-mgmt -p rsk-oath -p rsk-otp -p rsk-piv -p rsk-rescue -p rsk-led -p rsk-ui -p rsk-bip39 -p rsk-slip39 --target "$HOST"
 # The PQC-advertisement opt-in changes the getInfo shape — test both forms.
 run "test (advertise-pqc)"     cargo test -p rsk-fido --features advertise-pqc --target "$HOST" getinfo
 # fido-conformance suppresses the default EdDSA (-8) advertisement — verify that
@@ -61,8 +61,8 @@ run "build firmware (display)" env LED_KIND=none cargo build --release -p firmwa
 # a standard key can not pull any of the screen code in.
 run "display code absent from default image" sh -c '
   if ! out=$(cargo tree -p firmware -e normal 2>&1); then echo "$out"; exit 1; fi
-  if printf "%s\n" "$out" | grep -qE "rsk-ui|rsk-bip39|mipidsi"; then
-    echo "FAIL: display code (rsk-ui/rsk-bip39/mipidsi) leaked into the default (no-display) firmware image"; exit 1
+  if printf "%s\n" "$out" | grep -qE "rsk-ui|rsk-bip39|rsk-slip39|mipidsi"; then
+    echo "FAIL: display code (rsk-ui/rsk-bip39/rsk-slip39/mipidsi) leaked into the default (no-display) firmware image"; exit 1
   fi'
 # The test build: no BOOTSEL presence, so the automated suites don't hang on a touch.
 run "build firmware (test, --features no-touch)" cargo build --release -p firmware --features no-touch

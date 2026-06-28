@@ -15,6 +15,20 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Added
 
+- **On-device SLIP-39 Shamir share display — split the seed on the screen (experimental).**
+  The trusted-display recovery reveal now offers a **format chooser**: a single BIP-39 phrase
+  (as before), or **`T`-of-`N` SLIP-39 Shamir shares** rendered **on the device** so no share
+  ever crosses USB. After the one device-PIN re-auth, **Shamir shares** opens a `T`/`N` picker
+  (default **2-of-3**, configurable on-panel), then a deliberate hold over the warning, then
+  each 33-word share page-by-page with a "Share i/N" title and a global pager. The shares are
+  split from the device DRBG and are **bit-for-bit recombinable by `rsk backup restore
+  --scheme slip39`** (single group, non-extendable, iteration exponent 1, empty passphrase —
+  matching the host `shamir_mnemonic`), so any `T` of the `N` written-down shares reconstruct
+  the FIDO seed. The seed is wiped the instant the shares are derived; the share words on exit.
+  The SLIP-39 encode lives in a new host-tested `rsk-slip39` crate whose 1024-word wordlist is
+  checksum-pinned and whose output is verified against the host library bit-for-bit (golden
+  vectors), with a Kani proof bounding the word indices. Display flavor only; disabled on a
+  `fips-profile` device (non-exportable seed). bcdDevice 0x07B4 → 0x07B5.
 - **On-device recovery-phrase display — the seed never crosses USB (experimental).** The
   trusted display can now show the device's **24-word BIP-39 recovery phrase on its own
   screen**, derived **on the device** from the master seed, so the seed is never exported to

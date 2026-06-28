@@ -25,13 +25,15 @@ use embedded_graphics::{
 use crate::{
     ADJ_MINUS_RECT, ADJ_PLUS_RECT, ALLOW_RECT, AccountRow, AuditKind, AuditRow, BACK_RECT,
     BACKUP_REVEAL_RECT, BACKUP_SEAL_RECT, BRIGHTNESS_LEVELS, BackupView, CONTENT_TOP,
-    ConfirmPrompt, DEL_HOLD_RECT, DENY_RECT, Glyph, HomeView, Label, NAV_H, NAV_TABS, NAV_TOP,
-    NavTab, PAGER_NEXT_RECT, PAGER_PREV_RECT, PANEL_H, PANEL_W, PIN_CANCEL_RECT, PIN_COLS,
-    PIN_EYE_RECT, PIN_ROWS, PK_BACK_RECT, PK_LIST_TOP, PinCaption, PinKey, PinPad, Point,
-    RN_BKSP_RECT, RN_DOWN_RECT, RN_FIELD_RECT, RN_INS_RECT, RN_SAVE_RECT, RN_UP_RECT, Rect, RpRow,
-    STATUS_BAR_H, Screen, SettingsPage, SettingsView, StatusKind, SuccessKind, TITLE_BACK_RECT,
-    TITLE_BAR_H, TITLE_EDIT_RECT, font, font::Role, glyph, hex_u16, hex_u64, nav_tab_rect,
-    page_count, pin_grid_key, pin_key_rect, settings_row_rect, theme,
+    ConfirmPrompt, DEL_HOLD_RECT, DENY_RECT, FMT_PHRASE_RECT, FMT_SHARES_RECT, Glyph, HomeView,
+    Label, NAV_H, NAV_TABS, NAV_TOP, NavTab, PAGER_NEXT_RECT, PAGER_PREV_RECT, PANEL_H, PANEL_W,
+    PICK_CONTINUE_RECT, PICK_N_MINUS_RECT, PICK_N_PLUS_RECT, PICK_T_MINUS_RECT, PICK_T_PLUS_RECT,
+    PIN_CANCEL_RECT, PIN_COLS, PIN_EYE_RECT, PIN_ROWS, PK_BACK_RECT, PK_LIST_TOP, PinCaption,
+    PinKey, PinPad, Point, RN_BKSP_RECT, RN_DOWN_RECT, RN_FIELD_RECT, RN_INS_RECT, RN_SAVE_RECT,
+    RN_UP_RECT, Rect, RevealKind, RpRow, STATUS_BAR_H, Screen, SettingsPage, SettingsView,
+    StatusKind, SuccessKind, TITLE_BACK_RECT, TITLE_BAR_H, TITLE_EDIT_RECT, font, font::Role,
+    glyph, hex_u16, hex_u64, nav_tab_rect, page_count, pin_grid_key, pin_key_rect,
+    settings_row_rect, theme,
 };
 
 // Local semantic aliases, all sourced from `theme` so the whole renderer speaks one
@@ -554,11 +556,12 @@ where
     }
 }
 
-/// The deliberate **reveal gate** before showing the recovery phrase: a warning that the
-/// next screen prints the master secret, over a [hold button](render_hold_button) the
-/// firmware drives with [`crate::DEL_HOLD_RECT`] / [`crate::PK_BACK_RECT`] (cancel). The
-/// device PIN is checked *before* this screen; the hold is the second, deliberate gesture.
-pub fn render_reveal_warning<D>(t: &mut D) -> Result<(), D::Error>
+/// The **recovery-format chooser** (after the device-PIN re-auth, before any secret is
+/// shown): two cards — a single BIP-39 phrase, or SLIP-39 Shamir shares. Chrome-less like
+/// the reveal gate; the firmware maps a tap with [`crate::hit_backup_format`] and the
+/// top-left [`crate::PK_BACK_RECT`] chevron cancels. Each card is a title over a dim format
+/// sublabel.
+pub fn render_backup_format<D>(t: &mut D) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb565>,
 {
@@ -566,7 +569,160 @@ where
     back_button(t, PK_BACK_RECT, theme::ACCENT)?;
     text_left(
         t,
-        "Reveal phrase",
+        "Choose format",
+        EgPoint::new(PK_BACK_RECT.x as i32 + PK_BACK_RECT.w as i32 + 8, 22),
+        Role::Heading,
+        theme::TEXT,
+    )?;
+    choice_card(t, FMT_PHRASE_RECT, "Single phrase", "24 words (BIP-39)")?;
+    choice_card(
+        t,
+        FMT_SHARES_RECT,
+        "Shamir shares",
+        "Split T-of-N (SLIP-39)",
+    )
+}
+
+/// A two-line choice card: a bright title over a dim sublabel, on a bordered key surface —
+/// the format-chooser's tappable options.
+fn choice_card<D>(t: &mut D, r: Rect, title: &str, sub: &str) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    key_surface(t, r, KEY_FILL, true)?;
+    text_left(
+        t,
+        title,
+        EgPoint::new(r.x as i32 + 14, r.y as i32 + 22),
+        Role::Strong,
+        FG,
+    )?;
+    text_left(
+        t,
+        sub,
+        EgPoint::new(r.x as i32 + 14, r.y as i32 + 44),
+        Role::Body,
+        MUTED,
+    )
+}
+
+/// The SLIP-39 **share picker**: two −/+ steppers (recovery threshold `T`, total shares `N`)
+/// and a Continue button, summarising "Any T of N shares". Chrome-less like the chooser; the
+/// firmware maps taps with [`crate::hit_share_picker`], steps the pair with
+/// [`crate::step_share_params`], and the top-left [`crate::PK_BACK_RECT`] chevron returns to
+/// the chooser.
+pub fn render_share_picker<D>(t: &mut D, threshold: u8, total: u8) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    t.clear(BG)?;
+    back_button(t, PK_BACK_RECT, theme::ACCENT)?;
+    text_left(
+        t,
+        "Shamir shares",
+        EgPoint::new(PK_BACK_RECT.x as i32 + PK_BACK_RECT.w as i32 + 8, 22),
+        Role::Heading,
+        theme::TEXT,
+    )?;
+    stepper_row(
+        t,
+        "Needed to recover",
+        PICK_T_MINUS_RECT,
+        PICK_T_PLUS_RECT,
+        threshold,
+    )?;
+    stepper_row(
+        t,
+        "Total shares",
+        PICK_N_MINUS_RECT,
+        PICK_N_PLUS_RECT,
+        total,
+    )?;
+    // "Any T of N shares reconstruct the seed." — split across two lines.
+    let mut b1 = [0u8; 5];
+    let mut b2 = [0u8; 5];
+    let mut line = [0u8; 24];
+    let mut i = 0;
+    for &c in b"Any " {
+        line[i] = c;
+        i += 1;
+    }
+    for &c in fmt_u16(threshold as u16, &mut b1).as_bytes() {
+        line[i] = c;
+        i += 1;
+    }
+    for &c in b" of " {
+        line[i] = c;
+        i += 1;
+    }
+    for &c in fmt_u16(total as u16, &mut b2).as_bytes() {
+        line[i] = c;
+        i += 1;
+    }
+    for &c in b" shares" {
+        line[i] = c;
+        i += 1;
+    }
+    text(
+        t,
+        str8(&line[..i]),
+        EgPoint::new(MIDX, 228),
+        Role::Body,
+        theme::ACCENT_TEXT,
+    )?;
+    button(t, PICK_CONTINUE_RECT, "Continue", theme::ACCENT_FILL)
+}
+
+/// One picker stepper: a caption above a `[−]  value  [+]` row, the value centred between the
+/// two key surfaces. Used for both the threshold and total rows.
+fn stepper_row<D>(
+    t: &mut D,
+    caption: &str,
+    minus: Rect,
+    plus: Rect,
+    value: u8,
+) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    text_left(
+        t,
+        caption,
+        EgPoint::new(16, minus.y as i32 - 14),
+        Role::Body,
+        MUTED,
+    )?;
+    key_surface(t, minus, KEY_FILL, true)?;
+    text(t, "-", center(minus), Role::Strong, FG)?;
+    key_surface(t, plus, KEY_FILL, true)?;
+    text(t, "+", center(plus), Role::Strong, FG)?;
+    let mut b = [0u8; 5];
+    text(
+        t,
+        fmt_u16(value as u16, &mut b),
+        EgPoint::new(MIDX, minus.y as i32 + minus.h as i32 / 2),
+        Role::Ready,
+        FG,
+    )
+}
+
+/// The deliberate **reveal gate** before showing the recovery phrase: a warning that the
+/// next screen prints the master secret, over a [hold button](render_hold_button) the
+/// firmware drives with [`crate::DEL_HOLD_RECT`] / [`crate::PK_BACK_RECT`] (cancel). The
+/// device PIN is checked *before* this screen; the hold is the second, deliberate gesture.
+pub fn render_reveal_warning<D>(t: &mut D, kind: RevealKind) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let (heading, line1) = match kind {
+        RevealKind::Phrase => ("Reveal phrase", "Showing 24 secret words"),
+        RevealKind::Shares => ("Reveal shares", "Showing secret shares"),
+    };
+    t.clear(BG)?;
+    back_button(t, PK_BACK_RECT, theme::ACCENT)?;
+    text_left(
+        t,
+        heading,
         EgPoint::new(PK_BACK_RECT.x as i32 + PK_BACK_RECT.w as i32 + 8, 22),
         Role::Heading,
         theme::TEXT,
@@ -578,13 +734,7 @@ where
         32,
         theme::WARN,
     )?;
-    text_left(
-        t,
-        "Showing 24 secret words",
-        EgPoint::new(16, 118),
-        Role::Body,
-        theme::WARN,
-    )?;
+    text_left(t, line1, EgPoint::new(16, 118), Role::Body, theme::WARN)?;
     text_left(
         t,
         "that restore everything.",
@@ -673,6 +823,18 @@ where
     t.clear(BG)?;
     status_bar(t)?;
     title_bar(t, "Recovery phrase", theme::ACCENT, true)?;
+    word_grid(t, words, page)?;
+    render_pager(t, page, pages)
+}
+
+/// Paint up to twelve numbered words of `words` for `page` (0-based, 12 per page) in two
+/// columns of six — the shared body of the recovery-phrase and SLIP-39 share screens. The
+/// 1-based word number (within `words`, so per-phrase or per-share) is dimmed to the left of
+/// each bright word so a transcription error is unlikely.
+fn word_grid<D>(t: &mut D, words: &[&str], page: u16) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
     let per_page = 12usize;
     let start = page as usize * per_page;
     for c in 0..per_page {
@@ -712,7 +874,61 @@ where
             FG,
         )?;
     }
+    Ok(())
+}
+
+/// One page of a SLIP-39 **share**: `words` (the current share's full word list), under a
+/// "Share i/N" title so the user knows which share to label. `page`/`pages` are the **global**
+/// position across all shares (so the pager arrows dim correctly at the first/last page); the
+/// share's own sub-page (which 12 words to show) is derived from `page` modulo the share's
+/// page count. The words are secret (any threshold of shares reconstruct the seed) — the
+/// firmware holds them transiently and zeroizes on exit.
+pub fn render_slip39_share<D>(
+    t: &mut D,
+    words: &[&str],
+    share_idx: u16,
+    share_total: u16,
+    page: u16,
+    pages: u16,
+) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    t.clear(BG)?;
+    status_bar(t)?;
+    let mut buf = [0u8; 18];
+    title_bar(
+        t,
+        fmt_share_title(share_idx, share_total, &mut buf),
+        theme::ACCENT,
+        true,
+    )?;
+    let per_share = (words.len() as u16).div_ceil(12).max(1);
+    word_grid(t, words, page % per_share)?;
     render_pager(t, page, pages)
+}
+
+/// Format `"Share P/N"` into `buf`, no alloc. Sized for the full u16 domain: `"Share " (6)
+/// + 5 + "/" + 5 = 17` bytes.
+fn fmt_share_title(p: u16, n: u16, buf: &mut [u8; 18]) -> &str {
+    let mut i = 0;
+    for &c in b"Share " {
+        buf[i] = c;
+        i += 1;
+    }
+    let mut a = [0u8; 5];
+    for &c in fmt_u16(p, &mut a).as_bytes() {
+        buf[i] = c;
+        i += 1;
+    }
+    buf[i] = b'/';
+    i += 1;
+    let mut b = [0u8; 5];
+    for &c in fmt_u16(n, &mut b).as_bytes() {
+        buf[i] = c;
+        i += 1;
+    }
+    str8(&buf[..i])
 }
 
 /// One audit row: a status dot (its colour the at-a-glance signal), the event label, and
@@ -3186,12 +3402,36 @@ mod tests {
             assert!(!d.oob, "seed phrase page {page} drew outside the panel");
             assert!(d.drew_anything(), "seed phrase page {page} painted nothing");
         }
-        let mut d = Rec::new();
-        render_reveal_warning(&mut d).unwrap();
-        assert!(!d.oob && d.drew_anything());
+        for kind in [RevealKind::Phrase, RevealKind::Shares] {
+            let mut d = Rec::new();
+            render_reveal_warning(&mut d, kind).unwrap();
+            assert!(!d.oob && d.drew_anything());
+        }
         let mut d = Rec::new();
         render_seal_confirm(&mut d).unwrap();
         assert!(!d.oob && d.drew_anything());
+
+        // The recovery-format chooser, the SLIP-39 share picker, and a share page must all
+        // paint inside the panel.
+        let mut d = Rec::new();
+        render_backup_format(&mut d).unwrap();
+        assert!(
+            !d.oob && d.drew_anything(),
+            "format chooser drew outside the panel"
+        );
+        let mut d = Rec::new();
+        render_share_picker(&mut d, 2, 3).unwrap();
+        assert!(
+            !d.oob && d.drew_anything(),
+            "share picker drew outside the panel"
+        );
+        let share: [&str; 33] = ["academic"; 33];
+        for page in 0..3u16 {
+            let mut d = Rec::new();
+            render_slip39_share(&mut d, &share, 1, 3, page, 3).unwrap();
+            assert!(!d.oob, "share page {page} drew outside the panel");
+            assert!(d.drew_anything(), "share page {page} painted nothing");
+        }
     }
 
     #[test]

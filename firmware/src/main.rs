@@ -379,7 +379,7 @@ async fn main(spawner: Spawner) {
     config.max_power = 100;
     config.max_packet_size_0 = 64;
     // bcdDevice build counter; also surfaced on the trusted-display Info page.
-    let device_release: u16 = 0x07B4;
+    let device_release: u16 = 0x07B5;
     config.device_release = device_release;
 
     let mut builder = Builder::new(
@@ -675,7 +675,7 @@ async fn main(spawner: Spawner) {
         // reference is `Copy`; the `RefCell` provides the interior mutability). The
         // panel also shares the worker's `fs_ref` to enumerate resident credentials.
         let ui: &'static RefCell<display::Ui> = UI.init(RefCell::new(display::Ui::build(
-            panel, touch, info, fs_ref, keys, wake_btn,
+            panel, touch, info, fs_ref, keys, rng_ref, wake_btn,
         )));
         spawner.spawn(display::status_task(ui).unwrap());
         ui

@@ -1067,6 +1067,7 @@ dependencies = [
  "rsk-rescue",
  "rsk-rsa-asm",
  "rsk-sdk",
+ "rsk-slip39",
  "rsk-ui",
  "rsk-usb",
  "sequential-storage",
@@ -2198,6 +2199,14 @@ dependencies = [
 name = "rsk-sdk"
 version = "0.1.0"
 dependencies = [
+ "zeroize",
+]
+
+[[package]]
+name = "rsk-slip39"
+version = "0.1.0"
+dependencies = [
+ "rsk-crypto",
  "zeroize",
 ]
 

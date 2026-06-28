@@ -23,11 +23,11 @@ pub mod theme;
 pub mod touch;
 pub use glyph::Glyph;
 pub use render::{
-    render, render_add_passkey, render_audit_log, render_backup, render_confirm_delete,
-    render_confirm_factory_reset, render_erasing, render_hold_button, render_hold_fill,
-    render_passkeys_list, render_pin_blocked, render_pin_dots, render_rename,
-    render_reveal_warning, render_seal_confirm, render_seed_phrase, render_service, render_success,
-    render_success_circle,
+    render, render_add_passkey, render_audit_log, render_backup, render_backup_format,
+    render_confirm_delete, render_confirm_factory_reset, render_erasing, render_hold_button,
+    render_hold_fill, render_passkeys_list, render_pin_blocked, render_pin_dots, render_rename,
+    render_reveal_warning, render_seal_confirm, render_seed_phrase, render_service,
+    render_share_picker, render_slip39_share, render_success, render_success_circle,
 };
 
 /// Panel geometry (Waveshare RP2350-Touch-LCD-2.8, ST7789T3, portrait).
@@ -1202,6 +1202,149 @@ pub fn hit_backup(p: Point) -> Option<BackupKey> {
     }
 }
 
+// === Recovery reveal: format chooser, SLIP-39 T/N picker, share display ===
+
+/// The recovery format chosen on [`render_backup_format`] — a single BIP-39 phrase, or
+/// SLIP-39 Shamir shares. Both reveal the master secret on the trusted screen (never USB).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BackupFormat {
+    /// One 24-word BIP-39 phrase.
+    Phrase,
+    /// `T`-of-`N` SLIP-39 Shamir shares.
+    Shares,
+}
+
+/// The "Single phrase" choice card on the format chooser.
+pub const FMT_PHRASE_RECT: Rect = Rect::new(16, 92, PANEL_W - 32, 60);
+/// The "Shamir shares" choice card, below it.
+pub const FMT_SHARES_RECT: Rect = Rect::new(16, 164, PANEL_W - 32, 60);
+
+const _: () = {
+    // Both cards sit below the chrome-less back chevron, stacked and disjoint, on-panel.
+    assert!(FMT_PHRASE_RECT.y > PK_BACK_RECT.y + PK_BACK_RECT.h);
+    assert!(FMT_PHRASE_RECT.y + FMT_PHRASE_RECT.h <= FMT_SHARES_RECT.y);
+    assert!(FMT_SHARES_RECT.y + FMT_SHARES_RECT.h <= PANEL_H);
+};
+
+/// Which recovery-format card a tap at `p` selects; the chrome-less [`PK_BACK_RECT`] chevron
+/// cancels (handled by [`hit_pk_back`]).
+pub fn hit_backup_format(p: Point) -> Option<BackupFormat> {
+    if FMT_PHRASE_RECT.contains(p) {
+        Some(BackupFormat::Phrase)
+    } else if FMT_SHARES_RECT.contains(p) {
+        Some(BackupFormat::Shares)
+    } else {
+        None
+    }
+}
+
+/// The smallest / largest share counts the on-device picker offers. A meaningful Shamir
+/// split needs ≥ 2 shares (1-of-1 is just the seed); 5 keeps the written-down set practical
+/// on paper, while the crate itself supports up to `rsk_slip39::MAX_SHARES`.
+pub const SHARE_MIN: u8 = 2;
+/// See [`SHARE_MIN`].
+pub const SHARE_MAX: u8 = 5;
+
+/// A control on the SLIP-39 share picker ([`render_share_picker`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ShareAdjust {
+    /// Lower the recovery threshold `T`.
+    TMinus,
+    /// Raise the recovery threshold `T`.
+    TPlus,
+    /// Lower the total share count `N`.
+    NMinus,
+    /// Raise the total share count `N`.
+    NPlus,
+    /// Proceed to reveal the shares.
+    Continue,
+}
+
+const PICK_STEP: u16 = 46;
+/// Threshold `T` stepper (decrement / increment).
+pub const PICK_T_MINUS_RECT: Rect = Rect::new(16, 86, PICK_STEP, PICK_STEP);
+/// See [`PICK_T_MINUS_RECT`].
+pub const PICK_T_PLUS_RECT: Rect = Rect::new(PANEL_W - 16 - PICK_STEP, 86, PICK_STEP, PICK_STEP);
+/// Total `N` stepper (decrement / increment).
+pub const PICK_N_MINUS_RECT: Rect = Rect::new(16, 162, PICK_STEP, PICK_STEP);
+/// See [`PICK_N_MINUS_RECT`].
+pub const PICK_N_PLUS_RECT: Rect = Rect::new(PANEL_W - 16 - PICK_STEP, 162, PICK_STEP, PICK_STEP);
+/// The full-width Continue button (shares the destructive-band geometry).
+pub const PICK_CONTINUE_RECT: Rect =
+    Rect::new(BTN_SIDE, BTN_BAND_TOP, PANEL_W - 2 * BTN_SIDE, BTN_H);
+
+const _: () = {
+    // Each stepper's −/+ are disjoint with a gap; the two rows and the Continue button stack
+    // on-panel below the chrome.
+    assert!(PICK_T_MINUS_RECT.x + PICK_T_MINUS_RECT.w < PICK_T_PLUS_RECT.x);
+    assert!(PICK_N_MINUS_RECT.x + PICK_N_MINUS_RECT.w < PICK_N_PLUS_RECT.x);
+    assert!(PICK_T_MINUS_RECT.y > CONTENT_TOP);
+    assert!(PICK_T_MINUS_RECT.y + PICK_T_MINUS_RECT.h <= PICK_N_MINUS_RECT.y);
+    assert!(PICK_N_MINUS_RECT.y + PICK_N_MINUS_RECT.h <= PICK_CONTINUE_RECT.y);
+    assert!(PICK_CONTINUE_RECT.y + PICK_CONTINUE_RECT.h <= PANEL_H);
+    assert!(SHARE_MIN >= 2 && SHARE_MAX <= rsk_slip39_max());
+};
+
+/// `rsk_slip39::MAX_SHARES` as a const, kept local so the picker bound can be const-asserted
+/// without a cross-crate const dependency (the two are pinned equal by the firmware's use).
+const fn rsk_slip39_max() -> u8 {
+    16
+}
+
+/// Which picker control a tap at `p` selects; the chrome-less top-left [`PK_BACK_RECT`] chevron
+/// ([`hit_pk_back`]) returns to the format chooser.
+pub fn hit_share_picker(p: Point) -> Option<ShareAdjust> {
+    if PICK_T_MINUS_RECT.contains(p) {
+        Some(ShareAdjust::TMinus)
+    } else if PICK_T_PLUS_RECT.contains(p) {
+        Some(ShareAdjust::TPlus)
+    } else if PICK_N_MINUS_RECT.contains(p) {
+        Some(ShareAdjust::NMinus)
+    } else if PICK_N_PLUS_RECT.contains(p) {
+        Some(ShareAdjust::NPlus)
+    } else if PICK_CONTINUE_RECT.contains(p) {
+        Some(ShareAdjust::Continue)
+    } else {
+        None
+    }
+}
+
+/// Apply a `±1` step to the `(threshold, total)` pair, preserving `SHARE_MIN ≤ T ≤ N ≤
+/// SHARE_MAX`: raising `T` past `N` raises `N` with it; lowering `N` below `T` lowers `T`
+/// with it — so the pair is always a valid `T`-of-`N` split. [`ShareAdjust::Continue`] is a
+/// no-op here (the caller acts on it).
+pub fn step_share_params(threshold: u8, total: u8, key: ShareAdjust) -> (u8, u8) {
+    let (mut t, mut n) = (threshold, total);
+    match key {
+        ShareAdjust::TMinus => t = t.saturating_sub(1).max(SHARE_MIN),
+        ShareAdjust::TPlus => {
+            t = t.saturating_add(1).min(SHARE_MAX);
+            if t > n {
+                n = t;
+            }
+        }
+        ShareAdjust::NMinus => {
+            n = n.saturating_sub(1).max(SHARE_MIN);
+            if t > n {
+                t = n;
+            }
+        }
+        ShareAdjust::NPlus => n = n.saturating_add(1).min(SHARE_MAX),
+        ShareAdjust::Continue => {}
+    }
+    (t, n)
+}
+
+/// What the [`render_reveal_warning`] gate is about to show, so its copy names the right
+/// secret (a phrase, or shares).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RevealKind {
+    /// The 24-word BIP-39 phrase.
+    Phrase,
+    /// The SLIP-39 Shamir shares.
+    Shares,
+}
+
 /// Top-level screen the display task renders. The three top-level **tabs** (Home,
 /// Passkeys, Settings) carry the bottom nav bar and are shown by the idle loop; the
 /// **modals** (Splash, Confirm, Pin) are full-screen and shown by the worker.
@@ -1551,6 +1694,85 @@ mod tests {
             hit_security(Point::new(beyond.x + beyond.w / 2, beyond.y + beyond.h / 2)),
             None
         );
+    }
+
+    fn ctr(r: Rect) -> Point {
+        Point::new(r.x + r.w / 2, r.y + r.h / 2)
+    }
+
+    #[test]
+    fn backup_format_cards_map() {
+        assert_eq!(
+            hit_backup_format(ctr(FMT_PHRASE_RECT)),
+            Some(BackupFormat::Phrase)
+        );
+        assert_eq!(
+            hit_backup_format(ctr(FMT_SHARES_RECT)),
+            Some(BackupFormat::Shares)
+        );
+        // The gap between the two cards selects neither.
+        let gap = Point::new(FMT_PHRASE_RECT.x, FMT_PHRASE_RECT.y + FMT_PHRASE_RECT.h + 1);
+        assert_eq!(hit_backup_format(gap), None);
+    }
+
+    #[test]
+    fn share_picker_controls_map_to_their_rects() {
+        for (r, k) in [
+            (PICK_T_MINUS_RECT, ShareAdjust::TMinus),
+            (PICK_T_PLUS_RECT, ShareAdjust::TPlus),
+            (PICK_N_MINUS_RECT, ShareAdjust::NMinus),
+            (PICK_N_PLUS_RECT, ShareAdjust::NPlus),
+            (PICK_CONTINUE_RECT, ShareAdjust::Continue),
+        ] {
+            assert_eq!(hit_share_picker(ctr(r)), Some(k));
+        }
+        // The centre of the panel (between the two steppers) hits no control.
+        assert_eq!(hit_share_picker(Point::new(PANEL_W / 2, 130)), None);
+    }
+
+    #[test]
+    fn step_share_params_keeps_a_valid_split() {
+        // Default 2-of-3 is reachable and a valid split.
+        let (t, n) = (2u8, 3u8);
+        assert!(SHARE_MIN <= t && t <= n && n <= SHARE_MAX);
+
+        // Raising T past N drags N up with it; never exceeds SHARE_MAX.
+        let mut p = (3u8, 3u8);
+        p = step_share_params(p.0, p.1, ShareAdjust::TPlus);
+        assert_eq!(p, (4, 4));
+        // Lowering N below T drags T down with it.
+        let mut q = (3u8, 4u8);
+        q = step_share_params(q.0, q.1, ShareAdjust::NMinus);
+        assert_eq!(q, (3, 3));
+
+        // Clamps: T floors at SHARE_MIN, N ceils at SHARE_MAX.
+        assert_eq!(
+            step_share_params(SHARE_MIN, 3, ShareAdjust::TMinus),
+            (SHARE_MIN, 3)
+        );
+        assert_eq!(
+            step_share_params(2, SHARE_MAX, ShareAdjust::NPlus),
+            (2, SHARE_MAX)
+        );
+
+        // Exhaustive: every step from every valid (T,N) yields a valid (T,N).
+        for t in SHARE_MIN..=SHARE_MAX {
+            for n in t..=SHARE_MAX {
+                for k in [
+                    ShareAdjust::TMinus,
+                    ShareAdjust::TPlus,
+                    ShareAdjust::NMinus,
+                    ShareAdjust::NPlus,
+                    ShareAdjust::Continue,
+                ] {
+                    let (rt, rn) = step_share_params(t, n, k);
+                    assert!(
+                        SHARE_MIN <= rt && rt <= rn && rn <= SHARE_MAX,
+                        "step {k:?} from ({t},{n}) -> ({rt},{rn}) is not a valid split"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

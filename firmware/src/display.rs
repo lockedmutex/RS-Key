@@ -50,7 +50,7 @@ use rsk_ui::{
     SecurityEntry, SettingsPage, SettingsView, StatusKind, SuccessKind,
 };
 
-use crate::handler::Store;
+use crate::handler::{FidoRng, Store};
 use crate::led;
 use crate::presence::{CANCEL_REQUESTED, PRESENCE_TIMEOUT_MS, UP_PENDING};
 
@@ -279,6 +279,10 @@ pub struct Ui {
     fs: &'static RefCell<Store>,
     /// Device identity for unboxing the resident-credential seed on demand.
     keys: DeviceKeys,
+    /// The shared DRBG — the same `RefCell` the worker uses. Borrowed only to draw the
+    /// randomness an on-device SLIP-39 split needs (the share identifier + Shamir random
+    /// shares); the worker is parked while this thread-executor task runs, so no race.
+    rng: &'static RefCell<FidoRng>,
 }
 
 impl Ui {
@@ -293,6 +297,7 @@ impl Ui {
         info: DeviceInfo,
         fs: &'static RefCell<Store>,
         keys: DeviceKeys,
+        rng: &'static RefCell<FidoRng>,
         wake_btn: Option<(Input<'static>, bool)>,
     ) -> Ui {
         let PanelHw {
@@ -356,6 +361,7 @@ impl Ui {
             locked,
             fs,
             keys,
+            rng,
         }
     }
 
@@ -1097,7 +1103,7 @@ impl Ui {
                         && let Some(k) = rsk_ui::hit_backup(p)
                     {
                         match k {
-                            rsk_ui::BackupKey::Reveal => self.run_show_seed(),
+                            rsk_ui::BackupKey::Reveal => self.run_reveal_recovery(),
                             rsk_ui::BackupKey::Seal => self.run_seal_backup(),
                         }
                         if self.asleep {
@@ -1115,21 +1121,61 @@ impl Ui {
         }
     }
 
-    /// Show the 24-word BIP-39 recovery phrase on the trusted display — the seed is read,
-    /// converted to words **on-device**, and never crosses USB. Gated by the device PIN
-    /// (re-auth before exposing the master secret) then a deliberate hold. The seed is
-    /// zeroized the instant the words are derived; the word indices (also secret) are zeroized
-    /// on exit, and the screen auto-clears on the inactivity timeout (walked-away guard).
-    fn run_show_seed(&mut self) {
+    /// Reveal the recovery seed on the trusted display — read and rendered **on-device**, never
+    /// over USB. Gated by the device PIN (re-auth before any secret is shown), then a format
+    /// chooser: a single 24-word BIP-39 phrase, or `T`-of-`N` SLIP-39 Shamir shares. The PIN is
+    /// entered once; the chooser re-shows after each format flow so the user can view both. The
+    /// back chevron / power button / a queued host command / the inactivity timeout exit.
+    fn run_reveal_recovery(&mut self) {
         let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
         self.touch.wait_release(Instant::now(), idle_limit);
-        // Re-authenticate with the device PIN before the secret is shown (no PIN set returns
-        // true at once; a wrong PIN / decline / timeout aborts with nothing revealed).
+        // Re-authenticate with the device PIN before any recovery secret is shown (no PIN set
+        // returns true at once; a wrong PIN / decline / timeout aborts with nothing revealed).
         if !self.local_pin_gate("Enter PIN", PinScope::Device) {
             return;
         }
-        // A second, deliberate gesture over the warning.
-        let _ = rsk_ui::render_reveal_warning(&mut self.panel);
+        'chooser: loop {
+            let _ = rsk_ui::render_backup_format(&mut self.panel);
+            self.shown = None;
+            self.touch.wait_release(Instant::now(), idle_limit);
+            let mut last = Instant::now();
+            loop {
+                if self.sleep_button_pressed() {
+                    return;
+                }
+                if let Some(p) = self.touch.read() {
+                    last = Instant::now();
+                    if rsk_ui::hit_pk_back(p) {
+                        return;
+                    }
+                    if let Some(fmt) = rsk_ui::hit_backup_format(p) {
+                        match fmt {
+                            rsk_ui::BackupFormat::Phrase => self.reveal_phrase(),
+                            rsk_ui::BackupFormat::Shares => self.reveal_shares(),
+                        }
+                        if self.asleep {
+                            return; // a sub-modal slept + locked via the power button
+                        }
+                        continue 'chooser; // re-show the chooser after the format flow
+                    }
+                    self.touch.wait_release(last, idle_limit);
+                }
+                if crate::worker::host_request_pending() || last.elapsed() >= idle_limit {
+                    return;
+                }
+                block_for(Duration::from_millis(TOUCH_POLL_MS));
+            }
+        }
+    }
+
+    /// Show the 24-word BIP-39 recovery phrase (the chooser's "Single phrase" choice). A
+    /// deliberate hold over the warning, then the paged words. The seed is zeroized the instant
+    /// the indices are derived; the indices + word slots on exit, and the screen auto-clears on
+    /// the inactivity timeout (walked-away guard). The device PIN was already checked.
+    fn reveal_phrase(&mut self) {
+        let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
+        self.touch.wait_release(Instant::now(), idle_limit);
+        let _ = rsk_ui::render_reveal_warning(&mut self.panel, rsk_ui::RevealKind::Phrase);
         self.shown = None;
         self.touch.wait_release(Instant::now(), idle_limit);
         if !self.hold_to_confirm("Hold to reveal") {
@@ -1198,6 +1244,143 @@ impl Ui {
         let _ = core::hint::black_box(&words);
         note_activity();
         self.end_modal();
+    }
+
+    /// Show the recovery seed as `T`-of-`N` SLIP-39 Shamir shares (the chooser's "Shamir
+    /// shares" choice). A `T`/`N` picker (default 2-of-3), a deliberate hold over the warning,
+    /// then the shares page-by-page **on-device** (never over USB). The shares are split from
+    /// the device DRBG and are bit-for-bit recombinable by `rsk backup restore --scheme
+    /// slip39`. The seed is wiped the instant the shares are derived; the share words on exit.
+    fn reveal_shares(&mut self) {
+        let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
+        let (mut threshold, mut total): (u8, u8) = (2, 3); // default 2-of-3
+        'picker: loop {
+            let _ = rsk_ui::render_share_picker(&mut self.panel, threshold, total);
+            self.shown = None;
+            self.touch.wait_release(Instant::now(), idle_limit);
+            let mut last = Instant::now();
+            loop {
+                if self.sleep_button_pressed() {
+                    return;
+                }
+                if let Some(p) = self.touch.read() {
+                    last = Instant::now();
+                    if rsk_ui::hit_pk_back(p) {
+                        return; // back to the format chooser
+                    }
+                    if let Some(k) = rsk_ui::hit_share_picker(p) {
+                        if k == rsk_ui::ShareAdjust::Continue {
+                            break 'picker;
+                        }
+                        let (t, n) = rsk_ui::step_share_params(threshold, total, k);
+                        threshold = t;
+                        total = n;
+                        continue 'picker; // re-render the picker with the new values
+                    }
+                    self.touch.wait_release(last, idle_limit);
+                }
+                if crate::worker::host_request_pending() || last.elapsed() >= idle_limit {
+                    return;
+                }
+                block_for(Duration::from_millis(TOUCH_POLL_MS));
+            }
+        }
+
+        // A deliberate hold over the warning before any secret is shown.
+        self.touch.wait_release(Instant::now(), idle_limit);
+        let _ = rsk_ui::render_reveal_warning(&mut self.panel, rsk_ui::RevealKind::Shares);
+        self.shown = None;
+        self.touch.wait_release(Instant::now(), idle_limit);
+        if !self.hold_to_confirm("Hold to reveal") {
+            return;
+        }
+
+        // Read the seed and split it on-device; the seed lives only long enough to generate the
+        // shares, then is wiped (both the copied-out seed and the original `Option`).
+        let dev = self.keys.device();
+        let mut seed_opt = {
+            let mut fs = self.fs.borrow_mut();
+            rsk_fido::passkeys::load_keydev(&dev, &mut fs)
+        };
+        let mut shares = [[0u16; rsk_slip39::WORDS_PER_SHARE]; rsk_slip39::MAX_SHARES];
+        let ok = match seed_opt {
+            Some(mut seed) => {
+                let r = {
+                    let mut rng = self.rng.borrow_mut();
+                    let mut fill = |b: &mut [u8]| rsk_fido::Rng::fill(&mut *rng, b);
+                    rsk_slip39::generate(&seed, threshold, total, &mut fill, &mut shares)
+                };
+                seed.zeroize();
+                r.is_ok()
+            }
+            None => false, // no seed / soft-locked — nothing to show
+        };
+        seed_opt.zeroize();
+        if ok {
+            self.show_shares(&shares, total);
+        }
+        shares.zeroize();
+        note_activity();
+        self.end_modal();
+    }
+
+    /// Page through the generated SLIP-39 shares: "Share i/N" with that share's words, a global
+    /// pager walking every share's pages in order (3 pages of ≤12 words per 33-word share). The
+    /// back chevron / power button / a queued host command / the inactivity timeout exit; the
+    /// word slots are wiped on exit (the caller zeroizes the share indices).
+    fn show_shares(
+        &mut self,
+        shares: &[[u16; rsk_slip39::WORDS_PER_SHARE]; rsk_slip39::MAX_SHARES],
+        total: u8,
+    ) {
+        let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
+        let total = total as u16;
+        let per_share: u16 = (rsk_slip39::WORDS_PER_SHARE as u16).div_ceil(12); // 3 pages/share
+        let pages = total * per_share;
+        let mut words: [&str; rsk_slip39::WORDS_PER_SHARE] = [""; rsk_slip39::WORDS_PER_SHARE];
+        let mut page: u16 = 0;
+        let mut shown_share = u16::MAX;
+        'paged: loop {
+            let share = page / per_share;
+            if share != shown_share {
+                for (w, &i) in words.iter_mut().zip(shares[share as usize].iter()) {
+                    *w = rsk_slip39::word(i);
+                }
+                shown_share = share;
+            }
+            let _ =
+                rsk_ui::render_slip39_share(&mut self.panel, &words, share + 1, total, page, pages);
+            self.shown = None;
+            self.touch.wait_release(Instant::now(), idle_limit);
+            let mut last = Instant::now();
+            loop {
+                if self.sleep_button_pressed() {
+                    break 'paged;
+                }
+                if let Some(p) = self.touch.read() {
+                    last = Instant::now();
+                    if rsk_ui::hit_title_back(p) {
+                        break 'paged;
+                    }
+                    if let Some(k) = rsk_ui::hit_pager(p) {
+                        page = match k {
+                            rsk_ui::PagerKey::Prev => page.saturating_sub(1),
+                            rsk_ui::PagerKey::Next => (page + 1).min(pages - 1),
+                        };
+                        continue 'paged; // repaint (rebuilds words when the share changes)
+                    }
+                    self.touch.wait_release(last, idle_limit);
+                }
+                if crate::worker::host_request_pending() || last.elapsed() >= idle_limit {
+                    break 'paged;
+                }
+                block_for(Duration::from_millis(TOUCH_POLL_MS));
+            }
+        }
+        // The share words encode the (secret) share order — wipe the slots on exit. A
+        // black-boxed fill so the compiler can't elide it; the indices are the caller's to wipe.
+        words.fill("");
+        let _ = core::hint::black_box(&words);
     }
 
     /// Seal the backup window on-device (Settings → Security → Backup → Seal backup): a
