@@ -1005,6 +1005,8 @@ mod tests {
         );
     }
 
+    // Off the fips profile only: fips refuses export outright (see `fips_backup_export_refused`).
+    #[cfg(not(feature = "fips-profile"))]
     #[test]
     fn mse_then_export_roundtrips_seed() {
         let (mut fs, mut rng, mut st) = setup();
@@ -1040,6 +1042,8 @@ mod tests {
         assert_eq!(buf, seed);
     }
 
+    // Off the fips profile only: fips refuses export outright (see `fips_backup_export_refused`).
+    #[cfg(not(feature = "fips-profile"))]
     #[test]
     fn mse_hybrid_then_export_roundtrips_seed() {
         // End-to-end proof of the hybrid channel: if the device-side ML-KEM
@@ -1197,6 +1201,9 @@ mod tests {
         assert_eq!(e, Err(CtapError::NotAllowed));
     }
 
+    // Off the fips profile only: under fips export is refused with `NotAllowed` before the touch
+    // gate, masking this `OperationDenied` path (the fips refusal is `fips_backup_export_refused`).
+    #[cfg(not(feature = "fips-profile"))]
     #[test]
     fn export_refused_without_touch() {
         let (mut fs, mut rng, mut st) = setup();
@@ -1259,6 +1266,9 @@ mod tests {
         assert_eq!(e, Err(CtapError::IntegrityFailure));
     }
 
+    // Off the fips profile only: under fips export is refused with `NotAllowed` before the PIN/token
+    // check, masking this `PuatRequired` path (the fips refusal is `fips_backup_export_refused`).
+    #[cfg(not(feature = "fips-profile"))]
     #[test]
     fn export_with_pin_requires_token() {
         let (mut fs, mut rng, mut st) = setup();
@@ -1597,6 +1607,8 @@ mod tests {
         assert_eq!(e, Err(CtapError::NotAllowed));
     }
 
+    // Off the fips profile only: fips refuses export outright (see `fips_backup_export_refused`).
+    #[cfg(not(feature = "fips-profile"))]
     #[test]
     fn backup_export_serves_the_unlocked_ram_copy() {
         let (mut fs, mut rng, mut st, host, seed) = locked_setup();
