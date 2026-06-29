@@ -30,6 +30,18 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   timestamps and row glyphs sit one shade dimmer, matching the design hierarchy). No protocol or
   flag change. bcdDevice 0x07BA → 0x07BB.
 
+- **Redrawn icon set for the trusted-display UI (display builds).** The vector glyphs are cleaner
+  and instantly readable at the small list-row (14px) and nav (20px) sizes they are used at, not
+  just the large headline sizes. The previous "mirror the buffer" symmetry pass was the root of
+  the breakage — its union fill turned a ring (clock, gear) into a solid blob and erased centred
+  axis strokes on an even box (the USB cable, the globe meridian, the sun's rays). It is replaced
+  by symmetry **by construction** plus two guarantees in the renderer: a non-destructive symmetry
+  pass (mirror the canonical half, restore the centre band) that makes a claimed axis exact
+  without filling, and an **auto-centre** step that shifts each glyph's ink to equal margins on
+  every side. Several glyphs were redrawn so they read at a glance — USB (plug + cable), globe
+  (disc + equator + meridian), gear (open bore vs the sun's solid core), eye, lifebuoy, shield,
+  house, clock. No protocol or flag change. bcdDevice 0x07BB → 0x07BC.
+
 - **On-device PIN entry for OpenPGP & PIV over CCID (secure pinpad, experimental; display builds).**
   The trusted-display build now advertises itself as a **CCID pinpad reader** (`bPINSupport` =
   VERIFY) and handles `PC_to_RDR_Secure` (`0x69`): when the host driver asks for a secure PIN
