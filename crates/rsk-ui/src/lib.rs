@@ -570,7 +570,8 @@ pub fn hit_security(p: Point) -> Option<SecurityEntry> {
     None
 }
 
-/// Adjust-page controls: a big −/+ pair and a full-width Back below them.
+/// Adjust-page controls: a big −/+ pair. Back is the shared title-bar chevron
+/// ([`TITLE_BACK_RECT`]) like every other screen — no bottom Back slab.
 const ADJ_W: u16 = 88;
 const ADJ_H: u16 = 80;
 const ADJ_Y: u16 = 150;
@@ -578,8 +579,6 @@ const ADJ_Y: u16 = 150;
 pub const ADJ_MINUS_RECT: Rect = Rect::new(16, ADJ_Y, ADJ_W, ADJ_H);
 /// Increment target (right).
 pub const ADJ_PLUS_RECT: Rect = Rect::new(PANEL_W - 16 - ADJ_W, ADJ_Y, ADJ_W, ADJ_H);
-/// Back/Close target, full-width along the bottom — shared by every sub-page.
-pub const BACK_RECT: Rect = Rect::new(16, 262, PANEL_W - 32, 46);
 
 // Compile-time layout invariants (paint and hit-test share these rects): the Root
 // rows fit on-panel with a real gap; the −/+ controls are disjoint with a gap and
@@ -594,8 +593,7 @@ const _: () = {
     assert!(last.x + last.w <= PANEL_W && last.y + last.h <= PANEL_H);
     assert!(ADJ_MINUS_RECT.x + ADJ_MINUS_RECT.w < ADJ_PLUS_RECT.x);
     assert!(ADJ_PLUS_RECT.x + ADJ_PLUS_RECT.w <= PANEL_W);
-    assert!(ADJ_MINUS_RECT.y + ADJ_MINUS_RECT.h <= BACK_RECT.y);
-    assert!(BACK_RECT.x + BACK_RECT.w <= PANEL_W && BACK_RECT.y + BACK_RECT.h <= PANEL_H);
+    assert!(ADJ_MINUS_RECT.y + ADJ_MINUS_RECT.h <= PANEL_H);
 };
 
 /// Which Root entry, if any, a tap at `p` selects. Rows are disjoint by
@@ -618,7 +616,7 @@ pub fn hit_adjust(p: Point) -> Option<AdjustKey> {
         Some(AdjustKey::Minus)
     } else if ADJ_PLUS_RECT.contains(p) {
         Some(AdjustKey::Plus)
-    } else if BACK_RECT.contains(p) {
+    } else if TITLE_BACK_RECT.contains(p) {
         Some(AdjustKey::Back)
     } else {
         None
@@ -1563,8 +1561,8 @@ mod proofs {
         kani::assume(i < SETTINGS_ROWS && j < SETTINGS_ROWS && i != j);
         assert!(!(settings_row_rect(i).contains(p) && settings_row_rect(j).contains(p)));
         assert!(!(ADJ_MINUS_RECT.contains(p) && ADJ_PLUS_RECT.contains(p)));
-        assert!(!(ADJ_MINUS_RECT.contains(p) && BACK_RECT.contains(p)));
-        assert!(!(ADJ_PLUS_RECT.contains(p) && BACK_RECT.contains(p)));
+        assert!(!(ADJ_MINUS_RECT.contains(p) && TITLE_BACK_RECT.contains(p)));
+        assert!(!(ADJ_PLUS_RECT.contains(p) && TITLE_BACK_RECT.contains(p)));
     }
 
     /// No tap selects two nav tabs at once, and no tap selects two list rows at once
@@ -1904,7 +1902,7 @@ mod tests {
         let centers = [
             (ADJ_MINUS_RECT, AdjustKey::Minus),
             (ADJ_PLUS_RECT, AdjustKey::Plus),
-            (BACK_RECT, AdjustKey::Back),
+            (TITLE_BACK_RECT, AdjustKey::Back),
         ];
         for (r, key) in centers {
             assert_eq!(

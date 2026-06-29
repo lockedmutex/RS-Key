@@ -109,11 +109,18 @@ pub fn right<D: DrawTarget<Color = Rgb565>>(
     draw(t, s, at, role, color, HorizontalAlignment::Right)
 }
 
-/// Pixel width `s` occupies in `role` — for laying a trailing element flush against a
-/// variable-width (proportional) label. `None` only on the impossible glyph-miss.
+/// Pixel width `s` occupies in `role`, measured from the pen origin to the rightmost ink
+/// — i.e. the left side bearing (`top_left.x`) **plus** the ink width, not the ink width
+/// alone. Callers clip a label to this and lay trailing elements flush against it; using
+/// the bare `size.width` under-reports by the bearing, so a label that "fits" by ~1px has
+/// its last glyph's right edge clipped (a 'd' rendered as a 'c'). `None` only on the
+/// impossible glyph-miss.
 pub fn width(s: &str, role: Role) -> Option<u32> {
     renderer(role)
         .get_rendered_dimensions(s, EgPoint::zero(), VerticalPosition::Center)
         .ok()
-        .map(|d| d.bounding_box.map_or(0, |b| b.size.width))
+        .map(|d| {
+            d.bounding_box
+                .map_or(0, |b| b.top_left.x.max(0) as u32 + b.size.width)
+        })
 }

@@ -13,27 +13,25 @@
 use embedded_graphics::{
     Drawable,
     draw_target::{DrawTarget, DrawTargetExt},
-    geometry::{Point as EgPoint, Size},
+    geometry::{Angle, Point as EgPoint, Size},
     pixelcolor::Rgb565,
-    prelude::{RgbColor, WebColors},
     primitives::{
-        Circle, Line, Primitive, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle,
+        Arc, Circle, Line, Primitive, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle,
         RoundedRectangle, StrokeAlignment, Triangle,
     },
 };
 
 use crate::{
-    ADJ_MINUS_RECT, ADJ_PLUS_RECT, ALLOW_RECT, AccountRow, AuditKind, AuditRow, BACK_RECT,
-    BACKUP_REVEAL_RECT, BACKUP_SEAL_RECT, BRIGHTNESS_LEVELS, BackupView, CONTENT_TOP,
-    ConfirmPrompt, DEL_HOLD_RECT, DENY_RECT, FMT_PHRASE_RECT, FMT_SHARES_RECT, Glyph, HomeView,
-    Label, NAV_H, NAV_TABS, NAV_TOP, NavTab, PAGER_NEXT_RECT, PAGER_PREV_RECT, PANEL_H, PANEL_W,
-    PICK_CONTINUE_RECT, PICK_N_MINUS_RECT, PICK_N_PLUS_RECT, PICK_T_MINUS_RECT, PICK_T_PLUS_RECT,
-    PIN_CANCEL_RECT, PIN_COLS, PIN_EYE_RECT, PIN_ROWS, PK_BACK_RECT, PK_LIST_TOP, PinCaption,
-    PinKey, PinPad, Point, RN_BKSP_RECT, RN_DOWN_RECT, RN_FIELD_RECT, RN_INS_RECT, RN_SAVE_RECT,
-    RN_UP_RECT, Rect, RevealKind, RpRow, STATUS_BAR_H, Screen, SettingsPage, SettingsView,
-    StatusKind, SuccessKind, TITLE_BACK_RECT, TITLE_BAR_H, TITLE_EDIT_RECT, font, font::Role,
-    glyph, hex_u16, hex_u64, nav_tab_rect, page_count, pin_grid_key, pin_key_rect,
-    settings_row_rect, theme,
+    ADJ_MINUS_RECT, ADJ_PLUS_RECT, ALLOW_RECT, AccountRow, AuditKind, AuditRow, BACKUP_REVEAL_RECT,
+    BACKUP_SEAL_RECT, BRIGHTNESS_LEVELS, BackupView, CONTENT_TOP, ConfirmPrompt, DEL_HOLD_RECT,
+    DENY_RECT, FMT_PHRASE_RECT, FMT_SHARES_RECT, Glyph, HomeView, Label, NAV_H, NAV_TABS, NAV_TOP,
+    NavTab, PAGER_NEXT_RECT, PAGER_PREV_RECT, PANEL_H, PANEL_W, PICK_CONTINUE_RECT,
+    PICK_N_MINUS_RECT, PICK_N_PLUS_RECT, PICK_T_MINUS_RECT, PICK_T_PLUS_RECT, PIN_CANCEL_RECT,
+    PIN_COLS, PIN_EYE_RECT, PIN_ROWS, PK_BACK_RECT, PK_LIST_TOP, PinCaption, PinKey, PinPad, Point,
+    RN_BKSP_RECT, RN_DOWN_RECT, RN_FIELD_RECT, RN_INS_RECT, RN_SAVE_RECT, RN_UP_RECT, Rect,
+    RevealKind, RpRow, STATUS_BAR_H, Screen, SettingsPage, SettingsView, StatusKind, SuccessKind,
+    TITLE_BACK_RECT, TITLE_BAR_H, TITLE_EDIT_RECT, font, font::Role, glyph, hex_u16, hex_u64,
+    nav_tab_rect, page_count, pin_grid_key, pin_key_rect, settings_row_rect, theme,
 };
 use crate::{AppsView, OathRow, OpenpgpView, PgpKeyView, PivSlotView, PivView};
 
@@ -164,16 +162,39 @@ fn home<D: DrawTarget<Color = Rgb565>>(t: &mut D, v: &HomeView) -> Result<(), D:
             false,
         )?;
     } else {
-        let c = status_color(v.status);
-        Circle::new(EgPoint::new(MIDX - 18, 70), 36)
-            .into_styled(PrimitiveStyle::with_fill(c))
+        // A themed ring + bright 270° arc reads as an in-progress spinner (the design's
+        // request spinner), not a flat raw-colour disc. Painted once, not animated: the
+        // display loop only repaints the status screen on a state change.
+        let (track, mark) = status_ring(v.status);
+        let center = EgPoint::new(MIDX, 92);
+        const RING_D: u32 = 50;
+        Circle::with_center(center, RING_D)
+            .into_styled(
+                PrimitiveStyleBuilder::new()
+                    .stroke_color(track)
+                    .stroke_width(3)
+                    .build(),
+            )
             .draw(t)?;
+        Arc::with_center(
+            center,
+            RING_D,
+            Angle::from_degrees(-90.0),
+            Angle::from_degrees(270.0),
+        )
+        .into_styled(
+            PrimitiveStyleBuilder::new()
+                .stroke_color(mark)
+                .stroke_width(3)
+                .build(),
+        )
+        .draw(t)?;
         text(
             t,
             v.status.label(),
-            EgPoint::new(MIDX, 140),
+            EgPoint::new(MIDX, 158),
             Role::Heading,
-            c,
+            FG,
         )?;
     }
     render_nav(t, NavTab::Home)
@@ -430,17 +451,29 @@ where
         (
             Glyph::Key,
             "OpenPGP",
-            fmt_count(v.openpgp_keys as u16, "keys", &mut b0),
+            fmt_count(
+                v.openpgp_keys as u16,
+                if v.openpgp_keys == 1 { "key" } else { "keys" },
+                &mut b0,
+            ),
         ),
         (
             Glyph::Cpu,
             "PIV",
-            fmt_count(v.piv_slots as u16, "slots", &mut b1),
+            fmt_count(
+                v.piv_slots as u16,
+                if v.piv_slots == 1 { "slot" } else { "slots" },
+                &mut b1,
+            ),
         ),
         (
             Glyph::Clock,
             "OATH",
-            fmt_count(v.oath_codes, "codes", &mut b2),
+            fmt_count(
+                v.oath_codes,
+                if v.oath_codes == 1 { "code" } else { "codes" },
+                &mut b2,
+            ),
         ),
     ];
     for (i, (g, name, trailing)) in rows.into_iter().enumerate() {
@@ -1034,7 +1067,7 @@ where
     } else {
         ("Missing", theme::DANGER)
     };
-    render_row(t, row0, Glyph::Lifebuoy, "Recovery seed", Some(seed), false)?;
+    render_row(t, row0, Glyph::Lifebuoy, "Seed", Some(seed), false)?;
     let window = if v.sealed {
         ("Sealed", theme::OK)
     } else if v.exportable {
@@ -1328,7 +1361,7 @@ where
 {
     t.clear(BG)?;
     status_bar(t)?;
-    title_bar(t, "Recovery phrase", theme::ACCENT, true)?;
+    title_bar_wide(t, "Seed phrase", theme::ACCENT, true)?;
     word_grid(t, words, page)?;
     render_pager(t, page, pages)
 }
@@ -1468,7 +1501,7 @@ fn audit_row<D: DrawTarget<Color = Rgb565>>(
         (label_right - label_x).max(0) as u16,
         rect.h,
     );
-    text_left_clipped(
+    text_left_ellipsized(
         t,
         r.kind.label(),
         EgPoint::new(label_x, cy),
@@ -1970,7 +2003,7 @@ fn centered_clipped<D: DrawTarget<Color = Rgb565>>(
     if w <= clip.w as u32 {
         text(t, s, EgPoint::new(cx, y), role, color)
     } else {
-        text_left_clipped(t, s, EgPoint::new(clip.x as i32, y), role, color, clip)
+        text_left_ellipsized(t, s, EgPoint::new(clip.x as i32, y), role, color, clip)
     }
 }
 
@@ -2600,12 +2633,13 @@ fn key_label(k: PinKey) -> &'static str {
     }
 }
 
-fn status_color(kind: StatusKind) -> Rgb565 {
+/// Track + accent colours for the non-idle status ring (themed, not the LED layer's raw
+/// RGB): blue = working, amber = awaiting touch, muted = booting.
+fn status_ring(kind: StatusKind) -> (Rgb565, Rgb565) {
     match kind {
-        StatusKind::Boot => Rgb565::RED,
-        StatusKind::Idle => Rgb565::GREEN,
-        StatusKind::Processing => Rgb565::YELLOW,
-        StatusKind::Touch => Rgb565::CSS_ORANGE,
+        StatusKind::Touch => (theme::BORDER_CARD, theme::WARN),
+        StatusKind::Boot => (theme::BORDER_CARD, theme::MUTED),
+        _ => (theme::BORDER_CARD, theme::ACCENT),
     }
 }
 
@@ -2667,6 +2701,46 @@ fn text_left_clipped<D: DrawTarget<Color = Rgb565>>(
     clip: Rect,
 ) -> Result<(), D::Error> {
     font::left(&mut t.clipped(&eg_rect(clip)), s, at, role, color)
+}
+
+/// Like [`text_left_clipped`], but when `s` is too wide for `clip` it is shortened to the
+/// widest character prefix that fits with a trailing `"..."` — so an over-long label reads
+/// as deliberately truncated ("Authenticat...") instead of cut mid-glyph ("Authentica"),
+/// and on the anti-phishing screens a padded look-alike id is *visibly* truncated. Input is
+/// ASCII-sanitised ([`crate::Label::clamp`]) and the static titles are ASCII, so a byte is a
+/// char; the ellipsis is ASCII because the `_tr` faces carry no `U+2026`.
+fn text_left_ellipsized<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    s: &str,
+    at: EgPoint,
+    role: Role,
+    color: Rgb565,
+    clip: Rect,
+) -> Result<(), D::Error> {
+    if font::width(s, role).unwrap_or(0) <= clip.w as u32 {
+        return font::left(&mut t.clipped(&eg_rect(clip)), s, at, role, color);
+    }
+    const ELL: &str = "...";
+    let budget = (clip.w as u32).saturating_sub(font::width(ELL, role).unwrap_or(0));
+    // Widest byte-prefix (byte == char on ASCII input) whose width still leaves room for
+    // the ellipsis. Bounded to the 64-byte buffer below; only runs on the rare overflow.
+    let mut end = 0;
+    let mut i = 1;
+    while i <= s.len() && i <= 64 {
+        if s.is_char_boundary(i) {
+            if font::width(&s[..i], role).unwrap_or(u32::MAX) <= budget {
+                end = i;
+            } else {
+                break;
+            }
+        }
+        i += 1;
+    }
+    let mut buf = [0u8; 67];
+    buf[..end].copy_from_slice(&s.as_bytes()[..end]);
+    buf[end..end + ELL.len()].copy_from_slice(ELL.as_bytes());
+    let out = core::str::from_utf8(&buf[..end + ELL.len()]).unwrap_or(ELL);
+    font::left(&mut t.clipped(&eg_rect(clip)), out, at, role, color)
 }
 
 /// The persistent top **status bar** (the design's framing chrome): a mono "RS-Key"
@@ -2752,7 +2826,7 @@ fn title_bar_to<D: DrawTarget<Color = Rgb565>>(
         right.saturating_sub(tx as u16),
         TITLE_BAR_H,
     );
-    text_left_clipped(t, title, EgPoint::new(tx, cy), Role::Heading, color, clip)
+    text_left_ellipsized(t, title, EgPoint::new(tx, cy), Role::Heading, color, clip)
 }
 
 /// The top header strip: a title (accent or muted) at the left, an optional status
@@ -2845,7 +2919,7 @@ pub fn render_row<D: DrawTarget<Color = Rgb565>>(
         (label_right - label_x).max(0) as u16,
         rect.h,
     );
-    text_left_clipped(
+    text_left_ellipsized(
         t,
         label,
         EgPoint::new(label_x, cy),
@@ -3156,7 +3230,7 @@ fn settings_brightness<D: DrawTarget<Color = Rgb565>>(
     level: u8,
 ) -> Result<(), D::Error> {
     status_bar(t)?;
-    title_bar(t, "Brightness", theme::ACCENT, false)?;
+    title_bar(t, "Brightness", theme::ACCENT, true)?;
     level_bar(t, level)?;
     adjust_controls(t)
 }
@@ -3164,7 +3238,7 @@ fn settings_brightness<D: DrawTarget<Color = Rgb565>>(
 /// Touch-timeout adjust: the current value in seconds plus −/+/Back.
 fn settings_timeout<D: DrawTarget<Color = Rgb565>>(t: &mut D, secs: u16) -> Result<(), D::Error> {
     status_bar(t)?;
-    title_bar(t, "Touch timeout", theme::ACCENT, false)?;
+    title_bar(t, "Touch timeout", theme::ACCENT, true)?;
     let mut buf = [0u8; 8];
     text(
         t,
@@ -3179,7 +3253,7 @@ fn settings_timeout<D: DrawTarget<Color = Rgb565>>(t: &mut D, secs: u16) -> Resu
 /// Display-sleep adjust: the current timeout (or "Off") plus the shared −/+/Back.
 fn settings_sleep<D: DrawTarget<Color = Rgb565>>(t: &mut D, secs: u16) -> Result<(), D::Error> {
     status_bar(t)?;
-    title_bar(t, "Display sleep", theme::ACCENT, false)?;
+    title_bar(t, "Display sleep", theme::ACCENT, true)?;
     if secs == 0 {
         text(
             t,
@@ -3328,13 +3402,13 @@ where
     )
 }
 
-/// The −/+/Back controls shared by both adjust pages, painted in their hit rects.
+/// The −/+ controls shared by the adjust pages, painted in their hit rects. Back is the
+/// title-bar chevron (like every other screen), so these pages carry no bottom Back slab.
 fn adjust_controls<D: DrawTarget<Color = Rgb565>>(t: &mut D) -> Result<(), D::Error> {
     key_surface(t, ADJ_MINUS_RECT, KEY_FILL, true)?;
     text(t, "-", center(ADJ_MINUS_RECT), Role::Strong, FG)?;
     key_surface(t, ADJ_PLUS_RECT, KEY_FILL, true)?;
-    text(t, "+", center(ADJ_PLUS_RECT), Role::Strong, FG)?;
-    button(t, BACK_RECT, "Back", MUTED)
+    text(t, "+", center(ADJ_PLUS_RECT), Role::Strong, FG)
 }
 
 /// A row of `BRIGHTNESS_LEVELS` segments, the first `filled` lit green — a coarse
@@ -4458,7 +4532,11 @@ mod tests {
             render(&mut d, &Screen::Settings(view(page))).unwrap();
             assert!(d.any_non_bg_in(ADJ_MINUS_RECT), "{page:?} minus unpainted");
             assert!(d.any_non_bg_in(ADJ_PLUS_RECT), "{page:?} plus unpainted");
-            assert!(d.any_non_bg_in(BACK_RECT), "{page:?} back unpainted");
+            // Back is now the title-bar chevron (no bottom slab), in its hit rect.
+            assert!(
+                has_color(&d, crate::TITLE_BACK_RECT, theme::ACCENT),
+                "{page:?} back chevron unpainted"
+            );
         }
     }
 

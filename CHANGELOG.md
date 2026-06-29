@@ -15,6 +15,17 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Added
 
+- **Trusted-display UI polish (display builds).** A fit-and-finish pass over the on-device
+  screens. Over-long labels and titles now end in an ellipsis ("Authenticat…") instead of being
+  cut mid-glyph — fixing a text-measurement bug where a label that "fit" by a pixel had its last
+  glyph's right edge clipped (a `d` rendered as a `c`): proportional width is now measured to the
+  rightmost ink (left bearing + ink width), not the ink width alone, so a clip is correct across
+  every screen. The applet item counts read grammatically ("1 slot", not "1 slots"). The busy
+  **"Working…"** status screen is a blue ring-and-arc spinner on a dim track instead of a flat
+  filled disc. The brightness / touch-timeout / display-sleep adjust pages back out via the
+  standard title-bar chevron like every other screen, dropping the odd full-width grey "Back"
+  slab. No protocol or wire-format change. bcdDevice 0x07BE → 0x07BF.
+
 - **On-device OpenPGP / PIV / OATH screens behind a unified "Apps" hub (display builds).**
   The bottom navigation gains a fourth tab — **Apps** (a 2×2 grid glyph) — between Passkeys and
   Settings, and every tab now carries a caption under its icon (the four tabs are tighter at
