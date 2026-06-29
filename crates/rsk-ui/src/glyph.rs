@@ -81,6 +81,9 @@ pub enum Glyph {
     /// A microchip — a square die with a smaller core and two pins per side. The
     /// installed-firmware marker on the Firmware screen / its settings row.
     Cpu,
+    /// A 2×2 grid of tiles — the unified "Apps" nav tab (the applet launcher:
+    /// OpenPGP / PIV / OATH).
+    Apps,
 }
 
 /// 1-bit scratch a glyph rasterizes into so the renderer can impose mirror symmetry before
@@ -131,7 +134,7 @@ fn sym(g: Glyph) -> Sym {
     match g {
         Chevron | Backspace => Sym { v: false, h: true },
         Lock | Home | Shield | Warn | Usb => Sym { v: true, h: false },
-        Sun | Globe | Gear | Eye | Lifebuoy | Cpu => Sym { v: true, h: true },
+        Sun | Globe | Gear | Eye | Lifebuoy | Cpu | Apps => Sym { v: true, h: true },
         _ => Sym { v: false, h: false },
     }
 }
@@ -516,6 +519,15 @@ fn paths<D: DrawTarget<Color = Rgb565>>(t: &mut D, g: Glyph, s: u16) -> Result<(
                 .into_styled(stroke)
                 .draw(t)
         }
+        Glyph::Apps => {
+            // Four equal tiles in a 2×2 grid — the unified applet launcher.
+            for (gx, gy) in [(3, 3), (9, 3), (3, 9), (9, 9)] {
+                Rectangle::new(gp(gx, gy), Size::new(glen(4), glen(4)))
+                    .into_styled(fill)
+                    .draw(t)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -557,7 +569,7 @@ mod tests {
         }
     }
 
-    const ALL: [Glyph; 21] = [
+    const ALL: [Glyph; 22] = [
         Glyph::Usb,
         Glyph::Check,
         Glyph::Backspace,
@@ -579,6 +591,7 @@ mod tests {
         Glyph::Eye,
         Glyph::Lifebuoy,
         Glyph::Cpu,
+        Glyph::Apps,
     ];
 
     #[test]

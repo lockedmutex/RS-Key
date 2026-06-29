@@ -16,6 +16,7 @@ pub mod dobj;
 pub mod files;
 pub mod getdata;
 pub mod importdata;
+pub mod info;
 pub mod init;
 pub mod internalaut;
 pub mod keypairgen;

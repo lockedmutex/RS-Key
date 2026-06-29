@@ -23,10 +23,11 @@ pub mod theme;
 pub mod touch;
 pub use glyph::Glyph;
 pub use render::{
-    PIN_TITLE_BAND, pin_title_overflows, render, render_add_passkey, render_audit_log,
+    PIN_TITLE_BAND, pin_title_overflows, render, render_add_passkey, render_apps, render_audit_log,
     render_backup, render_backup_format, render_confirm_delete, render_confirm_factory_reset,
-    render_erasing, render_firmware, render_hold_button, render_hold_fill, render_passkeys_list,
-    render_pin_blocked, render_pin_dots, render_pin_title, render_rebooting, render_rename,
+    render_erasing, render_firmware, render_hold_button, render_hold_fill, render_oath,
+    render_openpgp, render_openpgp_key, render_passkeys_list, render_pin_blocked, render_pin_dots,
+    render_pin_title, render_piv, render_piv_slot, render_rebooting, render_rename,
     render_reveal_warning, render_seal_confirm, render_seed_phrase, render_service,
     render_share_picker, render_slip39_share, render_success, render_success_circle,
 };
@@ -758,12 +759,31 @@ pub const NAV_TOP: u16 = PANEL_H - NAV_H;
 pub enum NavTab {
     Home,
     Passkeys,
+    /// The applet hub: a chooser for the OpenPGP / PIV / OATH read-only screens.
+    Apps,
     Settings,
 }
 
+impl NavTab {
+    /// The short caption shown under the tab glyph.
+    pub const fn label(self) -> &'static str {
+        match self {
+            NavTab::Home => "Home",
+            NavTab::Passkeys => "Passkeys",
+            NavTab::Apps => "Apps",
+            NavTab::Settings => "Settings",
+        }
+    }
+}
+
 /// The nav tabs in display (left-to-right) order.
-pub const NAV_TABS: [NavTab; 3] = [NavTab::Home, NavTab::Passkeys, NavTab::Settings];
-const NAV_CELL_W: u16 = PANEL_W / 3;
+pub const NAV_TABS: [NavTab; 4] = [
+    NavTab::Home,
+    NavTab::Passkeys,
+    NavTab::Apps,
+    NavTab::Settings,
+];
+const NAV_CELL_W: u16 = PANEL_W / NAV_TABS.len() as u16;
 
 /// The rect of nav tab `i` (`0..3`) — single source of truth for the renderer and
 /// [`hit_nav`].
@@ -816,7 +836,7 @@ pub fn hit_list(p: Point, y0: u16, n: u16) -> Option<u16> {
 // two chrome strips stack inside the top of the panel and the title-bar back chevron
 // sits entirely within the title strip, clear of (above) any content.
 const _: () = {
-    assert!(NAV_CELL_W * 3 <= PANEL_W);
+    assert!(NAV_CELL_W * NAV_TABS.len() as u16 <= PANEL_W);
     assert!(NAV_TOP + NAV_H <= PANEL_H);
     assert!(LIST_ROW_GAP > 0 && LIST_ROW_X > 0 && HEADER_H < NAV_TOP);
     assert!(TITLE_BACK_RECT.y >= STATUS_BAR_H);
@@ -1344,6 +1364,110 @@ pub enum RevealKind {
     Phrase,
     /// The SLIP-39 Shamir shares.
     Shares,
+}
+
+// --- Applet hub (OpenPGP / PIV / OATH) --------------------------------------
+
+/// An entry on the Apps chooser list (the unified applet launcher).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AppEntry {
+    OpenPgp,
+    Piv,
+    Oath,
+}
+
+/// Number of Apps chooser rows.
+pub const APP_ROWS: u16 = 3;
+const _: () = assert!(APP_ROWS <= PK_ROWS_MAX as u16);
+
+/// Which applet, if any, a tap selects on the Apps chooser. The chooser reuses the
+/// tab-list row geometry ([`row_rect`] from [`PK_LIST_TOP`]), so paint + hit share it.
+pub fn hit_apps(p: Point) -> Option<AppEntry> {
+    hit_list(p, PK_LIST_TOP, APP_ROWS).map(|i| match i {
+        0 => AppEntry::OpenPgp,
+        1 => AppEntry::Piv,
+        _ => AppEntry::Oath,
+    })
+}
+
+/// The Apps chooser's per-applet item counts, shown as each row's trailing value.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct AppsView {
+    pub openpgp_keys: u8,
+    pub piv_slots: u8,
+    pub oath_codes: u16,
+}
+
+/// One OpenPGP slot row on the overview (SIG / DEC / AUT).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct PgpSlotRow {
+    pub present: bool,
+    /// Algorithm label (e.g. "Ed25519"); empty when the slot holds no key.
+    pub algo: Label,
+    pub touch: bool,
+}
+
+/// The OpenPGP overview: the three key slots, the signature counter, and the
+/// PW1 / PW3 remaining-attempts footer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct OpenpgpView {
+    pub slots: [PgpSlotRow; 3],
+    pub sig_count: u32,
+    pub pw1: u8,
+    pub pw3: u8,
+}
+
+/// One OpenPGP key's detail: its slot (`0`=SIG, `1`=DEC, `2`=AUT), whether a key is
+/// present, algorithm, touch policy, whether a generation time is recorded, and the
+/// SHA-1 fingerprint. An empty slot is still drillable — the screen explains the slot.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct PgpKeyView {
+    pub slot: u8,
+    pub present: bool,
+    pub algo: Label,
+    pub touch: bool,
+    pub created: bool,
+    pub fingerprint: [u8; 20],
+    pub has_fp: bool,
+}
+
+/// One PIV slot row on the overview (9A / 9C / 9D / 9E).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct PivSlotRow {
+    pub slot: u8,
+    pub present: bool,
+    pub cert: bool,
+    /// Algorithm label; empty when the slot holds no key.
+    pub algo: Label,
+}
+
+/// The PIV overview: the four primary slots + the PIN / PUK remaining attempts.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct PivView {
+    pub slots: [PivSlotRow; 4],
+    pub pin: u8,
+    pub puk: u8,
+}
+
+/// One PIV slot's detail: algorithm, PIN / touch policy, key origin, cert presence.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct PivSlotView {
+    pub slot: u8,
+    pub present: bool,
+    pub cert: bool,
+    pub algo: Label,
+    pub pin_policy: Label,
+    pub touch_policy: Label,
+    pub origin: Label,
+}
+
+/// One OATH credential row: its (sanitized) label, whether it is HOTP (else TOTP),
+/// and whether it is touch-gated. No code is shown (the device has no clock).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct OathRow {
+    pub name: Label,
+    pub hotp: bool,
+    pub touch: bool,
 }
 
 /// Top-level screen the display task renders. The three top-level **tabs** (Home,

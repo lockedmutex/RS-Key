@@ -15,6 +15,29 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Added
 
+- **On-device OpenPGP / PIV / OATH screens behind a unified "Apps" hub (display builds).**
+  The bottom navigation gains a fourth tab — **Apps** (a 2×2 grid glyph) — between Passkeys and
+  Settings, and every tab now carries a caption under its icon (the four tabs are tighter at
+  60px each). The Apps tab opens an **applet chooser** (OpenPGP / PIV / OATH, each with a live
+  item count) that drills into a read-only screen per applet. **OpenPGP** lists the three key
+  slots (Signature / Encryption / Authentication) with each one's algorithm (Ed25519, Cv25519,
+  NIST P-256, RSA 2048, …), the signature counter, and the remaining PW1/PW3 attempts; a present
+  slot drills into a detail card showing the algorithm, touch policy, whether a generation time
+  is recorded, and the full 40-hex SHA-1 fingerprint. **PIV** lists the four primary slots
+  (9A/9C/9D/9E) with each one's algorithm (or "cert" when only a certificate is stored) and the
+  remaining PIN/PUK attempts; a populated slot drills into a detail card with the PIN policy,
+  touch policy, key origin (Generated / Imported), and certificate presence. **OATH** lists the
+  stored credentials (label, TOTP/HOTP, and a padlock when touch-gated); no code is shown — the
+  device has no clock for time-correct TOTP, so codes are still read in the host app. Every fact
+  is read **plaintext / device-sealed without a PIN** (new host-tested `read_info` readers in
+  `rsk-openpgp` / `rsk-piv` and a `for_each_cred` enumerator in `rsk-oath`); no key material,
+  PIN, or public point is ever surfaced (the OpenPGP public key isn't reconstructable without a
+  PIN, by design). All screens are read-only — no on-device mutation, so no PIN gate. **Every
+  OpenPGP / PIV slot row is tappable** and drills into its own detail, even when empty — an
+  unprovisioned slot's screen names the slot's role (e.g. "Signs data and commits",
+  "Authentication / login") and how to set it up over USB, rather than being an inert row. No
+  protocol or wire-format change. bcdDevice 0x07BC → 0x07BE.
+
 - **Design-fidelity polish of the trusted-display UI (display builds).** A visual pass that
   brings the on-screen widgets closer to the handoff and reads more finished. The
   hold-to-confirm buttons are now a **solid fill** (primary blue / danger red) with a lighter

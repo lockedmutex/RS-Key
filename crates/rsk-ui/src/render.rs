@@ -35,6 +35,7 @@ use crate::{
     glyph, hex_u16, hex_u64, nav_tab_rect, page_count, pin_grid_key, pin_key_rect,
     settings_row_rect, theme,
 };
+use crate::{AppsView, OathRow, OpenpgpView, PgpKeyView, PivSlotView, PivView};
 
 // Local semantic aliases, all sourced from `theme` so the whole renderer speaks one
 // palette (these equal their tokens — re-sourcing is hygiene, not a visual change).
@@ -265,6 +266,493 @@ where
     }
     list_tail(t, page, total, "account", "accounts")?;
     render_nav(t, NavTab::Passkeys)
+}
+
+// --- Applet hub (OpenPGP / PIV / OATH) --------------------------------------
+
+/// Colour a remaining-attempts count by how close it is to lockout.
+fn retry_color(n: u8) -> Rgb565 {
+    match n {
+        0 => theme::DANGER,
+        1 => theme::WARN,
+        _ => theme::CAPTION,
+    }
+}
+
+/// Format `"<label> <n>"` (e.g. "PIN 3") into `buf`. Takes a `u32` so the OpenPGP
+/// signature counter (a 3-byte field up to 16,777,215) is never narrowed.
+fn fmt_labeled<'a>(label: &str, n: u32, buf: &'a mut [u8]) -> &'a str {
+    let mut tn = [0u8; 10];
+    let mut i = tn.len();
+    let mut v = n;
+    if v == 0 {
+        i -= 1;
+        tn[i] = b'0';
+    }
+    while v > 0 {
+        i -= 1;
+        tn[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    let num = &tn[i..];
+    let lab = label.as_bytes();
+    let need = lab.len() + 1 + num.len();
+    if need > buf.len() {
+        return "";
+    }
+    buf[..lab.len()].copy_from_slice(lab);
+    buf[lab.len()] = b' ';
+    buf[lab.len() + 1..need].copy_from_slice(num);
+    str8(&buf[..need])
+}
+
+/// Format `"<label> <a>/<b>"` (e.g. "PIN 3/3") into `buf`.
+fn fmt_pair<'a>(label: &str, a: u8, b: u8, buf: &'a mut [u8]) -> &'a str {
+    let (mut ta, mut tb) = ([0u8; 5], [0u8; 5]);
+    let sa = fmt_u16(a as u16, &mut ta).as_bytes();
+    let sb = fmt_u16(b as u16, &mut tb).as_bytes();
+    let lab = label.as_bytes();
+    let need = lab.len() + 1 + sa.len() + 1 + sb.len();
+    if need > buf.len() {
+        return "";
+    }
+    let mut n = 0;
+    for part in [lab, b" ", sa, b"/", sb] {
+        buf[n..n + part.len()].copy_from_slice(part);
+        n += part.len();
+    }
+    str8(&buf[..n])
+}
+
+/// Hex-encode `bytes` into `buf` as upper-case pairs with a space every 2 bytes
+/// ("A1B2 C3D4 …") — the on-screen form of an OpenPGP fingerprint.
+fn fmt_hex_grouped<'a>(bytes: &[u8], buf: &'a mut [u8]) -> &'a str {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut n = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        if i > 0 && i % 2 == 0 && n < buf.len() {
+            buf[n] = b' ';
+            n += 1;
+        }
+        if n + 2 <= buf.len() {
+            buf[n] = HEX[(b >> 4) as usize];
+            buf[n + 1] = HEX[(b & 0xf) as usize];
+            n += 2;
+        }
+    }
+    str8(&buf[..n])
+}
+
+/// A read-only detail card: a bordered surface of `label → value` rows, each a muted
+/// label at the left and its value (mono) at the right, divided by hairlines. Used by
+/// the OpenPGP key-detail and PIV slot-detail screens.
+fn detail_card<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    top: u16,
+    rows: &[(&str, &str, Rgb565)],
+) -> Result<(), D::Error> {
+    const X: u16 = 13;
+    const W: u16 = PANEL_W - 2 * X;
+    const RH: i32 = 30;
+    let h = rows.len() as u16 * RH as u16 + 8;
+    card(
+        t,
+        Rect::new(X, top, W, h),
+        theme::SURFACE,
+        theme::BORDER_CARD,
+    )?;
+    for (i, (label, value, color)) in rows.iter().enumerate() {
+        let row_top = top as i32 + 4 + i as i32 * RH;
+        if i > 0 {
+            Line::new(
+                EgPoint::new(X as i32 + 10, row_top),
+                EgPoint::new((X + W) as i32 - 10, row_top),
+            )
+            .into_styled(PrimitiveStyle::with_stroke(theme::DIVIDER, 1))
+            .draw(t)?;
+        }
+        let cy = row_top + RH / 2;
+        text_left(
+            t,
+            label,
+            EgPoint::new(X as i32 + 12, cy),
+            Role::Body,
+            theme::MUTED,
+        )?;
+        text_right(
+            t,
+            value,
+            EgPoint::new((X + W) as i32 - 12, cy),
+            Role::Mono,
+            *color,
+        )?;
+    }
+    Ok(())
+}
+
+/// The empty-slot body of an applet detail screen: a centred muted glyph, a headline,
+/// and a one-line hint on how to populate the slot. Keeps an unprovisioned slot
+/// explorable (it still drills in) rather than an inert, unexplained row.
+fn empty_slot<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    icon: Glyph,
+    headline: &str,
+    hint: &str,
+) -> Result<(), D::Error> {
+    glyph::draw(t, icon, Point::new(MIDX as u16 - 22, 120), 44, MUTED)?;
+    text(
+        t,
+        headline,
+        EgPoint::new(MIDX, 192),
+        Role::Strong,
+        theme::TEXT_2,
+    )?;
+    text(
+        t,
+        hint,
+        EgPoint::new(MIDX, 216),
+        Role::MonoSmall,
+        theme::CAPTION,
+    )
+}
+
+/// The Apps tab: the unified applet launcher — one row per credential applet
+/// (OpenPGP / PIV / OATH) with its live item count, plus the bottom nav.
+pub fn render_apps<D>(t: &mut D, v: &AppsView) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    t.clear(BG)?;
+    status_bar(t)?;
+    title_bar_wide(t, "Apps", theme::ACCENT, false)?;
+    let (mut b0, mut b1, mut b2) = ([0u8; 16], [0u8; 16], [0u8; 16]);
+    let rows: [(Glyph, &str, &str); 3] = [
+        (
+            Glyph::Key,
+            "OpenPGP",
+            fmt_count(v.openpgp_keys as u16, "keys", &mut b0),
+        ),
+        (
+            Glyph::Cpu,
+            "PIV",
+            fmt_count(v.piv_slots as u16, "slots", &mut b1),
+        ),
+        (
+            Glyph::Clock,
+            "OATH",
+            fmt_count(v.oath_codes, "codes", &mut b2),
+        ),
+    ];
+    for (i, (g, name, trailing)) in rows.into_iter().enumerate() {
+        render_row(
+            t,
+            crate::row_rect(PK_LIST_TOP, i as u16),
+            g,
+            name,
+            Some((trailing, MUTED)),
+            true,
+        )?;
+    }
+    render_nav(t, NavTab::Apps)
+}
+
+/// The OpenPGP overview: the three key slots (Signature / Encryption / Authentication)
+/// with their algorithm, a footer with the signature counter and the PW1 / PW3
+/// remaining attempts, and the nav bar. A present slot drills into its key detail.
+pub fn render_openpgp<D>(t: &mut D, v: &OpenpgpView) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    t.clear(BG)?;
+    status_bar(t)?;
+    title_bar_wide(t, "OpenPGP", theme::ACCENT, true)?;
+    const NAMES: [&str; 3] = ["Signature", "Encryption", "Authentication"];
+    const GLYPHS: [Glyph; 3] = [Glyph::Edit, Glyph::Lock, Glyph::Shield];
+    for (i, slot) in v.slots.iter().enumerate() {
+        let trailing = if slot.present {
+            (slot.algo.as_str(), MUTED)
+        } else {
+            ("—", theme::CAPTION)
+        };
+        // Every slot drills into its own detail (an empty slot's screen explains its
+        // role), so every row gets the chevron.
+        render_row(
+            t,
+            crate::row_rect(PK_LIST_TOP, i as u16),
+            GLYPHS[i],
+            NAMES[i],
+            Some(trailing),
+            true,
+        )?;
+    }
+    let cy = NAV_TOP as i32 - 10;
+    let mut sbuf = [0u8; 16];
+    text_left(
+        t,
+        fmt_labeled("sig", v.sig_count, &mut sbuf),
+        EgPoint::new(13, cy),
+        Role::Mono,
+        theme::CAPTION,
+    )?;
+    let mut pbuf = [0u8; 16];
+    text_right(
+        t,
+        fmt_pair("PIN", v.pw1, v.pw3, &mut pbuf),
+        EgPoint::new(PANEL_W as i32 - 13, cy),
+        Role::Mono,
+        retry_color(v.pw1.min(v.pw3)),
+    )?;
+    render_nav(t, NavTab::Apps)
+}
+
+/// One OpenPGP key's detail (back-only, no nav). A present slot shows its algorithm,
+/// touch policy, generation-time state, and the full SHA-1 fingerprint (two grouped
+/// mono rows) — the public key itself is deliberately not shown (it is not
+/// reconstructable without a PIN, and never leaves the card). An empty slot shows what
+/// the slot is for and how to set it up, so every slot is explorable.
+pub fn render_openpgp_key<D>(t: &mut D, v: &PgpKeyView) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    t.clear(BG)?;
+    status_bar(t)?;
+    let (title, purpose) = match v.slot {
+        0 => ("Sign key", "Signs data and commits"),
+        1 => ("Decrypt key", "Decrypts messages"),
+        _ => ("Auth key", "SSH and authentication"),
+    };
+    title_bar_wide(t, title, theme::ACCENT, true)?;
+    text_left(
+        t,
+        purpose,
+        EgPoint::new(14, CONTENT_TOP as i32 + 12),
+        Role::Body,
+        theme::MUTED,
+    )?;
+    if !v.present {
+        return empty_slot(
+            t,
+            Glyph::Key,
+            "No key in this slot",
+            "Set it up with gpg over USB.",
+        );
+    }
+    let card_top = CONTENT_TOP + 28;
+    detail_card(
+        t,
+        card_top,
+        &[
+            ("Algorithm", v.algo.as_str(), theme::TEXT),
+            (
+                "Touch to use",
+                if v.touch { "Required" } else { "Off" },
+                if v.touch {
+                    theme::ACCENT_TEXT
+                } else {
+                    theme::MUTED
+                },
+            ),
+            (
+                "Created",
+                if v.created { "Recorded" } else { "Not set" },
+                theme::MUTED,
+            ),
+        ],
+    )?;
+    let fp_top = card_top as i32 + 3 * 30 + 8 + 8;
+    text_left(
+        t,
+        "FINGERPRINT",
+        EgPoint::new(14, fp_top),
+        Role::Mono,
+        theme::CAPTION,
+    )?;
+    if v.has_fp {
+        let mut r0 = [0u8; 32];
+        let mut r1 = [0u8; 32];
+        text_left(
+            t,
+            fmt_hex_grouped(&v.fingerprint[..10], &mut r0),
+            EgPoint::new(14, fp_top + 24),
+            Role::Mono,
+            theme::TEXT_2,
+        )?;
+        text_left(
+            t,
+            fmt_hex_grouped(&v.fingerprint[10..], &mut r1),
+            EgPoint::new(14, fp_top + 44),
+            Role::Mono,
+            theme::TEXT_2,
+        )?;
+    } else {
+        text_left(
+            t,
+            "Not set",
+            EgPoint::new(14, fp_top + 26),
+            Role::Body,
+            theme::MUTED,
+        )?;
+    }
+    text_left(
+        t,
+        "Public key is not exportable",
+        EgPoint::new(14, PANEL_H as i32 - 18),
+        Role::MonoSmall,
+        theme::CAPTION,
+    )
+}
+
+/// The PIV overview: the four primary slots (9A / 9C / 9D / 9E) with their algorithm
+/// (or "cert" when only a certificate is stored), a footer with the PIN / PUK remaining
+/// attempts, and the nav bar. A populated slot drills into its detail.
+pub fn render_piv<D>(t: &mut D, v: &PivView) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    t.clear(BG)?;
+    status_bar(t)?;
+    title_bar_wide(t, "PIV", theme::ACCENT, true)?;
+    const NAMES: [&str; 4] = ["Authentication", "Signature", "Key Management", "Card Auth"];
+    for (i, slot) in v.slots.iter().enumerate() {
+        let trailing = if slot.present {
+            (slot.algo.as_str(), MUTED)
+        } else if slot.cert {
+            ("cert", theme::CAPTION)
+        } else {
+            ("—", theme::CAPTION)
+        };
+        // Every slot drills into its own detail (an empty slot's screen explains its
+        // role), so every row gets the chevron.
+        render_row(
+            t,
+            crate::row_rect(PK_LIST_TOP, i as u16),
+            Glyph::Cpu,
+            NAMES[i],
+            Some(trailing),
+            true,
+        )?;
+    }
+    let cy = NAV_TOP as i32 - 10;
+    let mut a = [0u8; 12];
+    text_left(
+        t,
+        fmt_labeled("PIN", v.pin as u32, &mut a),
+        EgPoint::new(13, cy),
+        Role::Mono,
+        retry_color(v.pin),
+    )?;
+    let mut b = [0u8; 12];
+    text_right(
+        t,
+        fmt_labeled("PUK", v.puk as u32, &mut b),
+        EgPoint::new(PANEL_W as i32 - 13, cy),
+        Role::Mono,
+        retry_color(v.puk),
+    )?;
+    render_nav(t, NavTab::Apps)
+}
+
+/// One PIV slot's detail (back-only, no nav). A populated slot shows its algorithm,
+/// PIN / touch policy, key origin, and certificate presence. An empty slot shows what
+/// the slot is for and how to set it up (and notes a stored cert if one exists without
+/// a key), so every slot is explorable.
+pub fn render_piv_slot<D>(t: &mut D, v: &PivSlotView) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    t.clear(BG)?;
+    status_bar(t)?;
+    let (title, purpose) = match v.slot {
+        0x9A => ("9A Auth", "Authentication / login"),
+        0x9C => ("9C Sign", "Digital signatures"),
+        0x9D => ("9D Key Mgmt", "Encryption / key mgmt"),
+        0x9E => ("9E Card Auth", "Card auth, no PIN"),
+        _ => ("PIV slot", ""),
+    };
+    title_bar_wide(t, title, theme::ACCENT, true)?;
+    text_left(
+        t,
+        purpose,
+        EgPoint::new(14, CONTENT_TOP as i32 + 12),
+        Role::Body,
+        theme::MUTED,
+    )?;
+    if v.present {
+        detail_card(
+            t,
+            CONTENT_TOP + 28,
+            &[
+                ("Algorithm", v.algo.as_str(), theme::TEXT),
+                ("PIN policy", v.pin_policy.as_str(), theme::MUTED),
+                ("Touch policy", v.touch_policy.as_str(), theme::MUTED),
+                ("Origin", v.origin.as_str(), theme::MUTED),
+                (
+                    "Certificate",
+                    if v.cert { "Stored" } else { "None" },
+                    if v.cert {
+                        theme::ACCENT_TEXT
+                    } else {
+                        theme::CAPTION
+                    },
+                ),
+            ],
+        )
+    } else {
+        let hint = if v.cert {
+            "Certificate stored, no key."
+        } else {
+            "Set it up with ykman over USB."
+        };
+        empty_slot(t, Glyph::Cpu, "No key in this slot", hint)
+    }
+}
+
+/// The OATH list: one row per stored credential (a clock, or a padlock when touch-gated,
+/// plus the label and its TOTP / HOTP type), the nav bar, and a footer reminding that
+/// codes themselves are read in the host app (the device has no clock for TOTP). Paged
+/// when it spans more than one screen.
+pub fn render_oath<D>(t: &mut D, rows: &[OathRow], page: u16, total: u16) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    t.clear(BG)?;
+    status_bar(t)?;
+    title_bar_wide(t, "OATH", theme::ACCENT, true)?;
+    if total == 0 {
+        glyph::draw(t, Glyph::Clock, Point::new(MIDX as u16 - 18, 96), 36, MUTED)?;
+        text(
+            t,
+            "No codes yet",
+            EgPoint::new(MIDX, 160),
+            Role::Body,
+            MUTED,
+        )?;
+    } else {
+        for (i, r) in rows.iter().enumerate() {
+            let icon = if r.touch { Glyph::Lock } else { Glyph::Clock };
+            let kind = if r.hotp { "HOTP" } else { "TOTP" };
+            render_row(
+                t,
+                crate::row_rect(PK_LIST_TOP, i as u16),
+                icon,
+                r.name.as_str(),
+                Some((kind, MUTED)),
+                false,
+            )?;
+        }
+        if page_count(total) > 1 {
+            render_pager(t, page, page_count(total))?;
+        } else {
+            text(
+                t,
+                "Codes shown in the RS-Key app",
+                EgPoint::new(MIDX, NAV_TOP as i32 - 10),
+                Role::MonoSmall,
+                theme::CAPTION,
+            )?;
+        }
+    }
+    render_nav(t, NavTab::Apps)
 }
 
 /// The rename screen: a character-wheel editor for a relying party's device-local
@@ -2226,6 +2714,31 @@ pub fn title_bar<D: DrawTarget<Color = Rgb565>>(
     color: Rgb565,
     back: bool,
 ) -> Result<(), D::Error> {
+    // Default: leave the right edge for the [`render_service`] edit pencil.
+    title_bar_to(t, title, color, back, TITLE_EDIT_RECT.x.saturating_sub(4))
+}
+
+/// A [`title_bar`] for screens that draw **no** right-edge affordance (the applet
+/// overview / detail screens): the title clips to the full content margin instead of
+/// reserving the edit-pencil zone, so a longer title isn't cut mid-word.
+fn title_bar_wide<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    title: &str,
+    color: Rgb565,
+    back: bool,
+) -> Result<(), D::Error> {
+    title_bar_to(t, title, color, back, PANEL_W - 13)
+}
+
+/// Shared title-bar paint: an optional back chevron, then the title clipped to end at
+/// `right` (a single px past which nothing paints), so paint and the back hit-test agree.
+fn title_bar_to<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    title: &str,
+    color: Rgb565,
+    back: bool,
+    right: u16,
+) -> Result<(), D::Error> {
     let cy = STATUS_BAR_H as i32 + TITLE_BAR_H as i32 / 2;
     let tx = if back {
         back_button(t, TITLE_BACK_RECT, color)?;
@@ -2233,7 +2746,6 @@ pub fn title_bar<D: DrawTarget<Color = Rgb565>>(
     } else {
         13
     };
-    let right = TITLE_EDIT_RECT.x.saturating_sub(4); // a gap before the affordance zone
     let clip = Rect::new(
         tx as u16,
         STATUS_BAR_H,
@@ -2375,13 +2887,18 @@ pub fn render_nav<D: DrawTarget<Color = Rgb565>>(
         let g = match tab {
             NavTab::Home => Glyph::Home,
             NavTab::Passkeys => Glyph::Key,
+            NavTab::Apps => Glyph::Apps,
             NavTab::Settings => Glyph::Gear,
         };
-        glyph::draw(
+        // Glyph high in the cell, its caption centred below — four tabs at 60px each
+        // are tight, so the label disambiguates the (smaller, 16px) icon.
+        let cx = r.x + r.w / 2;
+        glyph::draw(t, g, Point::new(cx - 8, NAV_TOP + 4), 16, color)?;
+        text(
             t,
-            g,
-            Point::new(r.x + r.w / 2 - 10, r.y + r.h / 2 - 10),
-            20,
+            tab.label(),
+            EgPoint::new(cx as i32, NAV_TOP as i32 + 28),
+            Role::MonoSmall,
             color,
         )?;
     }
@@ -4036,12 +4553,170 @@ mod tests {
             (r.y..r.y + r.h).any(|y| (r.x..r.x + r.w).any(|x| d.at(x, y) == c))
         };
         assert!(
-            has(crate::nav_tab_rect(2), theme::ACCENT),
+            has(crate::nav_tab_rect(3), theme::ACCENT),
             "active tab not accented"
         );
         assert!(
             !has(crate::nav_tab_rect(0), theme::ACCENT),
             "inactive tab accented"
+        );
+    }
+
+    #[test]
+    fn applet_screens_paint_inside_the_panel() {
+        use crate::{PgpSlotRow, PivSlotRow};
+        let mut d = Rec::new();
+        render_apps(
+            &mut d,
+            &AppsView {
+                openpgp_keys: 2,
+                piv_slots: 1,
+                oath_codes: 5,
+            },
+        )
+        .unwrap();
+        assert!(!d.oob && d.drew_anything(), "apps chooser");
+
+        let pgp = OpenpgpView {
+            slots: [
+                PgpSlotRow {
+                    present: true,
+                    algo: Label::clamp(b"Ed25519"),
+                    touch: true,
+                },
+                PgpSlotRow {
+                    present: true,
+                    algo: Label::clamp(b"Cv25519"),
+                    touch: false,
+                },
+                PgpSlotRow::default(),
+            ],
+            sig_count: 42,
+            pw1: 3,
+            pw3: 3,
+        };
+        let mut d = Rec::new();
+        render_openpgp(&mut d, &pgp).unwrap();
+        assert!(!d.oob, "openpgp overview spilled");
+
+        let mut d = Rec::new();
+        render_openpgp_key(
+            &mut d,
+            &PgpKeyView {
+                slot: 0,
+                present: true,
+                algo: Label::clamp(b"Ed25519"),
+                touch: true,
+                created: true,
+                fingerprint: [0xAB; 20],
+                has_fp: true,
+            },
+        )
+        .unwrap();
+        assert!(!d.oob, "openpgp key detail spilled");
+
+        // The empty-slot branch must also paint inside the panel.
+        let mut d = Rec::new();
+        render_openpgp_key(
+            &mut d,
+            &PgpKeyView {
+                slot: 2,
+                present: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!d.oob && d.drew_anything(), "openpgp empty slot");
+
+        let piv = PivView {
+            slots: [
+                PivSlotRow {
+                    slot: 0x9A,
+                    present: true,
+                    cert: true,
+                    algo: Label::clamp(b"NIST P-256"),
+                },
+                PivSlotRow {
+                    slot: 0x9C,
+                    present: false,
+                    cert: true,
+                    algo: Label::default(),
+                },
+                PivSlotRow {
+                    slot: 0x9D,
+                    ..Default::default()
+                },
+                PivSlotRow {
+                    slot: 0x9E,
+                    ..Default::default()
+                },
+            ],
+            pin: 1,
+            puk: 0,
+        };
+        let mut d = Rec::new();
+        render_piv(&mut d, &piv).unwrap();
+        assert!(!d.oob, "piv overview spilled");
+
+        let mut d = Rec::new();
+        render_piv_slot(
+            &mut d,
+            &PivSlotView {
+                slot: 0x9D,
+                present: true,
+                cert: false,
+                algo: Label::clamp(b"RSA 2048"),
+                pin_policy: Label::clamp(b"Once"),
+                touch_policy: Label::clamp(b"Always"),
+                origin: Label::clamp(b"Imported"),
+            },
+        )
+        .unwrap();
+        assert!(!d.oob, "piv slot detail spilled");
+
+        let mut d = Rec::new();
+        render_piv_slot(
+            &mut d,
+            &PivSlotView {
+                slot: 0x9E,
+                present: false,
+                cert: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!d.oob && d.drew_anything(), "piv empty slot");
+
+        let oath = [
+            OathRow {
+                name: Label::clamp(b"GitHub:alex"),
+                hotp: false,
+                touch: true,
+            },
+            OathRow {
+                name: Label::clamp(b"AWS root"),
+                hotp: true,
+                touch: false,
+            },
+        ];
+        let mut d = Rec::new();
+        render_oath(&mut d, &oath, 0, 2).unwrap();
+        assert!(!d.oob, "oath list spilled");
+        let mut d = Rec::new();
+        render_oath(&mut d, &[], 0, 0).unwrap();
+        assert!(!d.oob && d.drew_anything(), "oath empty");
+    }
+
+    #[test]
+    fn apps_chooser_accents_the_apps_tab() {
+        let mut d = Rec::new();
+        render_apps(&mut d, &AppsView::default()).unwrap();
+        let has = |r: Rect, c: Rgb565| {
+            (r.y..r.y + r.h).any(|y| (r.x..r.x + r.w).any(|x| d.at(x, y) == c))
+        };
+        assert!(
+            has(crate::nav_tab_rect(2), theme::ACCENT),
+            "Apps tab not accented"
         );
     }
 

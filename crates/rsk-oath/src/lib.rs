@@ -883,6 +883,79 @@ fn present_creds<S: Storage>(fs: &mut Fs<S>, out: &mut [u16; MAX_OATH_CRED as us
     n
 }
 
+/// One stored credential's public metadata, unsealed for the trusted display.
+/// The secret HMAC key is never surfaced — only its type/hash byte is decoded.
+pub struct OathCredView<'a> {
+    /// Credential label (issuer:account), as stored; sanitise before display.
+    pub name: &'a [u8],
+    /// HOTP (event-based) when set, else TOTP (time-based).
+    pub hotp: bool,
+    /// HMAC hash algorithm (`ALG_HMAC_SHA1/256/512`, the key byte's low nibble).
+    pub algo: u8,
+    /// Code length (digits).
+    pub digits: u8,
+    /// Whether the credential is touch-gated.
+    pub touch: bool,
+}
+
+/// A short ASCII label for an OATH hash algorithm (the key byte's low nibble).
+pub fn algo_name(algo: u8) -> &'static str {
+    match algo {
+        ALG_HMAC_SHA1 => "SHA1",
+        ALG_HMAC_SHA256 => "SHA256",
+        ALG_HMAC_SHA512 => "SHA512",
+        _ => "?",
+    }
+}
+
+/// Visit every stored credential's public metadata for the trusted display,
+/// returning the count. Each credential is device-unsealed (no PIN, no SET-CODE
+/// gate) into a scratch buffer the callback borrows for the call; the scratch —
+/// which holds the secret key bytes — is zeroized before returning, and the view
+/// exposes only name / type / algorithm / digits / touch. No code is computed
+/// (the device has no clock for TOTP, and HOTP would mutate a counter).
+pub fn for_each_cred<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    mut f: impl FnMut(OathCredView<'_>),
+) -> usize {
+    let mut fids = [0u16; MAX_OATH_CRED as usize];
+    let nfids = present_creds(fs, &mut fids);
+    let mut scratch = [0u8; CRED_MAX];
+    let mut count = 0;
+    for &fid in &fids[..nfids] {
+        let Some(n) = seal::seal_read(dev, fs, KeyFid::new(fid), &mut scratch) else {
+            continue;
+        };
+        let blob = &scratch[..n.min(CRED_MAX)];
+        let (Some(name), Some(key)) = (
+            find_tag(blob, TAG_NAME as u16),
+            find_tag(blob, TAG_KEY as u16),
+        ) else {
+            continue;
+        };
+        if key.is_empty() {
+            continue;
+        }
+        let hotp = key[0] & OATH_TYPE_MASK == OATH_TYPE_HOTP;
+        let algo = key[0] & ALG_MASK;
+        let digits = key.get(1).copied().unwrap_or(0);
+        let touch = find_tag(blob, TAG_PROPERTY as u16)
+            .and_then(|v| v.first().copied())
+            .is_some_and(|p| p & PROP_TOUCH != 0);
+        f(OathCredView {
+            name,
+            hotp,
+            algo,
+            digits,
+            touch,
+        });
+        count += 1;
+    }
+    scratch.zeroize();
+    count
+}
+
 /// Find a present credential whose `TAG_NAME` equals `name`; the blob is left in
 /// `buf`. Only present slots are read (see [`present_creds`]).
 fn find_cred<S: Storage>(
@@ -1179,6 +1252,50 @@ mod tests {
         assert_eq!(body[1], 5);
         let v = u32::from_be_bytes([body[3], body[4], body[5], body[6]]);
         v % 10u32.pow(digits)
+    }
+
+    #[test]
+    fn for_each_cred_lists_public_metadata() {
+        let mut fs = new_fs();
+        let rng = RefCell::new(CountRng(7));
+        let touch = RefCell::new(AlwaysConfirm);
+        let mut app = OathApplet::new(SERIAL, [0x22; 32], None, &rng, &touch);
+        // TOTP/SHA1, 6 digits, no touch; HOTP/SHA256, 8 digits, touch-gated.
+        assert_eq!(
+            put(
+                &mut app,
+                &mut fs,
+                &put_data(b"GitHub:alex", 0x21, 6, &[0xAA; 20], false, None)
+            ),
+            Sw::OK
+        );
+        assert_eq!(
+            put(
+                &mut app,
+                &mut fs,
+                &put_data(b"AWS", 0x12, 8, &[0xBB; 32], true, Some(0))
+            ),
+            Sw::OK
+        );
+
+        let dev = Device {
+            serial_hash: &[0x22; 32],
+            serial_id: &SERIAL,
+            otp_key: None,
+        };
+        let mut seen: Vec<(Vec<u8>, bool, u8, u8, bool)> = Vec::new();
+        let n = for_each_cred(&dev, &mut fs, |c| {
+            seen.push((c.name.to_vec(), c.hotp, c.algo, c.digits, c.touch))
+        });
+        assert_eq!(n, 2);
+        let gh = seen.iter().find(|c| c.0 == b"GitHub:alex").unwrap();
+        assert_eq!((gh.1, gh.2, gh.3, gh.4), (false, ALG_HMAC_SHA1, 6, false));
+        assert_eq!(algo_name(gh.2), "SHA1");
+        let aws = seen.iter().find(|c| c.0 == b"AWS").unwrap();
+        assert_eq!(
+            (aws.1, aws.2, aws.3, aws.4),
+            (true, ALG_HMAC_SHA256, 8, true)
+        );
     }
 
     #[test]

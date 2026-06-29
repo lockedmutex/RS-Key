@@ -52,7 +52,7 @@ use mipidsi::{Builder, Display};
 use rsk_crypto::Device;
 use rsk_sdk::Confirm;
 use rsk_ui::{
-    ALLOW_RECT, AccountRow, AdjustKey, AuditRow, BRIGHTNESS_LEVELS, BackupView, Button,
+    ALLOW_RECT, AccountRow, AdjustKey, AppEntry, AuditRow, BRIGHTNESS_LEVELS, BackupView, Button,
     ConfirmPrompt, HomeView, Label, NavTab, PinCaption, PinKey, PinPad, RootEntry, RpRow, Screen,
     SecurityEntry, SettingsPage, SettingsView, StatusKind, SuccessKind,
 };
@@ -840,6 +840,7 @@ impl Ui {
                         // Already on this tab — ignore (don't drop to Home).
                         NavTab::Passkeys => {}
                         NavTab::Home => break None,
+                        NavTab::Apps => break Some(NavTab::Apps),
                         NavTab::Settings => break Some(NavTab::Settings),
                     }
                 }
@@ -910,6 +911,7 @@ impl Ui {
                         // The active tab drills back out to its own list.
                         NavTab::Passkeys => ServiceResult::Back,
                         NavTab::Home => ServiceResult::Leave(None),
+                        NavTab::Apps => ServiceResult::Leave(Some(NavTab::Apps)),
                         NavTab::Settings => ServiceResult::Leave(Some(NavTab::Settings)),
                     };
                 }
@@ -967,6 +969,388 @@ impl Ui {
             }
             block_for(Duration::from_millis(TOUCH_POLL_MS));
         }
+    }
+
+    /// Snapshot the per-applet item counts for the Apps chooser. One borrow covers all
+    /// three reads (the device is taken first, so the OATH unseal-walk and the `fs` borrow
+    /// don't overlap). Borrow-safe like [`Self::load_rps`] — the worker is parked here.
+    fn load_apps(&self) -> rsk_ui::AppsView {
+        let dev = self.keys.device();
+        let mut fs = self.fs.borrow_mut();
+        let openpgp_keys = rsk_openpgp::info::read_info(&mut fs).key_count();
+        let piv_slots = rsk_piv::info::read_info(&mut fs).populated();
+        let oath_codes =
+            rsk_oath::for_each_cred(&dev, &mut fs, |_| {}).min(u16::MAX as usize) as u16;
+        rsk_ui::AppsView {
+            openpgp_keys,
+            piv_slots,
+            oath_codes,
+        }
+    }
+
+    /// The Apps tab: a chooser for the credential applets. Reuses the tab modal shape — a
+    /// drill-in per applet, the bottom nav for direct tab switches, the power button to
+    /// sleep, and a break the moment a host command queues so a browse never starves the
+    /// worker. Returns the next nav destination (`None` = back to idle Home).
+    fn run_apps(&mut self) -> Option<NavTab> {
+        let view = self.load_apps();
+        let _ = rsk_ui::render_apps(&mut self.panel, &view);
+        self.shown = None;
+        self.touch
+            .wait_release(Instant::now(), Duration::from_millis(MENU_INACTIVITY_MS));
+        let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
+        let mut last = Instant::now();
+        let next = loop {
+            if self.sleep_button_pressed() {
+                break None;
+            }
+            if let Some(p) = self.touch.read() {
+                last = Instant::now();
+                if let Some(entry) = rsk_ui::hit_apps(p) {
+                    let leave = match entry {
+                        AppEntry::OpenPgp => self.run_openpgp(),
+                        AppEntry::Piv => self.run_piv(),
+                        AppEntry::Oath => self.run_oath(),
+                    };
+                    if self.asleep {
+                        break None;
+                    }
+                    if leave.is_some() {
+                        break leave;
+                    }
+                    // Back from an applet: re-snapshot (a host op may have run while parked)
+                    // and repaint the chooser.
+                    let view = self.load_apps();
+                    let _ = rsk_ui::render_apps(&mut self.panel, &view);
+                    self.shown = None;
+                    self.touch.wait_release(Instant::now(), idle_limit);
+                    last = Instant::now();
+                    continue;
+                } else if let Some(tab) = rsk_ui::hit_nav(p) {
+                    match tab {
+                        NavTab::Apps => {}
+                        NavTab::Home => break None,
+                        NavTab::Passkeys => break Some(NavTab::Passkeys),
+                        NavTab::Settings => break Some(NavTab::Settings),
+                    }
+                }
+                self.touch.wait_release(last, idle_limit);
+            }
+            if crate::worker::host_request_pending() || last.elapsed() >= idle_limit {
+                break None;
+            }
+            block_for(Duration::from_millis(TOUCH_POLL_MS));
+        };
+        self.end_modal();
+        next
+    }
+
+    /// Build the OpenPGP overview from the applet's plaintext metadata (no PIN / DEK).
+    fn load_openpgp(&self) -> rsk_ui::OpenpgpView {
+        let mut fs = self.fs.borrow_mut();
+        let info = rsk_openpgp::info::read_info(&mut fs);
+        let mut slots = [rsk_ui::PgpSlotRow::default(); 3];
+        for (i, s) in info.slots.iter().enumerate() {
+            slots[i] = rsk_ui::PgpSlotRow {
+                present: s.present,
+                algo: if s.present {
+                    Label::clamp(s.algo.label().as_bytes())
+                } else {
+                    Label::default()
+                },
+                touch: s.touch,
+            };
+        }
+        rsk_ui::OpenpgpView {
+            slots,
+            sig_count: info.sig_count,
+            pw1: info.pw1_retries,
+            pw3: info.pw3_retries,
+        }
+    }
+
+    /// Build one OpenPGP key's detail (algorithm / touch / fingerprint).
+    fn load_openpgp_key(&self, slot: usize) -> rsk_ui::PgpKeyView {
+        let mut fs = self.fs.borrow_mut();
+        let s = rsk_openpgp::info::read_info(&mut fs).slots[slot];
+        rsk_ui::PgpKeyView {
+            slot: slot as u8,
+            present: s.present,
+            algo: Label::clamp(s.algo.label().as_bytes()),
+            touch: s.touch,
+            created: s.created,
+            fingerprint: s.fingerprint.unwrap_or([0u8; 20]),
+            has_fp: s.fingerprint.is_some(),
+        }
+    }
+
+    /// The OpenPGP overview (read-only): the three key slots + a drill-in to each present
+    /// slot's detail. Same modal shape as [`Self::run_apps`]; `None` returns to the Apps
+    /// chooser, `Some(tab)` leaves the hub to that tab.
+    fn run_openpgp(&mut self) -> Option<NavTab> {
+        let view = self.load_openpgp();
+        let _ = rsk_ui::render_openpgp(&mut self.panel, &view);
+        self.shown = None;
+        self.touch
+            .wait_release(Instant::now(), Duration::from_millis(MENU_INACTIVITY_MS));
+        let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
+        let mut last = Instant::now();
+        let next = loop {
+            if self.sleep_button_pressed() {
+                break None;
+            }
+            if let Some(p) = self.touch.read() {
+                last = Instant::now();
+                if rsk_ui::hit_title_back(p) {
+                    break None;
+                }
+                if let Some(i) = rsk_ui::hit_list(p, rsk_ui::PK_LIST_TOP, 3) {
+                    // Every slot drills in — an empty slot's detail explains its role.
+                    self.run_openpgp_key(i as usize);
+                    if self.asleep {
+                        break None;
+                    }
+                    let _ = rsk_ui::render_openpgp(&mut self.panel, &view);
+                    self.shown = None;
+                    self.touch.wait_release(Instant::now(), idle_limit);
+                    last = Instant::now();
+                    continue;
+                } else if let Some(tab) = rsk_ui::hit_nav(p) {
+                    match tab {
+                        NavTab::Apps => break None,
+                        NavTab::Home => break Some(NavTab::Home),
+                        NavTab::Passkeys => break Some(NavTab::Passkeys),
+                        NavTab::Settings => break Some(NavTab::Settings),
+                    }
+                }
+                self.touch.wait_release(last, idle_limit);
+            }
+            if crate::worker::host_request_pending() || last.elapsed() >= idle_limit {
+                break None;
+            }
+            block_for(Duration::from_millis(TOUCH_POLL_MS));
+        };
+        self.end_modal();
+        next
+    }
+
+    /// One OpenPGP key's detail screen (back-only, no nav). Read-only; back chevron / power
+    /// button / a queued host command / inactivity all return to the overview.
+    fn run_openpgp_key(&mut self, slot: usize) {
+        let view = self.load_openpgp_key(slot);
+        let _ = rsk_ui::render_openpgp_key(&mut self.panel, &view);
+        self.shown = None;
+        self.touch
+            .wait_release(Instant::now(), Duration::from_millis(MENU_INACTIVITY_MS));
+        let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
+        let mut last = Instant::now();
+        loop {
+            if self.sleep_button_pressed() {
+                break;
+            }
+            if let Some(p) = self.touch.read() {
+                last = Instant::now();
+                if rsk_ui::hit_title_back(p) {
+                    break;
+                }
+                self.touch.wait_release(last, idle_limit);
+            }
+            if crate::worker::host_request_pending() || last.elapsed() >= idle_limit {
+                break;
+            }
+            block_for(Duration::from_millis(TOUCH_POLL_MS));
+        }
+        self.end_modal();
+    }
+
+    /// Build the PIV overview from the applet's slot metadata (no PIN / management key).
+    fn load_piv(&self) -> rsk_ui::PivView {
+        let mut fs = self.fs.borrow_mut();
+        let info = rsk_piv::info::read_info(&mut fs);
+        let mut slots = [rsk_ui::PivSlotRow::default(); 4];
+        for (i, s) in info.slots.iter().enumerate() {
+            slots[i] = rsk_ui::PivSlotRow {
+                slot: s.slot,
+                present: s.present,
+                cert: s.cert,
+                algo: if s.present {
+                    Label::clamp(rsk_piv::info::algo_name(s.algo).as_bytes())
+                } else {
+                    Label::default()
+                },
+            };
+        }
+        rsk_ui::PivView {
+            slots,
+            pin: info.pin_retries,
+            puk: info.puk_retries,
+        }
+    }
+
+    /// Build one PIV slot's detail (algorithm / policies / origin / cert).
+    fn load_piv_slot(&self, idx: usize) -> rsk_ui::PivSlotView {
+        let mut fs = self.fs.borrow_mut();
+        let s = rsk_piv::info::read_info(&mut fs).slots[idx];
+        rsk_ui::PivSlotView {
+            slot: s.slot,
+            present: s.present,
+            cert: s.cert,
+            algo: Label::clamp(rsk_piv::info::algo_name(s.algo).as_bytes()),
+            pin_policy: Label::clamp(rsk_piv::info::pin_policy_name(s.pin_policy).as_bytes()),
+            touch_policy: Label::clamp(rsk_piv::info::touch_policy_name(s.touch_policy).as_bytes()),
+            origin: Label::clamp(rsk_piv::info::origin_name(s.origin).as_bytes()),
+        }
+    }
+
+    /// The PIV overview (read-only): the four primary slots + a drill-in to each populated
+    /// slot's detail. Mirrors [`Self::run_openpgp`].
+    fn run_piv(&mut self) -> Option<NavTab> {
+        let view = self.load_piv();
+        let _ = rsk_ui::render_piv(&mut self.panel, &view);
+        self.shown = None;
+        self.touch
+            .wait_release(Instant::now(), Duration::from_millis(MENU_INACTIVITY_MS));
+        let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
+        let mut last = Instant::now();
+        let next = loop {
+            if self.sleep_button_pressed() {
+                break None;
+            }
+            if let Some(p) = self.touch.read() {
+                last = Instant::now();
+                if rsk_ui::hit_title_back(p) {
+                    break None;
+                }
+                if let Some(i) = rsk_ui::hit_list(p, rsk_ui::PK_LIST_TOP, 4) {
+                    // Every slot drills in — an empty slot's detail explains its role.
+                    self.run_piv_slot(i as usize);
+                    if self.asleep {
+                        break None;
+                    }
+                    let _ = rsk_ui::render_piv(&mut self.panel, &view);
+                    self.shown = None;
+                    self.touch.wait_release(Instant::now(), idle_limit);
+                    last = Instant::now();
+                    continue;
+                } else if let Some(tab) = rsk_ui::hit_nav(p) {
+                    match tab {
+                        NavTab::Apps => break None,
+                        NavTab::Home => break Some(NavTab::Home),
+                        NavTab::Passkeys => break Some(NavTab::Passkeys),
+                        NavTab::Settings => break Some(NavTab::Settings),
+                    }
+                }
+                self.touch.wait_release(last, idle_limit);
+            }
+            if crate::worker::host_request_pending() || last.elapsed() >= idle_limit {
+                break None;
+            }
+            block_for(Duration::from_millis(TOUCH_POLL_MS));
+        };
+        self.end_modal();
+        next
+    }
+
+    /// One PIV slot's detail screen (back-only, no nav). Read-only.
+    fn run_piv_slot(&mut self, idx: usize) {
+        let view = self.load_piv_slot(idx);
+        let _ = rsk_ui::render_piv_slot(&mut self.panel, &view);
+        self.shown = None;
+        self.touch
+            .wait_release(Instant::now(), Duration::from_millis(MENU_INACTIVITY_MS));
+        let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
+        let mut last = Instant::now();
+        loop {
+            if self.sleep_button_pressed() {
+                break;
+            }
+            if let Some(p) = self.touch.read() {
+                last = Instant::now();
+                if rsk_ui::hit_title_back(p) {
+                    break;
+                }
+                self.touch.wait_release(last, idle_limit);
+            }
+            if crate::worker::host_request_pending() || last.elapsed() >= idle_limit {
+                break;
+            }
+            block_for(Duration::from_millis(TOUCH_POLL_MS));
+        }
+        self.end_modal();
+    }
+
+    /// Enumerate stored OATH credentials into `rows` (one page), returning the kept count
+    /// and the true total. Each credential is device-unsealed inside the enumerator (the
+    /// display never holds the secret); borrow-safe like [`Self::load_rps`].
+    fn load_oath(&self, rows: &mut [rsk_ui::OathRow], page: u16) -> (usize, u16) {
+        let dev = self.keys.device();
+        let offset = page as usize * rsk_ui::PK_ROWS_MAX;
+        let mut fs = self.fs.borrow_mut();
+        let mut idx = 0usize;
+        let mut n = 0usize;
+        let total = rsk_oath::for_each_cred(&dev, &mut fs, |c| {
+            if idx >= offset && n < rows.len() {
+                rows[n] = rsk_ui::OathRow {
+                    name: Label::clamp(c.name),
+                    hotp: c.hotp,
+                    touch: c.touch,
+                };
+                n += 1;
+            }
+            idx += 1;
+        });
+        (n, total.min(u16::MAX as usize) as u16)
+    }
+
+    /// The OATH list (read-only): one row per stored credential, paged. No code is shown
+    /// (the device has no clock for TOTP); the footer points at the host app. Mirrors
+    /// [`Self::run_passkeys`] — pager, nav, sleep, host-yield.
+    fn run_oath(&mut self) -> Option<NavTab> {
+        let mut rows = [rsk_ui::OathRow::default(); rsk_ui::PK_ROWS_MAX];
+        let mut page: u16 = 0;
+        let (mut n, mut total) = self.load_oath(&mut rows, page);
+        let _ = rsk_ui::render_oath(&mut self.panel, &rows[..n], page, total);
+        self.shown = None;
+        self.touch
+            .wait_release(Instant::now(), Duration::from_millis(MENU_INACTIVITY_MS));
+        let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
+        let mut last = Instant::now();
+        let next = loop {
+            if self.sleep_button_pressed() {
+                break None;
+            }
+            if let Some(p) = self.touch.read() {
+                last = Instant::now();
+                if rsk_ui::hit_title_back(p) {
+                    break None;
+                }
+                if let Some(k) = rsk_ui::hit_pager(p) {
+                    page = paged(page, total, k);
+                    let r = self.load_oath(&mut rows, page);
+                    n = r.0;
+                    total = r.1;
+                    let _ = rsk_ui::render_oath(&mut self.panel, &rows[..n], page, total);
+                    self.shown = None;
+                    self.touch.wait_release(last, idle_limit);
+                    last = Instant::now();
+                    continue;
+                } else if let Some(tab) = rsk_ui::hit_nav(p) {
+                    match tab {
+                        NavTab::Apps => break None,
+                        NavTab::Home => break Some(NavTab::Home),
+                        NavTab::Passkeys => break Some(NavTab::Passkeys),
+                        NavTab::Settings => break Some(NavTab::Settings),
+                    }
+                }
+                self.touch.wait_release(last, idle_limit);
+            }
+            if crate::worker::host_request_pending() || last.elapsed() >= idle_limit {
+                break None;
+            }
+            block_for(Duration::from_millis(TOUCH_POLL_MS));
+        };
+        self.end_modal();
+        next
     }
 
     /// The rename screen: edit a relying party's device-local nickname with the character
@@ -2258,13 +2642,16 @@ pub async fn status_task(ui: &'static RefCell<Ui>) {
                                 // the next nav destination, so the user switches tab→tab
                                 // directly (e.g. Passkeys → Settings) without a Home detour.
                                 let mut target = rsk_ui::hit_nav(p);
-                                let opened_tab =
-                                    matches!(target, Some(NavTab::Settings | NavTab::Passkeys));
+                                let opened_tab = matches!(
+                                    target,
+                                    Some(NavTab::Settings | NavTab::Passkeys | NavTab::Apps)
+                                );
                                 while let Some(tab) = target {
                                     target = match tab {
                                         NavTab::Home => None,
                                         NavTab::Settings => u.run_settings(),
                                         NavTab::Passkeys => u.run_passkeys(),
+                                        NavTab::Apps => u.run_apps(),
                                     };
                                 }
                                 note_activity(); // a browse session just ended — restart clock

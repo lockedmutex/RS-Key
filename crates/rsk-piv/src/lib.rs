@@ -14,6 +14,7 @@ extern crate alloc;
 
 mod auth;
 pub mod files;
+pub mod info;
 mod keygen;
 mod seal;
 mod x509;
