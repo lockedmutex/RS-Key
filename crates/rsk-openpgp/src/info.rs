@@ -165,6 +165,78 @@ pub fn read_info<S: Storage>(fs: &mut Fs<S>) -> OpenpgpInfo {
     }
 }
 
+/// Cap on each cardholder string surfaced to the display, matching the UI label
+/// width — longer values are truncated at read time.
+pub const CH_FIELD_MAX: usize = 48;
+
+/// The card's public cardholder data objects, all plaintext (no PIN / DEK): the
+/// cardholder name (`5B`), login data (`5E`), a URL (`5F50`) and the language
+/// preference (`5F2D`). These are written with PUT DATA and stored verbatim, so a
+/// passive read shows exactly what was provisioned; sanitise before display.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CardholderInfo {
+    name: [u8; CH_FIELD_MAX],
+    login: [u8; CH_FIELD_MAX],
+    url: [u8; CH_FIELD_MAX],
+    lang: [u8; 8],
+    name_len: u8,
+    login_len: u8,
+    url_len: u8,
+    lang_len: u8,
+}
+
+impl CardholderInfo {
+    pub fn name(&self) -> &[u8] {
+        &self.name[..self.name_len as usize]
+    }
+    pub fn login(&self) -> &[u8] {
+        &self.login[..self.login_len as usize]
+    }
+    pub fn url(&self) -> &[u8] {
+        &self.url[..self.url_len as usize]
+    }
+    pub fn lang(&self) -> &[u8] {
+        &self.lang[..self.lang_len as usize]
+    }
+    /// Whether the card carries any cardholder data at all.
+    pub fn any(&self) -> bool {
+        self.name_len != 0 || self.login_len != 0 || self.url_len != 0 || self.lang_len != 0
+    }
+}
+
+/// Read one plaintext simple-DO into `buf`, returning the bytes copied (capped at
+/// `buf.len()`). A zero-length or absent object yields `0`.
+fn read_field<S: Storage>(fs: &mut Fs<S>, fid: u16, buf: &mut [u8]) -> u8 {
+    let mut tmp = [0u8; CH_FIELD_MAX];
+    match fs.read(fid, &mut tmp) {
+        Some(n) if n > 0 => {
+            let k = n.min(buf.len());
+            buf[..k].copy_from_slice(&tmp[..k]);
+            k as u8
+        }
+        _ => 0,
+    }
+}
+
+/// Read the OpenPGP cardholder data objects for the trusted display.
+pub fn read_cardholder<S: Storage>(fs: &mut Fs<S>) -> CardholderInfo {
+    let mut info = CardholderInfo {
+        name: [0; CH_FIELD_MAX],
+        login: [0; CH_FIELD_MAX],
+        url: [0; CH_FIELD_MAX],
+        lang: [0; 8],
+        name_len: 0,
+        login_len: 0,
+        url_len: 0,
+        lang_len: 0,
+    };
+    info.name_len = read_field(fs, EF_CH_NAME, &mut info.name);
+    info.login_len = read_field(fs, EF_LOGIN_DATA, &mut info.login);
+    info.url_len = read_field(fs, EF_URI_URL, &mut info.url);
+    info.lang_len = read_field(fs, EF_LANG_PREF, &mut info.lang);
+    info
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,6 +300,35 @@ mod tests {
         assert_eq!(info.slots[2].algo.label(), "RSA 2048");
         assert!(info.slots[1].fingerprint.is_none());
         assert_eq!(info.key_count(), 2);
+    }
+
+    #[test]
+    fn empty_card_has_no_cardholder_data() {
+        let mut fs = fs();
+        let ch = read_cardholder(&mut fs);
+        assert!(!ch.any());
+        assert!(ch.name().is_empty() && ch.login().is_empty() && ch.url().is_empty());
+    }
+
+    #[test]
+    fn cardholder_fields_read_back_and_truncate() {
+        let mut fs = fs();
+        fs.put(EF_CH_NAME, b"Alice Dev").unwrap();
+        fs.put(EF_LOGIN_DATA, b"alice").unwrap();
+        fs.put(EF_URI_URL, b"https://keys.example.org/alice")
+            .unwrap();
+        fs.put(EF_LANG_PREF, b"en").unwrap();
+        let ch = read_cardholder(&mut fs);
+        assert!(ch.any());
+        assert_eq!(ch.name(), b"Alice Dev");
+        assert_eq!(ch.login(), b"alice");
+        assert_eq!(ch.url(), b"https://keys.example.org/alice");
+        assert_eq!(ch.lang(), b"en");
+
+        // A field longer than the cap is truncated, never overflowed.
+        let long = [b'x'; CH_FIELD_MAX + 20];
+        fs.put(EF_CH_NAME, &long).unwrap();
+        assert_eq!(read_cardholder(&mut fs).name().len(), CH_FIELD_MAX);
     }
 
     #[test]

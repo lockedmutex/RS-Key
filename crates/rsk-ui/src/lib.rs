@@ -26,11 +26,13 @@ pub use render::{
     PIN_TITLE_BAND, STATUS_ARC_START, pin_title_overflows, render, render_add_passkey, render_apps,
     render_audit_log, render_backup, render_backup_format, render_confirm_delete,
     render_confirm_factory_reset, render_erasing, render_firmware, render_hold_button,
-    render_hold_fill, render_locked_breathe, render_oath, render_openpgp, render_openpgp_key,
-    render_passkeys_list, render_pin_blocked, render_pin_dots, render_pin_title, render_piv,
-    render_piv_slot, render_rebooting, render_rename, render_rename_caret, render_reveal_warning,
-    render_seal_confirm, render_seed_phrase, render_service, render_share_picker,
-    render_slip39_share, render_status_arc, render_success, render_success_circle,
+    render_hold_fill, render_locked_breathe, render_oath, render_oath_cred, render_openpgp,
+    render_openpgp_cardholder, render_openpgp_key, render_passkeys_list, render_pin_blocked,
+    render_pin_dots, render_pin_title, render_piv, render_piv_extra, render_piv_keygen_confirm,
+    render_piv_keygen_pick, render_piv_slot, render_rebooting, render_rename, render_rename_caret,
+    render_reveal_warning, render_seal_confirm, render_seed_phrase, render_service,
+    render_share_picker, render_slip39_share, render_status_arc, render_success,
+    render_success_circle,
 };
 
 /// Panel geometry (Waveshare RP2350-Touch-LCD-2.8, ST7789T3, portrait).
@@ -1136,6 +1138,8 @@ pub enum SuccessKind {
     Deleted,
     /// The device was factory-wiped (about to reboot into a fresh state).
     Wiped,
+    /// An EC key was generated on-device into a retired PIV slot.
+    Generated,
 }
 
 /// Did a tap at `p` hit the success screen's **Done** button? It shares the
@@ -1422,6 +1426,20 @@ pub enum AppEntry {
 pub const APP_ROWS: u16 = 3;
 const _: () = assert!(APP_ROWS <= PK_ROWS_MAX as u16);
 
+/// Top of the on-device PIV key-generate algorithm chooser (its two rows sit below a
+/// one-line slot caption, so it starts lower than the tab lists).
+pub const PIV_KEYGEN_PICK_TOP: u16 = CONTENT_TOP + 34;
+
+/// OpenPGP overview rows: the three key slots + the card-holder row.
+pub const OPENPGP_ROWS: u16 = 4;
+/// PIV overview rows: the four primary slots + the "Retired & F9" row.
+pub const PIV_ROWS: u16 = 5;
+// Both lists share the tab-modal row band, which holds at most `PK_ROWS_MAX` rows
+// above the footer; the const-asserts here keep the footer (`NAV_TOP - 10`) clear.
+const _: () = assert!(OPENPGP_ROWS <= PK_ROWS_MAX as u16);
+const _: () = assert!(PIV_ROWS <= PK_ROWS_MAX as u16);
+const _: () = assert!(PK_LIST_TOP + PIV_ROWS * (LIST_ROW_H + LIST_ROW_GAP) <= NAV_TOP - 10);
+
 /// Which applet, if any, a tap selects on the Apps chooser. The chooser reuses the
 /// tab-list row geometry ([`row_rect`] from [`PK_LIST_TOP`]), so paint + hit share it.
 pub fn hit_apps(p: Point) -> Option<AppEntry> {
@@ -1449,14 +1467,28 @@ pub struct PgpSlotRow {
     pub touch: bool,
 }
 
-/// The OpenPGP overview: the three key slots, the signature counter, and the
-/// PW1 / PW3 remaining-attempts footer.
+/// The OpenPGP overview: the three key slots, a card-holder row (its name as the
+/// trailing value), the signature counter, and the PW1 / PW3 remaining-attempts footer.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct OpenpgpView {
     pub slots: [PgpSlotRow; 3],
+    /// The cardholder name shown on the "Card holder" row (empty → "Not set").
+    pub cardholder_name: Label,
     pub sig_count: u32,
     pub pw1: u8,
     pub pw3: u8,
+}
+
+/// The OpenPGP card-holder detail (back-only): the public cardholder data objects —
+/// name, login, URL and language — read without a PIN. An empty card shows a hint.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct CardholderView {
+    pub name: Label,
+    pub login: Label,
+    pub url: Label,
+    pub lang: Label,
+    /// Whether the card carries any cardholder data at all.
+    pub any: bool,
 }
 
 /// One OpenPGP key's detail: its slot (`0`=SIG, `1`=DEC, `2`=AUT), whether a key is
@@ -1483,12 +1515,30 @@ pub struct PivSlotRow {
     pub algo: Label,
 }
 
-/// The PIV overview: the four primary slots + the PIN / PUK remaining attempts.
+/// The PIV overview: the four primary slots, a "Retired & F9" row (its populated count
+/// as the trailing value), and the PIN / PUK remaining attempts.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct PivView {
     pub slots: [PivSlotRow; 4],
+    /// Populated retired slots + F9, shown on the "Retired & F9" row.
+    pub extra: u8,
     pub pin: u8,
     pub puk: u8,
+}
+
+/// One row on the "Retired & F9" screen: either a populated slot (retired 82–95 or the
+/// F9 attestation slot) or the trailing "Generate key" action. Slot rows drill into the
+/// shared slot-detail; the action row starts the on-device generate flow.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct PivExtraRow {
+    /// Wire slot (`0xF9` / `0x82..=0x95`); unused for the action row.
+    pub slot: u8,
+    pub present: bool,
+    pub cert: bool,
+    /// Algorithm label; empty when only a certificate is stored.
+    pub algo: Label,
+    /// `true` for the "Generate key" action row (not a slot).
+    pub generate: bool,
 }
 
 /// One PIV slot's detail: algorithm, PIN / touch policy, key origin, cert presence.
@@ -1509,6 +1559,19 @@ pub struct PivSlotView {
 pub struct OathRow {
     pub name: Label,
     pub hotp: bool,
+    pub touch: bool,
+}
+
+/// One OATH credential's detail (back-only): type, HMAC algorithm, digit count, TOTP
+/// step and touch gate. No code is computed (the device has no clock for TOTP).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct OathDetailView {
+    pub name: Label,
+    pub hotp: bool,
+    pub algo: Label,
+    pub digits: u8,
+    /// TOTP step in seconds; `0` for HOTP (counter-based).
+    pub period: u16,
     pub touch: bool,
 }
 

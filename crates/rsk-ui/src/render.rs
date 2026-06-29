@@ -25,15 +25,19 @@ use crate::{
     ADJ_MINUS_RECT, ADJ_PLUS_RECT, ALLOW_RECT, AccountRow, AuditKind, AuditRow, BACKUP_REVEAL_RECT,
     BACKUP_SEAL_RECT, BRIGHTNESS_LEVELS, BackupView, CONTENT_TOP, ConfirmPrompt, DEL_HOLD_RECT,
     DENY_RECT, FMT_PHRASE_RECT, FMT_SHARES_RECT, Glyph, HomeView, Label, NAV_H, NAV_TABS, NAV_TOP,
-    NavTab, PAGER_NEXT_RECT, PAGER_PREV_RECT, PANEL_H, PANEL_W, PICK_CONTINUE_RECT,
+    NavTab, OPENPGP_ROWS, PAGER_NEXT_RECT, PAGER_PREV_RECT, PANEL_H, PANEL_W, PICK_CONTINUE_RECT,
     PICK_N_MINUS_RECT, PICK_N_PLUS_RECT, PICK_T_MINUS_RECT, PICK_T_PLUS_RECT, PIN_CANCEL_RECT,
-    PIN_COLS, PIN_EYE_RECT, PIN_ROWS, PK_BACK_RECT, PK_LIST_TOP, PinCaption, PinKey, PinPad, Point,
-    RN_BKSP_RECT, RN_DOWN_RECT, RN_FIELD_RECT, RN_INS_RECT, RN_SAVE_RECT, RN_UP_RECT, Rect,
-    RevealKind, RpRow, STATUS_BAR_H, Screen, SettingsPage, SettingsView, StatusKind, SuccessKind,
-    TITLE_BACK_RECT, TITLE_BAR_H, TITLE_EDIT_RECT, font, font::Role, glyph, hex_u16, hex_u64,
-    nav_tab_rect, page_count, pin_grid_key, pin_key_rect, settings_row_rect, theme,
+    PIN_COLS, PIN_EYE_RECT, PIN_ROWS, PIV_KEYGEN_PICK_TOP, PIV_ROWS, PK_BACK_RECT, PK_LIST_TOP,
+    PinCaption, PinKey, PinPad, Point, RN_BKSP_RECT, RN_DOWN_RECT, RN_FIELD_RECT, RN_INS_RECT,
+    RN_SAVE_RECT, RN_UP_RECT, Rect, RevealKind, RpRow, STATUS_BAR_H, Screen, SettingsPage,
+    SettingsView, StatusKind, SuccessKind, TITLE_BACK_RECT, TITLE_BAR_H, TITLE_EDIT_RECT, font,
+    font::Role, glyph, hex_u16, hex_u64, nav_tab_rect, page_count, pin_grid_key, pin_key_rect,
+    settings_row_rect, theme,
 };
-use crate::{AppsView, OathRow, OpenpgpView, PgpKeyView, PivSlotView, PivView};
+use crate::{
+    AppsView, CardholderView, OathDetailView, OathRow, OpenpgpView, PgpKeyView, PivExtraRow,
+    PivSlotView, PivView,
+};
 
 // Local semantic aliases, all sourced from `theme` so the whole renderer speaks one
 // palette (these equal their tokens — re-sourcing is hygiene, not a visual change).
@@ -518,6 +522,18 @@ fn empty_slot<D: DrawTarget<Color = Rgb565>>(
     )
 }
 
+/// Build a retired-slot title `"Retired #N"` (N = wire slot − 0x81, so 82 → #1) into
+/// `buf`, returning the slice. `"Retired #" ` is 9 bytes + ≤2 digits ≤ 12.
+fn retired_title(slot: u8, buf: &mut [u8; 12]) -> &str {
+    const PRE: &[u8] = b"Retired #";
+    buf[..PRE.len()].copy_from_slice(PRE);
+    let mut nb = [0u8; 5];
+    let ns = fmt_u16(slot.wrapping_sub(0x81) as u16, &mut nb).as_bytes();
+    let end = PRE.len() + ns.len();
+    buf[PRE.len()..end].copy_from_slice(ns);
+    str8(&buf[..end])
+}
+
 /// The Apps tab: the unified applet launcher — one row per credential applet
 /// (OpenPGP / PIV / OATH) with its live item count, plus the bottom nav.
 pub fn render_apps<D>(t: &mut D, v: &AppsView) -> Result<(), D::Error>
@@ -584,7 +600,8 @@ where
     title_bar_wide(t, "OpenPGP", theme::ACCENT, true)?;
     const NAMES: [&str; 3] = ["Signature", "Encryption", "Authentication"];
     const GLYPHS: [Glyph; 3] = [Glyph::Edit, Glyph::Lock, Glyph::Shield];
-    group_card(t, PK_LIST_TOP, v.slots.len() as u16)?;
+    // Three key slots + a card-holder row (its name as the trailing value).
+    group_card(t, PK_LIST_TOP, OPENPGP_ROWS)?;
     for (i, slot) in v.slots.iter().enumerate() {
         let trailing = if slot.present {
             (slot.algo.as_str(), MUTED)
@@ -603,6 +620,20 @@ where
             true,
         )?;
     }
+    let ch_trailing = if v.cardholder_name.as_str().is_empty() {
+        ("Not set", theme::CAPTION)
+    } else {
+        (v.cardholder_name.as_str(), MUTED)
+    };
+    row_body(
+        t,
+        crate::row_rect(PK_LIST_TOP, 3),
+        Glyph::User,
+        "Card holder",
+        Some(ch_trailing),
+        true,
+        true,
+    )?;
     let cy = NAV_TOP as i32 - 10;
     let mut sbuf = [0u8; 16];
     text_left(
@@ -731,7 +762,8 @@ where
     status_bar(t)?;
     title_bar_wide(t, "PIV", theme::ACCENT, true)?;
     const NAMES: [&str; 4] = ["Authentication", "Signature", "Key Management", "Card Auth"];
-    group_card(t, PK_LIST_TOP, v.slots.len() as u16)?;
+    // Four primary slots + a "Retired & F9" row (its populated count as the trailing value).
+    group_card(t, PK_LIST_TOP, PIV_ROWS)?;
     for (i, slot) in v.slots.iter().enumerate() {
         let trailing = if slot.present {
             (slot.algo.as_str(), MUTED)
@@ -752,6 +784,16 @@ where
             true,
         )?;
     }
+    let mut eb = [0u8; 5];
+    row_body(
+        t,
+        crate::row_rect(PK_LIST_TOP, 4),
+        Glyph::Apps,
+        "Retired & F9",
+        Some((fmt_u16(v.extra as u16, &mut eb), MUTED)),
+        true,
+        true,
+    )?;
     let cy = NAV_TOP as i32 - 10;
     let mut a = [0u8; 12];
     text_left(
@@ -782,11 +824,14 @@ where
 {
     t.clear(BG)?;
     status_bar(t)?;
-    let (title, purpose) = match v.slot {
+    let mut tb = [0u8; 12];
+    let (title, purpose): (&str, &str) = match v.slot {
         0x9A => ("9A Auth", "Authentication / login"),
         0x9C => ("9C Sign", "Digital signatures"),
         0x9D => ("9D Key Mgmt", "Encryption / key mgmt"),
         0x9E => ("9E Card Auth", "Card auth, no PIN"),
+        0xF9 => ("F9 Attestation", "Device attestation key"),
+        s if (0x82..=0x95).contains(&s) => (retired_title(s, &mut tb), "Retired key-mgmt slot"),
         _ => ("PIV slot", ""),
     };
     title_bar_wide(t, title, theme::ACCENT, true)?;
@@ -852,13 +897,14 @@ where
         for (i, r) in rows.iter().enumerate() {
             let icon = if r.touch { Glyph::Lock } else { Glyph::Clock };
             let kind = if r.hotp { "HOTP" } else { "TOTP" };
+            // Each row drills into the credential's detail (algorithm / digits / period).
             row_body(
                 t,
                 crate::row_rect(PK_LIST_TOP, i as u16),
                 icon,
                 r.name.as_str(),
                 Some((kind, MUTED)),
-                false,
+                true,
                 true,
             )?;
         }
@@ -875,6 +921,261 @@ where
         }
     }
     render_nav(t, NavTab::Apps)
+}
+
+/// One OATH credential's detail (back-only, no nav): its type, HMAC algorithm, digit
+/// count, TOTP step and touch gate. No code is shown — the device has no clock, so it
+/// cannot compute a time-correct TOTP, and reading a HOTP would burn its counter; the
+/// footer points at the host app where codes are read.
+pub fn render_oath_cred<D>(t: &mut D, v: &OathDetailView) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    t.clear(BG)?;
+    status_bar(t)?;
+    title_bar_wide(t, v.name.as_str(), theme::ACCENT, true)?;
+    let purpose = if v.hotp {
+        "Counter-based \u{00B7} HOTP"
+    } else {
+        "Time-based \u{00B7} TOTP"
+    };
+    text_left(
+        t,
+        purpose,
+        EgPoint::new(14, CONTENT_TOP as i32 + 12),
+        Role::Body,
+        theme::MUTED,
+    )?;
+    let mut digit_buf = [0u8; 5];
+    let mut period_buf = [0u8; 8];
+    let period = if v.hotp {
+        "—"
+    } else {
+        fmt_secs(v.period, &mut period_buf)
+    };
+    detail_card(
+        t,
+        CONTENT_TOP + 28,
+        &[
+            ("Type", if v.hotp { "HOTP" } else { "TOTP" }, theme::TEXT),
+            ("Algorithm", v.algo.as_str(), theme::TEXT),
+            (
+                "Digits",
+                fmt_u16(v.digits as u16, &mut digit_buf),
+                theme::TEXT,
+            ),
+            ("Period", period, theme::MUTED),
+            (
+                "Touch to use",
+                if v.touch { "Required" } else { "Off" },
+                if v.touch {
+                    theme::ACCENT_TEXT
+                } else {
+                    theme::MUTED
+                },
+            ),
+        ],
+    )?;
+    text_left(
+        t,
+        "Codes shown in the RS-Key app",
+        EgPoint::new(14, PANEL_H as i32 - 18),
+        Role::MonoSmall,
+        theme::CAPTION,
+    )
+}
+
+/// The OpenPGP card-holder detail (back-only): the public cardholder data objects, read
+/// without a PIN — name, login and language in a card, the (possibly long) URL on its own
+/// ellipsized line below. An empty card shows what it is and how to set it.
+pub fn render_openpgp_cardholder<D>(t: &mut D, v: &CardholderView) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    t.clear(BG)?;
+    status_bar(t)?;
+    title_bar_wide(t, "Card holder", theme::ACCENT, true)?;
+    text_left(
+        t,
+        "Public card identity",
+        EgPoint::new(14, CONTENT_TOP as i32 + 12),
+        Role::Body,
+        theme::MUTED,
+    )?;
+    if !v.any {
+        return empty_slot(
+            t,
+            Glyph::User,
+            "No cardholder data",
+            "Set it with gpg over USB.",
+        );
+    }
+    // Stacked caption + value blocks. Every value is clipped/ellipsized to the panel width,
+    // so a long name / login / URL can never overrun the column or draw off-panel (the
+    // cardholder fields are free-form and may be near the 48-byte label cap).
+    let fields = [
+        ("NAME", v.name.as_str()),
+        ("LOGIN", v.login.as_str()),
+        ("URL", v.url.as_str()),
+        ("LANGUAGE", v.lang.as_str()),
+    ];
+    let mut y = CONTENT_TOP as i32 + 38;
+    for (cap, val) in fields {
+        text_left(t, cap, EgPoint::new(14, y), Role::Mono, theme::CAPTION)?;
+        let (shown, color) = if val.is_empty() {
+            ("Not set", theme::MUTED)
+        } else {
+            (val, theme::TEXT_2)
+        };
+        text_left_ellipsized(
+            t,
+            shown,
+            EgPoint::new(14, y + 20),
+            Role::Body,
+            color,
+            Rect::new(14, (y + 8) as u16, PANEL_W - 28, 24),
+        )?;
+        y += 46;
+    }
+    Ok(())
+}
+
+/// The "Retired & F9" screen (back-only, paged): the populated retired key-management
+/// slots (82–95) and the F9 attestation slot, plus a trailing "Generate key" action row
+/// when a retired slot is free. Each slot row drills into the shared slot-detail; the
+/// action row starts the on-device generate flow. Empty rows are not listed.
+pub fn render_piv_extra<D>(
+    t: &mut D,
+    rows: &[PivExtraRow],
+    page: u16,
+    total: u16,
+) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    t.clear(BG)?;
+    status_bar(t)?;
+    title_bar_wide(t, "Retired & F9", theme::ACCENT, true)?;
+    if rows.is_empty() {
+        return empty_slot(
+            t,
+            Glyph::Cpu,
+            "All slots full",
+            "Manage retired keys with ykman.",
+        );
+    }
+    group_card(t, PK_LIST_TOP, rows.len() as u16)?;
+    let mut tb = [0u8; 12];
+    for (i, r) in rows.iter().enumerate() {
+        let rect = crate::row_rect(PK_LIST_TOP, i as u16);
+        if r.generate {
+            row_body(
+                t,
+                rect,
+                Glyph::Key,
+                "Generate key",
+                Some(("EC", theme::ACCENT_TEXT)),
+                true,
+                true,
+            )?;
+            continue;
+        }
+        let (icon, label) = if r.slot == 0xF9 {
+            (Glyph::Shield, "F9 Attestation")
+        } else {
+            (Glyph::Cpu, retired_title(r.slot, &mut tb))
+        };
+        let trailing = if r.present {
+            (r.algo.as_str(), MUTED)
+        } else if r.cert {
+            ("cert", theme::CAPTION)
+        } else {
+            ("—", theme::CAPTION)
+        };
+        row_body(t, rect, icon, label, Some(trailing), true, true)?;
+    }
+    if page_count(total) > 1 {
+        render_pager(t, page, page_count(total))?;
+    }
+    Ok(())
+}
+
+/// The on-device key-generate algorithm chooser (back-only): a one-line caption naming the
+/// target retired slot over a two-row list of EC curves (P-256 / P-384). RSA is not offered
+/// on-device — its dual-core prime search would block the panel.
+pub fn render_piv_keygen_pick<D>(t: &mut D, slot: u8) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    t.clear(BG)?;
+    status_bar(t)?;
+    title_bar_wide(t, "New key", theme::ACCENT, true)?;
+    let mut tb = [0u8; 12];
+    text_left(
+        t,
+        retired_title(slot, &mut tb),
+        EgPoint::new(14, CONTENT_TOP as i32 + 12),
+        Role::Body,
+        theme::MUTED,
+    )?;
+    group_card(t, PIV_KEYGEN_PICK_TOP, 2)?;
+    row_body(
+        t,
+        crate::row_rect(PIV_KEYGEN_PICK_TOP, 0),
+        Glyph::Cpu,
+        "NIST P-256",
+        Some(("fast", theme::CAPTION)),
+        true,
+        true,
+    )?;
+    row_body(
+        t,
+        crate::row_rect(PIV_KEYGEN_PICK_TOP, 1),
+        Glyph::Cpu,
+        "NIST P-384",
+        Some(("stronger", theme::CAPTION)),
+        true,
+        true,
+    )?;
+    text_left(
+        t,
+        "Generated on-device, never leaves it",
+        EgPoint::new(14, PANEL_H as i32 - 18),
+        Role::MonoSmall,
+        theme::CAPTION,
+    )
+}
+
+/// The generate confirm screen: a deliberate hold (driven by the firmware on
+/// [`crate::DEL_HOLD_RECT`], the chrome-less [`crate::PK_BACK_RECT`] chevron cancels)
+/// before an EC key is written into the named retired slot.
+pub fn render_piv_keygen_confirm<D>(t: &mut D, slot: u8, algo: &str) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    // A full-screen confirm modal like the delete / factory / seal holds: chrome-less (no
+    // status bar), so the top-left PK_BACK_RECT cancel chevron stands alone — drawing the
+    // status bar here put "RS-Key" behind that chevron (PK_BACK_RECT starts at y=6).
+    t.clear(BG)?;
+    back_button(t, PK_BACK_RECT, theme::ACCENT)?;
+    text(t, "Generate key?", EgPoint::new(MIDX, 92), Role::Strong, FG)?;
+    let mut tb = [0u8; 12];
+    text(
+        t,
+        retired_title(slot, &mut tb),
+        EgPoint::new(MIDX, 122),
+        Role::Body,
+        MUTED,
+    )?;
+    text(t, algo, EgPoint::new(MIDX, 146), Role::Body, theme::TEXT_2)?;
+    text(
+        t,
+        "Adds a key. Does not erase anything.",
+        EgPoint::new(MIDX, 172),
+        Role::MonoSmall,
+        theme::CAPTION,
+    )?;
+    render_hold_button(t, DEL_HOLD_RECT, "Hold to generate", theme::ACCENT_FILL)
 }
 
 /// The rename screen: a character-wheel editor for a relying party's device-local
@@ -2023,6 +2324,13 @@ fn success_visuals(kind: SuccessKind) -> (Rgb565, Rgb565, Glyph, &'static str, &
             Glyph::Rotate,
             "RS-Key erased",
             "Restarting...",
+        ),
+        SuccessKind::Generated => (
+            theme::SUCCESS,
+            theme::SUCCESS_BG,
+            Glyph::Check,
+            "Key generated",
+            "Stored in the retired slot.",
         ),
     }
 }
@@ -3983,6 +4291,94 @@ mod tests {
     }
 
     #[test]
+    fn applet_detail_screens_fit_and_clip_max_values() {
+        // OATH credential detail.
+        let mut d = Rec::new();
+        render_oath_cred(
+            &mut d,
+            &OathDetailView {
+                name: Label::clamp(b"GitHub:alice"),
+                hotp: false,
+                algo: Label::clamp(b"SHA1"),
+                digits: 6,
+                period: 30,
+                touch: false,
+            },
+        )
+        .unwrap();
+        assert!(!d.oob && d.drew_anything(), "oath detail off-panel");
+        assert!(has_color(&d, crate::TITLE_BACK_RECT, theme::ACCENT));
+
+        // Cardholder detail with EVERY free-form field at the label cap must stay on-panel
+        // (the regression the value column would hit if it were right-anchored + unclipped).
+        let max = Label::clamp(&[b'W'; 64]);
+        let mut d = Rec::new();
+        render_openpgp_cardholder(
+            &mut d,
+            &CardholderView {
+                name: max,
+                login: max,
+                url: max,
+                lang: Label::clamp(b"en"),
+                any: true,
+            },
+        )
+        .unwrap();
+        assert!(!d.oob, "cardholder detail drew outside the panel");
+        assert!(d.drew_anything());
+
+        // Empty cardholder shows the hint without overrun.
+        let mut d = Rec::new();
+        render_openpgp_cardholder(&mut d, &CardholderView::default()).unwrap();
+        assert!(!d.oob && d.drew_anything());
+
+        // Retired & F9 list: F9, a populated retired slot, and the generate action row.
+        let rows = [
+            PivExtraRow {
+                slot: 0xF9,
+                present: true,
+                cert: true,
+                algo: Label::clamp(b"NIST P-384"),
+                generate: false,
+            },
+            PivExtraRow {
+                slot: 0x82,
+                present: true,
+                cert: false,
+                algo: Label::clamp(b"RSA 2048"),
+                generate: false,
+            },
+            PivExtraRow {
+                generate: true,
+                ..Default::default()
+            },
+        ];
+        let mut d = Rec::new();
+        render_piv_extra(&mut d, &rows, 0, rows.len() as u16).unwrap();
+        assert!(!d.oob, "retired/F9 list drew outside the panel");
+        assert!(has_color(&d, crate::TITLE_BACK_RECT, theme::ACCENT));
+        for i in 0..rows.len() as u16 {
+            assert!(d.any_non_bg_in(crate::row_rect(PK_LIST_TOP, i)));
+        }
+
+        // Keygen algorithm chooser + the hold-to-generate confirm.
+        let mut d = Rec::new();
+        render_piv_keygen_pick(&mut d, 0x82).unwrap();
+        assert!(!d.oob && d.drew_anything(), "keygen pick off-panel");
+        let mut d = Rec::new();
+        render_piv_keygen_confirm(&mut d, 0x82, "NIST P-256").unwrap();
+        assert!(!d.oob, "keygen confirm drew outside the panel");
+        // The hold button paints in DEL_HOLD_RECT, where hold_to_confirm reads the gesture.
+        assert!(has_color(&d, crate::DEL_HOLD_RECT, theme::ACCENT_FILL));
+        // It must stay a chrome-less modal: no status bar, so the top-left PK_BACK_RECT cancel
+        // chevron has nothing ("RS-Key" / battery) painted behind it (the y=6 overlap fix).
+        assert!(
+            !d.any_non_bg_in(Rect::new(PANEL_W - 36, 2, 30, 18)),
+            "generate-confirm must be chrome-less (no status bar behind the cancel chevron)"
+        );
+    }
+
+    #[test]
     fn rename_screen_paints_wheel_and_save() {
         let mut d = Rec::new();
         render_rename(&mut d, "work", b'a').unwrap();
@@ -4133,6 +4529,7 @@ mod tests {
             (SuccessKind::Approved, theme::SUCCESS),
             (SuccessKind::Deleted, theme::SUCCESS),
             (SuccessKind::Wiped, theme::GREY),
+            (SuccessKind::Generated, theme::SUCCESS),
         ] {
             let mut d = Rec::new();
             render_success(&mut d, kind, false).unwrap();
@@ -4898,6 +5295,7 @@ mod tests {
                 },
                 PgpSlotRow::default(),
             ],
+            cardholder_name: Label::clamp(b"Alice Dev"),
             sig_count: 42,
             pw1: 3,
             pw3: 3,
@@ -4905,6 +5303,24 @@ mod tests {
         let mut d = Rec::new();
         render_openpgp(&mut d, &pgp).unwrap();
         assert!(!d.oob, "openpgp overview spilled");
+
+        let mut d = Rec::new();
+        render_openpgp_cardholder(
+            &mut d,
+            &CardholderView {
+                name: Label::clamp(b"Alice Dev"),
+                login: Label::clamp(b"alice"),
+                url: Label::clamp(b"https://keys.example.org/very/long/path/alice"),
+                lang: Label::clamp(b"en"),
+                any: true,
+            },
+        )
+        .unwrap();
+        assert!(!d.oob && d.drew_anything(), "openpgp cardholder spilled");
+
+        let mut d = Rec::new();
+        render_openpgp_cardholder(&mut d, &CardholderView::default()).unwrap();
+        assert!(!d.oob && d.drew_anything(), "openpgp cardholder empty");
 
         let mut d = Rec::new();
         render_openpgp_key(
@@ -4958,12 +5374,72 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            extra: 3,
             pin: 1,
             puk: 0,
         };
         let mut d = Rec::new();
         render_piv(&mut d, &piv).unwrap();
         assert!(!d.oob, "piv overview spilled");
+
+        // The "Retired & F9" screen: F9, a retired key, a cert-only retired slot, and the
+        // trailing generate action — plus an empty-state and a retired/F9 slot detail.
+        let extra = [
+            PivExtraRow {
+                slot: 0xF9,
+                present: true,
+                cert: true,
+                algo: Label::clamp(b"NIST P-384"),
+                generate: false,
+            },
+            PivExtraRow {
+                slot: 0x82,
+                present: true,
+                cert: false,
+                algo: Label::clamp(b"NIST P-256"),
+                generate: false,
+            },
+            PivExtraRow {
+                slot: 0x95,
+                present: false,
+                cert: true,
+                algo: Label::default(),
+                generate: false,
+            },
+            PivExtraRow {
+                generate: true,
+                ..Default::default()
+            },
+        ];
+        let mut d = Rec::new();
+        render_piv_extra(&mut d, &extra, 0, 4).unwrap();
+        assert!(!d.oob && d.drew_anything(), "piv extra list spilled");
+        let mut d = Rec::new();
+        render_piv_extra(&mut d, &[], 0, 0).unwrap();
+        assert!(!d.oob && d.drew_anything(), "piv extra empty");
+
+        let mut d = Rec::new();
+        render_piv_slot(
+            &mut d,
+            &PivSlotView {
+                slot: 0x82,
+                present: true,
+                algo: Label::clamp(b"NIST P-256"),
+                pin_policy: Label::clamp(b"Once"),
+                touch_policy: Label::clamp(b"Always"),
+                origin: Label::clamp(b"Generated"),
+                cert: true,
+            },
+        )
+        .unwrap();
+        assert!(!d.oob, "retired slot detail spilled");
+
+        let mut d = Rec::new();
+        render_piv_keygen_pick(&mut d, 0x82).unwrap();
+        assert!(!d.oob && d.drew_anything(), "keygen pick spilled");
+        let mut d = Rec::new();
+        render_piv_keygen_confirm(&mut d, 0x82, "NIST P-256").unwrap();
+        assert!(!d.oob && d.drew_anything(), "keygen confirm spilled");
 
         let mut d = Rec::new();
         render_piv_slot(
@@ -5012,6 +5488,35 @@ mod tests {
         let mut d = Rec::new();
         render_oath(&mut d, &[], 0, 0).unwrap();
         assert!(!d.oob && d.drew_anything(), "oath empty");
+
+        let mut d = Rec::new();
+        render_oath_cred(
+            &mut d,
+            &OathDetailView {
+                name: Label::clamp(b"GitHub:alex"),
+                hotp: false,
+                algo: Label::clamp(b"SHA1"),
+                digits: 6,
+                period: 30,
+                touch: true,
+            },
+        )
+        .unwrap();
+        assert!(!d.oob && d.drew_anything(), "oath cred detail spilled");
+        let mut d = Rec::new();
+        render_oath_cred(
+            &mut d,
+            &OathDetailView {
+                name: Label::clamp(b"AWS"),
+                hotp: true,
+                algo: Label::clamp(b"SHA256"),
+                digits: 8,
+                period: 0,
+                touch: false,
+            },
+        )
+        .unwrap();
+        assert!(!d.oob && d.drew_anything(), "oath hotp detail spilled");
     }
 
     #[test]

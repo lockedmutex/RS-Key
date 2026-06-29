@@ -87,6 +87,8 @@ pub enum Glyph {
     /// A command prompt — a ">" caret and an underscore cursor: the marker for an SSH
     /// relying party (a shell host) on the Passkeys list, distinct from the web globe.
     Terminal,
+    /// A person (head + shoulders) — the OpenPGP "card holder" identity row.
+    User,
 }
 
 /// 1-bit scratch a glyph rasterizes into so the renderer can impose mirror symmetry before
@@ -136,7 +138,7 @@ fn sym(g: Glyph) -> Sym {
     use Glyph::*;
     match g {
         Chevron | Backspace => Sym { v: false, h: true },
-        Lock | Home | Shield | Warn | Usb => Sym { v: true, h: false },
+        Lock | Home | Shield | Warn | Usb | User => Sym { v: true, h: false },
         Sun | Globe | Gear | Eye | Lifebuoy | Cpu | Apps => Sym { v: true, h: true },
         _ => Sym { v: false, h: false },
     }
@@ -539,6 +541,19 @@ fn paths<D: DrawTarget<Color = Rgb565>>(t: &mut D, g: Glyph, s: u16) -> Result<(
                 .draw(t)?;
             Line::new(gp(9, 13), gp(13, 13)).into_styled(stroke).draw(t)
         }
+        Glyph::User => {
+            // A person: a solid round head over a trapezoidal bust. Filled, not outlined —
+            // a 1-bit outline of a head+shoulders at 16px reads as stray strokes; a solid
+            // silhouette stays crisp. Left–right symmetric (the sym pass mirrors the left
+            // half), so the bust is drawn as a centred trapezoid (two triangles).
+            circ(8, 5, 3).into_styled(fill).draw(t)?;
+            Triangle::new(gp(3, 14), gp(6, 9), gp(13, 14))
+                .into_styled(fill)
+                .draw(t)?;
+            Triangle::new(gp(6, 9), gp(10, 9), gp(13, 14))
+                .into_styled(fill)
+                .draw(t)
+        }
     }
 }
 
@@ -580,7 +595,7 @@ mod tests {
         }
     }
 
-    const ALL: [Glyph; 23] = [
+    const ALL: [Glyph; 24] = [
         Glyph::Usb,
         Glyph::Check,
         Glyph::Backspace,
@@ -604,6 +619,7 @@ mod tests {
         Glyph::Cpu,
         Glyph::Apps,
         Glyph::Terminal,
+        Glyph::User,
     ];
 
     #[test]

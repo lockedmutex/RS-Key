@@ -1091,11 +1091,26 @@ impl Ui {
                 touch: s.touch,
             };
         }
+        let cardholder_name = Label::clamp(rsk_openpgp::info::read_cardholder(&mut fs).name());
         rsk_ui::OpenpgpView {
             slots,
+            cardholder_name,
             sig_count: info.sig_count,
             pw1: info.pw1_retries,
             pw3: info.pw3_retries,
+        }
+    }
+
+    /// Build the OpenPGP card-holder detail (name / login / URL / language), all plaintext.
+    fn load_openpgp_cardholder(&self) -> rsk_ui::CardholderView {
+        let mut fs = self.fs.borrow_mut();
+        let ch = rsk_openpgp::info::read_cardholder(&mut fs);
+        rsk_ui::CardholderView {
+            name: Label::clamp(ch.name()),
+            login: Label::clamp(ch.login()),
+            url: Label::clamp(ch.url()),
+            lang: Label::clamp(ch.lang()),
+            any: ch.any(),
         }
     }
 
@@ -1134,9 +1149,14 @@ impl Ui {
                 if rsk_ui::hit_title_back(p) {
                     break None;
                 }
-                if let Some(i) = rsk_ui::hit_list(p, rsk_ui::PK_LIST_TOP, 3) {
-                    // Every slot drills in — an empty slot's detail explains its role.
-                    self.run_openpgp_key(i as usize);
+                if let Some(i) = rsk_ui::hit_list(p, rsk_ui::PK_LIST_TOP, rsk_ui::OPENPGP_ROWS) {
+                    // Rows 0..2 are the key slots (each drills in — an empty slot's detail
+                    // explains its role); row 3 opens the card-holder detail.
+                    if (i as usize) < view.slots.len() {
+                        self.run_openpgp_key(i as usize);
+                    } else {
+                        self.run_openpgp_cardholder();
+                    }
                     if self.asleep {
                         break None;
                     }
@@ -1193,6 +1213,35 @@ impl Ui {
         self.end_modal();
     }
 
+    /// The OpenPGP card-holder detail screen (back-only, no nav). Read-only; back chevron /
+    /// power button / a queued host command / inactivity all return to the overview.
+    fn run_openpgp_cardholder(&mut self) {
+        let view = self.load_openpgp_cardholder();
+        let _ = rsk_ui::render_openpgp_cardholder(&mut self.panel, &view);
+        self.shown = None;
+        self.touch
+            .wait_release(Instant::now(), Duration::from_millis(MENU_INACTIVITY_MS));
+        let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
+        let mut last = Instant::now();
+        loop {
+            if self.sleep_button_pressed() {
+                break;
+            }
+            if let Some(p) = self.touch.read() {
+                last = Instant::now();
+                if rsk_ui::hit_title_back(p) {
+                    break;
+                }
+                self.touch.wait_release(last, idle_limit);
+            }
+            if crate::worker::host_request_pending() || last.elapsed() >= idle_limit {
+                break;
+            }
+            block_for(Duration::from_millis(TOUCH_POLL_MS));
+        }
+        self.end_modal();
+    }
+
     /// Build the PIV overview from the applet's slot metadata (no PIN / management key).
     fn load_piv(&self) -> rsk_ui::PivView {
         let mut fs = self.fs.borrow_mut();
@@ -1210,17 +1259,20 @@ impl Ui {
                 },
             };
         }
+        let extra = rsk_piv::info::extra_count(&mut fs);
         rsk_ui::PivView {
             slots,
+            extra,
             pin: info.pin_retries,
             puk: info.puk_retries,
         }
     }
 
-    /// Build one PIV slot's detail (algorithm / policies / origin / cert).
-    fn load_piv_slot(&self, idx: usize) -> rsk_ui::PivSlotView {
+    /// Build one PIV slot's detail (algorithm / policies / origin / cert) by wire slot —
+    /// any slot, primary or retired / F9.
+    fn load_piv_slot(&self, slot: u8) -> rsk_ui::PivSlotView {
         let mut fs = self.fs.borrow_mut();
-        let s = rsk_piv::info::read_info(&mut fs).slots[idx];
+        let s = rsk_piv::info::read_slot(&mut fs, slot);
         rsk_ui::PivSlotView {
             slot: s.slot,
             present: s.present,
@@ -1251,12 +1303,18 @@ impl Ui {
                 if rsk_ui::hit_title_back(p) {
                     break None;
                 }
-                if let Some(i) = rsk_ui::hit_list(p, rsk_ui::PK_LIST_TOP, 4) {
-                    // Every slot drills in — an empty slot's detail explains its role.
-                    self.run_piv_slot(i as usize);
+                if let Some(i) = rsk_ui::hit_list(p, rsk_ui::PK_LIST_TOP, rsk_ui::PIV_ROWS) {
+                    // Rows 0..3 are the primary slots (each drills in — an empty slot's
+                    // detail explains its role); row 4 opens the retired / F9 screen.
+                    if (i as usize) < view.slots.len() {
+                        self.run_piv_slot(view.slots[i as usize].slot);
+                    } else {
+                        self.run_piv_extra();
+                    }
                     if self.asleep {
                         break None;
                     }
+                    let view = self.load_piv();
                     let _ = rsk_ui::render_piv(&mut self.panel, &view);
                     self.shown = None;
                     self.touch.wait_release(Instant::now(), idle_limit);
@@ -1281,9 +1339,10 @@ impl Ui {
         next
     }
 
-    /// One PIV slot's detail screen (back-only, no nav). Read-only.
-    fn run_piv_slot(&mut self, idx: usize) {
-        let view = self.load_piv_slot(idx);
+    /// One PIV slot's detail screen (back-only, no nav). Read-only. `slot` is the wire
+    /// reference (primary `0x9A…`, retired `0x82…0x95`, or F9).
+    fn run_piv_slot(&mut self, slot: u8) {
+        let view = self.load_piv_slot(slot);
         let _ = rsk_ui::render_piv_slot(&mut self.panel, &view);
         self.shown = None;
         self.touch
@@ -1307,6 +1366,175 @@ impl Ui {
             block_for(Duration::from_millis(TOUCH_POLL_MS));
         }
         self.end_modal();
+    }
+
+    /// Build one page of the "Retired & F9" list: every populated retired slot + F9, then a
+    /// trailing "Generate key" action row when a retired slot is free. Returns the kept count
+    /// and the true total (slots + the optional action).
+    fn load_piv_extra(&self, rows: &mut [rsk_ui::PivExtraRow], page: u16) -> (usize, u16) {
+        let mut fs = self.fs.borrow_mut();
+        let mut slots = [rsk_piv::info::PivSlot::default(); rsk_piv::info::MAX_EXTRA_SLOTS];
+        let nslots = rsk_piv::info::read_extra(&mut fs, &mut slots);
+        let can_gen = rsk_piv::info::next_free_retired(&mut fs).is_some();
+        let total = nslots + can_gen as usize;
+        let offset = page as usize * rsk_ui::PK_ROWS_MAX;
+        let mut n = 0;
+        let mut i = offset;
+        while i < total && n < rows.len() {
+            rows[n] = if i < nslots {
+                let s = slots[i];
+                rsk_ui::PivExtraRow {
+                    slot: s.slot,
+                    present: s.present,
+                    cert: s.cert,
+                    algo: if s.present {
+                        Label::clamp(rsk_piv::info::algo_name(s.algo).as_bytes())
+                    } else {
+                        Label::default()
+                    },
+                    generate: false,
+                }
+            } else {
+                rsk_ui::PivExtraRow {
+                    generate: true,
+                    ..Default::default()
+                }
+            };
+            n += 1;
+            i += 1;
+        }
+        (n, total.min(u16::MAX as usize) as u16)
+    }
+
+    /// The "Retired & F9" screen (back-only): the populated retired slots + F9, paged, each
+    /// drilling into the shared slot-detail, plus a "Generate key" action when a slot is free.
+    /// Mirrors [`Self::run_oath`] — pager, sleep, host-yield; no nav (a sub-screen of PIV).
+    fn run_piv_extra(&mut self) {
+        let mut rows = [rsk_ui::PivExtraRow::default(); rsk_ui::PK_ROWS_MAX];
+        let mut page: u16 = 0;
+        let (mut n, mut total) = self.load_piv_extra(&mut rows, page);
+        let _ = rsk_ui::render_piv_extra(&mut self.panel, &rows[..n], page, total);
+        self.shown = None;
+        let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
+        self.touch.wait_release(Instant::now(), idle_limit);
+        let mut last = Instant::now();
+        loop {
+            if self.sleep_button_pressed() {
+                break;
+            }
+            if let Some(p) = self.touch.read() {
+                last = Instant::now();
+                if rsk_ui::hit_title_back(p) {
+                    break;
+                }
+                if let Some(k) = rsk_ui::hit_pager(p) {
+                    page = paged(page, total, k);
+                    let r = self.load_piv_extra(&mut rows, page);
+                    n = r.0;
+                    total = r.1;
+                    let _ = rsk_ui::render_piv_extra(&mut self.panel, &rows[..n], page, total);
+                    self.shown = None;
+                    self.touch.wait_release(last, idle_limit);
+                    last = Instant::now();
+                    continue;
+                }
+                if let Some(i) = rsk_ui::hit_list(p, rsk_ui::PK_LIST_TOP, n as u16) {
+                    let row = rows[i as usize];
+                    if row.generate {
+                        self.run_piv_generate();
+                    } else {
+                        self.run_piv_slot(row.slot);
+                    }
+                    if self.asleep {
+                        break;
+                    }
+                    let r = self.load_piv_extra(&mut rows, page);
+                    n = r.0;
+                    total = r.1;
+                    let _ = rsk_ui::render_piv_extra(&mut self.panel, &rows[..n], page, total);
+                    self.shown = None;
+                    self.touch.wait_release(Instant::now(), idle_limit);
+                    last = Instant::now();
+                    continue;
+                }
+                self.touch.wait_release(last, idle_limit);
+            }
+            if crate::worker::host_request_pending() || last.elapsed() >= idle_limit {
+                break;
+            }
+            block_for(Duration::from_millis(TOUCH_POLL_MS));
+        }
+        self.end_modal();
+    }
+
+    /// The on-device PIV key-generate flow (from the "Retired & F9" screen's Generate row):
+    /// target the next free retired slot, gate on the device PIN (when set), pick an EC curve,
+    /// require a deliberate hold, then generate + seal the key. EC only — RSA's prime search
+    /// would block the panel. Physical presence here is the authorisation (no management key),
+    /// and generation only ever *adds* a key to an empty slot. Returns when done or cancelled.
+    fn run_piv_generate(&mut self) {
+        let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
+        self.touch.wait_release(Instant::now(), idle_limit);
+        let slot = match rsk_piv::info::next_free_retired(&mut self.fs.borrow_mut()) {
+            Some(s) => s,
+            None => return,
+        };
+        // PIN gate first (when set) so the chooser doesn't flash behind the pad.
+        if !self.local_pin_gate("Enter PIN", PinScope::Device) {
+            return;
+        }
+        // Algorithm chooser (EC only).
+        let _ = rsk_ui::render_piv_keygen_pick(&mut self.panel, slot);
+        self.shown = None;
+        self.touch.wait_release(Instant::now(), idle_limit);
+        let mut last = Instant::now();
+        let algo = loop {
+            if self.sleep_button_pressed() {
+                return;
+            }
+            if let Some(p) = self.touch.read() {
+                last = Instant::now();
+                if rsk_ui::hit_title_back(p) {
+                    return;
+                }
+                if let Some(i) = rsk_ui::hit_list(p, rsk_ui::PIV_KEYGEN_PICK_TOP, 2) {
+                    break if i == 0 {
+                        (rsk_piv::files::ALGO_ECCP256, "NIST P-256")
+                    } else {
+                        (rsk_piv::files::ALGO_ECCP384, "NIST P-384")
+                    };
+                }
+                self.touch.wait_release(last, idle_limit);
+            }
+            if crate::worker::host_request_pending() || last.elapsed() >= idle_limit {
+                return;
+            }
+            block_for(Duration::from_millis(TOUCH_POLL_MS));
+        };
+        // A deliberate hold before the write.
+        let _ = rsk_ui::render_piv_keygen_confirm(&mut self.panel, slot, algo.1);
+        self.shown = None;
+        self.touch.wait_release(Instant::now(), idle_limit);
+        if !self.hold_to_confirm("Hold to generate", rsk_ui::theme::ACCENT_FILL) {
+            return;
+        }
+        // EC keygen + seal is synchronous (no await), so the dev/rng/fs borrows are safe to
+        // hold across it; the worker can't run until this returns. Re-target the free slot
+        // under the same borrow in case state moved while the chooser was open.
+        let ok = {
+            let dev = self.keys.device();
+            let mut rng = self.rng.borrow_mut();
+            let mut fs = self.fs.borrow_mut();
+            match rsk_piv::info::next_free_retired(&mut fs) {
+                Some(s) => {
+                    rsk_piv::info::generate_slot_key(&dev, &mut fs, &mut *rng, s, algo.0).is_ok()
+                }
+                None => false,
+            }
+        };
+        if ok {
+            self.show_success(SuccessKind::Generated, Some(1100));
+        }
     }
 
     /// Enumerate stored OATH credentials into `rows` (one page), returning the kept count
@@ -1364,7 +1592,23 @@ impl Ui {
                     self.touch.wait_release(last, idle_limit);
                     last = Instant::now();
                     continue;
-                } else if let Some(tab) = rsk_ui::hit_nav(p) {
+                }
+                if let Some(i) = rsk_ui::hit_list(p, rsk_ui::PK_LIST_TOP, n as u16) {
+                    // Drill into the credential's detail (paged index → global position).
+                    self.run_oath_cred(page as usize * rsk_ui::PK_ROWS_MAX + i as usize);
+                    if self.asleep {
+                        break None;
+                    }
+                    let r = self.load_oath(&mut rows, page);
+                    n = r.0;
+                    total = r.1;
+                    let _ = rsk_ui::render_oath(&mut self.panel, &rows[..n], page, total);
+                    self.shown = None;
+                    self.touch.wait_release(Instant::now(), idle_limit);
+                    last = Instant::now();
+                    continue;
+                }
+                if let Some(tab) = rsk_ui::hit_nav(p) {
                     match tab {
                         NavTab::Apps => break None,
                         NavTab::Home => break Some(NavTab::Home),
@@ -1381,6 +1625,58 @@ impl Ui {
         };
         self.end_modal();
         next
+    }
+
+    /// Build one OATH credential's detail by its global list position. Re-enumerates (the
+    /// display holds no secret), clamps the picked credential's metadata for display.
+    fn load_oath_cred(&self, idx: usize) -> rsk_ui::OathDetailView {
+        let dev = self.keys.device();
+        let mut fs = self.fs.borrow_mut();
+        let mut view = rsk_ui::OathDetailView::default();
+        let mut i = 0usize;
+        rsk_oath::for_each_cred(&dev, &mut fs, |c| {
+            if i == idx {
+                view = rsk_ui::OathDetailView {
+                    name: Label::clamp(c.name),
+                    hotp: c.hotp,
+                    algo: Label::clamp(rsk_oath::algo_name(c.algo).as_bytes()),
+                    digits: c.digits,
+                    period: c.period,
+                    touch: c.touch,
+                };
+            }
+            i += 1;
+        });
+        view
+    }
+
+    /// One OATH credential's detail screen (back-only, no nav). Read-only; back chevron /
+    /// power button / a queued host command / inactivity all return to the list.
+    fn run_oath_cred(&mut self, idx: usize) {
+        let view = self.load_oath_cred(idx);
+        let _ = rsk_ui::render_oath_cred(&mut self.panel, &view);
+        self.shown = None;
+        self.touch
+            .wait_release(Instant::now(), Duration::from_millis(MENU_INACTIVITY_MS));
+        let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
+        let mut last = Instant::now();
+        loop {
+            if self.sleep_button_pressed() {
+                break;
+            }
+            if let Some(p) = self.touch.read() {
+                last = Instant::now();
+                if rsk_ui::hit_title_back(p) {
+                    break;
+                }
+                self.touch.wait_release(last, idle_limit);
+            }
+            if crate::worker::host_request_pending() || last.elapsed() >= idle_limit {
+                break;
+            }
+            block_for(Duration::from_millis(TOUCH_POLL_MS));
+        }
+        self.end_modal();
     }
 
     /// The rename screen: edit a relying party's device-local nickname with the character

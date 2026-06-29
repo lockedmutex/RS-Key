@@ -886,7 +886,8 @@ fn present_creds<S: Storage>(fs: &mut Fs<S>, out: &mut [u16; MAX_OATH_CRED as us
 /// One stored credential's public metadata, unsealed for the trusted display.
 /// The secret HMAC key is never surfaced — only its type/hash byte is decoded.
 pub struct OathCredView<'a> {
-    /// Credential label (issuer:account), as stored; sanitise before display.
+    /// Credential label (issuer:account), with any `<period>/` prefix stripped;
+    /// sanitise before display.
     pub name: &'a [u8],
     /// HOTP (event-based) when set, else TOTP (time-based).
     pub hotp: bool,
@@ -894,8 +895,30 @@ pub struct OathCredView<'a> {
     pub algo: u8,
     /// Code length (digits).
     pub digits: u8,
+    /// TOTP step in seconds (from the `<period>/` name prefix, default 30); `0`
+    /// for HOTP (counter-based, no period).
+    pub period: u16,
     /// Whether the credential is touch-gated.
     pub touch: bool,
+}
+
+/// Split a Yubico OATH credential id into its optional `<period>/` prefix and the
+/// bare `issuer:account` label. A TOTP credential whose step is not the default 30 s
+/// is stored as `"<period>/issuer:account"`; the default-30 case carries no prefix.
+/// Returns `(period, label)` — `period` is `None` when there is no numeric prefix.
+fn split_period(name: &[u8]) -> (Option<u16>, &[u8]) {
+    let mut i = 0;
+    while i < name.len() && i < 4 && name[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i > 0 && name.get(i) == Some(&b'/') {
+        let period = name[..i]
+            .iter()
+            .fold(0u16, |p, &d| p * 10 + (d - b'0') as u16);
+        (Some(period), &name[i + 1..])
+    } else {
+        (None, name)
+    }
 }
 
 /// A short ASCII label for an OATH hash algorithm (the key byte's low nibble).
@@ -943,11 +966,14 @@ pub fn for_each_cred<S: Storage>(
         let touch = find_tag(blob, TAG_PROPERTY as u16)
             .and_then(|v| v.first().copied())
             .is_some_and(|p| p & PROP_TOUCH != 0);
+        let (period_prefix, label) = split_period(name);
+        let period = if hotp { 0 } else { period_prefix.unwrap_or(30) };
         f(OathCredView {
-            name,
+            name: label,
             hotp,
             algo,
             digits,
+            period,
             touch,
         });
         count += 1;
@@ -1283,19 +1309,63 @@ mod tests {
             serial_id: &SERIAL,
             otp_key: None,
         };
-        let mut seen: Vec<(Vec<u8>, bool, u8, u8, bool)> = Vec::new();
+        let mut seen: Vec<(Vec<u8>, bool, u8, u8, u16, bool)> = Vec::new();
         let n = for_each_cred(&dev, &mut fs, |c| {
-            seen.push((c.name.to_vec(), c.hotp, c.algo, c.digits, c.touch))
+            seen.push((c.name.to_vec(), c.hotp, c.algo, c.digits, c.period, c.touch))
         });
         assert_eq!(n, 2);
         let gh = seen.iter().find(|c| c.0 == b"GitHub:alex").unwrap();
-        assert_eq!((gh.1, gh.2, gh.3, gh.4), (false, ALG_HMAC_SHA1, 6, false));
+        // No period prefix → default 30 s for a TOTP credential.
+        assert_eq!(
+            (gh.1, gh.2, gh.3, gh.4, gh.5),
+            (false, ALG_HMAC_SHA1, 6, 30, false)
+        );
         assert_eq!(algo_name(gh.2), "SHA1");
         let aws = seen.iter().find(|c| c.0 == b"AWS").unwrap();
+        // HOTP is counter-based → period 0 (not shown as a step).
         assert_eq!(
-            (aws.1, aws.2, aws.3, aws.4),
-            (true, ALG_HMAC_SHA256, 8, true)
+            (aws.1, aws.2, aws.3, aws.4, aws.5),
+            (true, ALG_HMAC_SHA256, 8, 0, true)
         );
+    }
+
+    #[test]
+    fn period_prefix_is_split_off_the_name() {
+        assert_eq!(
+            split_period(b"60/Example:bob"),
+            (Some(60), &b"Example:bob"[..])
+        );
+        assert_eq!(split_period(b"15/x"), (Some(15), &b"x"[..]));
+        // No prefix, a slash that is not a period, and an over-long digit run all pass through.
+        assert_eq!(split_period(b"GitHub:alex"), (None, &b"GitHub:alex"[..]));
+        assert_eq!(split_period(b"a/b"), (None, &b"a/b"[..]));
+        assert_eq!(split_period(b"12345/x"), (None, &b"12345/x"[..]));
+    }
+
+    #[test]
+    fn totp_with_period_prefix_reports_period_and_strips_prefix() {
+        let mut fs = new_fs();
+        let rng = RefCell::new(CountRng(7));
+        let touch = RefCell::new(AlwaysConfirm);
+        let mut app = OathApplet::new(SERIAL, [0x22; 32], None, &rng, &touch);
+        assert_eq!(
+            put(
+                &mut app,
+                &mut fs,
+                &put_data(b"60/Example:bob", 0x21, 8, &[0xAA; 20], false, None)
+            ),
+            Sw::OK
+        );
+        let dev = Device {
+            serial_hash: &[0x22; 32],
+            serial_id: &SERIAL,
+            otp_key: None,
+        };
+        let mut got = None;
+        for_each_cred(&dev, &mut fs, |c| {
+            got = Some((c.name.to_vec(), c.period, c.digits));
+        });
+        assert_eq!(got, Some((b"Example:bob".to_vec(), 60, 8)));
     }
 
     #[test]

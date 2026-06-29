@@ -8,7 +8,10 @@
 //! key bytes are sealed and never surfaced; the public point is *not* read (that
 //! is the management-key-gated GET METADATA path, deliberately out of scope).
 
+use rsk_crypto::Device;
 use rsk_fs::{Fs, Storage};
+use rsk_openpgp::Rng;
+use rsk_sdk::Sw;
 
 use crate::files::*;
 
@@ -24,7 +27,7 @@ pub const PRIMARY_SLOTS: [u8; 4] = [
 ];
 
 /// What one PIV slot holds, all read without a PIN or the management key.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct PivSlot {
     /// Wire key reference (`0x9A` …).
     pub slot: u8,
@@ -120,38 +123,89 @@ pub fn origin_name(o: u8) -> &'static str {
     }
 }
 
+/// The retired key-management slots, 82–95, plus the F9 attestation slot: the most
+/// the "Retired & F9" screen can list.
+pub const MAX_EXTRA_SLOTS: usize = 21;
+
+/// Read one slot's public metadata by wire reference — any slot (primary, retired
+/// or F9), PIN-free. The algorithm and policy come from the meta side-store; a slot
+/// with no key reports `present = false` and zeroed policy.
+pub fn read_slot<S: Storage>(fs: &mut Fs<S>, slot: u8) -> PivSlot {
+    let present = fs.has_key(key_fid(slot));
+    let mut meta = [0u8; 4];
+    let (algo, pin_policy, touch_policy, origin) = if present {
+        match fs.meta_find(key_fid(slot).get(), &mut meta) {
+            Some(n) if n >= 3 => (meta[0], meta[1], meta[2], if n >= 4 { meta[3] } else { 0 }),
+            _ => (0, 0, 0, 0),
+        }
+    } else {
+        (0, 0, 0, 0)
+    };
+    let cert = cert_fid_for_slot(slot).is_some_and(|f| fs.has_data(f));
+    PivSlot {
+        slot,
+        present,
+        algo,
+        pin_policy,
+        touch_policy,
+        origin,
+        cert,
+    }
+}
+
+/// Gather the attestation (F9) and every *populated* retired slot (82–95) for the
+/// trusted display, F9 first. A slot counts as populated when it holds a key or a
+/// stored certificate; empty retired slots are not listed (they are reached through
+/// the on-device generate action). Returns the count written to `out`.
+pub fn read_extra<S: Storage>(fs: &mut Fs<S>, out: &mut [PivSlot]) -> usize {
+    let mut n = 0;
+    for slot in core::iter::once(SLOT_ATTESTATION).chain(0x82u8..=0x95) {
+        if n >= out.len() {
+            break;
+        }
+        let s = read_slot(fs, slot);
+        if s.present || s.cert {
+            out[n] = s;
+            n += 1;
+        }
+    }
+    n
+}
+
+/// How many entries the "Retired & F9" screen will show (populated retired slots +
+/// F9), for the count on the PIV overview row.
+pub fn extra_count<S: Storage>(fs: &mut Fs<S>) -> u8 {
+    let mut out = [PivSlot::default(); MAX_EXTRA_SLOTS];
+    read_extra(fs, &mut out) as u8
+}
+
+/// The lowest-numbered retired slot (82–95) that holds no key, or `None` when all
+/// twenty are taken — the target for the on-device generate action.
+pub fn next_free_retired<S: Storage>(fs: &mut Fs<S>) -> Option<u8> {
+    (0x82u8..=0x95).find(|&slot| !fs.has_key(key_fid(slot)))
+}
+
+/// Generate an EC key on-device into an empty retired slot. Physical presence at the
+/// trusted display authorises it (no management-key auth, unlike the host GENERATE),
+/// and it is restricted to retired slots that hold no key — so it can only *add* a
+/// key, never overwrite one. EC only (P-256 / P-384); RSA stays USB-only. Writes the
+/// sealed key, a self-signed certificate and the metadata, so the slot then looks
+/// exactly like a host-generated one.
+pub fn generate_slot_key<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    rng: &mut dyn Rng,
+    slot: u8,
+    algo: u8,
+) -> Result<(), Sw> {
+    crate::keygen::generate_retired_ec(dev, fs, rng, slot, algo)
+}
+
 /// Read the public state of the PIV applet for the trusted display.
 pub fn read_info<S: Storage>(fs: &mut Fs<S>) -> PivInfo {
-    let mut slots = [PivSlot {
-        slot: 0,
-        present: false,
-        algo: 0,
-        pin_policy: 0,
-        touch_policy: 0,
-        origin: 0,
-        cert: false,
-    }; 4];
+    let mut slots = [PivSlot::default(); 4];
     for (i, &slot) in PRIMARY_SLOTS.iter().enumerate() {
-        let present = fs.has_key(key_fid(slot));
-        let mut meta = [0u8; 4];
-        let (algo, pin_policy, touch_policy, origin) = if present {
-            match fs.meta_find(key_fid(slot).get(), &mut meta) {
-                Some(n) if n >= 3 => (meta[0], meta[1], meta[2], if n >= 4 { meta[3] } else { 0 }),
-                _ => (0, 0, 0, 0),
-            }
-        } else {
-            (0, 0, 0, 0)
-        };
-        let cert = cert_fid_for_slot(slot).is_some_and(|f| fs.has_data(f));
-        slots[i] = PivSlot {
-            slot,
-            present,
-            algo,
-            pin_policy,
-            touch_policy,
-            origin,
-            cert,
-        };
+        slots[i] = read_slot(fs, slot);
     }
 
     let mut r = [0u8; 4];
@@ -231,5 +285,75 @@ mod tests {
         fs.put(EF_RETRIES, &[3, 2, 3, 0]).unwrap();
         let info = read_info(&mut fs);
         assert_eq!((info.pin_retries, info.puk_retries), (2, 0));
+    }
+
+    #[test]
+    fn extra_lists_populated_retired_and_f9_only() {
+        let mut fs = fs();
+        // F9 present, retired 0x82 has a key, 0x84 has only a cert, the rest are empty.
+        fs.put(key_fid(SLOT_ATTESTATION).get(), &[0xAA; 64])
+            .unwrap();
+        fs.put(key_fid(0x82).get(), &[0xBB; 64]).unwrap();
+        fs.put(
+            cert_fid_for_slot(0x84).unwrap(),
+            &[0x30, 0x03, 0x01, 0x02, 0x03],
+        )
+        .unwrap();
+        let mut out = [PivSlot::default(); MAX_EXTRA_SLOTS];
+        let n = read_extra(&mut fs, &mut out);
+        assert_eq!(n, 3);
+        assert_eq!((out[0].slot, out[0].present), (SLOT_ATTESTATION, true));
+        assert_eq!((out[1].slot, out[1].present), (0x82, true));
+        assert_eq!(
+            (out[2].slot, out[2].present, out[2].cert),
+            (0x84, false, true)
+        );
+        assert_eq!(extra_count(&mut fs), 3);
+    }
+
+    #[test]
+    fn next_free_retired_skips_taken_slots() {
+        let mut fs = fs();
+        assert_eq!(next_free_retired(&mut fs), Some(0x82));
+        fs.put(key_fid(0x82).get(), &[0xBB; 64]).unwrap();
+        assert_eq!(next_free_retired(&mut fs), Some(0x83));
+    }
+
+    /// Deterministic LCG randomness — enough for an EC keygen in a host test.
+    struct TestRng(u64);
+    impl Rng for TestRng {
+        fn fill(&mut self, b: &mut [u8]) {
+            for x in b.iter_mut() {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                *x = (self.0 >> 33) as u8;
+            }
+        }
+    }
+
+    #[test]
+    fn on_device_generate_fills_an_empty_retired_slot() {
+        let mut fs = fs();
+        let dev = Device {
+            serial_hash: &[0x22; 32],
+            serial_id: &[1, 2, 3, 4, 5, 6, 7, 8],
+            otp_key: None,
+        };
+        let mut rng = TestRng(0xC0FFEE);
+        assert!(generate_slot_key(&dev, &mut fs, &mut rng, 0x82, ALGO_ECCP256).is_ok());
+        let s = read_slot(&mut fs, 0x82);
+        assert!(s.present);
+        assert_eq!(algo_name(s.algo), "NIST P-256");
+        assert_eq!(origin_name(s.origin), "Generated");
+        assert!(s.cert, "a self-signed cert is stored alongside the key");
+
+        // Refuses to overwrite a populated slot, a non-retired slot, and RSA on-device.
+        assert!(generate_slot_key(&dev, &mut fs, &mut rng, 0x82, ALGO_ECCP256).is_err());
+        assert!(
+            generate_slot_key(&dev, &mut fs, &mut rng, SLOT_AUTHENTICATION, ALGO_ECCP256).is_err()
+        );
+        assert!(generate_slot_key(&dev, &mut fs, &mut rng, 0x83, ALGO_RSA2048).is_err());
     }
 }

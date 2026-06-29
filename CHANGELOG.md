@@ -15,6 +15,24 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Added
 
+- **Trusted-display applet detail screens — OATH / OpenPGP / PIV, plus on-device PIV key
+  generation (display builds).** The applet hub gained the detail screens that the overviews
+  only hinted at. **OATH:** each credential row now drills into a detail showing its type
+  (TOTP / HOTP), HMAC algorithm, digit count, TOTP step (the `<period>/` name prefix, default
+  30 s) and touch gate — still no code (the device has no clock). **OpenPGP:** the overview
+  gained a **Card holder** row opening a detail card with the public cardholder name, login,
+  URL and language (all plaintext, no PIN). **PIV:** the overview gained a **Retired & F9** row
+  opening a paged list of the populated retired key-management slots (82–95) and the F9
+  attestation slot, each drilling into the shared slot-detail. From that screen a **Generate
+  key** action creates an EC key (P-256 / P-384) on-device into the next free retired slot —
+  gated on the device PIN (when set) and a deliberate hold, EC only (RSA's prime search would
+  block the panel), and restricted to *empty* retired slots so it can only add a key, never
+  overwrite one (the four primary slots and F9 stay USB-managed; there is no management-key auth
+  — physical presence at the panel is the authorisation). The read paths are plaintext / device
+  metadata; no PIN, DEK or host session. No protocol or wire-format change. bcdDevice 0x07C1 →
+  0x07C3 (the **Card holder** row carries a new person `User` glyph; the generate-confirm screen
+  is a chrome-less modal so its cancel chevron no longer overlaps the status bar).
+
 - **Trusted-display Settings regrouped by domain (display builds).** The Settings root was a
   flat list of five unrelated rows; it is now three domains — **Display** (Brightness, Display
   sleep, Touch timeout), **Security** (the existing PIN / Audit / Backup / Factory-reset

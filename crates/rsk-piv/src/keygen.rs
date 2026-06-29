@@ -228,6 +228,57 @@ pub(crate) fn generate_rsa_blocking<S: Storage>(
     finish_rsa(dev, fs, rng, slot, req.algo, pol, &key, res)
 }
 
+/// On-device EC key generation into an empty retired slot (82–95), driven by the
+/// trusted display. There is no management-key auth — physical presence at the panel
+/// is the authorisation — so it is deliberately fenced to retired slots that hold no
+/// key: it can only *add* a key, never overwrite one (the four primary slots and F9
+/// stay USB-managed). EC only; RSA's dual-core prime search would block the UI, so it
+/// is rejected here. Stores the sealed key, a self-signed cert and the metadata, the
+/// same writes the host GENERATE makes, so `ykman` / GET DATA see a normal slot after.
+pub(crate) fn generate_retired_ec<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    rng: &mut dyn Rng,
+    slot: u8,
+    algo: u8,
+) -> Result<(), Sw> {
+    if !is_retired(slot) {
+        return Err(Sw::INCORRECT_P1P2);
+    }
+    // Never clobber a key on-device: overwriting a retired slot needs USB + mgmt-key.
+    if fs.has_key(key_fid(slot)) {
+        return Err(Sw::SECURITY_STATUS_NOT_SATISFIED);
+    }
+    let curve = match algo {
+        ALGO_ECCP256 => Curve::P256,
+        ALGO_ECCP384 => Curve::P384,
+        _ => return Err(WRONG_DATA),
+    };
+    let Some(key) = PrivKey::generate(curve, rng) else {
+        return Err(Sw::EXEC_ERROR);
+    };
+    let mut point = [0u8; 97];
+    let plen = key.public_point(&mut point)?;
+    store_slot_cert(
+        fs,
+        rng,
+        slot,
+        algo,
+        x509::Spki::Ec {
+            curve,
+            point: &point[..plen],
+        },
+        x509::Signer::Ec(&key),
+    )?;
+    seal::store_ec_key(dev, fs, rng, key_fid(slot), &key)?;
+    let pol = resolved_policies(slot, None, None);
+    fs.meta_add(
+        key_fid(slot).get(),
+        &[algo, pol[0], pol[1], ORIGIN_GENERATED],
+    )
+    .map_err(|_| Sw::MEMORY_FAILURE)
+}
+
 /// IMPORT ASYMMETRIC KEY; gated on management-key auth.
 pub(crate) fn import<S: Storage>(
     sess: &Session,
