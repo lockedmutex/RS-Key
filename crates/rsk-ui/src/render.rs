@@ -92,24 +92,72 @@ fn locked<D: DrawTarget<Color = Rgb565>>(t: &mut D) -> Result<(), D::Error> {
         theme::ACCENT,
     )?;
     text(t, "Locked", EgPoint::new(cx, 200), Role::Heading, FG)?;
-    // The design breathes this hint (opacity 0.5↔1); we paint it static — the locked
-    // screen is event-driven (no animation loop) and there is no retained framebuffer to
-    // pulse cheaply, so a static muted line is the faithful no-framebuffer rendering.
+    // The design breathes this hint (opacity 0.5↔1); the firmware pulses it by repainting
+    // [`render_locked_breathe`] through the shade ramp on a timer. The first paint uses the
+    // brightest shade (ramp index 0), the firmware then steps onward from there.
+    render_locked_breathe(t, 0)
+}
+
+/// The "Touch to unlock" hint position on the [`locked`] screen — shared by the static
+/// paint and the breathe repaint so they land on the same pixels (a recolour-in-place, no
+/// clear needed: the same string at the same spot just overwrites its own ink).
+const LOCKED_HINT_Y: i32 = 228;
+
+/// Phases in the locked-hint breathe ramp (a triangle 1.0 → 0.45 → 1.0 opacity over the
+/// background), one full cycle. The firmware passes any `u8`; the renderer wraps it here.
+const BREATHE_PHASES: u8 = 8;
+
+/// `MUTED` flattened onto the background at the ramp's opacities — precomputed because
+/// embedded-graphics has no alpha blend (the design's `rgba` pulse becomes solid shades).
+/// Index 0 is the brightest (the resting paint); the firmware steps a triangle from there.
+const BREATHE: [Rgb565; BREATHE_PHASES as usize] = [
+    rgb(154, 163, 173), // 1.00 (== MUTED)
+    rgb(139, 148, 157), // 0.90
+    rgb(118, 125, 134), // 0.75
+    rgb(96, 103, 110),  // 0.60
+    rgb(75, 80, 87),    // 0.45 (dimmest)
+    rgb(96, 103, 110),  // 0.60
+    rgb(118, 125, 134), // 0.75
+    rgb(139, 148, 157), // 0.90
+];
+
+/// 8-bit `#rrggbb` → `Rgb565`, for the local breathe ramp.
+const fn rgb(r: u8, g: u8, b: u8) -> Rgb565 {
+    Rgb565::new(r >> 3, g >> 2, b >> 3)
+}
+
+/// Repaint just the locked screen's "Touch to unlock" hint at breathe `phase`
+/// (`0..BREATHE_PHASES`). The firmware steps `phase` on a timer to pulse the hint without
+/// touching the rest of the locked frame.
+pub fn render_locked_breathe<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    phase: u8,
+) -> Result<(), D::Error> {
+    let color = BREATHE[(phase % BREATHE_PHASES) as usize];
     text(
         t,
         "Touch to unlock",
-        EgPoint::new(cx, 228),
+        EgPoint::new(MIDX, LOCKED_HINT_Y),
         Role::Body,
-        MUTED,
+        color,
     )
 }
 
 fn splash<D: DrawTarget<Color = Rgb565>>(t: &mut D) -> Result<(), D::Error> {
-    text(t, "RS-Key", EgPoint::new(MIDX, 140), Role::Heading, FG)?;
+    // A shield brand mark over the wordmark — the device is a trusted authenticator, and the
+    // shield echoes the approval prompt's glyph.
+    glyph::draw(
+        t,
+        Glyph::Shield,
+        Point::new(MIDX as u16 - 20, 92),
+        40,
+        theme::ACCENT,
+    )?;
+    text(t, "RS-Key", EgPoint::new(MIDX, 158), Role::Heading, FG)?;
     text(
         t,
         "trusted display",
-        EgPoint::new(MIDX, 175),
+        EgPoint::new(MIDX, 186),
         Role::Body,
         MUTED,
     )
@@ -129,15 +177,19 @@ fn home<D: DrawTarget<Color = Rgb565>>(t: &mut D, v: &HomeView) -> Result<(), D:
         // accent check, not a lone centred accent word.
         glyph::draw(t, Glyph::CheckCircle, Point::new(14, 40), 36, theme::ACCENT)?;
         text_left(t, "Ready", EgPoint::new(60, 58), Role::Ready, FG)?;
-        render_row(
+        // One grouped status card (USB / device PIN / passkey count), the design's panel —
+        // not three floating pills.
+        group_card(t, HOME_CARD_TOP, 3)?;
+        row_body(
             t,
             crate::row_rect(HOME_CARD_TOP, 0),
             Glyph::Usb,
             "USB connected",
             None,
             false,
+            false,
         )?;
-        render_row(
+        row_body(
             t,
             crate::row_rect(HOME_CARD_TOP, 1),
             Glyph::Lock,
@@ -148,47 +200,27 @@ fn home<D: DrawTarget<Color = Rgb565>>(t: &mut D, v: &HomeView) -> Result<(), D:
             },
             None,
             false,
+            false,
         )?;
         // The passkey count comes from the firmware's cached enumeration (refreshed at
         // modal boundaries, never per idle frame — a per-frame partition scan would stall
         // the panel, the lesson the PIV `has_data` lag taught).
         let mut buf = [0u8; 5];
-        render_row(
+        row_body(
             t,
             crate::row_rect(HOME_CARD_TOP, 2),
             Glyph::Key,
             "Passkeys",
             Some((fmt_u16(v.passkeys, &mut buf), theme::GREY)),
             false,
+            false,
         )?;
     } else {
         // A themed ring + bright 270° arc reads as an in-progress spinner (the design's
-        // request spinner), not a flat raw-colour disc. Painted once, not animated: the
-        // display loop only repaints the status screen on a state change.
-        let (track, mark) = status_ring(v.status);
-        let center = EgPoint::new(MIDX, 92);
-        const RING_D: u32 = 50;
-        Circle::with_center(center, RING_D)
-            .into_styled(
-                PrimitiveStyleBuilder::new()
-                    .stroke_color(track)
-                    .stroke_width(3)
-                    .build(),
-            )
-            .draw(t)?;
-        Arc::with_center(
-            center,
-            RING_D,
-            Angle::from_degrees(-90.0),
-            Angle::from_degrees(270.0),
-        )
-        .into_styled(
-            PrimitiveStyleBuilder::new()
-                .stroke_color(mark)
-                .stroke_width(3)
-                .build(),
-        )
-        .draw(t)?;
+        // request spinner), not a flat raw-colour disc. The firmware spins it by repainting
+        // [`render_status_arc`] at an advancing angle while busy (the arc's redraw of the
+        // full track erases the previous frame, so no per-frame clear / flicker).
+        render_status_arc(t, v.status, STATUS_ARC_START)?;
         text(
             t,
             v.status.label(),
@@ -198,6 +230,50 @@ fn home<D: DrawTarget<Color = Rgb565>>(t: &mut D, v: &HomeView) -> Result<(), D:
         )?;
     }
     render_nav(t, NavTab::Home)
+}
+
+/// The resting start angle of the status spinner's 270° arc (top, `-90°`), used for the
+/// first paint; the firmware advances it to animate.
+pub const STATUS_ARC_START: i32 = -90;
+
+/// Centre + diameter of the status spinner ring — the firmware sizes nothing itself; it
+/// only steps the angle through [`render_status_arc`].
+const STATUS_RING_CY: i32 = 92;
+const STATUS_RING_D: u32 = 50;
+
+/// Repaint just the status spinner — the full track ring plus the 270° arc starting at
+/// `angle_deg`. Drawing the full track every frame overwrites the previous arc with track
+/// colour (no background clear), so stepping `angle_deg` spins the arc flicker-free. The
+/// firmware calls this on a timer while the status is non-idle; the "Working…" label and
+/// the rest of the Home frame are untouched.
+pub fn render_status_arc<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    kind: StatusKind,
+    angle_deg: i32,
+) -> Result<(), D::Error> {
+    let (track, mark) = status_ring(kind);
+    let center = EgPoint::new(MIDX, STATUS_RING_CY);
+    Circle::with_center(center, STATUS_RING_D)
+        .into_styled(
+            PrimitiveStyleBuilder::new()
+                .stroke_color(track)
+                .stroke_width(3)
+                .build(),
+        )
+        .draw(t)?;
+    Arc::with_center(
+        center,
+        STATUS_RING_D,
+        Angle::from_degrees(angle_deg as f32),
+        Angle::from_degrees(270.0),
+    )
+    .into_styled(
+        PrimitiveStyleBuilder::new()
+            .stroke_color(mark)
+            .stroke_width(3)
+            .build(),
+    )
+    .draw(t)
 }
 
 /// The Passkeys tab: header, one row per relying party (generic globe + sanitized
@@ -228,6 +304,7 @@ where
             MUTED,
         )?;
     } else {
+        group_card(t, PK_LIST_TOP, rows.len() as u16)?;
         for (i, r) in rows.iter().enumerate() {
             let mut buf = [0u8; 16];
             let unit = if r.accounts == 1 {
@@ -236,12 +313,14 @@ where
                 "accounts"
             };
             let trailing = fmt_count(r.accounts as u16, unit, &mut buf);
-            render_row(
+            let name = r.shown();
+            row_body(
                 t,
                 crate::row_rect(PK_LIST_TOP, i as u16),
-                Glyph::Globe,
-                r.shown(),
+                service_glyph(name),
+                name,
                 Some((trailing, MUTED)),
+                true,
                 true,
             )?;
         }
@@ -270,19 +349,21 @@ where
     status_bar(t)?;
     title_bar(t, title.as_str(), theme::ACCENT, true)?;
     glyph_centered(t, Glyph::Edit, TITLE_EDIT_RECT, 18, theme::ACCENT)?;
+    group_card(t, PK_LIST_TOP, accounts.len() as u16)?;
     for (i, a) in accounts.iter().enumerate() {
         let trailing = if a.protected {
             Some(("UV", theme::ACCENT))
         } else {
             None
         };
-        render_row(
+        row_body(
             t,
             crate::row_rect(PK_LIST_TOP, i as u16),
             Glyph::Key,
             a.name.as_str(),
             trailing,
             false,
+            true,
         )?;
     }
     list_tail(t, page, total, "account", "accounts")?;
@@ -476,13 +557,15 @@ where
             ),
         ),
     ];
+    group_card(t, PK_LIST_TOP, rows.len() as u16)?;
     for (i, (g, name, trailing)) in rows.into_iter().enumerate() {
-        render_row(
+        row_body(
             t,
             crate::row_rect(PK_LIST_TOP, i as u16),
             g,
             name,
             Some((trailing, MUTED)),
+            true,
             true,
         )?;
     }
@@ -501,6 +584,7 @@ where
     title_bar_wide(t, "OpenPGP", theme::ACCENT, true)?;
     const NAMES: [&str; 3] = ["Signature", "Encryption", "Authentication"];
     const GLYPHS: [Glyph; 3] = [Glyph::Edit, Glyph::Lock, Glyph::Shield];
+    group_card(t, PK_LIST_TOP, v.slots.len() as u16)?;
     for (i, slot) in v.slots.iter().enumerate() {
         let trailing = if slot.present {
             (slot.algo.as_str(), MUTED)
@@ -509,12 +593,13 @@ where
         };
         // Every slot drills into its own detail (an empty slot's screen explains its
         // role), so every row gets the chevron.
-        render_row(
+        row_body(
             t,
             crate::row_rect(PK_LIST_TOP, i as u16),
             GLYPHS[i],
             NAMES[i],
             Some(trailing),
+            true,
             true,
         )?;
     }
@@ -646,6 +731,7 @@ where
     status_bar(t)?;
     title_bar_wide(t, "PIV", theme::ACCENT, true)?;
     const NAMES: [&str; 4] = ["Authentication", "Signature", "Key Management", "Card Auth"];
+    group_card(t, PK_LIST_TOP, v.slots.len() as u16)?;
     for (i, slot) in v.slots.iter().enumerate() {
         let trailing = if slot.present {
             (slot.algo.as_str(), MUTED)
@@ -656,12 +742,13 @@ where
         };
         // Every slot drills into its own detail (an empty slot's screen explains its
         // role), so every row gets the chevron.
-        render_row(
+        row_body(
             t,
             crate::row_rect(PK_LIST_TOP, i as u16),
             Glyph::Cpu,
             NAMES[i],
             Some(trailing),
+            true,
             true,
         )?;
     }
@@ -761,16 +848,18 @@ where
             MUTED,
         )?;
     } else {
+        group_card(t, PK_LIST_TOP, rows.len() as u16)?;
         for (i, r) in rows.iter().enumerate() {
             let icon = if r.touch { Glyph::Lock } else { Glyph::Clock };
             let kind = if r.hotp { "HOTP" } else { "TOTP" };
-            render_row(
+            row_body(
                 t,
                 crate::row_rect(PK_LIST_TOP, i as u16),
                 icon,
                 r.name.as_str(),
                 Some((kind, MUTED)),
                 false,
+                true,
             )?;
         }
         if page_count(total) > 1 {
@@ -793,8 +882,8 @@ where
 /// value field with a caret, then the wheel — a backspace key on the left, the ▲ / big
 /// candidate / ▼ centre column, and an insert (`+`) key on the right — over a full-width
 /// Save button. `value` is the current buffer; `candidate` the wheel's current byte
-/// (`b' '` shows as an underscore so a space is visible). The caret is static (no blink:
-/// there is no framebuffer / animation loop, as on the lock screen).
+/// (`b' '` shows as an underscore so a space is visible). The firmware blinks the caret by
+/// repainting [`render_rename_caret`] on a timer.
 pub fn render_rename<D>(t: &mut D, value: &str, candidate: u8) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb565>,
@@ -884,6 +973,27 @@ where
     button(t, RN_SAVE_RECT, "Save", ALLOW_FILL)
 }
 
+/// Repaint just the rename field's caret — drawn in accent when `on`, erased to the field
+/// surface when `off`, so the firmware can blink it on a timer without redrawing the
+/// screen. The caret sits at the end of `value` (clamped inside the field), matching
+/// [`render_rename`]'s static caret exactly.
+pub fn render_rename_caret<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    value: &str,
+    on: bool,
+) -> Result<(), D::Error> {
+    let field = RN_FIELD_RECT;
+    let text_w = font::width(value, Role::Body).unwrap_or(0) as i32;
+    let caret_x = (field.x as i32 + 10 + text_w).min(field.x as i32 + field.w as i32 - 6);
+    let color = if on { theme::ACCENT } else { theme::SURFACE };
+    Line::new(
+        EgPoint::new(caret_x, field.y as i32 + 7),
+        EgPoint::new(caret_x, field.y as i32 + field.h as i32 - 7),
+    )
+    .into_styled(PrimitiveStyle::with_stroke(color, 1))
+    .draw(t)
+}
+
 /// A filled wheel arrow (▲ when `up`, else ▼) centred in `r`.
 fn wheel_arrow<D: DrawTarget<Color = Rgb565>>(
     t: &mut D,
@@ -940,8 +1050,9 @@ where
             MUTED,
         )?;
     } else {
+        group_card(t, PK_LIST_TOP, rows.len() as u16)?;
         for (i, r) in rows.iter().enumerate() {
-            audit_row(t, crate::row_rect(PK_LIST_TOP, i as u16), r)?;
+            audit_body(t, crate::row_rect(PK_LIST_TOP, i as u16), r)?;
         }
         list_tail(t, page, total, "event", "events")?;
     }
@@ -1062,12 +1173,18 @@ where
     )?;
     let row0 = Rect::new(16, 138, PANEL_W - 32, 34);
     let row1 = Rect::new(16, 176, PANEL_W - 32, 34);
+    // One grouped card behind both fact rows, with a divider in the gap between them.
+    group_panel(
+        t,
+        Rect::new(row0.x, row0.y, row0.w, row1.y + row1.h - row0.y),
+    )?;
+    group_divider(t, row0.x, row0.w, (row0.y + row0.h + row1.y) as i32 / 2)?;
     let seed = if v.has_seed {
         ("Present", theme::OK)
     } else {
         ("Missing", theme::DANGER)
     };
-    render_row(t, row0, Glyph::Lifebuoy, "Seed", Some(seed), false)?;
+    row_body(t, row0, Glyph::Lifebuoy, "Seed", Some(seed), false, false)?;
     let window = if v.sealed {
         ("Sealed", theme::OK)
     } else if v.exportable {
@@ -1075,7 +1192,15 @@ where
     } else {
         ("Disabled", MUTED)
     };
-    render_row(t, row1, Glyph::Lock, "Backup window", Some(window), false)?;
+    row_body(
+        t,
+        row1,
+        Glyph::Lock,
+        "Backup window",
+        Some(window),
+        false,
+        false,
+    )?;
 
     if v.can_reveal {
         // Window open + seed readable: the on-device actions. The phrase is shown ON the
@@ -1473,12 +1598,11 @@ fn fmt_share_title(p: u16, n: u16, buf: &mut [u8; 18]) -> &str {
 /// One audit row: a status dot (its colour the at-a-glance signal), the event label, and
 /// a right-aligned "time ago". Mirrors [`render_row`]'s card + clip metrics, but leads
 /// with a coloured dot instead of a muted glyph.
-fn audit_row<D: DrawTarget<Color = Rgb565>>(
+fn audit_body<D: DrawTarget<Color = Rgb565>>(
     t: &mut D,
     rect: Rect,
     r: &AuditRow,
 ) -> Result<(), D::Error> {
-    card(t, rect, theme::ROW_BG, theme::BORDER_CARD)?;
     let cy = rect.y as i32 + rect.h as i32 / 2;
     let dot: u32 = 8;
     Circle::new(EgPoint::new(rect.x as i32 + 10, cy - dot as i32 / 2), dot)
@@ -2872,9 +2996,10 @@ fn card<D: DrawTarget<Color = Rgb565>>(
         .draw(t)
 }
 
-/// One list row: a lifted card, a leading glyph, the label, an optional trailing
-/// coloured status/value, and an optional chevron. The geometry is the caller's
-/// `rect` (from `row_rect`), so paint and [`crate::hit_list`] share it.
+/// One standalone list row: its own [`card`] plus the [`row_body`] content. The geometry is
+/// the caller's `rect` (from `row_rect`), so paint and [`crate::hit_list`] share it. A
+/// grouped list paints one [`group_card`] then calls [`row_body`] per row instead, so the
+/// rows read as a single panel rather than a stack of separate pills.
 pub fn render_row<D: DrawTarget<Color = Rgb565>>(
     t: &mut D,
     rect: Rect,
@@ -2884,14 +3009,38 @@ pub fn render_row<D: DrawTarget<Color = Rgb565>>(
     chevron: bool,
 ) -> Result<(), D::Error> {
     card(t, rect, theme::ROW_BG, theme::BORDER_CARD)?;
+    row_body(t, rect, icon, label, trailing, chevron, false)
+}
+
+/// The content of one list row — a leading glyph (on a service `chip` when set), the label,
+/// an optional trailing coloured status/value, and an optional drill-in chevron — *without*
+/// the card behind it. [`render_row`] adds the card for a standalone row; [`group_card`]
+/// backs a whole grouped list, then each row's content is drawn with this.
+#[allow(clippy::too_many_arguments)]
+fn row_body<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    rect: Rect,
+    icon: Glyph,
+    label: &str,
+    trailing: Option<(&str, Rgb565)>,
+    chevron: bool,
+    chip: bool,
+) -> Result<(), D::Error> {
     let cy = rect.y as i32 + rect.h as i32 / 2;
-    glyph::draw(
-        t,
-        icon,
-        Point::new(rect.x + 8, (cy - 7) as u16),
-        14,
-        theme::GREY,
-    )?;
+    // A service row carries the design's icon chip — a small rounded tile behind the glyph;
+    // status / settings rows draw the glyph bare. The label x is unchanged either way.
+    let gx = if chip {
+        RoundedRectangle::with_equal_corners(
+            eg_rect(Rect::new(rect.x + 3, (cy - 11) as u16, 22, 22)),
+            Size::new(6, 6),
+        )
+        .into_styled(PrimitiveStyle::with_fill(theme::CHIP))
+        .draw(t)?;
+        rect.x + 7
+    } else {
+        rect.x + 8
+    };
+    glyph::draw(t, icon, Point::new(gx, (cy - 7) as u16), 14, theme::GREY)?;
     // Lay the trailing block (chevron, then the value flush against it) first, tracking
     // the leftmost x it occupies — the label is then clipped to end before it.
     let mut right_x = rect.x as i32 + rect.w as i32 - 8;
@@ -2927,6 +3076,60 @@ pub fn render_row<D: DrawTarget<Color = Rgb565>>(
         theme::TEXT,
         clip,
     )
+}
+
+/// Paint one grouped surface behind list rows `0..n` (each at `row_rect(y0, i)`), with a
+/// hairline divider at every inter-row gap. The row content is then drawn on top with
+/// [`row_body`], so the list reads as the design's single grouped card rather than a stack
+/// of separate pills — while `row_rect` stays the tap target, so paint and
+/// [`crate::hit_list`] still share geometry.
+fn group_card<D: DrawTarget<Color = Rgb565>>(t: &mut D, y0: u16, n: u16) -> Result<(), D::Error> {
+    if n == 0 {
+        return Ok(());
+    }
+    let first = crate::row_rect(y0, 0);
+    let last = crate::row_rect(y0, n - 1);
+    group_panel(
+        t,
+        Rect::new(first.x, first.y, first.w, last.y + last.h - first.y),
+    )?;
+    for i in 1..n {
+        // The divider sits at the midpoint of the gap between consecutive row rects.
+        let dy = (crate::row_rect(y0, i - 1).y + crate::LIST_ROW_H + crate::row_rect(y0, i).y) / 2;
+        group_divider(t, first.x, first.w, dy as i32)?;
+    }
+    Ok(())
+}
+
+/// The surface behind a grouped list (or any multi-row group with custom rects): one
+/// rounded card, fill + hairline border, at the shared [`CARD_RADIUS`].
+fn group_panel<D: DrawTarget<Color = Rgb565>>(t: &mut D, span: Rect) -> Result<(), D::Error> {
+    card(t, span, theme::ROW_BG, theme::BORDER_CARD)
+}
+
+/// A hairline divider inside a grouped card, inset from the rounded edges.
+fn group_divider<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    x: u16,
+    w: u16,
+    y: i32,
+) -> Result<(), D::Error> {
+    Line::new(
+        EgPoint::new(x as i32 + 12, y),
+        EgPoint::new((x + w) as i32 - 12, y),
+    )
+    .into_styled(PrimitiveStyle::with_stroke(theme::DIVIDER, 1))
+    .draw(t)
+}
+
+/// A relying-party row's leading glyph: a terminal for an SSH host, else the generic globe.
+fn service_glyph(label: &str) -> Glyph {
+    let b = label.as_bytes();
+    // Case-insensitive search for "ssh" (`| 0x20` lowercases an ASCII letter).
+    let ssh = b
+        .windows(3)
+        .any(|w| w[0] | 0x20 == b's' && w[1] | 0x20 == b's' && w[2] | 0x20 == b'h');
+    if ssh { Glyph::Terminal } else { Glyph::Globe }
 }
 
 /// The gap kept between a row's (clipped) label and its trailing value / chevron, so the
@@ -3061,6 +3264,7 @@ pub fn render_hold_fill<D: DrawTarget<Color = Rgb565>>(
 fn settings<D: DrawTarget<Color = Rgb565>>(t: &mut D, v: &SettingsView) -> Result<(), D::Error> {
     match v.page {
         SettingsPage::Root => settings_root(t, v.version),
+        SettingsPage::Display => settings_display(t),
         SettingsPage::Brightness => settings_brightness(t, v.brightness),
         SettingsPage::Timeout => settings_timeout(t, v.timeout_secs),
         SettingsPage::Sleep => settings_sleep(t, v.sleep_secs),
@@ -3070,14 +3274,48 @@ fn settings<D: DrawTarget<Color = Rgb565>>(t: &mut D, v: &SettingsView) -> Resul
     }
 }
 
-/// The Root list: a header and the option rows, each in its `settings_row_rect` —
-/// the new list look, with leading glyphs and a drill-in chevron.
+/// The Root list — the three settings domains: **Display** (panel knobs), **Security**, and
+/// **Firmware** last (a rare maintenance action, its installed build inline). Settings is a
+/// top-level tab, so it paints the four-tab nav (with itself active) like Home / Passkeys /
+/// Apps — no back chevron; the nav is the way out.
 fn settings_root<D: DrawTarget<Color = Rgb565>>(t: &mut D, version: u16) -> Result<(), D::Error> {
     status_bar(t)?;
-    // Back chevron exits to Home (the design's settings → back flow), so the list needs
-    // no "Close" row — keeping all five at a touch-comfortable height with a gap below
-    // the chevron.
-    title_bar(t, "Settings", theme::ACCENT, true)?;
+    title_bar(t, "Settings", theme::ACCENT, false)?;
+    // Display drills into the brightness / sleep / touch-timeout panel knobs.
+    render_row(t, settings_row_rect(0), Glyph::Sun, "Display", None, true)?;
+    // Security drills into the Set/Change PIN + Audit / Backup + Factory reset sub-page,
+    // keeping the destructive reset one tap deeper.
+    render_row(
+        t,
+        settings_row_rect(1),
+        Glyph::Shield,
+        "Security",
+        None,
+        true,
+    )?;
+    // Firmware (last): the installed build (bcdDevice) inline, drilling into the
+    // reboot-to-update-over-USB screen.
+    let mut vbuf = [b'0', b'x', 0, 0, 0, 0];
+    vbuf[2..].copy_from_slice(&hex_u16(version));
+    render_row(
+        t,
+        settings_row_rect(2),
+        Glyph::Cpu,
+        "Firmware",
+        Some((str8(&vbuf), theme::FAINT)),
+        true,
+    )?;
+    render_nav(t, NavTab::Settings)
+}
+
+/// The Display sub-page: the three panel/interaction knobs — Brightness, Display sleep, and
+/// the Touch timeout — each drilling into its −/+ adjust page (which backs out to here). The
+/// title-bar back chevron returns to the Root list; no nav (a sub-page).
+fn settings_display<D: DrawTarget<Color = Rgb565>>(t: &mut D) -> Result<(), D::Error> {
+    status_bar(t)?;
+    title_bar(t, "Display", theme::ACCENT, true)?;
+    // Row order must match [`crate::display_row_entry`] — paint and tap-dispatch share
+    // `settings_row_rect(i)`.
     render_row(
         t,
         settings_row_rect(0),
@@ -3089,38 +3327,16 @@ fn settings_root<D: DrawTarget<Color = Rgb565>>(t: &mut D, version: u16) -> Resu
     render_row(
         t,
         settings_row_rect(1),
-        Glyph::Clock,
-        "Touch timeout",
+        Glyph::Moon,
+        "Display sleep",
         None,
         true,
     )?;
     render_row(
         t,
         settings_row_rect(2),
-        Glyph::Moon,
-        "Display sleep",
-        None,
-        true,
-    )?;
-    // Firmware: the installed build (bcdDevice) inline, drilling into the
-    // reboot-to-update-over-USB screen.
-    let mut vbuf = [b'0', b'x', 0, 0, 0, 0];
-    vbuf[2..].copy_from_slice(&hex_u16(version));
-    render_row(
-        t,
-        settings_row_rect(3),
-        Glyph::Cpu,
-        "Firmware",
-        Some((str8(&vbuf), theme::FAINT)),
-        true,
-    )?;
-    // Security drills into the Set/Change PIN + Factory reset sub-page (the design's
-    // settings → security flow), keeping the destructive reset one tap deeper.
-    render_row(
-        t,
-        settings_row_rect(4),
-        Glyph::Shield,
-        "Security",
+        Glyph::Clock,
+        "Touch timeout",
         None,
         true,
     )
@@ -4236,6 +4452,7 @@ mod tests {
     fn every_settings_page_fits_and_draws() {
         for page in [
             SettingsPage::Root,
+            SettingsPage::Display,
             SettingsPage::Brightness,
             SettingsPage::Timeout,
             SettingsPage::Sleep,
@@ -4517,6 +4734,18 @@ mod tests {
             assert!(
                 d.any_non_bg_in(settings_row_rect(i)),
                 "root row {i} unpainted"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_display_paints_every_row_in_its_hit_rect() {
+        let mut d = Rec::new();
+        render(&mut d, &Screen::Settings(view(SettingsPage::Display))).unwrap();
+        for i in 0..crate::DISPLAY_ROWS {
+            assert!(
+                d.any_non_bg_in(settings_row_rect(i)),
+                "display row {i} unpainted"
             );
         }
     }

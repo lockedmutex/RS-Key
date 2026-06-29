@@ -53,8 +53,8 @@ use rsk_crypto::Device;
 use rsk_sdk::Confirm;
 use rsk_ui::{
     ALLOW_RECT, AccountRow, AdjustKey, AppEntry, AuditRow, BRIGHTNESS_LEVELS, BackupView, Button,
-    ConfirmPrompt, HomeView, Label, NavTab, PinCaption, PinKey, PinPad, RootEntry, RpRow, Screen,
-    SecurityEntry, SettingsPage, SettingsView, StatusKind, SuccessKind,
+    ConfirmPrompt, DisplayEntry, HomeView, Label, NavTab, PinCaption, PinKey, PinPad, RootEntry,
+    RpRow, Screen, SecurityEntry, SettingsPage, SettingsView, StatusKind, SuccessKind,
 };
 
 use crate::handler::{FidoRng, Store};
@@ -66,6 +66,16 @@ const CST328_ADDR: u16 = 0x1A;
 /// Touch poll cadence during a confirm wait; `block_for` keeps interrupts on, so
 /// the high-priority USB executor runs between polls (mirrors the BOOTSEL wait).
 const TOUCH_POLL_MS: u64 = 16;
+
+/// Status-spinner arc step per ~100ms status-loop tick (≈1.5s per revolution — the
+/// design's ~1.4s request spinner).
+const SPIN_STEP_DEG: i32 = 24;
+/// The locked-hint breathe advances one shade every this many ~100ms status-loop ticks, so
+/// the 8-shade ramp cycles in ~2.4s (the design's breathe period).
+const BREATHE_TICKS: u32 = 3;
+/// Rename caret blink half-period: the caret toggles on/off every this many ms (~1s full
+/// cycle, the design's `steps(1)` 1s blink).
+const CARET_BLINK_MS: u64 = 500;
 
 /// Until this ms-since-boot the ambient status loop must not repaint. A modal
 /// (PIN pad / Approve-Deny) sets it on exit so a back-to-back hand-off — pad →
@@ -642,9 +652,9 @@ impl Ui {
     /// the ambient status loop on Close / Back or after the inactivity timeout.
     fn run_settings(&mut self) -> Option<NavTab> {
         // Render first (so the switch feels instant), then let the opening finger lift
-        // before polling so it isn't read as the first menu tap. Settings has no nav
-        // bar, so it always returns to idle — `None` — but the signature matches the
-        // other tabs for the [`status_task`] navigation dispatcher.
+        // before polling so it isn't read as the first menu tap. The Root page now carries
+        // the four-tab nav (Settings is a top-level tab), so it returns the next nav
+        // destination like the other tabs; sub-pages still exit via their back chevron.
         let mut page = SettingsPage::Root;
         self.render_settings(page);
         self.touch
@@ -652,40 +662,60 @@ impl Ui {
         let mut last = Instant::now();
         let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
 
-        loop {
+        let next = loop {
             // The power button sleeps from inside the menu too, not just on Home.
             if self.sleep_button_pressed() {
-                break;
+                break None;
             }
             if let Some(p) = self.touch.read() {
                 last = Instant::now();
                 let mut repaint = true;
                 match page {
                     SettingsPage::Root => {
-                        // The title-bar back chevron exits the menu (the design's
-                        // settings → back-to-Home flow; there is no "Close" row).
-                        if rsk_ui::hit_title_back(p) {
-                            break;
-                        }
-                        match rsk_ui::hit_settings_root(p) {
-                            Some(RootEntry::Brightness) => page = SettingsPage::Brightness,
-                            Some(RootEntry::Timeout) => page = SettingsPage::Timeout,
-                            Some(RootEntry::Sleep) => page = SettingsPage::Sleep,
-                            // Firmware: drill into the installed-version + reboot-to-update
-                            // sub-flow. A completed update hold queues a reboot and returns
-                            // `true` — break out of the menu so the ambient loop can park and
-                            // hand the executor to the worker, which scrubs + resets. A cancel
-                            // falls back to this list.
-                            Some(RootEntry::Firmware) => {
-                                if self.run_firmware() {
-                                    break;
-                                }
-                                last = Instant::now();
+                        // The bottom nav switches tabs directly (Settings is a top-level tab
+                        // now): Home → idle, the others hand off to that tab's modal.
+                        if let Some(tab) = rsk_ui::hit_nav(p) {
+                            match tab {
+                                NavTab::Settings => repaint = false,
+                                NavTab::Home => break None,
+                                NavTab::Passkeys => break Some(NavTab::Passkeys),
+                                NavTab::Apps => break Some(NavTab::Apps),
                             }
-                            // Security drills into the Set/Change PIN + Factory reset
-                            // sub-page (the destructive reset now lives one tap deeper).
-                            Some(RootEntry::Security) => page = SettingsPage::Security,
-                            None => repaint = false,
+                        } else {
+                            match rsk_ui::hit_settings_root(p) {
+                                // Display drills into the brightness / sleep / touch-timeout
+                                // panel knobs.
+                                Some(RootEntry::Display) => page = SettingsPage::Display,
+                                // Security drills into the Set/Change PIN + Factory reset
+                                // sub-page (the destructive reset now lives one tap deeper).
+                                Some(RootEntry::Security) => page = SettingsPage::Security,
+                                // Firmware (last): drill into the installed-version +
+                                // reboot-to-update sub-flow. A completed update hold queues a
+                                // reboot and returns `true` — break out of the menu so the
+                                // ambient loop can park and hand the executor to the worker,
+                                // which scrubs + resets. A cancel falls back to this list.
+                                Some(RootEntry::Firmware) => {
+                                    if self.run_firmware() {
+                                        break None;
+                                    }
+                                    last = Instant::now();
+                                }
+                                None => repaint = false,
+                            }
+                        }
+                    }
+                    SettingsPage::Display => {
+                        // The title-bar back chevron returns to the Root list; each row drills
+                        // into its −/+ adjust page (which backs out to here).
+                        if rsk_ui::hit_title_back(p) {
+                            page = SettingsPage::Root;
+                        } else {
+                            match rsk_ui::hit_display(p) {
+                                Some(DisplayEntry::Brightness) => page = SettingsPage::Brightness,
+                                Some(DisplayEntry::Sleep) => page = SettingsPage::Sleep,
+                                Some(DisplayEntry::Timeout) => page = SettingsPage::Timeout,
+                                None => repaint = false,
+                            }
                         }
                     }
                     SettingsPage::Security => {
@@ -727,19 +757,19 @@ impl Ui {
                         Some(AdjustKey::Plus) => {
                             self.set_brightness(rsk_ui::step_brightness(self.brightness, 1))
                         }
-                        Some(AdjustKey::Back) => page = SettingsPage::Root,
+                        Some(AdjustKey::Back) => page = SettingsPage::Display,
                         None => repaint = false,
                     },
                     SettingsPage::Timeout => match rsk_ui::hit_adjust(p) {
                         Some(AdjustKey::Minus) => adjust_timeout(-1),
                         Some(AdjustKey::Plus) => adjust_timeout(1),
-                        Some(AdjustKey::Back) => page = SettingsPage::Root,
+                        Some(AdjustKey::Back) => page = SettingsPage::Display,
                         None => repaint = false,
                     },
                     SettingsPage::Sleep => match rsk_ui::hit_adjust(p) {
                         Some(AdjustKey::Minus) => adjust_sleep(-1),
                         Some(AdjustKey::Plus) => adjust_sleep(1),
-                        Some(AdjustKey::Back) => page = SettingsPage::Root,
+                        Some(AdjustKey::Back) => page = SettingsPage::Display,
                         None => repaint = false,
                     },
                 }
@@ -747,7 +777,7 @@ impl Ui {
                 // button; if so, unwind without repainting over the now-blanked panel —
                 // status_task owns the asleep/Locked state from here.
                 if self.asleep {
-                    break;
+                    break None;
                 }
                 // One tap = one action: wait for release (bounded) before the next.
                 self.touch.wait_release(last, idle_limit);
@@ -758,13 +788,13 @@ impl Ui {
             // A host command is queued — yield to the parked worker at once, rather
             // than making it wait out the (now generous) inactivity bound.
             if crate::worker::host_request_pending() || last.elapsed() >= idle_limit {
-                break;
+                break None;
             }
             block_for(Duration::from_millis(TOUCH_POLL_MS));
-        }
+        };
 
         self.end_modal();
-        None
+        next
     }
 
     /// Hand the panel back to the ambient loop on a modal's exit. Closing a tab back to
@@ -1380,6 +1410,10 @@ impl Ui {
         self.touch.wait_release(Instant::now(), idle_limit);
 
         let mut last = Instant::now();
+        // Blink the field caret: a full render leaves it on, then it toggles every
+        // `CARET_BLINK_MS` via the in-place [`render_rename_caret`].
+        let mut caret_on = true;
+        let mut blink_at = Instant::now();
         loop {
             if self.sleep_button_pressed() {
                 return None;
@@ -1423,11 +1457,20 @@ impl Ui {
                         charset[cand],
                     );
                     self.shown = None;
+                    // A fresh frame draws the caret on — restart the blink from there.
+                    caret_on = true;
+                    blink_at = Instant::now();
                     self.touch.wait_release(last, idle_limit);
                     last = Instant::now();
                     continue;
                 }
                 self.touch.wait_release(last, idle_limit);
+            }
+            if blink_at.elapsed() >= Duration::from_millis(CARET_BLINK_MS) {
+                caret_on = !caret_on;
+                let v = val(&buf, len);
+                let _ = rsk_ui::render_rename_caret(&mut self.panel, v.as_str(), caret_on);
+                blink_at = Instant::now();
             }
             if crate::worker::host_request_pending() || last.elapsed() >= idle_limit {
                 return None;
@@ -2538,6 +2581,13 @@ pub async fn status_task(ui: &'static RefCell<Ui>) {
     // Prime the Home status-card cache once before the first idle paint (boot has settled
     // the flash; the worker is parked here while this task runs, so the borrow is safe).
     ui.borrow_mut().refresh_home_stats();
+    // Liveness animation state: the spinner arc angle (advanced while busy) and the
+    // locked-hint breathe phase (advanced every few ticks), plus a tick counter to pace
+    // the breathe. These pulse a small region on top of the already-painted frame, so
+    // they never trigger a full repaint and can't flicker the idle hot path.
+    let mut spin = rsk_ui::STATUS_ARC_START;
+    let mut breathe: u8 = 0;
+    let mut tick: u32 = 0;
     loop {
         // A Settings → Firmware update queued a reboot: stop driving the panel and just yield
         // so the worker (same thread-mode executor) gets scheduled to scrub the live secrets
@@ -2547,6 +2597,7 @@ pub async fn status_task(ui: &'static RefCell<Ui>) {
             Timer::after_millis(10).await;
             continue;
         }
+        tick = tick.wrapping_add(1);
         // Wrap-safe deadline checks (millis truncated to u32 wrap every ~49 days).
         let now = Instant::now().as_millis() as u32;
         if let Ok(mut u) = ui.try_borrow_mut() {
@@ -2607,6 +2658,20 @@ pub async fn status_task(ui: &'static RefCell<Ui>) {
                     if u.shown != Some(screen) {
                         let _ = rsk_ui::render(&mut u.panel, &screen);
                         u.shown = Some(screen);
+                    }
+                    // Liveness: pulse a small region over the (already-painted) frame — the
+                    // spinner arc while busy, the breathe hint while locked. Both redraw in
+                    // place (no clear), so they never flicker and the idle frame is untouched.
+                    match screen {
+                        Screen::Home(v) if v.status != StatusKind::Idle => {
+                            spin = spin.wrapping_add(SPIN_STEP_DEG);
+                            let _ = rsk_ui::render_status_arc(&mut u.panel, v.status, spin);
+                        }
+                        Screen::Locked if tick.is_multiple_of(BREATHE_TICKS) => {
+                            breathe = breathe.wrapping_add(1);
+                            let _ = rsk_ui::render_locked_breathe(&mut u.panel, breathe);
+                        }
+                        _ => {}
                     }
                     if kind == StatusKind::Idle {
                         if u.wake_pressed() {

@@ -15,6 +15,28 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Added
 
+- **Trusted-display Settings regrouped by domain (display builds).** The Settings root was a
+  flat list of five unrelated rows; it is now three domains — **Display** (Brightness, Display
+  sleep, Touch timeout), **Security** (the existing PIN / Audit / Backup / Factory-reset
+  sub-page), and **Firmware** last (a rarely-touched maintenance action). The three panel knobs
+  moved under a new Display sub-page, each still drilling into its −/+ adjust page (which now
+  backs out to Display, not the root). No protocol or wire-format change. bcdDevice 0x07C0 →
+  0x07C1.
+
+- **Trusted-display polish wave 2 — grouped cards, Settings nav, service icons, motion
+  (display builds).** Every list now reads as one grouped surface with hairline dividers — the
+  Home status card (USB / device PIN / passkey count), the Passkeys and service-detail lists,
+  the Apps / OpenPGP / PIV / OATH lists, the audit log, and the Backup fact rows — instead of a
+  stack of separate pills (the design's grouped-card look). **Settings** is now a full peer of
+  the other tabs: its root screen carries the four-tab bottom nav (Settings active) so you can
+  switch tabs from it, rather than only backing out to Home. Service rows gain the design's icon
+  chip behind each glyph, and an SSH relying party shows a new terminal (`>_`) glyph instead of
+  the generic globe; the boot splash gains a shield brand mark. The screens the design animates
+  now move: the **"Working…"** spinner arc rotates, the locked **"Touch to unlock"** hint
+  breathes, and the rename caret blinks (each a small in-place repaint on the display loop, so
+  the idle hot path and its flicker-free guarantees are untouched). No protocol or wire-format
+  change. bcdDevice 0x07BF → 0x07C0.
+
 - **Trusted-display UI polish (display builds).** A fit-and-finish pass over the on-device
   screens. Over-long labels and titles now end in an ellipsis ("Authenticat…") instead of being
   cut mid-glyph — fixing a text-measurement bug where a label that "fit" by a pixel had its last

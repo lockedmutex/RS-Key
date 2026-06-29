@@ -84,6 +84,9 @@ pub enum Glyph {
     /// A 2×2 grid of tiles — the unified "Apps" nav tab (the applet launcher:
     /// OpenPGP / PIV / OATH).
     Apps,
+    /// A command prompt — a ">" caret and an underscore cursor: the marker for an SSH
+    /// relying party (a shell host) on the Passkeys list, distinct from the web globe.
+    Terminal,
 }
 
 /// 1-bit scratch a glyph rasterizes into so the renderer can impose mirror symmetry before
@@ -528,6 +531,14 @@ fn paths<D: DrawTarget<Color = Rgb565>>(t: &mut D, g: Glyph, s: u16) -> Result<(
             }
             Ok(())
         }
+        Glyph::Terminal => {
+            // A shell prompt: a ">" caret over an underscore cursor (design's polyline +
+            // line). Asymmetric (claims no axis), so it is drawn as-is.
+            Polyline::new(&[gp(3, 4), gp(8, 8), gp(3, 12)])
+                .into_styled(stroke)
+                .draw(t)?;
+            Line::new(gp(9, 13), gp(13, 13)).into_styled(stroke).draw(t)
+        }
     }
 }
 
@@ -569,7 +580,7 @@ mod tests {
         }
     }
 
-    const ALL: [Glyph; 22] = [
+    const ALL: [Glyph; 23] = [
         Glyph::Usb,
         Glyph::Check,
         Glyph::Backspace,
@@ -592,6 +603,7 @@ mod tests {
         Glyph::Lifebuoy,
         Glyph::Cpu,
         Glyph::Apps,
+        Glyph::Terminal,
     ];
 
     #[test]

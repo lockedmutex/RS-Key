@@ -23,13 +23,14 @@ pub mod theme;
 pub mod touch;
 pub use glyph::Glyph;
 pub use render::{
-    PIN_TITLE_BAND, pin_title_overflows, render, render_add_passkey, render_apps, render_audit_log,
-    render_backup, render_backup_format, render_confirm_delete, render_confirm_factory_reset,
-    render_erasing, render_firmware, render_hold_button, render_hold_fill, render_oath,
-    render_openpgp, render_openpgp_key, render_passkeys_list, render_pin_blocked, render_pin_dots,
-    render_pin_title, render_piv, render_piv_slot, render_rebooting, render_rename,
-    render_reveal_warning, render_seal_confirm, render_seed_phrase, render_service,
-    render_share_picker, render_slip39_share, render_success, render_success_circle,
+    PIN_TITLE_BAND, STATUS_ARC_START, pin_title_overflows, render, render_add_passkey, render_apps,
+    render_audit_log, render_backup, render_backup_format, render_confirm_delete,
+    render_confirm_factory_reset, render_erasing, render_firmware, render_hold_button,
+    render_hold_fill, render_locked_breathe, render_oath, render_openpgp, render_openpgp_key,
+    render_passkeys_list, render_pin_blocked, render_pin_dots, render_pin_title, render_piv,
+    render_piv_slot, render_rebooting, render_rename, render_rename_caret, render_reveal_warning,
+    render_seal_confirm, render_seed_phrase, render_service, render_share_picker,
+    render_slip39_share, render_status_arc, render_success, render_success_circle,
 };
 
 /// Panel geometry (Waveshare RP2350-Touch-LCD-2.8, ST7789T3, portrait).
@@ -415,9 +416,13 @@ pub fn hit_pin(p: Point) -> Option<PinKey> {
 /// Which settings page is on screen.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SettingsPage {
-    /// The top-level list: Brightness / Touch timeout / Display sleep / Firmware /
-    /// Security (the title-bar back chevron exits — there is no "Close" row).
+    /// The top-level list: Display / Security / Firmware — three domains (the title-bar is
+    /// gone here; the bottom nav, Settings active, is the way out).
     Root,
+    /// The Display sub-page: Brightness / Display sleep / Touch timeout. Reached from the
+    /// Root "Display" row; its back chevron returns to Root, and each row drills into an
+    /// adjust page that backs out to *this* page.
+    Display,
     /// Backlight-level adjust (−/+/Back).
     Brightness,
     /// Touch-timeout adjust (−/+/Back).
@@ -468,19 +473,31 @@ pub struct SettingsView {
     pub backup_sealed: bool,
 }
 
-/// An entry on the settings Root list.
+/// An entry on the settings Root list — the three domains, in display order.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RootEntry {
-    Brightness,
-    Timeout,
-    /// Display-sleep timeout — blank the panel after inactivity (image-retention guard).
-    Sleep,
-    /// The Firmware screen: the installed build version and the (hold-to-confirm)
-    /// reboot-to-update-over-USB action. A drill-in that runs its own hold sub-flow.
-    Firmware,
+    /// Drill into the Display sub-page ([`SettingsPage::Display`]) — brightness, display
+    /// sleep, and the touch timeout (all the panel/interaction knobs).
+    Display,
     /// Drill into the Security sub-page ([`SettingsPage::Security`]) — device + FIDO PIN,
     /// the audit log, the backup status, and the (danger) Factory reset.
     Security,
+    /// The Firmware screen: the installed build version and the (hold-to-confirm)
+    /// reboot-to-update-over-USB action. Last on the list — a rarely-touched maintenance
+    /// action. A drill-in that runs its own hold sub-flow.
+    Firmware,
+}
+
+/// An entry on the Display sub-page list.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DisplayEntry {
+    /// Backlight-level adjust.
+    Brightness,
+    /// Display-sleep timeout — blank the panel after inactivity (image-retention guard).
+    Sleep,
+    /// Touch / presence-confirm timeout — how long a touch request waits for a tap (and how
+    /// long a revealed PIN stays lit).
+    Timeout,
 }
 
 /// An entry on the Security sub-page list.
@@ -510,41 +527,66 @@ pub enum AdjustKey {
     Back,
 }
 
-/// Root list: five full-width rows (Brightness / Touch timeout / Display sleep / Firmware /
-/// Security) — the title-bar back chevron exits the menu, so there is no "Close" row. Sized
-/// so all five fit below the chrome and above the panel bottom (a const-assert validates it)
-/// at a touch-comfortable row height, with a clear gap below the title-bar back chevron so a
-/// stray reach for it can't land on the first row.
+/// Settings list rows, shared by the Root list and its Display / Security sub-pages — each
+/// is a full-width row in `settings_row_rect(i)`. The Root has three (Display / Security /
+/// Firmware); Security has the most (five). Sized so the longest list (Security) fits below
+/// the chrome and above the panel bottom (a const-assert validates it) at a touch-comfortable
+/// row height, with a clear gap below the title-bar back chevron so a stray reach for it can't
+/// land on the first row.
 const ROW_X: u16 = 16;
 const ROW_W: u16 = PANEL_W - 2 * ROW_X;
-const ROW_H: u16 = 38;
+const ROW_H: u16 = 36;
 const ROW_GAP: u16 = 6;
 const ROW_Y0: u16 = CONTENT_TOP + 14;
-/// Number of Root list rows.
-pub const SETTINGS_ROWS: u16 = 5;
+/// Number of Root list rows (Display / Security / Firmware).
+pub const SETTINGS_ROWS: u16 = 3;
 
-/// The rectangle of Root list row `i` — single source of truth for the renderer and
-/// [`hit_settings_root`].
+/// The rectangle of settings list row `i` — single source of truth for the Root,
+/// [`hit_settings_root`], the Display sub-page ([`hit_display`]) and the Security sub-page
+/// ([`hit_security`]).
 pub const fn settings_row_rect(i: u16) -> Rect {
     Rect::new(ROW_X, ROW_Y0 + i * (ROW_H + ROW_GAP), ROW_W, ROW_H)
 }
 
-/// The Root entry painted on row `i`, in list order.
+/// The Root entry painted on row `i`, in list order (Firmware last — a rare maintenance
+/// action).
 pub const fn settings_row_entry(i: u16) -> RootEntry {
     match i {
-        0 => RootEntry::Brightness,
-        1 => RootEntry::Timeout,
-        2 => RootEntry::Sleep,
-        3 => RootEntry::Firmware,
-        _ => RootEntry::Security,
+        0 => RootEntry::Display,
+        1 => RootEntry::Security,
+        _ => RootEntry::Firmware,
     }
 }
 
+/// Number of Display sub-page rows (Brightness / Display sleep / Touch timeout).
+pub const DISPLAY_ROWS: u16 = 3;
+
+/// The Display entry on row `i`, in list order (the two screen-output knobs first, then the
+/// touch timeout).
+pub const fn display_row_entry(i: u16) -> DisplayEntry {
+    match i {
+        0 => DisplayEntry::Brightness,
+        1 => DisplayEntry::Sleep,
+        _ => DisplayEntry::Timeout,
+    }
+}
+
+/// Which Display entry, if any, a tap at `p` selects. Reuses [`settings_row_rect`] for the
+/// first [`DISPLAY_ROWS`] rows (disjoint by construction).
+pub fn hit_display(p: Point) -> Option<DisplayEntry> {
+    let mut i = 0;
+    while i < DISPLAY_ROWS {
+        if settings_row_rect(i).contains(p) {
+            return Some(display_row_entry(i));
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Number of Security sub-page rows (Device PIN, FIDO PIN, Audit log, Backup, Factory
-/// reset). They reuse the first [`settings_row_rect`] slots, so they inherit the Root
-/// list's proven-disjoint geometry (a const-assert keeps them within the Root row count).
+/// reset) — the longest settings list, so the shared row geometry is sized to fit it.
 pub const SECURITY_ROWS: u16 = 5;
-const _: () = assert!(SECURITY_ROWS <= SETTINGS_ROWS);
 
 /// The Security entry on row `i`, in list order (the danger Factory reset stays last).
 pub const fn security_row_entry(i: u16) -> SecurityEntry {
@@ -580,17 +622,19 @@ pub const ADJ_MINUS_RECT: Rect = Rect::new(16, ADJ_Y, ADJ_W, ADJ_H);
 /// Increment target (right).
 pub const ADJ_PLUS_RECT: Rect = Rect::new(PANEL_W - 16 - ADJ_W, ADJ_Y, ADJ_W, ADJ_H);
 
-// Compile-time layout invariants (paint and hit-test share these rects): the Root
-// rows fit on-panel with a real gap; the −/+ controls are disjoint with a gap and
-// sit above Back. A bad geometry edit fails the build. NB the Root page intentionally
-// paints no bottom nav bar (its title-bar back chevron is the exit), so the rows are
-// allowed to extend past `NAV_TOP` — the bound here is `PANEL_H`, not `NAV_TOP`.
+// Compile-time layout invariants (paint and hit-test share these rects): the longest
+// settings list (Security, five rows) fits above the bottom nav bar with a real gap; the
+// −/+ controls are disjoint with a gap and sit above Back. A bad geometry edit fails the
+// build. The Root page paints the four-tab nav (its peer tabs do) and the no-nav sub-pages
+// reuse the same rows below a back chevron — bounding the five-row case by `NAV_TOP` keeps
+// every list clear of the nav and on-panel.
 const _: () = {
     assert!(ROW_GAP > 0);
     // At least one brightness step (the level-bar math would underflow at 0).
     assert!(BRIGHTNESS_LEVELS >= 1);
-    let last = settings_row_rect(SETTINGS_ROWS - 1);
-    assert!(last.x + last.w <= PANEL_W && last.y + last.h <= PANEL_H);
+    assert!(SETTINGS_ROWS <= SECURITY_ROWS && DISPLAY_ROWS <= SECURITY_ROWS);
+    let last = settings_row_rect(SECURITY_ROWS - 1);
+    assert!(last.x + last.w <= PANEL_W && last.y + last.h <= NAV_TOP);
     assert!(ADJ_MINUS_RECT.x + ADJ_MINUS_RECT.w < ADJ_PLUS_RECT.x);
     assert!(ADJ_PLUS_RECT.x + ADJ_PLUS_RECT.w <= PANEL_W);
     assert!(ADJ_MINUS_RECT.y + ADJ_MINUS_RECT.h <= PANEL_H);
@@ -1772,13 +1816,8 @@ mod tests {
 
     #[test]
     fn settings_root_rows_map_in_order() {
-        let want = [
-            RootEntry::Brightness,
-            RootEntry::Timeout,
-            RootEntry::Sleep,
-            RootEntry::Firmware,
-            RootEntry::Security,
-        ];
+        let want = [RootEntry::Display, RootEntry::Security, RootEntry::Firmware];
+        assert_eq!(want.len() as u16, SETTINGS_ROWS);
         for (i, &e) in want.iter().enumerate() {
             let r = settings_row_rect(i as u16);
             let c = Point::new(r.x + r.w / 2, r.y + r.h / 2);
@@ -1793,6 +1832,28 @@ mod tests {
         );
         // Above the list (header area) selects nothing.
         assert_eq!(hit_settings_root(Point::new(PANEL_W / 2, 10)), None);
+    }
+
+    #[test]
+    fn display_rows_map_in_order() {
+        let want = [
+            DisplayEntry::Brightness,
+            DisplayEntry::Sleep,
+            DisplayEntry::Timeout,
+        ];
+        assert_eq!(want.len() as u16, DISPLAY_ROWS);
+        for (i, &e) in want.iter().enumerate() {
+            let r = settings_row_rect(i as u16);
+            let c = Point::new(r.x + r.w / 2, r.y + r.h / 2);
+            assert_eq!(hit_display(c), Some(e));
+            assert_eq!(display_row_entry(i as u16), e);
+        }
+        // The gap between two rows selects nothing.
+        let r0 = settings_row_rect(0);
+        assert_eq!(
+            hit_display(Point::new(r0.x + r0.w / 2, r0.y + r0.h + 1)),
+            None
+        );
     }
 
     #[test]
