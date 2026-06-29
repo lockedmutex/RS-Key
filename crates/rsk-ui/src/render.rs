@@ -116,25 +116,51 @@ fn splash<D: DrawTarget<Color = Rgb565>>(t: &mut D) -> Result<(), D::Error> {
     )
 }
 
-/// The Home tab: header, a large status indicator (Ready / Working …), one info row,
-/// and the bottom nav. The old MENU affordance is gone — the nav bar is the way into
-/// Passkeys / Settings now.
+/// Top of the Home status card — below the left-aligned "Ready" header, clear of the nav.
+const HOME_CARD_TOP: u16 = 92;
+
+/// The Home tab: a left-aligned "✓ Ready" header, the three-row status card (USB, device
+/// PIN, passkey count) backed by live data, and the bottom nav. While busy it shows the
+/// centred status indicator instead. The old MENU affordance is gone — the nav bar is the
+/// way into Passkeys / Settings now.
 fn home<D: DrawTarget<Color = Rgb565>>(t: &mut D, v: &HomeView) -> Result<(), D::Error> {
     status_bar(t)?;
     if matches!(v.status, StatusKind::Idle) {
-        glyph::draw(
+        // The design's left-aligned "✓ Ready" header — a calm white headline beside the
+        // accent check, not a lone centred accent word.
+        glyph::draw(t, Glyph::CheckCircle, Point::new(14, 40), 36, theme::ACCENT)?;
+        text_left(t, "Ready", EgPoint::new(60, 58), Role::Ready, FG)?;
+        render_row(
             t,
-            Glyph::CheckCircle,
-            Point::new(MIDX as u16 - 22, 64),
-            44,
-            theme::ACCENT,
+            crate::row_rect(HOME_CARD_TOP, 0),
+            Glyph::Usb,
+            "USB connected",
+            None,
+            false,
         )?;
-        text(
+        render_row(
             t,
-            "Ready",
-            EgPoint::new(MIDX, 140),
-            Role::Ready,
-            theme::ACCENT,
+            crate::row_rect(HOME_CARD_TOP, 1),
+            Glyph::Lock,
+            if v.pin_set {
+                "Device PIN set"
+            } else {
+                "No device PIN"
+            },
+            None,
+            false,
+        )?;
+        // The passkey count comes from the firmware's cached enumeration (refreshed at
+        // modal boundaries, never per idle frame — a per-frame partition scan would stall
+        // the panel, the lesson the PIV `has_data` lag taught).
+        let mut buf = [0u8; 5];
+        render_row(
+            t,
+            crate::row_rect(HOME_CARD_TOP, 2),
+            Glyph::Key,
+            "Passkeys",
+            Some((fmt_u16(v.passkeys, &mut buf), theme::GREY)),
+            false,
         )?;
     } else {
         let c = status_color(v.status);
@@ -149,14 +175,6 @@ fn home<D: DrawTarget<Color = Rgb565>>(t: &mut D, v: &HomeView) -> Result<(), D:
             c,
         )?;
     }
-    render_row(
-        t,
-        crate::row_rect(180, 0),
-        Glyph::Usb,
-        "USB connected",
-        None,
-        false,
-    )?;
     render_nav(t, NavTab::Home)
 }
 
@@ -756,7 +774,7 @@ where
         Role::Body,
         MUTED,
     )?;
-    render_hold_button(t, DEL_HOLD_RECT, "Hold to reveal", theme::DENY)
+    render_hold_button(t, DEL_HOLD_RECT, "Hold to reveal", theme::DANGER_FILL)
 }
 
 /// The **seal confirmation**: closing the backup window is one-way (until a factory reset),
@@ -803,7 +821,7 @@ where
         Role::Body,
         MUTED,
     )?;
-    render_hold_button(t, DEL_HOLD_RECT, "Hold to seal", theme::DENY)
+    render_hold_button(t, DEL_HOLD_RECT, "Hold to seal", theme::DANGER_FILL)
 }
 
 /// The **recovery phrase** itself: the 24 BIP-39 words rendered on the trusted display so
@@ -939,12 +957,10 @@ fn audit_row<D: DrawTarget<Color = Rgb565>>(
     rect: Rect,
     r: &AuditRow,
 ) -> Result<(), D::Error> {
-    RoundedRectangle::with_equal_corners(eg_rect(rect), Size::new(6, 6))
-        .into_styled(PrimitiveStyle::with_fill(theme::ROW_BG))
-        .draw(t)?;
+    card(t, rect, theme::ROW_BG, theme::BORDER_CARD)?;
     let cy = rect.y as i32 + rect.h as i32 / 2;
-    let dot: u32 = 12;
-    Circle::new(EgPoint::new(rect.x as i32 + 9, cy - dot as i32 / 2), dot)
+    let dot: u32 = 8;
+    Circle::new(EgPoint::new(rect.x as i32 + 10, cy - dot as i32 / 2), dot)
         .into_styled(PrimitiveStyle::with_fill(audit_dot(r.kind)))
         .draw(t)?;
     // Trailing time first (right), then the label clipped to end before it.
@@ -953,7 +969,7 @@ fn audit_row<D: DrawTarget<Color = Rgb565>>(
     let label_right = if let Some(secs) = r.secs_ago {
         let mut buf = [0u8; 8];
         let s = fmt_ago(secs, &mut buf);
-        text_right(t, s, EgPoint::new(right_x, cy), Role::Mono, MUTED)?;
+        text_right(t, s, EgPoint::new(right_x, cy), Role::Mono, theme::CAPTION)?;
         right_x - font::width(s, Role::Mono).unwrap_or(0) as i32 - ROW_TRAILING_GAP
     } else {
         right_x - ROW_TRAILING_GAP
@@ -1162,7 +1178,7 @@ where
         Role::Body,
         theme::WARN,
     )?;
-    render_hold_button(t, DEL_HOLD_RECT, "Hold to delete", theme::DENY)
+    render_hold_button(t, DEL_HOLD_RECT, "Hold to delete", theme::DANGER_FILL)
 }
 
 /// The trusted Factory-Reset confirm screen (reached from Settings → Factory reset):
@@ -1183,36 +1199,67 @@ where
         Role::Heading,
         theme::DENY,
     )?;
-    // Large centred warning triangle marks this as the destructive screen.
+    // A red-tinted disc around the warning triangle marks this as the destructive
+    // ceremony — danger red, not the amber of a recoverable caution.
+    const DIA: u32 = 58;
+    let circle_top = 46;
+    Circle::new(EgPoint::new(MIDX - DIA as i32 / 2, circle_top), DIA)
+        .into_styled(PrimitiveStyle::with_fill(theme::DANGER_BG))
+        .draw(t)?;
+    let cyc = circle_top + DIA as i32 / 2;
     glyph::draw(
         t,
         Glyph::Warn,
-        Point::new(PANEL_W / 2 - 16, 56),
-        32,
-        theme::WARN,
+        Point::new((MIDX - 14) as u16, (cyc - 13) as u16),
+        28,
+        theme::DANGER,
     )?;
+    text(
+        t,
+        "Erase RS-Key?",
+        EgPoint::new(MIDX, 124),
+        Role::Strong,
+        FG,
+    )?;
+    text(
+        t,
+        "This erases everything.",
+        EgPoint::new(MIDX, 150),
+        Role::Body,
+        MUTED,
+    )?;
+    text(
+        t,
+        "It cannot be undone.",
+        EgPoint::new(MIDX, 168),
+        Role::Body,
+        MUTED,
+    )?;
+    // The what-gets-wiped checklist: a red dot per item, so the stakes are explicit.
+    erase_item(t, 196, "All passkeys")?;
+    erase_item(t, 216, "Device PIN & lock")?;
+    erase_item(t, 236, "All applet keys")?;
+    render_hold_button(t, DEL_HOLD_RECT, "Hold to reset", theme::DANGER_FILL)
+}
+
+/// One red-dot row of the factory-reset "what gets wiped" checklist, the block centred
+/// under the heading (dot at a fixed indent, label flush after it).
+fn erase_item<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    cy: i32,
+    label: &str,
+) -> Result<(), D::Error> {
+    const X: i32 = 60;
+    Circle::new(EgPoint::new(X, cy - 3), 6)
+        .into_styled(PrimitiveStyle::with_fill(theme::DANGER))
+        .draw(t)?;
     text_left(
         t,
-        "Erases ALL passkeys, keys,",
-        EgPoint::new(16, 122),
+        label,
+        EgPoint::new(X + 14, cy),
         Role::Body,
-        theme::WARN,
-    )?;
-    text_left(
-        t,
-        "and the device PIN. This",
-        EgPoint::new(16, 140),
-        Role::Body,
-        theme::WARN,
-    )?;
-    text_left(
-        t,
-        "cannot be undone.",
-        EgPoint::new(16, 158),
-        Role::Body,
-        theme::WARN,
-    )?;
-    render_hold_button(t, DEL_HOLD_RECT, "Hold to reset", theme::DENY)
+        theme::TEXT_2,
+    )
 }
 
 /// The "wiping" notice shown after a factory reset is confirmed: a centred warning
@@ -2212,6 +2259,33 @@ pub fn render_header<D: DrawTarget<Color = Rgb565>>(
     Ok(())
 }
 
+/// The corner radius shared by every list-row / settings card — the design's 11px, so a
+/// row reads as a rounded card rather than the old near-square 6px tile.
+const CARD_RADIUS: u32 = 11;
+
+/// A list-row / settings card: the surface `fill` plus the design's 1px hairline `border`,
+/// at the shared [`CARD_RADIUS`]. The single place row chrome lives, so every list speaks
+/// the same visual language and a tweak lands everywhere at once.
+fn card<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    rect: Rect,
+    fill: Rgb565,
+    border: Rgb565,
+) -> Result<(), D::Error> {
+    RoundedRectangle::with_equal_corners(eg_rect(rect), Size::new(CARD_RADIUS, CARD_RADIUS))
+        .into_styled(PrimitiveStyle::with_fill(fill))
+        .draw(t)?;
+    RoundedRectangle::with_equal_corners(eg_rect(rect), Size::new(CARD_RADIUS, CARD_RADIUS))
+        .into_styled(
+            PrimitiveStyleBuilder::new()
+                .stroke_color(border)
+                .stroke_width(1)
+                .stroke_alignment(StrokeAlignment::Inside)
+                .build(),
+        )
+        .draw(t)
+}
+
 /// One list row: a lifted card, a leading glyph, the label, an optional trailing
 /// coloured status/value, and an optional chevron. The geometry is the caller's
 /// `rect` (from `row_rect`), so paint and [`crate::hit_list`] share it.
@@ -2223,16 +2297,14 @@ pub fn render_row<D: DrawTarget<Color = Rgb565>>(
     trailing: Option<(&str, Rgb565)>,
     chevron: bool,
 ) -> Result<(), D::Error> {
-    RoundedRectangle::with_equal_corners(eg_rect(rect), Size::new(6, 6))
-        .into_styled(PrimitiveStyle::with_fill(theme::ROW_BG))
-        .draw(t)?;
+    card(t, rect, theme::ROW_BG, theme::BORDER_CARD)?;
     let cy = rect.y as i32 + rect.h as i32 / 2;
     glyph::draw(
         t,
         icon,
         Point::new(rect.x + 8, (cy - 7) as u16),
         14,
-        theme::MUTED,
+        theme::GREY,
     )?;
     // Lay the trailing block (chevron, then the value flush against it) first, tracking
     // the leftmost x it occupies — the label is then clipped to end before it.
@@ -2316,31 +2388,33 @@ pub fn render_nav<D: DrawTarget<Color = Rgb565>>(
     Ok(())
 }
 
-/// The `fill`-coloured outline and the centred label of a hold button — re-stamped on
-/// top of the fill so the advancing edge never eats them.
-fn hold_outline_and_label<D: DrawTarget<Color = Rgb565>>(
+/// The lighter progress wash a hold button grows as the finger holds — what the design's
+/// `rgba(255,255,255,.26)` overlay resolves to over the solid base: [`theme::HOLD_ON_RED`]
+/// over a red ([`theme::DANGER_FILL`]) base, else [`theme::HOLD_ON_BLUE`] over the blue
+/// primary. Keyed off the base colour so each caller passes only its one fill.
+fn hold_overlay(base: Rgb565) -> Rgb565 {
+    if base == theme::DANGER_FILL {
+        theme::HOLD_ON_RED
+    } else {
+        theme::HOLD_ON_BLUE
+    }
+}
+
+/// Re-stamp the centred white label of a hold button on top of the fill, so the advancing
+/// progress edge never eats it. Small caption so longer labels ("Hold to approve") fit.
+fn hold_label<D: DrawTarget<Color = Rgb565>>(
     t: &mut D,
     rect: Rect,
     label: &str,
-    color: Rgb565,
 ) -> Result<(), D::Error> {
-    RoundedRectangle::with_equal_corners(eg_rect(rect), Size::new(BTN_RADIUS, BTN_RADIUS))
-        .into_styled(
-            PrimitiveStyleBuilder::new()
-                .stroke_color(color)
-                .stroke_width(1)
-                .stroke_alignment(StrokeAlignment::Inside)
-                .build(),
-        )
-        .draw(t)?;
-    // Small caption so longer labels ("Hold to approve") fit the button width.
-    text(t, label, center(rect), Role::Body, theme::TEXT)
+    text(t, label, center(rect), Role::Body, FG)
 }
 
-/// The **static base** of a hold-to-confirm button: a dark card, the `fill`-coloured
-/// outline and the centred label. Painted once when the screen appears and again on a
-/// hold reset; [`render_hold_fill`] then grows the fill over it without re-clearing the
-/// card, so the build-up never flickers.
+/// The **static base** of a hold-to-confirm button: a solid `fill` card (the design's
+/// primary blue / danger red) with the centred white label. Painted once when the screen
+/// appears and again on a hold reset; [`render_hold_fill`] then grows the lighter
+/// [`hold_overlay`] wash over it without re-clearing the card, so the build-up never
+/// flickers.
 pub fn render_hold_button<D: DrawTarget<Color = Rgb565>>(
     t: &mut D,
     rect: Rect,
@@ -2348,19 +2422,20 @@ pub fn render_hold_button<D: DrawTarget<Color = Rgb565>>(
     fill: Rgb565,
 ) -> Result<(), D::Error> {
     RoundedRectangle::with_equal_corners(eg_rect(rect), Size::new(BTN_RADIUS, BTN_RADIUS))
-        .into_styled(PrimitiveStyle::with_fill(theme::ROW_BG))
+        .into_styled(PrimitiveStyle::with_fill(fill))
         .draw(t)?;
-    hold_outline_and_label(t, rect, label, fill)
+    hold_label(t, rect, label)
 }
 
-/// Grow the hold fill from `prev_num/den` to `num/den` of the button width, drawn over
-/// the existing base/fill with **no card clear**, so repainting each poll doesn't
-/// flicker. The fill is the button's *own* rounded-rect shape painted through a clip of
-/// only the advancing strip `[prev_w, w]`: so its rounded corners are exactly the base's
-/// (no square corner ever pokes past the card — the artifact the earlier left-rounded
-/// approach left when narrow widths clamped the radius), the advancing edge is the flat
-/// clip boundary, and only the thin new strip is painted (the centred label is overdrawn
-/// ~2px at a time, not washed every frame). Pass `prev_num == 0` to start a fresh fill.
+/// Grow the hold wash from `prev_num/den` to `num/den` of the button width, drawn over the
+/// solid base with **no card clear**, so repainting each poll doesn't flicker. The wash —
+/// the lighter [`hold_overlay`] of the base `fill` — is the button's *own* rounded-rect
+/// shape painted through a clip of only the advancing strip `[prev_w, w]`: so its rounded
+/// corners are exactly the base's (no square corner ever pokes past the card — the artifact
+/// the earlier left-rounded approach left when narrow widths clamped the radius), the
+/// advancing edge is the flat clip boundary, and only the thin new strip is painted (the
+/// centred label is overdrawn ~2px at a time, not washed every frame). Pass `prev_num == 0`
+/// to start a fresh fill.
 pub fn render_hold_fill<D: DrawTarget<Color = Rgb565>>(
     t: &mut D,
     rect: Rect,
@@ -2380,11 +2455,11 @@ pub fn render_hold_fill<D: DrawTarget<Color = Rgb565>>(
             );
             let mut clipped = t.clipped(&strip);
             RoundedRectangle::with_equal_corners(eg_rect(rect), Size::new(BTN_RADIUS, BTN_RADIUS))
-                .into_styled(PrimitiveStyle::with_fill(fill))
+                .into_styled(PrimitiveStyle::with_fill(hold_overlay(fill)))
                 .draw(&mut clipped)?;
         }
     }
-    hold_outline_and_label(t, rect, label, fill)
+    hold_label(t, rect, label)
 }
 
 // --- Settings menu ---------------------------------------------------------
@@ -2525,16 +2600,15 @@ fn settings_security<D: DrawTarget<Color = Rgb565>>(
     danger_row(t, settings_row_rect(4), "Factory reset")
 }
 
-/// A destructive option row: the [`render_row`] card, but with a warning glyph,
-/// label, and drill-in chevron all in the decline colour.
+/// A destructive option row: the [`render_row`] card, but red-tinted (the [`theme::DANGER_BG`]
+/// fill and [`theme::DANGER_BORDER`] edge) with a warning glyph, label, and drill-in chevron
+/// all in the decline colour — so a destructive action stands out from the neutral rows.
 fn danger_row<D: DrawTarget<Color = Rgb565>>(
     t: &mut D,
     rect: Rect,
     label: &str,
 ) -> Result<(), D::Error> {
-    RoundedRectangle::with_equal_corners(eg_rect(rect), Size::new(6, 6))
-        .into_styled(PrimitiveStyle::with_fill(theme::ROW_BG))
-        .draw(t)?;
+    card(t, rect, theme::DANGER_BG, theme::DANGER_BORDER)?;
     let cy = rect.y as i32 + rect.h as i32 / 2;
     glyph::draw(
         t,
@@ -2999,7 +3073,15 @@ mod tests {
             StatusKind::Touch,
         ] {
             let mut d = Rec::new();
-            render(&mut d, &Screen::Home(HomeView { status })).unwrap();
+            render(
+                &mut d,
+                &Screen::Home(HomeView {
+                    status,
+                    pin_set: true,
+                    passkeys: 12,
+                }),
+            )
+            .unwrap();
             assert!(!d.oob, "home {status:?} drew outside the panel");
             assert!(d.drew_anything(), "home {status:?} drew nothing");
             // The bottom nav is always present on a tab; Home is the active one.
@@ -3160,7 +3242,7 @@ mod tests {
         render_confirm_delete(&mut d, &rp, &account).unwrap();
         assert!(!d.oob, "confirm-delete drew outside the panel");
         assert!(
-            has_color(&d, crate::DEL_HOLD_RECT, theme::DENY),
+            has_color(&d, crate::DEL_HOLD_RECT, theme::DANGER_FILL),
             "Hold-to-delete not in its rect"
         );
         assert!(
@@ -3178,13 +3260,58 @@ mod tests {
         render_confirm_factory_reset(&mut d).unwrap();
         assert!(!d.oob, "confirm-factory-reset drew outside the panel");
         assert!(
-            has_color(&d, crate::DEL_HOLD_RECT, theme::DENY),
+            has_color(&d, crate::DEL_HOLD_RECT, theme::DANGER_FILL),
             "Hold-to-reset not in its rect"
         );
         assert!(
             has_color(&d, crate::PK_BACK_RECT, theme::DENY),
             "cancel chevron not in its rect"
         );
+    }
+
+    /// The factory-reset confirm is a destructive ceremony: its warning reads danger red,
+    /// never the amber of a recoverable caution.
+    #[test]
+    fn factory_reset_warns_in_danger_red_not_amber() {
+        let mut d = Rec::new();
+        render_confirm_factory_reset(&mut d).unwrap();
+        let band = Rect::new(MIDX as u16 - 30, 44, 60, 62); // the warning disc + triangle
+        assert!(
+            has_color(&d, band, theme::DANGER),
+            "factory-reset warning must be danger red"
+        );
+        assert!(
+            !has_color(&d, band, theme::WARN),
+            "factory-reset warning must not use the amber caution colour"
+        );
+    }
+
+    /// Home's idle status card shows three rows — USB, device PIN, passkeys — each a
+    /// bordered card, the live-data rows the design calls for.
+    #[test]
+    fn home_idle_paints_the_three_status_rows() {
+        let mut d = Rec::new();
+        render(
+            &mut d,
+            &Screen::Home(HomeView {
+                status: StatusKind::Idle,
+                pin_set: true,
+                passkeys: 7,
+            }),
+        )
+        .unwrap();
+        assert!(!d.oob, "home idle drew outside the panel");
+        for i in 0..3u16 {
+            let r = crate::row_rect(HOME_CARD_TOP, i);
+            assert!(
+                has_color(&d, r, theme::ROW_BG),
+                "home status row {i} not painted"
+            );
+            assert!(
+                has_color(&d, r, theme::BORDER_CARD),
+                "home status row {i} missing its card border"
+            );
+        }
     }
 
     /// Around the centred success circle — comfortably covers the mark glyph at any
@@ -3920,28 +4047,26 @@ mod tests {
 
     #[test]
     fn hold_fill_grows_left_to_right_with_a_flat_edge() {
-        // Count fill pixels along the horizontal centre line only — whole-column
-        // sampling would also catch the fill-coloured outline (it spans the full
-        // width) and mask the progress difference.
+        // The wash painted by the fill is the base's lighter `hold_overlay` — for the blue
+        // base that is HOLD_ON_BLUE. Count wash pixels along the horizontal centre line.
+        let wash = theme::HOLD_ON_BLUE;
         let r = Rect::new(20, 200, 120, 60);
         let yc = r.y + r.h / 2;
         let lit = |num: u16| {
             let mut d = Rec::new();
             render_hold_fill(&mut d, r, "Hold", 0, num, 10, theme::APPROVE).unwrap();
-            (r.x..r.x + r.w)
-                .filter(|&x| d.at(x, yc) == theme::APPROVE)
-                .count()
+            (r.x..r.x + r.w).filter(|&x| d.at(x, yc) == wash).count()
         };
         assert!(
             lit(8) > lit(2),
             "more hold progress must fill more of the button"
         );
-        // The advancing edge is flat (only the left corners are rounded), so the fill
+        // The advancing edge is flat (only the left corners are rounded), so the wash
         // reaches the top row right up to its right edge — a rounded-all-corners fill
         // would leave that corner empty (the artifact this guards against).
         let mut d = Rec::new();
         render_hold_fill(&mut d, r, "Hold", 0, 5, 10, theme::APPROVE).unwrap();
         let w = r.w / 2; // num/den = 5/10
-        assert_eq!(d.at(r.x + w - 3, r.y + 2), theme::APPROVE);
+        assert_eq!(d.at(r.x + w - 3, r.y + 2), wash);
     }
 }

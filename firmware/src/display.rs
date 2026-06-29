@@ -361,6 +361,11 @@ pub struct Ui {
     rng: &'static RefCell<FidoRng>,
     /// 1-bit scratch for the flicker-free PIN-title marquee blit ([`BandMask`]).
     marquee_mask: [u8; MARQUEE_MASK_BYTES],
+    /// Cached Home status-card facts (device-PIN-set + resident passkey count), refreshed
+    /// by [`Ui::refresh_home_stats`] only at modal boundaries — boot, wake, a closed tab
+    /// modal — so the idle Home frame never triggers a per-paint flash enumeration.
+    home_pin_set: bool,
+    home_passkeys: u16,
 }
 
 impl Ui {
@@ -441,7 +446,28 @@ impl Ui {
             keys,
             rng,
             marquee_mask: [0; MARQUEE_MASK_BYTES],
+            // Seeded from the cheap PIN bit (== `locked`); the count is filled by the first
+            // `refresh_home_stats` before Home is ever painted.
+            home_pin_set: locked,
+            home_passkeys: 0,
         }
+    }
+
+    /// Refresh the Home status-card facts — whether a device PIN is set and how many
+    /// resident passkeys are stored — into the cache the idle Home frame reads. Enumerates
+    /// flash (the seed-unboxing RP walk), so it runs only at modal boundaries (boot, wake,
+    /// a closed tab modal), never per idle frame: a per-paint partition scan would stall the
+    /// panel, the lesson the PIV `has_data` lag taught. Borrow-safe like [`Self::load_rps`]
+    /// (the worker is parked while this thread-executor task runs).
+    fn refresh_home_stats(&mut self) {
+        let dev = self.keys.device();
+        let mut store = self.fs.borrow_mut();
+        self.home_pin_set = rsk_fido::passkeys::device_pin_is_set(&mut store);
+        let mut creds = 0u16;
+        let _ = rsk_fido::passkeys::for_each_rp(&dev, &mut store, |rp| {
+            creds = creds.saturating_add(rp.count as u16);
+        });
+        self.home_passkeys = creds;
     }
 
     /// Composite one marquee frame of `title` (scrolled by `off` px) into the 1-bit mask,
@@ -1278,7 +1304,7 @@ impl Ui {
         let _ = rsk_ui::render_reveal_warning(&mut self.panel, rsk_ui::RevealKind::Phrase);
         self.shown = None;
         self.touch.wait_release(Instant::now(), idle_limit);
-        if !self.hold_to_confirm("Hold to reveal", rsk_ui::theme::DENY) {
+        if !self.hold_to_confirm("Hold to reveal", rsk_ui::theme::DANGER_FILL) {
             return;
         }
         // Read + derive. The seed lives only long enough to compute the indices, then is wiped.
@@ -1391,7 +1417,7 @@ impl Ui {
         let _ = rsk_ui::render_reveal_warning(&mut self.panel, rsk_ui::RevealKind::Shares);
         self.shown = None;
         self.touch.wait_release(Instant::now(), idle_limit);
-        if !self.hold_to_confirm("Hold to reveal", rsk_ui::theme::DENY) {
+        if !self.hold_to_confirm("Hold to reveal", rsk_ui::theme::DANGER_FILL) {
             return;
         }
 
@@ -1493,7 +1519,7 @@ impl Ui {
         let _ = rsk_ui::render_seal_confirm(&mut self.panel);
         self.shown = None;
         self.touch.wait_release(Instant::now(), idle_limit);
-        if self.hold_to_confirm("Hold to seal", rsk_ui::theme::DENY) {
+        if self.hold_to_confirm("Hold to seal", rsk_ui::theme::DANGER_FILL) {
             let _ = rsk_fido::passkeys::mark_backup_sealed(&mut self.fs.borrow_mut());
         }
         self.end_modal();
@@ -1875,7 +1901,7 @@ impl Ui {
         self.shown = None;
         self.touch.wait_release(Instant::now(), idle_limit);
 
-        if self.hold_to_confirm("Hold to delete", rsk_ui::theme::DENY) {
+        if self.hold_to_confirm("Hold to delete", rsk_ui::theme::DANGER_FILL) {
             let removed = rsk_fido::passkeys::delete_cred(&mut self.fs.borrow_mut(), fid);
             if removed {
                 self.show_success(SuccessKind::Deleted, None);
@@ -1889,8 +1915,9 @@ impl Ui {
     /// [`HOLD_MS`] (so a brush can't commit). The header back chevron, a lifted or
     /// slid-off finger then the inactivity timeout, or a queued host command all
     /// return `false`. The caller paints the surrounding screen first; `label` is
-    /// the button caption and `fill` its progress colour (red [`rsk_ui::theme::DENY`] for the
-    /// destructive / reveal holds, blue [`rsk_ui::theme::ACCENT_FILL`] for the firmware update).
+    /// the button caption and `fill` its solid base colour (red [`rsk_ui::theme::DANGER_FILL`]
+    /// for the destructive / reveal holds, blue [`rsk_ui::theme::ACCENT_FILL`] for the firmware
+    /// update); the lighter progress wash is derived from it inside `render_hold_fill`.
     fn hold_to_confirm(&mut self, label: &str, fill: Rgb565) -> bool {
         let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
         let mut hold_start: Option<Instant> = None;
@@ -1959,7 +1986,7 @@ impl Ui {
         self.shown = None;
         self.touch.wait_release(Instant::now(), idle_limit);
 
-        if self.hold_to_confirm("Hold to reset", rsk_ui::theme::DENY) {
+        if self.hold_to_confirm("Hold to reset", rsk_ui::theme::DANGER_FILL) {
             // The scrub blocks the panel for seconds, so paint the notice first, then
             // wipe everything but the attestation and reboot into a fresh device. The
             // reboot clears RAM and re-seeds at boot, so no rng/state is needed here.
@@ -2124,6 +2151,9 @@ fn audit_kind(ev: u8) -> rsk_ui::AuditKind {
 pub async fn status_task(ui: &'static RefCell<Ui>) {
     Timer::after_millis(600).await; // let the boot splash linger
     note_activity(); // the fresh boot counts as activity, so the sleep clock starts now
+    // Prime the Home status-card cache once before the first idle paint (boot has settled
+    // the flash; the worker is parked here while this task runs, so the borrow is safe).
+    ui.borrow_mut().refresh_home_stats();
     loop {
         // A Settings → Firmware update queued a reboot: stop driving the panel and just yield
         // so the worker (same thread-mode executor) gets scheduled to scrub the live secrets
@@ -2150,8 +2180,13 @@ pub async fn status_task(ui: &'static RefCell<Ui>) {
                     let screen = if u.locked {
                         Screen::Locked
                     } else {
+                        // Woke from sleep: a host ceremony may have added/removed a passkey
+                        // while the panel was dark, so refresh the card before painting.
+                        u.refresh_home_stats();
                         Screen::Home(HomeView {
                             status: status_to_kind(led::status()),
+                            pin_set: u.home_pin_set,
+                            passkeys: u.home_passkeys,
                         })
                     };
                     let _ = rsk_ui::render(&mut u.panel, &screen);
@@ -2178,7 +2213,12 @@ pub async fn status_task(ui: &'static RefCell<Ui>) {
                     let screen = if u.locked {
                         Screen::Locked
                     } else {
-                        Screen::Home(HomeView { status: kind })
+                        // Idle hot path: cached stats only — never a per-frame flash scan.
+                        Screen::Home(HomeView {
+                            status: kind,
+                            pin_set: u.home_pin_set,
+                            passkeys: u.home_passkeys,
+                        })
                     };
                     if u.shown != Some(screen) {
                         let _ = rsk_ui::render(&mut u.panel, &screen);
@@ -2202,8 +2242,13 @@ pub async fn status_task(ui: &'static RefCell<Ui>) {
                                 let screen = if u.locked {
                                     Screen::Locked
                                 } else {
+                                    // Just unlocked: a host op during the lock may have
+                                    // changed the count, so refresh before painting Home.
+                                    u.refresh_home_stats();
                                     Screen::Home(HomeView {
                                         status: status_to_kind(led::status()),
+                                        pin_set: u.home_pin_set,
+                                        passkeys: u.home_passkeys,
                                     })
                                 };
                                 let _ = rsk_ui::render(&mut u.panel, &screen);
@@ -2233,9 +2278,14 @@ pub async fn status_task(ui: &'static RefCell<Ui>) {
                                 } else if opened_tab && !crate::worker::host_request_pending() {
                                     // Closing a tab back to idle repaints Home now (not next
                                     // poll) so it feels instant. Skip if a host command is
-                                    // queued — the worker paints next (no stale flash).
+                                    // queued — the worker paints next (no stale flash). The
+                                    // tab modal may have added/deleted a passkey or set the
+                                    // PIN, so refresh the card facts first.
+                                    u.refresh_home_stats();
                                     let screen = Screen::Home(HomeView {
                                         status: status_to_kind(led::status()),
+                                        pin_set: u.home_pin_set,
+                                        passkeys: u.home_passkeys,
                                     });
                                     let _ = rsk_ui::render(&mut u.panel, &screen);
                                     u.shown = Some(screen);

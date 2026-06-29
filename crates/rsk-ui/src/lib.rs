@@ -846,11 +846,15 @@ impl StatusKind {
     }
 }
 
-/// What the Home tab shows: the device status, mirrored from the LED engine. Info
-/// rows backed by live data (PIN set, passkey count) land in a later wave.
+/// What the Home tab shows: the device status (mirrored from the LED engine) plus the two
+/// live facts the status card states — whether a device PIN is set and how many resident
+/// passkeys are stored. The firmware fills `pin_set` / `passkeys` from a cached
+/// enumeration refreshed at modal boundaries (never per idle frame).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct HomeView {
     pub status: StatusKind,
+    pub pin_set: bool,
+    pub passkeys: u16,
 }
 
 // --- Passkeys list + service detail ----------------------------------------

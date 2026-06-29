@@ -15,6 +15,21 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Added
 
+- **Design-fidelity polish of the trusted-display UI (display builds).** A visual pass that
+  brings the on-screen widgets closer to the handoff and reads more finished. The
+  hold-to-confirm buttons are now a **solid fill** (primary blue / danger red) with a lighter
+  progress wash growing over them, instead of a dark outline that filled in. Every list /
+  settings row is a **bordered card** (1px hairline + 11px corners) rather than a borderless
+  tile, and a destructive row is red-tinted. The idle **Home** screen shows a calm white
+  "Ready" beside the status check and a **three-row status card** backed by live data — USB,
+  whether a **device PIN** is set, and the **resident-passkey count** (read from a cache
+  refreshed only at modal boundaries — boot, wake, a closed tab — never per idle frame, so it
+  never triggers a per-paint flash scan). The **Factory reset** confirm is a proper destructive
+  ceremony — a red warning disc, a danger-red triangle (not amber), an "Erase RS-Key?" headline,
+  and a red-dot list of what gets wiped. The muted/caption text tiers are tightened (audit
+  timestamps and row glyphs sit one shade dimmer, matching the design hierarchy). No protocol or
+  flag change. bcdDevice 0x07BA → 0x07BB.
+
 - **On-device PIN entry for OpenPGP & PIV over CCID (secure pinpad, experimental; display builds).**
   The trusted-display build now advertises itself as a **CCID pinpad reader** (`bPINSupport` =
   VERIFY) and handles `PC_to_RDR_Secure` (`0x69`): when the host driver asks for a secure PIN
