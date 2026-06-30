@@ -2519,7 +2519,7 @@ impl Ui {
         );
         self.shown = None;
         self.touch.wait_release(Instant::now(), idle_limit);
-        if self.hold_to_confirm("Hold to update", rsk_ui::theme::ACCENT_FILL) {
+        if self.hold_to_confirm("Verify & install", rsk_ui::theme::ACCENT_FILL) {
             let _ = rsk_ui::render_rebooting(&mut self.panel);
             crate::vendor::request_reboot(true);
             return true;
@@ -2953,7 +2953,7 @@ impl Ui {
         self.shown = None;
         self.touch.wait_release(Instant::now(), idle_limit);
 
-        if self.hold_to_confirm("Hold to reset", rsk_ui::theme::DANGER_FILL) {
+        if self.hold_to_confirm("Hold to wipe", rsk_ui::theme::DANGER_FILL) {
             // The scrub blocks the panel for seconds, so paint the notice first, then
             // wipe everything but the attestation and reboot into a fresh device. The
             // reboot clears RAM and re-seeds at boot, so no rng/state is needed here.

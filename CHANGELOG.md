@@ -600,6 +600,16 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Changed
 
+- **Trusted-display: design-token fidelity polish pass.** A pass over the on-device
+  screens to close residual drift from the high-fidelity handoff: the PIN keypad keys
+  tighten to the design's 7px grid gap (re-centred so the pad stays balanced) and 9px
+  key radius, the backspace key takes its darker `#101317` shade, outline buttons
+  (Deny / Cancel) gain the design's faint tinted fill behind a 1px border (was a bare
+  2px stroke), buttons settle to the 11px card radius, the Home "Ready" check icon to
+  38px, list rows align to the 13px content gutter, and three screen labels match the
+  spec wording (*Verify & install*, *Hold to wipe*, *RECOVERY SHARES*). No behaviour or
+  wire change. bcdDevice 0x07CE → 0x07CF.
+
 - **Trusted-display visual redesign — typography and palette (experimental).** The
   on-device screens move to the high-fidelity design language: proportional 1-bit
   text (Helvetica-style `helvR`/`helvB` and `profont` for mono labels, via the new

@@ -49,8 +49,11 @@ const MUTED: Rgb565 = theme::MUTED;
 /// pair (Deny / Cancel) is a low-emphasis outline in [`theme::DENY`] instead, so
 /// there is no filled-red counterpart const here.
 const ALLOW_FILL: Rgb565 = theme::APPROVE;
-/// Corner radius for the floating buttons — enough to read as rounded cards.
-const BTN_RADIUS: u32 = 12;
+/// Corner radius for the floating buttons — the design's 11px, matching [`CARD_RADIUS`].
+const BTN_RADIUS: u32 = 11;
+/// Corner radius for the pad / stepper key surfaces — the design's 9px, tighter than the
+/// 11px buttons (handoff: "Клавиатура PIN: … скругление 9").
+const KEY_RADIUS: u32 = 9;
 /// Fill for the numeric PIN keys and the settings −/+ steppers — a dark neutral card
 /// ([`theme::KEY_BG`]) edged with [`theme::KEY_BORDER`]. The affirmative OK is a solid
 /// Allow-green key and Del a backspace glyph, so the special keys still stand out.
@@ -242,7 +245,7 @@ fn home<D: DrawTarget<Color = Rgb565>>(t: &mut D, v: &HomeView) -> Result<(), D:
     if matches!(v.status, StatusKind::Idle) {
         // The design's left-aligned "✓ Ready" header — a calm white headline beside the
         // accent check, not a lone centred accent word.
-        glyph::draw(t, Glyph::CheckCircle, Point::new(14, 40), 36, theme::ACCENT)?;
+        glyph::draw(t, Glyph::CheckCircle, Point::new(14, 40), 38, theme::ACCENT)?;
         text_left(t, "Ready", EgPoint::new(60, 58), Role::Ready, FG)?;
         // One grouped status card (USB / device PIN / passkey count), the design's panel —
         // not three floating pills.
@@ -1737,7 +1740,7 @@ where
     // The honest facts, as a small group below the plate.
     text_left(
         t,
-        "RECOVERY",
+        "RECOVERY SHARES",
         EgPoint::new(14, plate.y as i32 + plate.h as i32 + 14),
         Role::Mono,
         theme::CAPTION,
@@ -2455,7 +2458,7 @@ where
     erase_item(t, 196, "All passkeys")?;
     erase_item(t, 216, "Device PIN & lock")?;
     erase_item(t, 236, "All applet keys")?;
-    render_hold_button(t, DEL_HOLD_RECT, "Hold to reset", theme::DANGER_FILL)
+    render_hold_button(t, DEL_HOLD_RECT, "Hold to wipe", theme::DANGER_FILL)
 }
 
 /// One red-dot row of the factory-reset "what gets wiped" checklist, the block centred
@@ -2949,13 +2952,25 @@ fn outline_button<D: DrawTarget<Color = Rgb565>>(
     label: &str,
     color: Rgb565,
 ) -> Result<(), D::Error> {
+    // The design's outline button is a 1px border over a faint tint of its own colour, not a
+    // bare stroke: danger (Deny / Cancel) on [`theme::DANGER_BG`] edged [`theme::DANGER_BORDER`],
+    // any other accent on the blue [`theme::TINT_BLUE`] edged [`theme::BORDER_FIELD`]. The label
+    // keeps the full-strength `color`.
+    let (bg, border) = if color == theme::DANGER {
+        (theme::DANGER_BG, theme::DANGER_BORDER)
+    } else {
+        (theme::TINT_BLUE, theme::BORDER_FIELD)
+    };
+    RoundedRectangle::with_equal_corners(eg_rect(r), Size::new(BTN_RADIUS, BTN_RADIUS))
+        .into_styled(PrimitiveStyle::with_fill(bg))
+        .draw(t)?;
     // Inside-aligned stroke: the outline stays within `r`, so a button's paint never
     // bleeds past the exact rect the hit-test maps (the Allow/Deny contract).
     RoundedRectangle::with_equal_corners(eg_rect(r), Size::new(BTN_RADIUS, BTN_RADIUS))
         .into_styled(
             PrimitiveStyleBuilder::new()
-                .stroke_color(color)
-                .stroke_width(2)
+                .stroke_color(border)
+                .stroke_width(1)
                 .stroke_alignment(StrokeAlignment::Inside)
                 .build(),
         )
@@ -2988,11 +3003,11 @@ fn key_surface<D: DrawTarget<Color = Rgb565>>(
     fill: Rgb565,
     bordered: bool,
 ) -> Result<(), D::Error> {
-    RoundedRectangle::with_equal_corners(eg_rect(r), Size::new(BTN_RADIUS, BTN_RADIUS))
+    RoundedRectangle::with_equal_corners(eg_rect(r), Size::new(KEY_RADIUS, KEY_RADIUS))
         .into_styled(PrimitiveStyle::with_fill(fill))
         .draw(t)?;
     if bordered {
-        RoundedRectangle::with_equal_corners(eg_rect(r), Size::new(BTN_RADIUS, BTN_RADIUS))
+        RoundedRectangle::with_equal_corners(eg_rect(r), Size::new(KEY_RADIUS, KEY_RADIUS))
             .into_styled(
                 PrimitiveStyleBuilder::new()
                     .stroke_color(theme::KEY_BORDER)
@@ -3149,7 +3164,9 @@ fn pin<D: DrawTarget<Color = Rgb565>>(t: &mut D, pad: &PinPad) -> Result<(), D::
                     glyph_centered(t, Glyph::Check, r, 24, FG)?;
                 }
                 PinKey::Del => {
-                    key_surface(t, r, KEY_FILL, true)?;
+                    // The design's darker backspace key (#101317), set apart from the
+                    // neutral digit cards (#15191F).
+                    key_surface(t, r, theme::KEY_DARK, true)?;
                     glyph_centered(t, Glyph::Backspace, r, 24, MUTED)?;
                 }
                 key => {
@@ -4165,7 +4182,7 @@ where
         Role::Mono,
         theme::CAPTION,
     )?;
-    render_hold_button(t, DEL_HOLD_RECT, "Hold to update", theme::ACCENT_FILL)
+    render_hold_button(t, DEL_HOLD_RECT, "Verify & install", theme::ACCENT_FILL)
 }
 
 /// The brief notice painted the instant a [`render_firmware`] hold commits, before the

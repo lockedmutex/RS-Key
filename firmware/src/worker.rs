@@ -326,7 +326,7 @@ impl<'a> Worker<'a> {
                 Either3::Third(_) => {
                     self.button_tick();
                     // A reboot queued off-transport — the display's Settings → Firmware
-                    // "Hold to update" — is serviced on this idle tick so it lands within a
+                    // "Verify & install" — is serviced on this idle tick so it lands within a
                     // button-poll period instead of waiting on the next host APDU. The
                     // worker owns the live RAM secrets, so the scrub-then-reset in `reboot`
                     // runs here, not from the display task.

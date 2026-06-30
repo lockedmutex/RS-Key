@@ -386,10 +386,13 @@ pub const PIN_ROWS: u16 = 4;
 pub const PIN_KEY_W: u16 = 64;
 /// Key height.
 pub const PIN_KEY_H: u16 = 48;
-const PIN_GRID_X0: u16 = 12;
+// Origin recomputed to keep the grid horizontally centred at the design's 7px gap:
+// X0 = (PANEL_W − (3·PIN_KEY_W + 2·PIN_GAP_X)) / 2 = (240 − 206) / 2 = 17, so the left and
+// right margins match (a `pin_grid_is_horizontally_centred` test guards it).
+const PIN_GRID_X0: u16 = 17;
 const PIN_GRID_Y0: u16 = 84;
-const PIN_GAP_X: u16 = 12;
-const PIN_GAP_Y: u16 = 8;
+const PIN_GAP_X: u16 = 7;
+const PIN_GAP_Y: u16 = 7;
 /// Cancel target, in the header above the grid — kept clear of the digit keys so a
 /// digit tap can never abandon entry.
 pub const PIN_CANCEL_RECT: Rect = Rect::new(8, 6, 40, 34);
@@ -589,7 +592,7 @@ pub enum AdjustKey {
 /// the chrome and above the panel bottom (a const-assert validates it) at a touch-comfortable
 /// row height, with a clear gap below the title-bar back chevron so a stray reach for it can't
 /// land on the first row.
-const ROW_X: u16 = 16;
+const ROW_X: u16 = 13;
 const ROW_W: u16 = PANEL_W - 2 * ROW_X;
 const ROW_H: u16 = 36;
 const ROW_GAP: u16 = 6;
@@ -908,7 +911,7 @@ pub fn hit_nav(p: Point) -> Option<NavTab> {
 /// List-row height (a lifted card holding icon + label + trailing + chevron).
 pub const LIST_ROW_H: u16 = 30;
 const LIST_ROW_GAP: u16 = 6;
-const LIST_ROW_X: u16 = 10;
+const LIST_ROW_X: u16 = 13;
 /// List-row width, inset from both panel edges.
 pub const LIST_ROW_W: u16 = PANEL_W - 2 * LIST_ROW_X;
 
@@ -1959,6 +1962,16 @@ mod tests {
             hit_pin(Point::new(e.x + e.w / 2, e.y + e.h / 2)),
             Some(PinKey::Reveal)
         );
+    }
+
+    #[test]
+    fn pin_grid_is_horizontally_centred() {
+        // The pad's left and right margins are equal, so the 3×4 grid sits centred on the
+        // panel at the design's 7px gap. Guards PIN_GRID_X0 / PIN_GAP_X / PIN_KEY_W from
+        // drifting out of balance (e.g. tightening the gap without re-deriving the origin).
+        let left = pin_key_rect(0, 0);
+        let right = pin_key_rect(PIN_COLS - 1, 0);
+        assert_eq!(left.x, PANEL_W - (right.x + right.w));
     }
 
     #[test]
