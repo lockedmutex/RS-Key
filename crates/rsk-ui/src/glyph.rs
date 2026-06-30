@@ -259,6 +259,10 @@ fn paths<D: DrawTarget<Color = Rgb565>>(t: &mut D, g: Glyph, s: u16) -> Result<(
     let sw: u32 = if s >= 20 { 2 } else { 1 };
     let ink = Rgb565::new(0x1f, 0x3f, 0x1f);
     let stroke = PrimitiveStyle::with_stroke(ink, sw);
+    // A forced 2px stroke for the on-axis rays of the Sun / Gear: a 1px ray on the centre
+    // grid line (col/row 8) sits a pixel off the body, which centres on the 7–8 boundary;
+    // a 2px stroke straddles 7–8 and reads centred.
+    let stroke2 = PrimitiveStyle::with_stroke(ink, 2);
     let fill = PrimitiveStyle::with_fill(ink);
     // Map a 16-grid coord to a pixel, rounded; grid 0..=16 spans the full box 0..=s-1.
     let g1 = (s as i32 - 1).max(1);
@@ -267,14 +271,21 @@ fn paths<D: DrawTarget<Color = Rgb565>>(t: &mut D, g: Glyph, s: u16) -> Result<(
     let circ = |cx: i32, cy: i32, r: i32| Circle::new(gp(cx - r, cy - r), glen(2 * r));
 
     match g {
-        Glyph::Chevron => Polyline::new(&[gp(5, 4), gp(11, 8), gp(5, 12)])
+        // The TOP arm (a clean 45° to the tip) plus a short vertical at the tip that crosses
+        // the glyph's horizontal centre line; the h-symmetry pass mirrors this to build the
+        // bottom arm. The vertical is what keeps the two arms joined at every size: at some
+        // sizes the centre row isn't hit by any single grid coord, so a tip that stopped above
+        // it left a 1px gap once mirrored. Equal arms, clean point. Back reuses it, flipped.
+        Glyph::Chevron => Polyline::new(&[gp(5, 3), gp(10, 7), gp(10, 8)])
             .into_styled(stroke)
             .draw(t),
         // Back is rendered from Chevron's base + a final left–right flip (see `draw`).
-        Glyph::Back => Polyline::new(&[gp(5, 4), gp(11, 8), gp(5, 12)])
+        Glyph::Back => Polyline::new(&[gp(5, 3), gp(10, 7), gp(10, 8)])
             .into_styled(stroke)
             .draw(t),
-        Glyph::Check => Polyline::new(&[gp(4, 9), gp(7, 12), gp(13, 4)])
+        // Both arms a clean 45° (gp(3,7)->gp(6,11) and gp(6,11)->gp(13,4) each map to even
+        // pixel diagonals), so the tick reads straight, not kinked.
+        Glyph::Check => Polyline::new(&[gp(3, 7), gp(6, 11), gp(13, 4)])
             .into_styled(stroke)
             .draw(t),
         Glyph::Backspace => {
@@ -289,16 +300,20 @@ fn paths<D: DrawTarget<Color = Rgb565>>(t: &mut D, g: Glyph, s: u16) -> Result<(
             ])
             .into_styled(stroke)
             .draw(t)?;
-            Line::new(gp(9, 6), gp(13, 10))
+            // A small, even × in the body (each stroke a clean 3px 45° diagonal) — was a
+            // ragged 4px blob.
+            Line::new(gp(9, 6), gp(12, 10))
                 .into_styled(stroke)
                 .draw(t)?;
-            Line::new(gp(13, 6), gp(9, 10)).into_styled(stroke).draw(t)
+            Line::new(gp(12, 6), gp(9, 10)).into_styled(stroke).draw(t)
         }
         Glyph::CheckCircle => {
             // A ring with a check inside. Both drawn here (no mirror pass), so the check
             // reads as a single mark, not a doubled one.
             circ(8, 8, 7).into_styled(stroke).draw(t)?;
-            Polyline::new(&[gp(5, 8), gp(7, 11), gp(12, 5)])
+            // Smaller, centred tick that clears the ring (was reaching col ~11 and kissing
+            // the rim); both arms even diagonals.
+            Polyline::new(&[gp(5, 8), gp(7, 10), gp(11, 6)])
                 .into_styled(stroke)
                 .draw(t)
         }
@@ -308,10 +323,12 @@ fn paths<D: DrawTarget<Color = Rgb565>>(t: &mut D, g: Glyph, s: u16) -> Result<(
             Rectangle::new(gp(4, 8), Size::new(glen(8), glen(6)))
                 .into_styled(stroke)
                 .draw(t)?;
-            Polyline::new(&[gp(6, 8), gp(6, 5), gp(8, 4), gp(10, 5), gp(10, 8)])
+            // Shackle with a 2px flat top (cols 7–8) so it sits centred over the body, not a
+            // lone apex pixel; the 2px keyhole straddles centre to match.
+            Polyline::new(&[gp(6, 8), gp(6, 5), gp(7, 4), gp(9, 4), gp(10, 5), gp(10, 8)])
                 .into_styled(stroke)
                 .draw(t)?;
-            Line::new(gp(8, 10), gp(8, 12)).into_styled(stroke).draw(t)
+            Line::new(gp(8, 10), gp(8, 12)).into_styled(stroke2).draw(t)
         }
         Glyph::Key => {
             // A round bow (ring) at the lower-left, a shaft up to the top-right, and two
@@ -329,8 +346,11 @@ fn paths<D: DrawTarget<Color = Rgb565>>(t: &mut D, g: Glyph, s: u16) -> Result<(
             // A triangle roof (its base is the eave line) over rectangular walls, with a
             // centred door. Drawing the roof base + the wall top on the same row joins them
             // cleanly instead of leaving a 1px notch where a diagonal eave meets a wall.
-            Line::new(gp(8, 3), gp(3, 8)).into_styled(stroke).draw(t)?;
-            Line::new(gp(8, 3), gp(13, 8)).into_styled(stroke).draw(t)?;
+            // Roof with a 2px flat peak (cols 7–8) so the apex sits centred, not a lone pixel
+            // poking to one side; both slopes a clean 45°.
+            Polyline::new(&[gp(3, 8), gp(7, 4), gp(9, 4), gp(13, 8)])
+                .into_styled(stroke)
+                .draw(t)?;
             Rectangle::new(gp(4, 8), Size::new(glen(8), glen(6)))
                 .into_styled(stroke)
                 .draw(t)?;
@@ -343,13 +363,13 @@ fn paths<D: DrawTarget<Color = Rgb565>>(t: &mut D, g: Glyph, s: u16) -> Result<(
             // diagonals). The open bore (vs the Sun's solid core) tells them apart.
             circ(8, 8, 4).into_styled(stroke).draw(t)?;
             circ(8, 8, 2).into_styled(stroke).draw(t)?;
-            Line::new(gp(8, 4), gp(8, 1)).into_styled(stroke).draw(t)?;
+            Line::new(gp(8, 4), gp(8, 1)).into_styled(stroke2).draw(t)?;
             Line::new(gp(8, 12), gp(8, 15))
-                .into_styled(stroke)
+                .into_styled(stroke2)
                 .draw(t)?;
-            Line::new(gp(4, 8), gp(1, 8)).into_styled(stroke).draw(t)?;
+            Line::new(gp(4, 8), gp(1, 8)).into_styled(stroke2).draw(t)?;
             Line::new(gp(12, 8), gp(15, 8))
-                .into_styled(stroke)
+                .into_styled(stroke2)
                 .draw(t)?;
             Line::new(gp(11, 5), gp(13, 3))
                 .into_styled(stroke)
@@ -360,12 +380,14 @@ fn paths<D: DrawTarget<Color = Rgb565>>(t: &mut D, g: Glyph, s: u16) -> Result<(
                 .draw(t)?;
             Line::new(gp(5, 11), gp(3, 13)).into_styled(stroke).draw(t)
         }
+        // Straight sides, then a clean 45° taper to a centred 2px point (no ragged tail
+        // pixel below it).
         Glyph::Shield => Polyline::new(&[
             gp(4, 3),
             gp(12, 3),
-            gp(12, 8),
-            gp(8, 14),
-            gp(4, 8),
+            gp(12, 9),
+            gp(7, 12),
+            gp(4, 9),
             gp(4, 3),
         ])
         .into_styled(stroke)
@@ -380,35 +402,49 @@ fn paths<D: DrawTarget<Color = Rgb565>>(t: &mut D, g: Glyph, s: u16) -> Result<(
                 .draw(t)
         }
         Glyph::Usb => {
-            // The design's USB indicator: a plug head with two contact pins and a cable —
-            // "powered over USB". Symmetric, so it stays clean at the 14px status-row size.
-            Rectangle::new(gp(5, 2), Size::new(glen(6), glen(6)))
+            // The USB trident: a 2px centred shaft, an arrowhead at the top, a round base at
+            // the bottom, and two symmetric branches to small nodes — the iconic "USB" mark,
+            // far clearer than the old plug-box. v-symmetric (branches mirror).
+            Line::new(gp(8, 2), gp(8, 14)).into_styled(stroke).draw(t)?;
+            Triangle::new(gp(8, 1), gp(6, 4), gp(10, 4))
+                .into_styled(fill)
+                .draw(t)?;
+            Line::new(gp(8, 11), gp(5, 8)).into_styled(stroke).draw(t)?;
+            circ(5, 7, 1).into_styled(fill).draw(t)?;
+            Line::new(gp(8, 11), gp(11, 8))
                 .into_styled(stroke)
                 .draw(t)?;
-            Line::new(gp(7, 4), gp(7, 6)).into_styled(stroke).draw(t)?;
-            Line::new(gp(9, 4), gp(9, 6)).into_styled(stroke).draw(t)?;
-            Line::new(gp(8, 8), gp(8, 14)).into_styled(stroke).draw(t)
+            circ(11, 7, 1).into_styled(fill).draw(t)?;
+            circ(8, 14, 1).into_styled(fill).draw(t)
         }
         Glyph::Warn => {
-            // A roomy triangle with the exclamation kept high and short so it never merges
-            // into the lower edge.
-            Triangle::new(gp(8, 2), gp(2, 14), gp(14, 14))
+            // Only the LEFT half is drawn (left side + left half of the base); the v-symmetry
+            // pass mirrors it, so the two sides are pixel-identical (the Triangle primitive
+            // rasterizes its two edges a row out of phase — that was the "crooked right side").
+            // The apex is col 7, which the mirror turns into a centred 2px top (cols 7–8) — no
+            // lone off-centre tip. The side runs apex→gp(2,14): a 5-wide / 10-tall half = an exact
+            // 1:2 slope, so the staircase is regular (one even 2-row step per column).
+            Polyline::new(&[gp(7, 3), gp(2, 14), gp(8, 14)])
                 .into_styled(stroke)
                 .draw(t)?;
-            Line::new(gp(8, 6), gp(8, 9)).into_styled(stroke).draw(t)?;
-            circ(8, 11, 1).into_styled(fill).draw(t)
+            // Exclamation, centred on the same cols 7–8 the apex straddles: a 2px bar (the left
+            // col 7 mirrored) and a dot the same width (never wider than the bar), gapped below.
+            Line::new(gp(7, 7), gp(7, 10)).into_styled(stroke).draw(t)?;
+            Rectangle::new(gp(7, 12), Size::new(sw, sw))
+                .into_styled(fill)
+                .draw(t)
         }
         Glyph::Sun => {
             // A small SOLID core + eight rays (four on the axes, four on the diagonals). The
             // filled core (vs the Gear's open bore) tells them apart.
             circ(8, 8, 2).into_styled(fill).draw(t)?;
-            Line::new(gp(8, 3), gp(8, 1)).into_styled(stroke).draw(t)?;
+            Line::new(gp(8, 3), gp(8, 1)).into_styled(stroke2).draw(t)?;
             Line::new(gp(8, 13), gp(8, 15))
-                .into_styled(stroke)
+                .into_styled(stroke2)
                 .draw(t)?;
-            Line::new(gp(3, 8), gp(1, 8)).into_styled(stroke).draw(t)?;
+            Line::new(gp(3, 8), gp(1, 8)).into_styled(stroke2).draw(t)?;
             Line::new(gp(13, 8), gp(15, 8))
-                .into_styled(stroke)
+                .into_styled(stroke2)
                 .draw(t)?;
             Line::new(gp(11, 5), gp(13, 3))
                 .into_styled(stroke)
@@ -420,10 +456,11 @@ fn paths<D: DrawTarget<Color = Rgb565>>(t: &mut D, g: Glyph, s: u16) -> Result<(
             Line::new(gp(5, 11), gp(3, 13)).into_styled(stroke).draw(t)
         }
         Glyph::Clock => {
-            // A ring + an hour hand (up) and a minute hand (right) meeting at the centre.
+            // A ring + a thin (1px) hour hand (up) and minute hand (right) meeting at the ring's
+            // centre — the hub at gp(7,7) sits on the ring centre (~6.5,7), not a pixel low-right.
             circ(8, 8, 6).into_styled(stroke).draw(t)?;
-            Line::new(gp(8, 8), gp(8, 5)).into_styled(stroke).draw(t)?;
-            Line::new(gp(8, 8), gp(11, 8)).into_styled(stroke).draw(t)
+            Line::new(gp(7, 7), gp(7, 4)).into_styled(stroke).draw(t)?;
+            Line::new(gp(7, 7), gp(10, 7)).into_styled(stroke).draw(t)
         }
         Glyph::Moon => {
             // A crescent built as the gap between a disc and an overlapping disc would be
@@ -459,24 +496,11 @@ fn paths<D: DrawTarget<Color = Rgb565>>(t: &mut D, g: Glyph, s: u16) -> Result<(
                 .draw(t)
         }
         Glyph::Eye => {
-            // An almond lens (two arcs meeting at the corners) with a centred pupil.
-            Arc::new(
-                gp(1, 1),
-                glen(14),
-                Angle::from_degrees(20.0),
-                Angle::from_degrees(140.0),
-            )
-            .into_styled(stroke)
-            .draw(t)?;
-            Arc::new(
-                gp(1, 1),
-                glen(14),
-                Angle::from_degrees(200.0),
-                Angle::from_degrees(140.0),
-            )
-            .into_styled(stroke)
-            .draw(t)?;
-            circ(8, 8, 2).into_styled(stroke).draw(t)?;
+            // A wide, flat lens (an ellipse, taller-than-wide arcs read out of proportion at
+            // icon sizes) with a small 2px pupil instead of a 4px block.
+            Ellipse::new(gp(1, 4), Size::new(glen(14), glen(8)))
+                .into_styled(stroke)
+                .draw(t)?;
             circ(8, 8, 1).into_styled(fill).draw(t)
         }
         Glyph::Lifebuoy => {
@@ -525,8 +549,10 @@ fn paths<D: DrawTarget<Color = Rgb565>>(t: &mut D, g: Glyph, s: u16) -> Result<(
                 .draw(t)
         }
         Glyph::Apps => {
-            // Four equal tiles in a 2×2 grid — the unified applet launcher.
-            for (gx, gy) in [(3, 3), (9, 3), (3, 9), (9, 9)] {
+            // Four equal tiles in a 2×2 grid — the unified applet launcher. Placed at
+            // gp(3)/gp(10) so the inter-tile gap straddles the centre (cols 7–8 at 16px)
+            // instead of sitting a pixel off (gp(9) maps onto the centre column).
+            for (gx, gy) in [(3, 3), (10, 3), (3, 10), (10, 10)] {
                 Rectangle::new(gp(gx, gy), Size::new(glen(4), glen(4)))
                     .into_styled(fill)
                     .draw(t)?;
@@ -536,7 +562,7 @@ fn paths<D: DrawTarget<Color = Rgb565>>(t: &mut D, g: Glyph, s: u16) -> Result<(
         Glyph::Terminal => {
             // A shell prompt: a ">" caret over an underscore cursor (design's polyline +
             // line). Asymmetric (claims no axis), so it is drawn as-is.
-            Polyline::new(&[gp(3, 4), gp(8, 8), gp(3, 12)])
+            Polyline::new(&[gp(3, 3), gp(8, 8), gp(3, 14)])
                 .into_styled(stroke)
                 .draw(t)?;
             Line::new(gp(9, 13), gp(13, 13)).into_styled(stroke).draw(t)

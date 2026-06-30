@@ -600,6 +600,16 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Changed
 
+- **Trusted-display: redraw the icon set for crisp, centred rendering at small sizes.** A
+  pass over the vector glyphs to fix the rough edges that showed at 14–20px: diagonals
+  (chevron / back / the check marks / the terminal caret) now step at a clean 45°, on-axis
+  features that sat a pixel off-centre (the sun and gear central rays, the clock hands, the
+  lock shackle and home roof peaks, the apps tile gap) are re-centred, the warning sign's
+  exclamation no longer merges into the triangle edge, the eye is re-proportioned with a
+  small pupil, the shield tapers to a clean point, and the USB indicator is redrawn as the
+  familiar trident instead of an unclear plug box. No new glyphs, no behaviour change.
+  bcdDevice 0x07CF → 0x07D0.
+
 - **Trusted-display: design-token fidelity polish pass.** A pass over the on-device
   screens to close residual drift from the high-fidelity handoff: the PIN keypad keys
   tighten to the design's 7px grid gap (re-centred so the pad stays balanced) and 9px
