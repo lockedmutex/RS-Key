@@ -600,6 +600,17 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Changed
 
+- **Trusted-display: per-size icon bitmaps for crisp small-size rendering.** The glyph
+  renderer no longer scales one 16×16 vector contour to every size — the root cause of the
+  rounding artefacts that detailed icons (key, globe, gear, lifebuoy, microchip, sun, clock)
+  still showed at 14–20px, where features fell off-axis and the icon collapsed into a blob.
+  Each glyph is now a hand-authored 1-bit bitmap at the canonical sizes the UI paints
+  (14 / 16 / 18 / 20 / 36 / 44 px), blitted 1:1 with a centre-sampled nearest-neighbour
+  fallback for the few off-canonical sizes; the round / detailed icons were redrawn cleanly
+  at the small sizes via a distance-field rasteriser, while the large sizes are frozen from
+  the prior renders (no regression). No new glyphs, no behaviour change. bcdDevice
+  0x07D0 → 0x07D1.
+
 - **Trusted-display: redraw the icon set for crisp, centred rendering at small sizes.** A
   pass over the vector glyphs to fix the rough edges that showed at 14–20px: diagonals
   (chevron / back / the check marks / the terminal caret) now step at a clean 45°, on-axis
