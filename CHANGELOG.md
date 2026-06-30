@@ -15,6 +15,16 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Added
 
+- **Trusted-display: every PIN screen names which credential it's asking for, and a fresh
+  device offers to set a PIN.** The on-screen PIN pad now titles each entry with the
+  credential it collects — **Device PIN**, **FIDO PIN**, **PIV PIN** / **PIV PUK**, or the
+  OpenPGP PINs — so the four independent PINs can no longer be confused (the New / Confirm /
+  current step moves to the caption line beneath, keeping the scope label fixed at the top).
+  And on a fresh, PIN-less device the panel shows a one-time **Set a PIN?** prompt at first run
+  (*Set a PIN* / *Continue without PIN*); choosing to continue without one is remembered (a
+  flag in the `EF_DISPLAY` record, forward-compatibly extended), so the offer isn't repeated
+  until a factory reset. bcdDevice 0x07CB → 0x07CC.
+
 - **Trusted-display + PIV: set a PIN-protected random management key on the panel (ykman
   `--protect`).** Settings → Security → PIV PIN gains a **Protect mgmt key** action: the device
   generates a fresh random AES-256 management key, seals it, and marks it PIN-protected, so a
@@ -621,6 +631,13 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   a meaningful `0x08`, so the realignment is safe. bcdDevice 0x0783 → 0x0784.
 
 ### Fixed
+
+- **Trusted display: the "Protect mgmt key" row label is no longer clipped to nothing on
+  the PIV PIN menu.** Its long right-aligned hint ("random, PIN-unlocked", 159 px) crowded
+  the 128 px label down to 1 px, so the row showed only the hint and not its name. The hint
+  is dropped (the random / PIN-unlocked consequence is stated in full on the confirm screen),
+  so the label shows like the other rows; a regression test now asserts every menu label fits
+  beside its caption. Display flavor only.
 
 - **Trusted display: the device now locks from the audit-log screen.** The power/wake
   button now sleeps and locks the on-device UI from inside the audit log too — previously

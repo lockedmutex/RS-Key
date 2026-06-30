@@ -5,32 +5,48 @@
 //! trusted-display firmware reads at boot and writes when the user edits them in
 //! Settings → Display.
 //!
-//! The block is `[brightness, sleep_secs_be(2)]` (3 bytes): the backlight level
-//! (`1..=BRIGHTNESS_LEVELS`) and the display-sleep timeout in seconds (`0` = Off).
+//! The block is `[brightness, sleep_secs_be(2), flags]` (4 bytes): the backlight
+//! level (`1..=BRIGHTNESS_LEVELS`), the display-sleep timeout in seconds (`0` =
+//! Off), and a flags byte (currently only [`FLAG_PIN_DECLINED`] — the user chose
+//! "continue without a device PIN" at first-run, so the panel must not re-prompt).
 //! The **touch timeout** is *not* here — it persists in the phy record's
 //! `PresenceTimeout` tag (shared with `rsk hw --touch-timeout`), so it keeps one
 //! source of truth.
 //!
-//! [`DisplayConfig::apply_block`] overlays a stored block onto a default `self`, so
-//! a record written by an *older* firmware (a shorter block) or read by an *older*
-//! firmware (a future, longer block — only its known prefix is read) survives a
-//! firmware upgrade without losing or misreading a field; anything a shorter block
-//! omits keeps its current value. [`DisplayConfig::default`] mirrors the firmware's
-//! live defaults, so a device with no record behaves exactly as before.
+//! [`DisplayConfig::apply_block`] overlays a stored block onto a default `self`,
+//! field by field, so a record written by an *older* firmware (the original
+//! [`CORE_LEN`]-byte block, no flags) or read by an *older* firmware (a future,
+//! longer block — only its known prefix is read) survives a firmware upgrade
+//! without losing or misreading a field; anything a shorter block omits keeps its
+//! current value. [`DisplayConfig::default`] mirrors the firmware's live defaults,
+//! so a device with no record behaves exactly as before.
 //!
 //! Like `rsk-led`'s codec this crate is pure (no `embassy` / HAL), so the format is
 //! unit-testable on the host; `firmware/src/display.rs` owns the live brightness
 //! field and the `SLEEP_TIMEOUT_MS` atomic and marshals them through here.
 
-/// `EF_DISPLAY` length: `[brightness, sleep_secs_be(2)]`.
-pub const CONF_LEN: usize = 3;
+/// `EF_DISPLAY` length: `[brightness, sleep_secs_be(2), flags]`.
+pub const CONF_LEN: usize = 4;
+
+/// The original layout (`[brightness, sleep_secs_be(2)]`, no flags byte). A record
+/// written before the flags byte existed is exactly this long; [`DisplayConfig::apply_block`]
+/// still reads its two fields and leaves the flags at their default, so an already-provisioned
+/// device keeps its brightness / sleep across the upgrade that added the byte.
+const CORE_LEN: usize = 3;
+
+/// Flags-byte bit 0: the user chose "continue without a device PIN" at the
+/// first-run prompt. Set, the panel never re-shows that onboarding screen (until a
+/// factory reset wipes `EF_DISPLAY`); clear (the default), a PIN-less device is
+/// offered the prompt once.
+pub const FLAG_PIN_DECLINED: u8 = 0x01;
 
 /// Default display-sleep timeout in seconds — mirrors the firmware's
 /// `DEFAULT_SLEEP_MS` (60 s) so a device with no record blanks on the same schedule
 /// it did before this record existed.
 pub const DEFAULT_SLEEP_SECS: u16 = 60;
 
-/// The persisted display settings: backlight level plus the display-sleep timeout.
+/// The persisted display settings: backlight level, the display-sleep timeout, and
+/// the first-run PIN-prompt flag.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct DisplayConfig {
     /// Backlight level `1..=BRIGHTNESS_LEVELS`. Stored raw; the firmware clamps it
@@ -39,6 +55,10 @@ pub struct DisplayConfig {
     pub brightness: u8,
     /// Display-sleep timeout in seconds; `0` = Off (never blanks).
     pub sleep_secs: u16,
+    /// The user has dismissed the first-run "set a device PIN?" prompt by choosing
+    /// to continue without one — so the panel must not re-offer it. Cleared on a
+    /// factory reset (which wipes the record), so a wiped device re-onboards.
+    pub pin_declined: bool,
 }
 
 impl Default for DisplayConfig {
@@ -46,27 +66,38 @@ impl Default for DisplayConfig {
         Self {
             brightness: crate::BRIGHTNESS_LEVELS,
             sleep_secs: DEFAULT_SLEEP_SECS,
+            pin_declined: false,
         }
     }
 }
 
 impl DisplayConfig {
-    /// Pack into the 3-byte wire block: `[brightness, sleep_secs_be]` (big-endian
-    /// sleep, matching the phy record's byte order).
+    /// Pack into the 4-byte wire block: `[brightness, sleep_secs_be, flags]`
+    /// (big-endian sleep, matching the phy record's byte order).
     pub fn encode(&self) -> [u8; CONF_LEN] {
         let s = self.sleep_secs.to_be_bytes();
-        [self.brightness, s[0], s[1]]
+        let flags = if self.pin_declined {
+            FLAG_PIN_DECLINED
+        } else {
+            0
+        };
+        [self.brightness, s[0], s[1], flags]
     }
 
-    /// Overlay a stored block onto `self`. The block always carries both fields
-    /// (there is no shorter legacy layout — this record was born at `CONF_LEN`), and a
-    /// future, longer block is read up to its known prefix. Anything shorter than
-    /// `CONF_LEN` can only be flash corruption, so `self` is left at its defaults
-    /// rather than half-applied.
+    /// Overlay a stored block onto `self`, field by field. The brightness + sleep
+    /// pair is read from any block at least [`CORE_LEN`] long (so the original
+    /// flags-less record still loads, keeping `pin_declined` at its default); the
+    /// flags byte is read only from a full [`CONF_LEN`] block. A future, longer
+    /// block is read up to its known prefix. Anything shorter than `CORE_LEN` can
+    /// only be flash corruption, so those fields stay at their defaults rather than
+    /// half-applied.
     pub fn apply_block(&mut self, b: &[u8]) {
-        if b.len() >= CONF_LEN {
+        if b.len() >= CORE_LEN {
             self.brightness = b[0];
             self.sleep_secs = u16::from_be_bytes([b[1], b[2]]);
+        }
+        if b.len() >= CONF_LEN {
+            self.pin_declined = b[3] & FLAG_PIN_DECLINED != 0;
         }
     }
 }
@@ -82,6 +113,7 @@ mod proofs {
         let cfg = DisplayConfig {
             brightness: kani::any(),
             sleep_secs: kani::any(),
+            pin_declined: kani::any(),
         };
         let mut got = DisplayConfig::default();
         got.apply_block(&cfg.encode());
@@ -95,7 +127,8 @@ mod tests {
 
     #[test]
     fn conf_len_matches_layout() {
-        assert_eq!(CONF_LEN, 3);
+        assert_eq!(CONF_LEN, 4);
+        assert_eq!(CORE_LEN, 3);
     }
 
     #[test]
@@ -103,6 +136,7 @@ mod tests {
         let d = DisplayConfig::default();
         assert_eq!(d.brightness, crate::BRIGHTNESS_LEVELS);
         assert_eq!(d.sleep_secs, 60);
+        assert!(!d.pin_declined);
     }
 
     #[test]
@@ -110,6 +144,7 @@ mod tests {
         let cfg = DisplayConfig {
             brightness: 3,
             sleep_secs: 120,
+            pin_declined: true,
         };
         let mut got = DisplayConfig::default();
         got.apply_block(&cfg.encode());
@@ -117,15 +152,28 @@ mod tests {
     }
 
     #[test]
-    fn encode_layout_is_brightness_then_be_sleep() {
+    fn encode_layout_is_brightness_then_be_sleep_then_flags() {
         let b = DisplayConfig {
             brightness: 4,
             sleep_secs: 300,
+            pin_declined: true,
         }
         .encode();
-        assert_eq!(b.len(), 3);
+        assert_eq!(b.len(), 4);
         assert_eq!(b[0], 4);
         assert_eq!(u16::from_be_bytes([b[1], b[2]]), 300);
+        assert_eq!(b[3], FLAG_PIN_DECLINED);
+    }
+
+    #[test]
+    fn pin_declined_clear_encodes_zero_flags() {
+        let b = DisplayConfig {
+            brightness: 2,
+            sleep_secs: 60,
+            pin_declined: false,
+        }
+        .encode();
+        assert_eq!(b[3], 0);
     }
 
     #[test]
@@ -133,10 +181,33 @@ mod tests {
         let cfg = DisplayConfig {
             brightness: 5,
             sleep_secs: 0, // Off
+            pin_declined: false,
         };
         let mut got = DisplayConfig::default();
         got.apply_block(&cfg.encode());
         assert_eq!(got, cfg);
+    }
+
+    #[test]
+    fn legacy_core_block_loads_fields_and_keeps_flag_default() {
+        // A record written before the flags byte existed is exactly CORE_LEN: its
+        // brightness + sleep still load, and pin_declined stays at its default
+        // (false) — so an already-provisioned device survives the upgrade.
+        let core = [3u8, 0x00, 0x1E]; // brightness 3, sleep 30 s, no flags
+        let mut got = DisplayConfig::default();
+        got.apply_block(&core);
+        assert_eq!(got.brightness, 3);
+        assert_eq!(got.sleep_secs, 30);
+        assert!(!got.pin_declined);
+    }
+
+    #[test]
+    fn unknown_flag_bits_do_not_set_pin_declined() {
+        // Only bit 0 is FLAG_PIN_DECLINED; a future bit set alone must not be read
+        // as a decline.
+        let mut got = DisplayConfig::default();
+        got.apply_block(&[5, 0x00, 0x3C, 0x02]);
+        assert!(!got.pin_declined);
     }
 
     #[test]
@@ -147,9 +218,9 @@ mod tests {
     }
 
     #[test]
-    fn short_block_below_conf_len_keeps_defaults() {
-        // No sub-CONF_LEN layout was ever written, so a 1- or 2-byte block is
-        // corruption: leave both fields at their defaults rather than half-apply.
+    fn short_block_below_core_len_keeps_defaults() {
+        // No sub-CORE_LEN layout was ever written, so a 1- or 2-byte block is
+        // corruption: leave the fields at their defaults rather than half-apply.
         for short in [&[2u8][..], &[2u8, 0u8][..]] {
             let mut got = DisplayConfig::default();
             got.apply_block(short);
@@ -159,12 +230,13 @@ mod tests {
 
     #[test]
     fn longer_future_block_reads_known_prefix() {
-        // A future, longer record still loads its first 3 bytes (the >= branch).
+        // A future, longer record still loads its first CONF_LEN bytes (the >= branch).
         let cfg = DisplayConfig {
             brightness: 1,
             sleep_secs: 30,
+            pin_declined: true,
         };
-        let mut b = [0u8; 6];
+        let mut b = [0u8; 7];
         b[..CONF_LEN].copy_from_slice(&cfg.encode());
         let mut got = DisplayConfig::default();
         got.apply_block(&b);

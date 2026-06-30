@@ -195,6 +195,29 @@ enum PinScope {
     Fido,
 }
 
+impl PinScope {
+    /// The PIN-screen header for this scope — so every pad names *which* credential it
+    /// is collecting (the user's reported confusion: the same bare "Enter PIN" served
+    /// the device lock, the FIDO clientPIN, and the PIV PIN). The step (New / Confirm /
+    /// current) rides in the caption line, so this stays a stable scope label.
+    fn pin_title(self) -> &'static str {
+        match self {
+            PinScope::Device => "Device PIN",
+            PinScope::Fido => "FIDO PIN",
+        }
+    }
+}
+
+/// The PIN-screen header for a PIV reference (the application PIN or the PUK), the
+/// PIV analog of [`PinScope::pin_title`]. Matches the CCID secure-PIN path's "PIV PIN"
+/// title so a host VERIFY and an on-panel change name the same thing.
+fn piv_ref_title(which: rsk_piv::PinRef) -> &'static str {
+    match which {
+        rsk_piv::PinRef::Pin => "PIV PIN",
+        rsk_piv::PinRef::Puk => "PIV PUK",
+    }
+}
+
 /// Outcome of the per-RP service-detail screen: return to the Passkeys list, or leave
 /// the tab to another nav destination (`None` = the idle Home screen).
 enum ServiceResult {
@@ -375,6 +398,16 @@ pub struct Ui {
     /// by a correct on-screen PIN. Gates only the panel UI — host CTAP ceremonies (confirm
     /// / built-in-UV) are unaffected and paint their own prompts over it.
     locked: bool,
+    /// The first-run onboarding prompt is active: a fresh, PIN-less device that hasn't yet
+    /// offered (and had dismissed) the "set a device PIN?" screen. While set, the idle loop
+    /// shows [`Screen::Onboard`] instead of Home and a tap routes to [`Ui::run_onboarding`];
+    /// cleared once the user sets a PIN or chooses to continue without one. Mutually
+    /// exclusive with `locked` (onboarding only exists when no device PIN is set).
+    onboarding: bool,
+    /// The persisted "continue without a device PIN" choice ([`rsk_ui::DisplayConfig`]'s
+    /// `pin_declined`), held so every `EF_DISPLAY` write preserves it. Set true (and flushed)
+    /// when the user dismisses onboarding; a factory reset wipes the record back to false.
+    pin_declined: bool,
     /// The shared flash store — the same `RefCell` the worker uses. The Passkeys tab
     /// borrows it to enumerate resident credentials; safe because the worker is parked
     /// (it never holds the borrow across an `.await`) while this thread-executor task
@@ -471,6 +504,10 @@ impl Ui {
         // the PIN to reach its on-device UI, not open. Without a PIN there is nothing to
         // unlock with, so it boots open (the lock is a no-op then anyway).
         let locked = rsk_fido::passkeys::device_pin_is_set(&mut fs.borrow_mut());
+        // A fresh, PIN-less device that hasn't already had the prompt dismissed comes up on
+        // the onboarding screen offering to set a device PIN (declining is remembered in
+        // `EF_DISPLAY`, so it's a one-time first-run offer). Mutually exclusive with `locked`.
+        let onboarding = !locked && !dcfg.pin_declined;
 
         Ui {
             panel,
@@ -483,6 +520,8 @@ impl Ui {
             asleep: false,
             wake_btn,
             locked,
+            onboarding,
+            pin_declined: dcfg.pin_declined,
             fs,
             keys,
             rng,
@@ -612,7 +651,7 @@ impl Ui {
         // authenticatorReset (clears it in place) or the device-PIN-gated on-device factory
         // reset (reboots). Both are authorized resets, so "no PIN ⇒ unlock" is the correct
         // post-reset behaviour (nothing to verify against), never a bypass.
-        if self.local_pin_gate("Enter PIN", PinScope::Device) {
+        if self.local_pin_gate(PinScope::Device) {
             self.locked = false;
         }
         self.end_modal();
@@ -854,11 +893,7 @@ impl Ui {
     /// parked while this runs.
     fn persist_settings(&mut self, save_display: bool, save_presence: bool) {
         if save_display {
-            let cfg = rsk_ui::DisplayConfig {
-                brightness: self.brightness,
-                sleep_secs: (SLEEP_TIMEOUT_MS.load(Ordering::Relaxed) / 1000) as u16,
-            };
-            let _ = self.fs.borrow_mut().put(EF_DISPLAY, &cfg.encode());
+            self.save_display_config();
         }
         if save_presence {
             let secs = (PRESENCE_TIMEOUT_MS.load(Ordering::Relaxed) / 1000) as u8;
@@ -867,6 +902,57 @@ impl Ui {
             phy.presence_timeout = Some(secs);
             let _ = rsk_rescue::phy::save(&mut fs, &phy);
         }
+    }
+
+    /// Write the live display settings (brightness + sleep) plus the persisted
+    /// `pin_declined` flag to `EF_DISPLAY` in one record. Every `EF_DISPLAY` write goes
+    /// through here so the onboarding flag is never dropped by a brightness/sleep save (and
+    /// vice-versa) — the record carries all three fields. Synchronous; the worker is parked.
+    fn save_display_config(&mut self) {
+        let cfg = rsk_ui::DisplayConfig {
+            brightness: self.brightness,
+            sleep_secs: (SLEEP_TIMEOUT_MS.load(Ordering::Relaxed) / 1000) as u16,
+            pin_declined: self.pin_declined,
+        };
+        let _ = self.fs.borrow_mut().put(EF_DISPLAY, &cfg.encode());
+    }
+
+    /// Handle a tap on the first-run onboarding screen ([`Screen::Onboard`]). **Set a PIN**
+    /// opens the device-PIN set flow; if a PIN ends up set, onboarding is done (and the
+    /// device is unlocked for this session — the user just proved presence). **Continue
+    /// without PIN** records the choice in `EF_DISPLAY` so the prompt is never shown again
+    /// (until a factory reset), then drops to Home. A tap that misses both buttons, or a
+    /// queued host command / timeout reaching here, leaves onboarding pending — it re-shows
+    /// on the next idle frame, so the offer is never silently lost. `p` is the opening tap.
+    fn run_onboarding(&mut self, p: rsk_ui::Point) {
+        match rsk_ui::hit_onboard(p) {
+            Some(rsk_ui::OnboardChoice::SetPin) => {
+                // `run_set_pin` waits for the opening finger to lift, gates (a no-op with no
+                // PIN set yet), then collects New + Confirm; it writes only on a match.
+                self.run_set_pin(PinScope::Device);
+                if rsk_fido::passkeys::device_pin_is_set(&mut self.fs.borrow_mut()) {
+                    self.onboarding = false;
+                    self.refresh_home_stats();
+                }
+            }
+            Some(rsk_ui::OnboardChoice::Skip) => {
+                self.pin_declined = true;
+                self.save_display_config();
+                self.onboarding = false;
+                // Refresh the Home cache before the caller paints Home: a host ceremony can
+                // have added/removed a resident passkey while the panel sat on Onboard (it
+                // paints over Onboard without consulting `onboarding`), so the count could be
+                // stale — the same reason the unlock path refreshes. (The SetPin branch above
+                // already refreshes.)
+                self.refresh_home_stats();
+                // Let the choosing finger lift before the next idle read paints Home, so the
+                // same touch isn't re-read as a nav tap.
+                self.touch
+                    .wait_release(Instant::now(), Duration::from_millis(MENU_INACTIVITY_MS));
+            }
+            None => {}
+        }
+        self.end_modal();
     }
 
     /// Hand the panel back to the ambient loop on a modal's exit. Closing a tab back to
@@ -1552,7 +1638,7 @@ impl Ui {
             None => return,
         };
         // PIN gate first (when set) so the chooser doesn't flash behind the pad.
-        if !self.local_pin_gate("Enter PIN", PinScope::Device) {
+        if !self.local_pin_gate(PinScope::Device) {
             return;
         }
         // Algorithm chooser: the curves are instant; the RSA row drills into a size
@@ -2137,7 +2223,7 @@ impl Ui {
         self.touch.wait_release(Instant::now(), idle_limit);
         // Re-authenticate with the device PIN before any recovery secret is shown (no PIN set
         // returns true at once; a wrong PIN / decline / timeout aborts with nothing revealed).
-        if !self.local_pin_gate("Enter PIN", PinScope::Device) {
+        if !self.local_pin_gate(PinScope::Device) {
             return;
         }
         'chooser: loop {
@@ -2620,7 +2706,8 @@ impl Ui {
     /// re-prompts with a "Wrong PIN, N left" caption until the right PIN, a decline /
     /// timeout, or the counter is spent. Returns whether the action may proceed (`true` =
     /// no PIN of that scope set, or the correct PIN was entered).
-    fn local_pin_gate(&mut self, title: &'static str, scope: PinScope) -> bool {
+    fn local_pin_gate(&mut self, scope: PinScope) -> bool {
+        let title = scope.pin_title();
         let (retries, expected) = {
             let mut fs = self.fs.borrow_mut();
             let is_set = match scope {
@@ -2773,7 +2860,7 @@ impl Ui {
         // Gate on the device PIN first: when one is set the pad is shown straight away,
         // so the confirm screen below doesn't flash for a frame behind it. With no PIN,
         // `local_pin_gate` returns at once and the confirm screen is the first thing seen.
-        if !self.local_pin_gate("Enter PIN", PinScope::Device) {
+        if !self.local_pin_gate(PinScope::Device) {
             return; // no PIN, wrong PIN, or declined — nothing removed
         }
         // The destructive-action screen: name the rp + account, then require the hold.
@@ -2858,7 +2945,7 @@ impl Ui {
         self.touch.wait_release(Instant::now(), idle_limit);
         // PIN gate first (when set) so the pad doesn't flash the confirm screen behind it;
         // no PIN returns at once and the confirm screen below is shown directly.
-        if !self.local_pin_gate("Enter PIN", PinScope::Device) {
+        if !self.local_pin_gate(PinScope::Device) {
             return; // no PIN set is fine; a wrong PIN or decline aborts — nothing erased
         }
         // The destructive-action screen, then a deliberate hold to commit.
@@ -2898,7 +2985,7 @@ impl Ui {
         // Let the Security-row tap's finger lift before the pad reads digits.
         self.touch
             .wait_release(Instant::now(), Duration::from_millis(MENU_INACTIVITY_MS));
-        if !self.local_pin_gate("Current PIN", target) {
+        if !self.local_pin_gate(target) {
             return; // wrong current PIN, decline, timeout, or host yield — nothing changed
         }
         // The device PIN has no host policy → the compile-time MIN_PIN_LENGTH floor (4, or 6
@@ -2916,19 +3003,21 @@ impl Ui {
         // always one the store path can verify, and the store re-checks.
         let mut new = [0u8; rsk_fido::passkeys::MAX_PIN_LENGTH];
         let mut confirm = [0u8; rsk_fido::passkeys::MAX_PIN_LENGTH];
-        // The createpin step opens with a muted "Choose a PIN" hint; a New ≠ Confirm
-        // mismatch re-prompts it with the danger-coloured reason instead.
+        // The header names the scope ("Device PIN" / "FIDO PIN"); the step rides in the
+        // caption — a muted "Choose a PIN" on the first entry, "Re-enter to confirm" on the
+        // second, or the danger-coloured "PINs don't match" after a mismatch.
+        let title = target.pin_title();
         let mut new_caption = Some(PinCaption::ChoosePin);
         loop {
             new.zeroize();
             confirm.zeroize();
             let expected = min.min(u8::MAX as usize) as u8;
-            let n1 = match self.collect_pin("New PIN", new_caption, min, expected, &mut new, true) {
+            let n1 = match self.collect_pin(title, new_caption, min, expected, &mut new, true) {
                 rsk_fido::PinEntry::Entered(n) => n.min(new.len()),
                 _ => break, // declined / timeout / host yield — nothing set
             };
             let n2 = match self.collect_pin(
-                "Confirm PIN",
+                title,
                 Some(PinCaption::Reenter),
                 min,
                 expected,
@@ -3007,18 +3096,8 @@ impl Ui {
                 block_for(Duration::from_millis(TOUCH_POLL_MS));
             };
             match pick {
-                0 => self.run_change_piv_ref(
-                    rsk_piv::PinRef::Pin,
-                    "Current PIN",
-                    "New PIN",
-                    "Confirm PIN",
-                ),
-                1 => self.run_change_piv_ref(
-                    rsk_piv::PinRef::Puk,
-                    "Current PUK",
-                    "New PUK",
-                    "Confirm PUK",
-                ),
+                0 => self.run_change_piv_ref(rsk_piv::PinRef::Pin),
+                1 => self.run_change_piv_ref(rsk_piv::PinRef::Puk),
                 2 => self.run_unblock_piv_pin(),
                 _ => self.run_protect_mgm_key(),
             }
@@ -3031,12 +3110,8 @@ impl Ui {
     /// spent. Returns the secret padded to the 8-byte PIV wire form on success (for the
     /// following change/unblock), or `None` on cancel / timeout / blocked (the latter shows
     /// the lockout notice). The retry counter is the PIV applet's own (`EF_RETRIES`).
-    fn gate_piv_ref(
-        &mut self,
-        which: rsk_piv::PinRef,
-        title: &'static str,
-        buf: &mut [u8],
-    ) -> Option<[u8; 8]> {
+    fn gate_piv_ref(&mut self, which: rsk_piv::PinRef, buf: &mut [u8]) -> Option<[u8; 8]> {
+        let title = piv_ref_title(which);
         let mut caption = rsk_piv::reference_retries_left(&mut self.fs.borrow_mut(), which)
             .map(|left| PinCaption::TriesRemaining { left });
         loop {
@@ -3070,14 +3145,12 @@ impl Ui {
         }
     }
 
-    /// Collect a new PIV PIN twice on the pad and return it padded to the wire form, or `None`
-    /// on cancel / timeout / host-yield. A New ≠ Confirm mismatch re-prompts in place; both
-    /// pad buffers are zeroized on every iteration and at exit.
-    fn collect_new_piv_pin(
-        &mut self,
-        title: &'static str,
-        confirm_title: &'static str,
-    ) -> Option<[u8; 8]> {
+    /// Collect a new PIV PIN/PUK twice on the pad and return it padded to the wire form, or
+    /// `None` on cancel / timeout / host-yield. The `title` names the scope ("PIV PIN" /
+    /// "PIV PUK"); the New vs Confirm step rides in the caption (a muted "Choose a PIN" then
+    /// "Re-enter to confirm"). A New ≠ Confirm mismatch re-prompts in place; both pad buffers
+    /// are zeroized on every iteration and at exit.
+    fn collect_new_piv_pin(&mut self, title: &'static str) -> Option<[u8; 8]> {
         let mut new = [0u8; 8];
         let mut confirm = [0u8; 8];
         let mut new_caption = Some(PinCaption::ChoosePin);
@@ -3096,7 +3169,7 @@ impl Ui {
                 _ => break None,
             };
             let n2 = match self.collect_pin(
-                confirm_title,
+                title,
                 Some(PinCaption::Reenter),
                 PIV_PIN_MIN,
                 PIV_PIN_MIN as u8,
@@ -3120,17 +3193,11 @@ impl Ui {
     /// collect the new one twice. Both are padded to the PIV wire form so a host VERIFY (which
     /// always pads to 8 with `0xFF`) accepts the result. Mirrors [`Self::run_set_pin`] but
     /// against the PIV applet's own PIN/PUK records, not the device/FIDO PIN.
-    fn run_change_piv_ref(
-        &mut self,
-        which: rsk_piv::PinRef,
-        cur_title: &'static str,
-        new_title: &'static str,
-        confirm_title: &'static str,
-    ) {
+    fn run_change_piv_ref(&mut self, which: rsk_piv::PinRef) {
         self.touch
             .wait_release(Instant::now(), Duration::from_millis(MENU_INACTIVITY_MS));
         let mut cur = [0u8; 8];
-        let gated = self.gate_piv_ref(which, cur_title, &mut cur);
+        let gated = self.gate_piv_ref(which, &mut cur);
         cur.zeroize();
         let mut cur_pad = match gated {
             Some(p) => p,
@@ -3139,7 +3206,7 @@ impl Ui {
                 return;
             }
         };
-        let applied = match self.collect_new_piv_pin(new_title, confirm_title) {
+        let applied = match self.collect_new_piv_pin(piv_ref_title(which)) {
             Some(mut new_pad) => {
                 let sw = {
                     let dev = self.keys.device();
@@ -3171,7 +3238,7 @@ impl Ui {
         self.touch
             .wait_release(Instant::now(), Duration::from_millis(MENU_INACTIVITY_MS));
         let mut puk = [0u8; 8];
-        let gated = self.gate_piv_ref(rsk_piv::PinRef::Puk, "PUK", &mut puk);
+        let gated = self.gate_piv_ref(rsk_piv::PinRef::Puk, &mut puk);
         puk.zeroize();
         let mut puk_pad = match gated {
             Some(p) => p,
@@ -3180,7 +3247,7 @@ impl Ui {
                 return;
             }
         };
-        let applied = match self.collect_new_piv_pin("New PIN", "Confirm PIN") {
+        let applied = match self.collect_new_piv_pin(piv_ref_title(rsk_piv::PinRef::Pin)) {
             Some(mut new_pad) => {
                 let sw = {
                     let dev = self.keys.device();
@@ -3221,7 +3288,7 @@ impl Ui {
             let mut fs = self.fs.borrow_mut();
             let _ = rsk_piv::files::scan_files(&dev, &mut fs, &mut *rng);
         }
-        if !self.local_pin_gate("Enter PIN", PinScope::Device) {
+        if !self.local_pin_gate(PinScope::Device) {
             return;
         }
         let _ = rsk_ui::render_piv_protect_confirm(&mut self.panel);
@@ -3348,11 +3415,14 @@ pub async fn status_task(ui: &'static RefCell<Ui>) {
                 if u.touch.read().is_some() || u.wake_pressed() {
                     u.wake();
                     note_activity();
-                    // Wake to the Locked screen if the device locked on sleep; the wake
-                    // gesture only wakes (it isn't read as the unlock tap — that comes
-                    // after release). Otherwise wake straight to Home.
+                    // Wake to the Locked screen if the device locked on sleep, or the
+                    // onboarding screen on a fresh PIN-less device; the wake gesture only
+                    // wakes (it isn't read as the unlock/onboard tap — that comes after
+                    // release). Otherwise wake straight to Home.
                     let screen = if u.locked {
                         Screen::Locked
+                    } else if u.onboarding {
+                        Screen::Onboard
                     } else {
                         // Woke from sleep: a host ceremony may have added/removed a passkey
                         // while the panel was dark, so refresh the card before painting.
@@ -3381,11 +3451,14 @@ pub async fn status_task(ui: &'static RefCell<Ui>) {
                         note_activity();
                     }
                     // When the on-device UI is locked, the Locked screen stands in for
-                    // Home; a tap there starts the unlock PIN flow instead of nav. Host
-                    // ceremonies still paint their own prompts over this (they don't
-                    // consult `locked`).
+                    // Home; a tap there starts the unlock PIN flow instead of nav. A fresh
+                    // PIN-less device stands on the Onboard screen instead, until the user
+                    // sets a PIN or continues without. Host ceremonies still paint their own
+                    // prompts over either (they don't consult `locked` / `onboarding`).
                     let screen = if u.locked {
                         Screen::Locked
+                    } else if u.onboarding {
+                        Screen::Onboard
                     } else {
                         // Idle hot path: cached stats only — never a per-frame flash scan.
                         Screen::Home(HomeView {
@@ -3433,6 +3506,26 @@ pub async fn status_task(ui: &'static RefCell<Ui>) {
                                     // Just unlocked: a host op during the lock may have
                                     // changed the count, so refresh before painting Home.
                                     u.refresh_home_stats();
+                                    Screen::Home(HomeView {
+                                        status: status_to_kind(led::status()),
+                                        pin_set: u.home_pin_set,
+                                        passkeys: u.home_passkeys,
+                                    })
+                                };
+                                let _ = rsk_ui::render(&mut u.panel, &screen);
+                                u.shown = Some(screen);
+                            } else if u.onboarding {
+                                // Fresh PIN-less device: route the tap to the onboarding
+                                // buttons (Set a PIN / Continue without). Repaint at once —
+                                // Onboard again if it's still pending (a missed-button tap or
+                                // an abandoned set), else Home now that the offer is resolved.
+                                // `run_onboarding` refreshes the Home cache on whichever branch
+                                // resolves the prompt, so the cached stats are current here.
+                                u.run_onboarding(p);
+                                note_activity();
+                                let screen = if u.onboarding {
+                                    Screen::Onboard
+                                } else {
                                     Screen::Home(HomeView {
                                         status: status_to_kind(led::status()),
                                         pin_set: u.home_pin_set,
@@ -3677,9 +3770,11 @@ impl TouchPresence {
         // and panic. The placeholder dots (sized from `min_len`) still show; the host
         // already exposes the retry count via getPINRetries / getUVRetries.
         let expected = min_len.min(u8::MAX as usize) as u8;
+        // The host built-in-UV PIN is the FIDO clientPIN — name it, so the user knows it
+        // isn't the device-unlock or PIV PIN (the reported confusion behind a reset).
         self.ui
             .borrow_mut()
-            .collect_pin("Enter PIN", None, min_len, expected, out, false)
+            .collect_pin("FIDO PIN", None, min_len, expected, out, false)
     }
 
     /// Collect a PIN on the on-screen pad for a host CCID secure-PIN-entry request

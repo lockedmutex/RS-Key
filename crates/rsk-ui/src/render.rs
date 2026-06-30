@@ -25,14 +25,14 @@ use crate::{
     ADJ_MINUS_RECT, ADJ_PLUS_RECT, ALLOW_RECT, AccountRow, AuditKind, AuditRow, BACKUP_REVEAL_RECT,
     BACKUP_SEAL_RECT, BRIGHTNESS_LEVELS, BackupView, CONTENT_TOP, ConfirmPrompt, DEL_HOLD_RECT,
     DENY_RECT, FMT_PHRASE_RECT, FMT_SHARES_RECT, Glyph, HomeView, Label, NAV_H, NAV_TABS, NAV_TOP,
-    NavTab, OPENPGP_ROWS, PAGER_NEXT_RECT, PAGER_PREV_RECT, PANEL_H, PANEL_W, PICK_CONTINUE_RECT,
-    PICK_N_MINUS_RECT, PICK_N_PLUS_RECT, PICK_T_MINUS_RECT, PICK_T_PLUS_RECT, PIN_CANCEL_RECT,
-    PIN_COLS, PIN_EYE_RECT, PIN_ROWS, PIV_KEYGEN_PICK_TOP, PIV_ROWS, PK_BACK_RECT, PK_LIST_TOP,
-    PinCaption, PinKey, PinPad, Point, RN_BKSP_RECT, RN_DOWN_RECT, RN_FIELD_RECT, RN_INS_RECT,
-    RN_SAVE_RECT, RN_UP_RECT, Rect, RevealKind, RpRow, STATUS_BAR_H, Screen, SettingsPage,
-    SettingsView, StatusKind, SuccessKind, TITLE_BACK_RECT, TITLE_BAR_H, TITLE_EDIT_RECT, font,
-    font::Role, glyph, hex_u16, hex_u64, nav_tab_rect, page_count, pin_grid_key, pin_key_rect,
-    settings_row_rect, theme,
+    NavTab, ONBOARD_SET_RECT, ONBOARD_SKIP_RECT, OPENPGP_ROWS, PAGER_NEXT_RECT, PAGER_PREV_RECT,
+    PANEL_H, PANEL_W, PICK_CONTINUE_RECT, PICK_N_MINUS_RECT, PICK_N_PLUS_RECT, PICK_T_MINUS_RECT,
+    PICK_T_PLUS_RECT, PIN_CANCEL_RECT, PIN_COLS, PIN_EYE_RECT, PIN_ROWS, PIV_KEYGEN_PICK_TOP,
+    PIV_ROWS, PK_BACK_RECT, PK_LIST_TOP, PinCaption, PinKey, PinPad, Point, RN_BKSP_RECT,
+    RN_DOWN_RECT, RN_FIELD_RECT, RN_INS_RECT, RN_SAVE_RECT, RN_UP_RECT, Rect, RevealKind, RpRow,
+    STATUS_BAR_H, Screen, SettingsPage, SettingsView, StatusKind, SuccessKind, TITLE_BACK_RECT,
+    TITLE_BAR_H, TITLE_EDIT_RECT, font, font::Role, glyph, hex_u16, hex_u64, nav_tab_rect,
+    page_count, pin_grid_key, pin_key_rect, settings_row_rect, theme,
 };
 use crate::{
     AppsView, CardholderView, OathDetailView, OathRow, OpenpgpView, PgpKeyView, PivExtraRow,
@@ -69,6 +69,7 @@ where
     match screen {
         Screen::Splash => splash(target),
         Screen::Locked => locked(target),
+        Screen::Onboard => onboard(target),
         Screen::Home(v) => home(target, v),
         Screen::Confirm(prompt) => confirm(target, prompt),
         Screen::Pin(pad) => pin(target, pad),
@@ -144,6 +145,68 @@ pub fn render_locked_breathe<D: DrawTarget<Color = Rgb565>>(
         EgPoint::new(MIDX, LOCKED_HINT_Y),
         Role::Body,
         color,
+    )
+}
+
+/// The first-run onboarding prompt on a fresh, PIN-less device: a lock mark, a short
+/// heading, two explanatory lines, then a primary **Set a PIN** (filled, in
+/// [`ONBOARD_SET_RECT`]) above a low-emphasis **Continue without PIN** (outlined, in
+/// [`ONBOARD_SKIP_RECT`]). Each caption is painted inside the exact rect
+/// [`crate::hit_onboard`] maps a tap to, so paint and hit-test can't disagree. The
+/// secondary label uses the [`Role::Body`] font so the long "Continue without PIN"
+/// fits the button without scrolling.
+fn onboard<D: DrawTarget<Color = Rgb565>>(t: &mut D) -> Result<(), D::Error> {
+    const DIA: u32 = 64;
+    let cx = MIDX;
+    let circle_top = 36;
+    Circle::new(EgPoint::new(cx - DIA as i32 / 2, circle_top), DIA)
+        .into_styled(PrimitiveStyle::with_fill(theme::SURFACE))
+        .draw(t)?;
+    let cyc = circle_top + DIA as i32 / 2;
+    glyph::draw(
+        t,
+        Glyph::Lock,
+        Point::new((cx - 16) as u16, (cyc - 16) as u16),
+        32,
+        theme::ACCENT,
+    )?;
+    text(t, "Set a PIN?", EgPoint::new(cx, 120), Role::Heading, FG)?;
+    text(
+        t,
+        "A device PIN locks the",
+        EgPoint::new(cx, 146),
+        Role::Body,
+        MUTED,
+    )?;
+    // Keep the last body line clear of the Set button below it (its centre + the Body
+    // font's descent must stay above ONBOARD_SET_RECT.y — guarded by a render test).
+    text(
+        t,
+        "on-device menus.",
+        EgPoint::new(cx, 164),
+        Role::Body,
+        MUTED,
+    )?;
+    button(t, ONBOARD_SET_RECT, "Set a PIN", theme::ACCENT_FILL)?;
+    // Low-emphasis outline; the Body font keeps the long caption inside the button.
+    RoundedRectangle::with_equal_corners(
+        eg_rect(ONBOARD_SKIP_RECT),
+        Size::new(BTN_RADIUS, BTN_RADIUS),
+    )
+    .into_styled(
+        PrimitiveStyleBuilder::new()
+            .stroke_color(MUTED)
+            .stroke_width(2)
+            .stroke_alignment(StrokeAlignment::Inside)
+            .build(),
+    )
+    .draw(t)?;
+    text(
+        t,
+        "Continue without PIN",
+        center(ONBOARD_SKIP_RECT),
+        Role::Body,
+        MUTED,
     )
 }
 
@@ -1263,12 +1326,16 @@ where
         true,
         true,
     )?;
+    // No trailing caption: a right-aligned hint here is laid out first and the label is
+    // clipped to what's left, and "Protect mgmt key" is wide enough that any meaningful
+    // caption ("random, PIN-unlocked" was 159 px) ellipsised the label to nothing. The
+    // random / PIN-unlocked consequence is stated in full on the confirm screen instead.
     row_body(
         t,
         crate::row_rect(PIV_KEYGEN_PICK_TOP, 3),
         Glyph::Shield,
         "Protect mgmt key",
-        Some(("random, PIN-unlocked", theme::CAPTION)),
+        None,
         true,
         true,
     )?;
@@ -4316,6 +4383,15 @@ mod tests {
     }
 
     #[test]
+    fn scope_pin_titles_fit_static() {
+        // The credential-scope titles the firmware now shows on every PIN screen
+        // must fit the band so the scope reads statically (never marquees away).
+        for t in ["Device PIN", "FIDO PIN", "PIV PIN", "PIV PUK"] {
+            assert!(!pin_title_overflows(t), "{t} should fit the title band");
+        }
+    }
+
+    #[test]
     fn pin_marquee_never_touches_chevron_or_lock() {
         let mut d = Rec::new();
         render_pin_title(&mut d, "OpenPGP Sign PIN", 0).unwrap();
@@ -4653,6 +4729,51 @@ mod tests {
     /// cancel chevron in `PK_BACK_RECT` (both in the decline colour) — exactly the
     /// regions `hit_del_hold` / `hit_pk_back` map a tap to — with the rp + account on
     /// screen so the user sees what they are removing.
+    #[test]
+    fn onboard_paints_buttons_in_their_hit_rects() {
+        let mut d = Rec::new();
+        render(&mut d, &Screen::Onboard).unwrap();
+        assert!(!d.oob, "onboard drew outside the panel");
+        // The primary Set-a-PIN button is filled in its hit rect; the secondary
+        // Continue-without is a muted outline in its own rect — the two regions
+        // `hit_onboard` maps a tap to.
+        assert!(
+            has_color(&d, crate::ONBOARD_SET_RECT, theme::ACCENT_FILL),
+            "Set-a-PIN button not in its rect"
+        );
+        assert!(
+            has_color(&d, crate::ONBOARD_SKIP_RECT, theme::MUTED),
+            "Continue-without outline not in its rect"
+        );
+    }
+
+    #[test]
+    fn onboard_button_labels_fit_their_buttons() {
+        // Both captions are centred inside their button rect; the long secondary one
+        // must fit so it never overruns the button or clips.
+        assert!(
+            font::width("Set a PIN", Role::Strong).unwrap() <= crate::ONBOARD_SET_RECT.w as u32
+        );
+        assert!(
+            font::width("Continue without PIN", Role::Body).unwrap()
+                <= crate::ONBOARD_SKIP_RECT.w as u32
+        );
+    }
+
+    #[test]
+    fn onboard_body_text_clears_the_set_button() {
+        // The body lines sit above the primary button; the strip just above the button must
+        // stay background — a body line that descends into it overlaps "Set a PIN" (the
+        // reported bug). 6 px is wider than the Body font's descent.
+        let mut d = Rec::new();
+        render(&mut d, &Screen::Onboard).unwrap();
+        let gap = Rect::new(0, crate::ONBOARD_SET_RECT.y - 6, PANEL_W, 6);
+        assert!(
+            !d.any_non_bg_in(gap),
+            "onboard body text overlaps the Set-a-PIN button"
+        );
+    }
+
     #[test]
     fn confirm_delete_paints_hold_and_cancel_in_their_hit_rects() {
         let rp = Label::clamp(b"github.com");
@@ -5137,6 +5258,38 @@ mod tests {
             assert!(
                 d.any_non_bg_in(crate::row_rect(PIV_KEYGEN_PICK_TOP, i)),
                 "PIV PIN menu row {i} unpainted"
+            );
+        }
+    }
+
+    /// Each PIV-PIN-menu row's full label must fit the width [`row_body`] leaves after it
+    /// lays out the (right-aligned) trailing caption + chevron — else the label is ellipsised
+    /// to nothing while only the caption shows (the "Protect mgmt key" regression: a 159 px
+    /// caption left its 128 px label 1 px). Mirrors `row_body`'s geometry; the row table must
+    /// match [`render_piv_pin_menu`].
+    #[test]
+    fn piv_pin_menu_labels_fit_beside_their_captions() {
+        let r0 = crate::row_rect(PIV_KEYGEN_PICK_TOP, 0);
+        let (row_x, row_w) = (r0.x as i32, r0.w as i32);
+        // (label, trailing caption) — must mirror render_piv_pin_menu.
+        let rows: [(&str, Option<&str>); 4] = [
+            ("Change PIN", None),
+            ("Change PUK", None),
+            ("Unblock PIN", Some("with PUK")),
+            ("Protect mgmt key", None),
+        ];
+        for (label, cap) in rows {
+            let label_x = row_x + 28; // row_body's label inset
+            let mut right = row_x + row_w - 8 - 12; // row edge, minus the chevron these rows draw
+            right -= match cap {
+                Some(c) => 4 + font::width(c, Role::Body).unwrap() as i32 + ROW_TRAILING_GAP,
+                None => ROW_TRAILING_GAP,
+            };
+            let avail = right - label_x;
+            let lw = font::width(label, Role::Body).unwrap() as i32;
+            assert!(
+                lw <= avail,
+                "PIV PIN menu label '{label}' ({lw} px) clipped to {avail} px by its caption"
             );
         }
     }

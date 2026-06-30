@@ -228,6 +228,53 @@ pub fn hit_confirm(p: Point) -> Option<Button> {
     }
 }
 
+/// The first-run onboarding choice on the [`Screen::Onboard`] screen: set a device
+/// PIN now, or continue without one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OnboardChoice {
+    /// Open the on-screen PIN set flow.
+    SetPin,
+    /// Continue without a device PIN (a deliberate, remembered choice).
+    Skip,
+}
+
+/// Onboarding button geometry: two full-width stacked buttons, so the long
+/// "Continue without PIN" label fits without scrolling. The primary **Set a PIN**
+/// sits above the secondary **Skip**, which shares the bottom band the confirm
+/// screens use ([`BTN_BAND_TOP`]). A tap outside both selects nothing.
+const ONBOARD_BTN_W: u16 = PANEL_W - 2 * BTN_SIDE;
+/// Vertical gap between the two stacked onboarding buttons.
+const ONBOARD_BTN_GAP: u16 = 12;
+/// **Set a PIN** (primary, filled): one row above the bottom band.
+pub const ONBOARD_SET_RECT: Rect = Rect::new(
+    BTN_SIDE,
+    BTN_BAND_TOP - BTN_H - ONBOARD_BTN_GAP,
+    ONBOARD_BTN_W,
+    BTN_H,
+);
+/// **Continue without PIN** (secondary, outlined): the bottom band.
+pub const ONBOARD_SKIP_RECT: Rect = Rect::new(BTN_SIDE, BTN_BAND_TOP, ONBOARD_BTN_W, BTN_H);
+
+// Compile-time layout invariants: the two stacked buttons are disjoint with a real
+// gap, and both sit fully inside the panel.
+const _: () = {
+    assert!(ONBOARD_SET_RECT.y + ONBOARD_SET_RECT.h < ONBOARD_SKIP_RECT.y);
+    assert!(ONBOARD_SKIP_RECT.y + ONBOARD_SKIP_RECT.h < PANEL_H);
+    assert!(ONBOARD_SET_RECT.x > 0 && ONBOARD_SET_RECT.x + ONBOARD_SET_RECT.w < PANEL_W);
+};
+
+/// Which onboarding button, if any, a tap at `p` selects. The two rectangles are
+/// disjoint by construction, so at most one matches; a tap elsewhere returns `None`.
+pub fn hit_onboard(p: Point) -> Option<OnboardChoice> {
+    if ONBOARD_SET_RECT.contains(p) {
+        Some(OnboardChoice::SetPin)
+    } else if ONBOARD_SKIP_RECT.contains(p) {
+        Some(OnboardChoice::Skip)
+    } else {
+        None
+    }
+}
+
 // --- PIN pad (built-in user verification) ----------------------------------
 
 /// A key on the on-screen numeric PIN pad (the trusted-display built-in-UV input).
@@ -1600,6 +1647,10 @@ pub enum Screen {
     /// whole screen is the unlock affordance (any tap starts the on-screen PIN entry).
     /// Gates only the on-device UI — host CTAP ceremonies are unaffected.
     Locked,
+    /// The first-run onboarding prompt shown on a fresh, PIN-less device: offers to
+    /// set a device PIN ([`ONBOARD_SET_RECT`]) or continue without one
+    /// ([`ONBOARD_SKIP_RECT`], a remembered choice). Host ceremonies paint over it.
+    Onboard,
     /// The Home tab — status indicator + bottom nav.
     Home(HomeView),
     /// A pending trusted Deny / Hold-to-approve decision.
@@ -1826,6 +1877,25 @@ mod tests {
         let allow_c = Point::new(ALLOW_RECT.x + ALLOW_RECT.w / 2, ALLOW_RECT.y + BTN_H / 2);
         assert_eq!(hit_confirm(deny_c), Some(Button::Deny));
         assert_eq!(hit_confirm(allow_c), Some(Button::Allow));
+    }
+
+    #[test]
+    fn hit_onboard_maps_each_stacked_button() {
+        let set_c = Point::new(
+            ONBOARD_SET_RECT.x + ONBOARD_SET_RECT.w / 2,
+            ONBOARD_SET_RECT.y + ONBOARD_SET_RECT.h / 2,
+        );
+        let skip_c = Point::new(
+            ONBOARD_SKIP_RECT.x + ONBOARD_SKIP_RECT.w / 2,
+            ONBOARD_SKIP_RECT.y + ONBOARD_SKIP_RECT.h / 2,
+        );
+        assert_eq!(hit_onboard(set_c), Some(OnboardChoice::SetPin));
+        assert_eq!(hit_onboard(skip_c), Some(OnboardChoice::Skip));
+        // The gap between the two stacked buttons selects nothing.
+        let gap_y = ONBOARD_SET_RECT.y + ONBOARD_SET_RECT.h + 2;
+        assert_eq!(hit_onboard(Point::new(PANEL_W / 2, gap_y)), None);
+        // Above the prompt's button area, too.
+        assert_eq!(hit_onboard(Point::new(PANEL_W / 2, 0)), None);
     }
 
     #[test]
