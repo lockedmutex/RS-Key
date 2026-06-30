@@ -144,6 +144,15 @@ fn note_activity() {
     LAST_ACTIVITY_MS.store(Instant::now().as_millis() as u32, Ordering::Relaxed);
 }
 
+/// Persisted display-settings record: the backlight level and display-sleep timeout
+/// edited in Settings → Display, read at boot ([`Ui::build`]) and rewritten on
+/// Settings exit ([`Ui::persist_settings`]) so they survive a reboot. In the system
+/// config FID range next to `EF_PHY` (`0xE020`) / `EF_META`, outside every applet's
+/// reset scope; not reachable by any host APDU. The touch timeout is *not* here — it
+/// rides `EF_PHY`'s `PresenceTimeout` tag, the same record `rsk hw --touch-timeout`
+/// writes (see [`rsk_ui::DisplayConfig`]).
+const EF_DISPLAY: u16 = 0xE030;
+
 /// Device identity shown read-only on the settings Firmware screen + its list row.
 pub struct DeviceInfo {
     /// bcdDevice firmware build counter.
@@ -426,9 +435,23 @@ impl Ui {
             .unwrap();
 
         let _ = rsk_ui::render(&mut panel, &Screen::Splash);
-        // Backlight up to full only now there is something to show (it was built at
-        // zero duty, so the panel stayed dark through init — no white flash).
-        bl.set_config(&backlight_cfg(level_duty(BRIGHTNESS_LEVELS)));
+
+        // Restore the persisted display settings before lighting the panel, so it
+        // comes up at the saved brightness (no full-bright flash then dim) and the
+        // saved sleep timeout. Absent (fresh device) keeps the live defaults.
+        let mut dcfg = rsk_ui::DisplayConfig::default();
+        {
+            let mut buf = [0u8; rsk_ui::DISPLAY_CONF_LEN];
+            if let Some(n) = fs.borrow_mut().read(EF_DISPLAY, &mut buf) {
+                dcfg.apply_block(&buf[..n.min(buf.len())]);
+            }
+        }
+        SLEEP_TIMEOUT_MS.store(dcfg.sleep_secs as u32 * 1000, Ordering::Relaxed);
+        let brightness = dcfg.brightness.clamp(1, BRIGHTNESS_LEVELS);
+
+        // Backlight up to the saved level only now there is something to show (it was
+        // built at zero duty, so the panel stayed dark through init — no white flash).
+        bl.set_config(&backlight_cfg(level_duty(brightness)));
 
         // CST328 reset pulse (high → low → high), then normal reporting mode.
         tp_rst.set_high();
@@ -452,7 +475,7 @@ impl Ui {
             tp_rst,
             shown: None,
             info,
-            brightness: BRIGHTNESS_LEVELS,
+            brightness,
             asleep: false,
             wake_btn,
             locked,
@@ -666,6 +689,11 @@ impl Ui {
         let mut last = Instant::now();
         let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
 
+        // Track whether the user actually changed a knob, so the persist on exit is one
+        // flash write per editing session (on every exit path), not one per −/+ tap.
+        let mut display_dirty = false;
+        let mut presence_dirty = false;
+
         let next = loop {
             // The power button sleeps from inside the menu too, not just on Home.
             if self.sleep_button_pressed() {
@@ -756,23 +784,27 @@ impl Ui {
                     }
                     SettingsPage::Brightness => match rsk_ui::hit_adjust(p) {
                         Some(AdjustKey::Minus) => {
-                            self.set_brightness(rsk_ui::step_brightness(self.brightness, -1))
+                            let was = self.brightness;
+                            self.set_brightness(rsk_ui::step_brightness(self.brightness, -1));
+                            display_dirty |= self.brightness != was;
                         }
                         Some(AdjustKey::Plus) => {
-                            self.set_brightness(rsk_ui::step_brightness(self.brightness, 1))
+                            let was = self.brightness;
+                            self.set_brightness(rsk_ui::step_brightness(self.brightness, 1));
+                            display_dirty |= self.brightness != was;
                         }
                         Some(AdjustKey::Back) => page = SettingsPage::Display,
                         None => repaint = false,
                     },
                     SettingsPage::Timeout => match rsk_ui::hit_adjust(p) {
-                        Some(AdjustKey::Minus) => adjust_timeout(-1),
-                        Some(AdjustKey::Plus) => adjust_timeout(1),
+                        Some(AdjustKey::Minus) => presence_dirty |= adjust_timeout(-1),
+                        Some(AdjustKey::Plus) => presence_dirty |= adjust_timeout(1),
                         Some(AdjustKey::Back) => page = SettingsPage::Display,
                         None => repaint = false,
                     },
                     SettingsPage::Sleep => match rsk_ui::hit_adjust(p) {
-                        Some(AdjustKey::Minus) => adjust_sleep(-1),
-                        Some(AdjustKey::Plus) => adjust_sleep(1),
+                        Some(AdjustKey::Minus) => display_dirty |= adjust_sleep(-1),
+                        Some(AdjustKey::Plus) => display_dirty |= adjust_sleep(1),
                         Some(AdjustKey::Back) => page = SettingsPage::Display,
                         None => repaint = false,
                     },
@@ -797,8 +829,36 @@ impl Ui {
             block_for(Duration::from_millis(TOUCH_POLL_MS));
         };
 
+        self.persist_settings(display_dirty, presence_dirty);
         self.end_modal();
         next
+    }
+
+    /// Persist the display settings the user edited so they survive a reboot. Called
+    /// once on Settings exit (every exit path — Back, a tab switch, the inactivity
+    /// timeout, the power button), not per −/+ tap, so a tweak costs one flash write
+    /// rather than one per step. Brightness + display-sleep live in `EF_DISPLAY`; the
+    /// touch timeout shares `EF_PHY`'s `PresenceTimeout` tag with
+    /// `rsk hw --touch-timeout`, so it is read-modify-written there (preserving the
+    /// other phy fields) to keep a single source of truth — last writer wins, and an
+    /// on-panel edit snaps to the menu's choices, so it overwrites a custom value a
+    /// host set. Synchronous, like the other display-task flash writes — the worker is
+    /// parked while this runs.
+    fn persist_settings(&mut self, save_display: bool, save_presence: bool) {
+        if save_display {
+            let cfg = rsk_ui::DisplayConfig {
+                brightness: self.brightness,
+                sleep_secs: (SLEEP_TIMEOUT_MS.load(Ordering::Relaxed) / 1000) as u16,
+            };
+            let _ = self.fs.borrow_mut().put(EF_DISPLAY, &cfg.encode());
+        }
+        if save_presence {
+            let secs = (PRESENCE_TIMEOUT_MS.load(Ordering::Relaxed) / 1000) as u8;
+            let mut fs = self.fs.borrow_mut();
+            let mut phy = rsk_rescue::phy::load(&mut fs).unwrap_or_default();
+            phy.presence_timeout = Some(secs);
+            let _ = rsk_rescue::phy::save(&mut fs, &phy);
+        }
     }
 
     /// Hand the panel back to the ambient loop on a modal's exit. Closing a tab back to
@@ -2899,19 +2959,25 @@ impl Ui {
 }
 
 /// Step the live presence/touch timeout to the next/previous menu choice and store
-/// it (the seconds → ms atomic the waits read). Runtime-only: a reboot re-seeds it
-/// from the phy record, so persisting it across boots is a later, flash-format change.
-fn adjust_timeout(delta: i8) {
+/// it (the seconds → ms atomic the waits read). [`Ui::persist_settings`] writes the
+/// new value back to the phy record's `PresenceTimeout` tag on Settings exit, so it
+/// survives a reboot (the same tag `rsk hw --touch-timeout` and boot both read).
+/// Returns whether the value actually changed, so a no-op tap at a clamp boundary
+/// doesn't mark the session dirty (and thus doesn't trigger a redundant flash write).
+fn adjust_timeout(delta: i8) -> bool {
     let cur = (PRESENCE_TIMEOUT_MS.load(Ordering::Relaxed) / 1000) as u16;
     let next = rsk_ui::step_timeout(cur, delta);
     PRESENCE_TIMEOUT_MS.store(next as u32 * 1000, Ordering::Relaxed);
+    next != cur
 }
 
 /// Step the display-sleep timeout from the menu (−/+). `0` seconds = Off (never blanks).
-fn adjust_sleep(delta: i8) {
+/// Returns whether the value actually changed (see [`adjust_timeout`]).
+fn adjust_sleep(delta: i8) -> bool {
     let cur = (SLEEP_TIMEOUT_MS.load(Ordering::Relaxed) / 1000) as u16;
     let next = rsk_ui::step_sleep(cur, delta);
     SLEEP_TIMEOUT_MS.store(next as u32 * 1000, Ordering::Relaxed);
+    next != cur
 }
 
 /// Map the LED status engine's index ([`led::status`]) onto the on-screen status,

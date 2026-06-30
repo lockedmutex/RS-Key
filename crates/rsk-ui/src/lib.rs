@@ -19,6 +19,7 @@
 pub mod font;
 pub mod glyph;
 pub mod render;
+pub mod settings_store;
 pub mod theme;
 pub mod touch;
 pub use glyph::Glyph;
@@ -34,6 +35,7 @@ pub use render::{
     render_seal_confirm, render_seed_phrase, render_service, render_share_picker,
     render_slip39_share, render_status_arc, render_success, render_success_circle,
 };
+pub use settings_store::{CONF_LEN as DISPLAY_CONF_LEN, DisplayConfig};
 
 /// Panel geometry (Waveshare RP2350-Touch-LCD-2.8, ST7789T3, portrait).
 pub const PANEL_W: u16 = 240;

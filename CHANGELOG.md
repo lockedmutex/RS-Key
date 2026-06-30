@@ -15,6 +15,18 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Added
 
+- **Trusted-display: the brightness, display-sleep and touch-timeout settings persist across
+  reboots.** Edits made in Settings → Display used to reset to their defaults on the next power
+  cycle; they now survive it. Brightness and the display-sleep timeout are stored in a new
+  `EF_DISPLAY` flash record (a 3-byte block — `[brightness, sleep_secs]` — with a pure,
+  host-tested + Kani-proved codec in `rsk-ui`, read at boot so the panel comes up at the saved
+  brightness with no full-bright flash). The touch timeout is written back to `EF_PHY`'s
+  existing `PresenceTimeout` tag — the same field `rsk hw --touch-timeout` and the boot path
+  already read and write — so there is one source of truth (last writer wins; an on-panel edit
+  snaps to the menu's choices). The record is rewritten once when you leave Settings (not per −/+
+  tap, and only when a value actually changed), and an older/newer record loads
+  forward-compatibly. bcdDevice 0x07C8 → 0x07C9.
+
 - **Trusted-display: the on-device keygen spinner animates during the RSA prime search.** The
   *Generating…* screen's indicator arc now spins while an on-device RSA key is generated, so it
   reads as actively working rather than hung — important for RSA-4096, whose search can take a
