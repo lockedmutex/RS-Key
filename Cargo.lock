@@ -2162,6 +2162,7 @@ dependencies = [
 name = "rsk-piv"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
  "p256",
  "p384",
  "rsa",
@@ -2171,6 +2172,7 @@ dependencies = [
  "rsk-openpgp",
  "rsk-sdk",
  "sha2",
+ "x25519-dalek",
  "x509-parser",
  "zeroize",
 ]

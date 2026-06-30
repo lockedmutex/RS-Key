@@ -8,6 +8,7 @@
 //! key bytes are sealed and never surfaced; the public point is *not* read (that
 //! is the management-key-gated GET METADATA path, deliberately out of scope).
 
+use rsa::RsaPrivateKey;
 use rsk_crypto::Device;
 use rsk_fs::{Fs, Storage};
 use rsk_openpgp::Rng;
@@ -85,6 +86,7 @@ pub fn algo_name(algo: u8) -> &'static str {
         ALGO_RSA4096 => "RSA 4096",
         ALGO_ECCP256 => "NIST P-256",
         ALGO_ECCP384 => "NIST P-384",
+        ALGO_ED25519 => "Ed25519",
         ALGO_X25519 => "X25519",
         ALGO_3DES => "3DES",
         ALGO_AES128 => "AES-128",
@@ -185,12 +187,12 @@ pub fn next_free_retired<S: Storage>(fs: &mut Fs<S>) -> Option<u8> {
     (0x82u8..=0x95).find(|&slot| !fs.has_key(key_fid(slot)))
 }
 
-/// Generate an EC key on-device into an empty retired slot. Physical presence at the
-/// trusted display authorises it (no management-key auth, unlike the host GENERATE),
-/// and it is restricted to retired slots that hold no key — so it can only *add* a
-/// key, never overwrite one. EC only (P-256 / P-384); RSA stays USB-only. Writes the
-/// sealed key, a self-signed certificate and the metadata, so the slot then looks
-/// exactly like a host-generated one.
+/// Generate an instant (EC / Ed25519 / X25519) key on-device into an empty retired slot.
+/// Physical presence at the trusted display authorises it (no management-key auth, unlike
+/// the host GENERATE), and it is restricted to retired slots that hold no key — so it can
+/// only *add* a key, never overwrite one. Writes the sealed key, a self-signed certificate
+/// (none for X25519) and the metadata, so the slot then looks exactly like a host-generated
+/// one. RSA goes through [`store_retired_rsa`] (its prime search runs in the firmware).
 pub fn generate_slot_key<S: Storage>(
     dev: &Device,
     fs: &mut Fs<S>,
@@ -199,6 +201,20 @@ pub fn generate_slot_key<S: Storage>(
     algo: u8,
 ) -> Result<(), Sw> {
     crate::keygen::generate_retired_ec(dev, fs, rng, slot, algo)
+}
+
+/// Persist a firmware-generated RSA key on-device into an empty retired slot — the RSA
+/// companion to [`generate_slot_key`]. Same empty-retired-slot fence and the same writes
+/// (sealed key, self-signed cert, metadata); the slow dual-core prime search runs in the
+/// firmware before this is called, so the key arrives ready to store.
+pub fn store_retired_rsa<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    rng: &mut dyn Rng,
+    slot: u8,
+    key: &RsaPrivateKey,
+) -> Result<(), Sw> {
+    crate::keygen::store_retired_rsa(dev, fs, rng, slot, key)
 }
 
 /// Read the public state of the PIV applet for the trusted display.

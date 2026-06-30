@@ -70,6 +70,10 @@ const TOUCH_POLL_MS: u64 = 16;
 /// Status-spinner arc step per ~100ms status-loop tick (≈1.5s per revolution — the
 /// design's ~1.4s request spinner).
 const SPIN_STEP_DEG: i32 = 24;
+/// Repaint cadence for the on-device keygen spinner. The hook fires far more often than this
+/// (once per prime candidate); time-gating to ~100ms keeps the panel repaint off the keygen's
+/// hot path so the search isn't slowed by SPI traffic.
+const KEYGEN_SPIN_MS: u64 = 100;
 /// The locked-hint breathe advances one shade every this many ~100ms status-loop ticks, so
 /// the 8-shade ramp cycles in ~2.4s (the design's breathe period).
 const BREATHE_TICKS: u32 = 3;
@@ -1483,33 +1487,74 @@ impl Ui {
         if !self.local_pin_gate("Enter PIN", PinScope::Device) {
             return;
         }
-        // Algorithm chooser (EC only).
-        let _ = rsk_ui::render_piv_keygen_pick(&mut self.panel, slot);
-        self.shown = None;
-        self.touch.wait_release(Instant::now(), idle_limit);
-        let mut last = Instant::now();
+        // Algorithm chooser: the curves are instant; the RSA row drills into a size
+        // sub-picker (2048/3072/4096), each run by the firmware's dual-core prime search.
         let algo = loop {
-            if self.sleep_button_pressed() {
-                return;
-            }
-            if let Some(p) = self.touch.read() {
-                last = Instant::now();
-                if rsk_ui::hit_title_back(p) {
+            let _ = rsk_ui::render_piv_keygen_pick(&mut self.panel, slot);
+            self.shown = None;
+            self.touch.wait_release(Instant::now(), idle_limit);
+            let mut last = Instant::now();
+            // `None` selects the RSA row (open the size sub-picker); `Some` is a concrete algo.
+            let main_pick = loop {
+                if self.sleep_button_pressed() {
                     return;
                 }
-                if let Some(i) = rsk_ui::hit_list(p, rsk_ui::PIV_KEYGEN_PICK_TOP, 2) {
-                    break if i == 0 {
-                        (rsk_piv::files::ALGO_ECCP256, "NIST P-256")
-                    } else {
-                        (rsk_piv::files::ALGO_ECCP384, "NIST P-384")
-                    };
+                if let Some(p) = self.touch.read() {
+                    last = Instant::now();
+                    if rsk_ui::hit_title_back(p) {
+                        return;
+                    }
+                    if let Some(i) = rsk_ui::hit_list(p, rsk_ui::PIV_KEYGEN_PICK_TOP, 5) {
+                        break match i {
+                            0 => Some((rsk_piv::files::ALGO_ECCP256, "NIST P-256")),
+                            1 => Some((rsk_piv::files::ALGO_ECCP384, "NIST P-384")),
+                            2 => Some((rsk_piv::files::ALGO_ED25519, "Ed25519")),
+                            3 => Some((rsk_piv::files::ALGO_X25519, "X25519")),
+                            _ => None,
+                        };
+                    }
+                    self.touch.wait_release(last, idle_limit);
                 }
-                self.touch.wait_release(last, idle_limit);
+                if crate::worker::host_request_pending() || last.elapsed() >= idle_limit {
+                    return;
+                }
+                block_for(Duration::from_millis(TOUCH_POLL_MS));
+            };
+            if let Some(a) = main_pick {
+                break a;
             }
-            if crate::worker::host_request_pending() || last.elapsed() >= idle_limit {
-                return;
+            // RSA size sub-picker; its back chevron returns to the main chooser.
+            let _ = rsk_ui::render_piv_keygen_rsa_pick(&mut self.panel, slot);
+            self.shown = None;
+            self.touch.wait_release(Instant::now(), idle_limit);
+            let mut last = Instant::now();
+            let sub_pick = loop {
+                if self.sleep_button_pressed() {
+                    return;
+                }
+                if let Some(p) = self.touch.read() {
+                    last = Instant::now();
+                    if rsk_ui::hit_title_back(p) {
+                        break None;
+                    }
+                    if let Some(i) = rsk_ui::hit_list(p, rsk_ui::PIV_KEYGEN_PICK_TOP, 3) {
+                        break Some(match i {
+                            0 => (rsk_piv::files::ALGO_RSA2048, "RSA 2048"),
+                            1 => (rsk_piv::files::ALGO_RSA3072, "RSA 3072"),
+                            _ => (rsk_piv::files::ALGO_RSA4096, "RSA 4096"),
+                        });
+                    }
+                    self.touch.wait_release(last, idle_limit);
+                }
+                if crate::worker::host_request_pending() || last.elapsed() >= idle_limit {
+                    return;
+                }
+                block_for(Duration::from_millis(TOUCH_POLL_MS));
+            };
+            if let Some(a) = sub_pick {
+                break a;
             }
-            block_for(Duration::from_millis(TOUCH_POLL_MS));
+            // Otherwise the user backed out of the sub-picker — re-show the main chooser.
         };
         // A deliberate hold before the write.
         let _ = rsk_ui::render_piv_keygen_confirm(&mut self.panel, slot, algo.1);
@@ -1518,10 +1563,54 @@ impl Ui {
         if !self.hold_to_confirm("Hold to generate", rsk_ui::theme::ACCENT_FILL) {
             return;
         }
-        // EC keygen + seal is synchronous (no await), so the dev/rng/fs borrows are safe to
-        // hold across it; the worker can't run until this returns. Re-target the free slot
-        // under the same borrow in case state moved while the chooser was open.
-        let ok = {
+        // The keygen + seal holds the dev/rng/fs borrows across a synchronous, no-await
+        // span, so the worker can't preempt and the borrows stay safe. The free slot is
+        // re-checked under the borrow in case state moved while the chooser was open.
+        let rsa_nbits = match algo.0 {
+            rsk_piv::files::ALGO_RSA2048 => Some(2048usize),
+            rsk_piv::files::ALGO_RSA3072 => Some(3072),
+            rsk_piv::files::ALGO_RSA4096 => Some(4096),
+            _ => None,
+        };
+        let ok = if let Some(nbits) = rsa_nbits {
+            // RSA's prime search is slow (seconds for 2048, up to minutes for 4096): paint a
+            // "generating" screen, then run it dual-core. The search is a blocking busy-loop
+            // (no await), so the panel can't repaint on its own — instead the search's per-
+            // candidate hook spins the indicator arc (throttled to KEYGEN_SPIN_MS) so it reads
+            // as actively working, not hung. USB + CCID keepalives stay interrupt-driven.
+            let _ = rsk_ui::render_piv_keygen_working(&mut self.panel);
+            self.shown = None;
+            let key = {
+                let mut rng = self.rng.borrow_mut();
+                let panel = &mut self.panel;
+                let mut spin = rsk_ui::STATUS_ARC_START;
+                let mut last_paint = Instant::now();
+                let mut tick = || {
+                    if last_paint.elapsed() >= Duration::from_millis(KEYGEN_SPIN_MS) {
+                        spin = spin.wrapping_add(SPIN_STEP_DEG);
+                        let _ = rsk_ui::render_status_arc(panel, StatusKind::Processing, spin);
+                        last_paint = Instant::now();
+                    }
+                };
+                crate::core1::run_rsa_search_progress(nbits, &mut *rng, &mut tick)
+            };
+            match key {
+                Some(key) => {
+                    let dev = self.keys.device();
+                    let mut rng = self.rng.borrow_mut();
+                    let mut fs = self.fs.borrow_mut();
+                    match rsk_piv::info::next_free_retired(&mut fs) {
+                        Some(s) => {
+                            rsk_piv::info::store_retired_rsa(&dev, &mut fs, &mut *rng, s, &key)
+                                .is_ok()
+                        }
+                        None => false,
+                    }
+                }
+                None => false,
+            }
+        } else {
+            // EC / Ed25519 / X25519 are instant.
             let dev = self.keys.device();
             let mut rng = self.rng.borrow_mut();
             let mut fs = self.fs.borrow_mut();

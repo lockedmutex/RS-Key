@@ -15,6 +15,40 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Added
 
+- **Trusted-display: the on-device keygen spinner animates during the RSA prime search.** The
+  *Generating…* screen's indicator arc now spins while an on-device RSA key is generated, so it
+  reads as actively working rather than hung — important for RSA-4096, whose search can take a
+  minute-plus. The search is a blocking dual-core busy-loop that owns the core, so the panel
+  can't repaint from a loop; instead a new `run_rsa_search_progress` hook (invoked once per prime
+  candidate, off the keygen state) drives the arc, throttled to ~100 ms so the SPI repaints don't
+  slow the search. bcdDevice 0x07C6 → 0x07C7.
+
+- **PIV: RSA-3072 and RSA-4096 keys, including on-device generation (display builds).** PIV gained
+  RSA-3072/4096 across generate, import, sign/decrypt, attestation and metadata — the applet's
+  buffers were lifted off their long-standing RSA-2048 ceiling (the at-rest seal, the on-card
+  X.509 builder, the GENERAL AUTHENTICATE and metadata paths). On the trusted display, the
+  on-device **Generate key** chooser (PIV → Retired & F9) now offers RSA via a size sub-picker
+  (**2048 / 3072 / 4096**) alongside the four curves. RSA runs the firmware's **dual-core** prime
+  search (the same one the USB GENERATE uses) behind a *Generating…* screen — the panel freezes
+  while it runs (a few seconds for 2048, up to a minute-plus for 4096) with USB / CCID keepalives
+  still flowing on interrupts. Same authorisation and fence as the curve path: device PIN (when
+  set) + a deliberate hold, empty retired slots only (add a key, never overwrite), self-signed
+  cert + sealed key written exactly as a host GENERATE. RSA-1024 (weak / FIPS-disabled) is still
+  not offered on-device. bcdDevice 0x07C4 → 0x07C6.
+
+- **PIV: Ed25519 and X25519 keys (algorithm ids `0xE0` / `0xE1`, Yubico 5.7 PIV).** The PIV
+  applet now generates, imports and uses Curve25519 keys alongside RSA and the NIST curves.
+  **GENERATE** mints an Ed25519 key with an RFC 8410 self-signed certificate (id-Ed25519 SPKI,
+  PureEdDSA over the TBS); X25519 is key-agreement-only and cannot self-sign, so it is stored
+  with no auto-certificate (a host/CA provisions one later via PUT DATA). **GENERAL
+  AUTHENTICATE** signs with Ed25519 (the raw message, bare 64-byte signature) and performs
+  X25519 key agreement (`ykman piv calculate-secret`); **IMPORT** accepts the raw 32-byte
+  seed / scalar (yubikit tags `0x07` / `0x08`); **GET METADATA** and attestation cover both.
+  Interoperates with `ykman`. The same curves are offered by the on-device **Generate key**
+  chooser on display builds (four rows now: P-256 / P-384 / Ed25519 / X25519). EdDSA is FIPS
+  186-5-approved and X25519 is widely deployed, so the `fips-profile` does not restrict either.
+  No proprietary wire change (standard NIST SP 800-73 / Yubico PIV). bcdDevice 0x07C3 → 0x07C4.
+
 - **Trusted-display applet detail screens — OATH / OpenPGP / PIV, plus on-device PIV key
   generation (display builds).** The applet hub gained the detail screens that the overviews
   only hinted at. **OATH:** each credential row now drills into a detail showing its type

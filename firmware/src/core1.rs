@@ -252,6 +252,21 @@ fn search(job: &Job) {
 /// returns. `None` is the old `RsaStep::Failed`: an unusable size / failed
 /// modexp self-test, or key assembly failure.
 pub fn run_rsa_search(nbits: usize, rng: &mut dyn Rng) -> Option<Box<RsaPrivateKey>> {
+    run_rsa_search_progress(nbits, rng, &mut || {})
+}
+
+/// As [`run_rsa_search`], with an `on_tick` hook invoked once at the top of every
+/// search iteration. It is a pure observation point (it never touches the keygen,
+/// the core1 mailbox, or `rng`), so the trusted display can spin its "generating"
+/// indicator from it while the search blocks the panel — the only way to animate,
+/// since the search owns this core. The hook must time-gate its own work: it runs
+/// on the keygen's hot path, so anything expensive (a panel repaint) slows the
+/// search if not throttled.
+pub fn run_rsa_search_progress(
+    nbits: usize,
+    rng: &mut dyn Rng,
+    on_tick: &mut dyn FnMut(),
+) -> Option<Box<RsaPrivateKey>> {
     let mut kg = RsaKeygen::new(nbits);
     if !kg.usable() {
         return None;
@@ -312,6 +327,8 @@ pub fn run_rsa_search(nbits: usize, rng: &mut dyn Rng) -> Option<Box<RsaPrivateK
     // `Some(Some(key))` = assembled, `Some(None)` = the old `Failed`.
     let mut outcome: Option<Option<Box<RsaPrivateKey>>> = None;
     while outcome.is_none() {
+        // Observation hook (display spinner); time-gated by the caller, off the keygen state.
+        on_tick();
         // Core1's finds first (cheap to drain)…
         let mut batch = MAILBOX.lock(|mb| {
             let mut mb = mb.borrow_mut();

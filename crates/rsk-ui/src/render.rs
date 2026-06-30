@@ -1069,15 +1069,9 @@ where
     for (i, r) in rows.iter().enumerate() {
         let rect = crate::row_rect(PK_LIST_TOP, i as u16);
         if r.generate {
-            row_body(
-                t,
-                rect,
-                Glyph::Key,
-                "Generate key",
-                Some(("EC", theme::ACCENT_TEXT)),
-                true,
-                true,
-            )?;
+            // No algorithm badge: the action now offers EC / Ed25519 / X25519 / RSA, picked on
+            // the next screen — any single-algo label here (it used to read "EC") would mislead.
+            row_body(t, rect, Glyph::Key, "Generate key", None, true, true)?;
             continue;
         }
         let (icon, label) = if r.slot == 0xF9 {
@@ -1101,8 +1095,10 @@ where
 }
 
 /// The on-device key-generate algorithm chooser (back-only): a one-line caption naming the
-/// target retired slot over a two-row list of EC curves (P-256 / P-384). RSA is not offered
-/// on-device — its dual-core prime search would block the panel.
+/// target retired slot over a five-row list (P-256 / P-384 / Ed25519 / X25519 / RSA). The curves
+/// are instant; the **RSA** row drills into [`render_piv_keygen_rsa_pick`] (2048 / 3072 / 4096),
+/// each of which runs a slow dual-core prime search behind a "generating" screen. RSA-1024 (weak)
+/// is not offered.
 pub fn render_piv_keygen_pick<D>(t: &mut D, slot: u8) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb565>,
@@ -1118,7 +1114,7 @@ where
         Role::Body,
         theme::MUTED,
     )?;
-    group_card(t, PIV_KEYGEN_PICK_TOP, 2)?;
+    group_card(t, PIV_KEYGEN_PICK_TOP, 5)?;
     row_body(
         t,
         crate::row_rect(PIV_KEYGEN_PICK_TOP, 0),
@@ -1137,9 +1133,91 @@ where
         true,
         true,
     )?;
+    row_body(
+        t,
+        crate::row_rect(PIV_KEYGEN_PICK_TOP, 2),
+        Glyph::Cpu,
+        "Ed25519",
+        Some(("EdDSA", theme::CAPTION)),
+        true,
+        true,
+    )?;
+    row_body(
+        t,
+        crate::row_rect(PIV_KEYGEN_PICK_TOP, 3),
+        Glyph::Cpu,
+        "X25519",
+        Some(("ECDH", theme::CAPTION)),
+        true,
+        true,
+    )?;
+    row_body(
+        t,
+        crate::row_rect(PIV_KEYGEN_PICK_TOP, 4),
+        Glyph::Cpu,
+        "RSA",
+        Some(("2048-4096", theme::CAPTION)),
+        true,
+        true,
+    )?;
     text_left(
         t,
         "Generated on-device, never leaves it",
+        EgPoint::new(14, PANEL_H as i32 - 18),
+        Role::MonoSmall,
+        theme::CAPTION,
+    )
+}
+
+/// The RSA key-size sub-picker (reached from the **RSA** row of [`render_piv_keygen_pick`]) — a
+/// three-row list of RSA 2048 / 3072 / 4096. Each runs the firmware's dual-core prime search,
+/// slower with size: 2048 is a few seconds, 4096 can be a minute-plus of frozen panel.
+pub fn render_piv_keygen_rsa_pick<D>(t: &mut D, slot: u8) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    t.clear(BG)?;
+    status_bar(t)?;
+    title_bar_wide(t, "RSA size", theme::ACCENT, true)?;
+    let mut tb = [0u8; 12];
+    text_left(
+        t,
+        retired_title(slot, &mut tb),
+        EgPoint::new(14, CONTENT_TOP as i32 + 12),
+        Role::Body,
+        theme::MUTED,
+    )?;
+    group_card(t, PIV_KEYGEN_PICK_TOP, 3)?;
+    row_body(
+        t,
+        crate::row_rect(PIV_KEYGEN_PICK_TOP, 0),
+        Glyph::Cpu,
+        "RSA 2048",
+        Some(("slow", theme::CAPTION)),
+        true,
+        true,
+    )?;
+    row_body(
+        t,
+        crate::row_rect(PIV_KEYGEN_PICK_TOP, 1),
+        Glyph::Cpu,
+        "RSA 3072",
+        Some(("slower", theme::CAPTION)),
+        true,
+        true,
+    )?;
+    row_body(
+        t,
+        crate::row_rect(PIV_KEYGEN_PICK_TOP, 2),
+        Glyph::Cpu,
+        "RSA 4096",
+        Some(("slowest", theme::CAPTION)),
+        true,
+        true,
+    )?;
+    text_left(
+        t,
+        "Larger keys take much longer",
         EgPoint::new(14, PANEL_H as i32 - 18),
         Role::MonoSmall,
         theme::CAPTION,
@@ -1176,6 +1254,33 @@ where
         theme::CAPTION,
     )?;
     render_hold_button(t, DEL_HOLD_RECT, "Hold to generate", theme::ACCENT_FILL)
+}
+
+/// The "generating" screen shown while an on-device RSA prime search runs. This paints the
+/// full frame once (spinner ring + label); the search itself is a blocking dual-core busy-loop,
+/// so the firmware can't repaint from a loop — instead it spins just the indicator arc
+/// ([`render_status_arc`]) from the search's per-candidate hook, so the screen reads as actively
+/// working rather than hung. USB / CCID keepalives stay interrupt-driven throughout.
+pub fn render_piv_keygen_working<D>(t: &mut D) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    t.clear(BG)?;
+    render_status_arc(t, StatusKind::Processing, STATUS_ARC_START)?;
+    text(
+        t,
+        "Generating key...",
+        EgPoint::new(MIDX, 158),
+        Role::Heading,
+        FG,
+    )?;
+    text(
+        t,
+        "This can take a while",
+        EgPoint::new(MIDX, 186),
+        Role::MonoSmall,
+        theme::CAPTION,
+    )
 }
 
 /// The rename screen: a character-wheel editor for a relying party's device-local
@@ -4361,7 +4466,7 @@ mod tests {
             assert!(d.any_non_bg_in(crate::row_rect(PK_LIST_TOP, i)));
         }
 
-        // Keygen algorithm chooser + the hold-to-generate confirm.
+        // Keygen algorithm chooser + the hold-to-generate confirm + the RSA "generating" screen.
         let mut d = Rec::new();
         render_piv_keygen_pick(&mut d, 0x82).unwrap();
         assert!(!d.oob && d.drew_anything(), "keygen pick off-panel");
@@ -4375,6 +4480,16 @@ mod tests {
         assert!(
             !d.any_non_bg_in(Rect::new(PANEL_W - 36, 2, 30, 18)),
             "generate-confirm must be chrome-less (no status bar behind the cancel chevron)"
+        );
+        // The RSA size sub-picker and the "generating" screen (shown while the search runs).
+        let mut d = Rec::new();
+        render_piv_keygen_rsa_pick(&mut d, 0x82).unwrap();
+        assert!(!d.oob && d.drew_anything(), "RSA size picker off-panel");
+        let mut d = Rec::new();
+        render_piv_keygen_working(&mut d).unwrap();
+        assert!(
+            !d.oob && d.drew_anything(),
+            "keygen working screen off-panel"
         );
     }
 

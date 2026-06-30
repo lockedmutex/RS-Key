@@ -139,6 +139,8 @@ impl<'a> PivApplet<'a> {
         let nbits = match req.algo {
             ALGO_RSA1024 => 1024,
             ALGO_RSA2048 => 2048,
+            ALGO_RSA3072 => 3072,
+            ALGO_RSA4096 => 4096,
             _ => return None,
         };
         let pol = keygen::resolved_policies(p2, req.pin_policy, req.touch_policy);
@@ -156,10 +158,8 @@ impl<'a> PivApplet<'a> {
         key: &RsaPrivateKey,
         resp: &mut [u8],
     ) -> (usize, Sw) {
-        let algo = if key.size() == 128 {
-            ALGO_RSA1024
-        } else {
-            ALGO_RSA2048
+        let Some(algo) = keygen::rsa_algo_from_size(key.size()) else {
+            return (0, Sw::EXEC_ERROR);
         };
         let dev = Device {
             serial_hash: &self.serial_hash,
@@ -476,13 +476,12 @@ impl PivApplet<'_> {
         };
         let mut rng = self.rng.borrow_mut();
         match req.algo {
-            ALGO_ECCP256 | ALGO_ECCP384 => {
+            ALGO_ECCP256 | ALGO_ECCP384 | ALGO_ED25519 | ALGO_X25519 => {
                 keygen::generate_ec(dev, fs, &mut *rng, apdu.p2, &req, res)
             }
-            ALGO_RSA1024 | ALGO_RSA2048 => {
+            ALGO_RSA1024 | ALGO_RSA2048 | ALGO_RSA3072 | ALGO_RSA4096 => {
                 keygen::generate_rsa_blocking(dev, fs, &mut *rng, apdu.p2, &req, res)
             }
-            // X25519 generation is unsupported: fail rather than store nothing.
             _ => WRONG_DATA,
         }
     }
@@ -636,9 +635,9 @@ impl PivApplet<'_> {
         algo: u8,
         res: &mut ResBuf,
     ) -> Sw {
-        let mut body = [0u8; 5 + 4 + 256 + 2 + 8];
+        let mut body = [0u8; 5 + 4 + 512 + 2 + 8];
         let n = match algo {
-            ALGO_RSA1024 | ALGO_RSA2048 => {
+            ALGO_RSA1024 | ALGO_RSA2048 | ALGO_RSA3072 | ALGO_RSA4096 => {
                 let key = match seal::load_rsa_key(dev, fs, key_fid(slot)) {
                     Ok(k) => k,
                     Err(_) => return Sw::EXEC_ERROR,
@@ -649,7 +648,7 @@ impl PivApplet<'_> {
                 body.copy_within(5..full, 0);
                 full - 5
             }
-            ALGO_ECCP256 | ALGO_ECCP384 => {
+            ALGO_ECCP256 | ALGO_ECCP384 | ALGO_ED25519 | ALGO_X25519 => {
                 let key = match seal::load_ec_key(dev, fs, key_fid(slot)) {
                     Ok(k) => k,
                     Err(_) => return Sw::EXEC_ERROR,
@@ -748,8 +747,9 @@ impl PivApplet<'_> {
             return Sw::INCORRECT_P1P2;
         }
         // The sealed blob is bound to the device, not the fid, so it moves
-        // verbatim.
-        let mut blob = [0u8; 300];
+        // verbatim. Sized to the largest sealed record (RSA-4096 `P ‖ Q`); a
+        // smaller buffer would truncate/overrun-slice a 3072/4096 key's blob.
+        let mut blob = [0u8; seal::MAX_BLOB];
         let Some(blob_n) = fs.read_key(key_fid(from), &mut blob) else {
             return Sw::FILE_NOT_FOUND;
         };
@@ -1660,6 +1660,348 @@ mod tests {
         assert_eq!(sw, Sw::INCORRECT_PARAMS);
     }
 
+    /// Generate an Ed25519 key, sign through GENERAL AUTHENTICATE and check the
+    /// self-signed certificate carries the RFC 8410 SPKI and a valid PureEdDSA
+    /// self-signature over the raw TBS.
+    #[test]
+    fn ed25519_generate_sign_and_self_signed_cert() {
+        let rng = RefCell::new(TestRng(7));
+        let pres = RefCell::new(AlwaysConfirm);
+        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
+        let mut fs = new_fs();
+        select(&mut app, &mut fs);
+        auth_mgm(&mut app, &mut fs);
+        verify_pin(&mut app, &mut fs);
+        let (sw, resp) = run(
+            &mut app,
+            &mut fs,
+            INS_ASYM_KEYGEN,
+            0,
+            0x9A,
+            &gen_template(ALGO_ED25519),
+        );
+        assert_eq!(sw, Sw::OK);
+        let point = ec_point_of(&resp);
+        assert_eq!(point.len(), 32);
+        let pk: [u8; 32] = point.as_slice().try_into().unwrap();
+        let vk = ed25519_dalek::VerifyingKey::from_bytes(&pk).unwrap();
+
+        // GET METADATA reports algo 0xE0 and the same 32-byte public key (tag 0x86).
+        let (sw, md) = run(&mut app, &mut fs, INS_GET_METADATA, 0, 0x9A, &[]);
+        assert_eq!(sw, Sw::OK);
+        assert_eq!(find_tag(&md, 0x01).unwrap(), &[ALGO_ED25519]);
+        let metapk = find_tag(find_tag(&md, 0x04).unwrap(), 0x86).unwrap();
+        assert_eq!(metapk, &point[..]);
+
+        // GENERAL AUTHENTICATE signs the raw message; the bare 64-byte sig verifies.
+        let message = [0x42u8; 32];
+        let mut msg = vec![0x7C, 0x24, 0x82, 0x00, 0x81, 0x20];
+        msg.extend_from_slice(&message);
+        let (sw, sig) = run(
+            &mut app,
+            &mut fs,
+            INS_AUTHENTICATE,
+            ALGO_ED25519,
+            0x9A,
+            &msg,
+        );
+        assert_eq!(sw, Sw::OK);
+        let raw = find_tag(find_tag(&sig, 0x7C).unwrap(), 0x82).unwrap();
+        assert_eq!(raw.len(), 64);
+        let sigbytes: [u8; 64] = raw.try_into().unwrap();
+        vk.verify_strict(&message, &ed25519_dalek::Signature::from_bytes(&sigbytes))
+            .unwrap();
+
+        // The self-signed cert parses, names the slot and self-verifies.
+        let (sw, obj) = run(
+            &mut app,
+            &mut fs,
+            INS_GET_DATA,
+            0x3F,
+            0xFF,
+            &[0x5C, 0x03, 0x5F, 0xC1, 0x05],
+        );
+        assert_eq!(sw, Sw::OK);
+        let cert = find_tag(find_tag(&obj, 0x53).unwrap(), 0x70).unwrap();
+        let (_, parsed) = x509_parser::parse_x509_certificate(cert).unwrap();
+        assert!(
+            parsed
+                .subject()
+                .to_string()
+                .contains("CN=RS-Key PIV Slot 9A")
+        );
+        let csig: [u8; 64] = parsed.signature_value.data.as_ref().try_into().unwrap();
+        vk.verify_strict(
+            parsed.tbs_certificate.as_ref(),
+            &ed25519_dalek::Signature::from_bytes(&csig),
+        )
+        .unwrap();
+    }
+
+    /// Generate an X25519 key: it gets no self-signed certificate (it can't sign),
+    /// and GENERAL AUTHENTICATE exponentiation (`ykman calculate-secret`) agrees a
+    /// shared secret that matches the host side.
+    #[test]
+    fn x25519_generate_has_no_cert_and_agrees() {
+        let rng = RefCell::new(TestRng(7));
+        let pres = RefCell::new(AlwaysConfirm);
+        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
+        let mut fs = new_fs();
+        select(&mut app, &mut fs);
+        auth_mgm(&mut app, &mut fs);
+        verify_pin(&mut app, &mut fs);
+        let (sw, resp) = run(
+            &mut app,
+            &mut fs,
+            INS_ASYM_KEYGEN,
+            0,
+            0x9D,
+            &gen_template(ALGO_X25519),
+        );
+        assert_eq!(sw, Sw::OK);
+        let card_point = ec_point_of(&resp);
+        assert_eq!(card_point.len(), 32);
+
+        // No certificate was written for the slot (5FC10B, the 9D cert object).
+        let (sw, _) = run(
+            &mut app,
+            &mut fs,
+            INS_GET_DATA,
+            0x3F,
+            0xFF,
+            &[0x5C, 0x03, 0x5F, 0xC1, 0x0B],
+        );
+        assert_eq!(sw, Sw::FILE_NOT_FOUND);
+
+        // calculate-secret: host public point in tag 0x85 → 32-byte shared secret.
+        let host_scalar = [0x33u8; 32];
+        let host_pub = x25519_dalek::x25519(host_scalar, x25519_dalek::X25519_BASEPOINT_BYTES);
+        let mut msg = vec![0x7C, 0x22, 0x85, 0x20];
+        msg.extend_from_slice(&host_pub);
+        let (sw, secret) = run(&mut app, &mut fs, INS_AUTHENTICATE, ALGO_X25519, 0x9D, &msg);
+        assert_eq!(sw, Sw::OK);
+        let shared = find_tag(find_tag(&secret, 0x7C).unwrap(), 0x82).unwrap();
+        let cardpk: [u8; 32] = card_point.as_slice().try_into().unwrap();
+        let expected = x25519_dalek::x25519(host_scalar, cardpk);
+        assert_eq!(shared, &expected[..]);
+    }
+
+    /// Import an Ed25519 seed (tag 0x07) and an X25519 scalar (tag 0x08) the way
+    /// `ykman piv keys import` does, then sign / agree with the imported keys.
+    #[test]
+    fn import_ed25519_and_x25519() {
+        let rng = RefCell::new(TestRng(7));
+        let pres = RefCell::new(AlwaysConfirm);
+        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
+        let mut fs = new_fs();
+        select(&mut app, &mut fs);
+        auth_mgm(&mut app, &mut fs);
+        verify_pin(&mut app, &mut fs);
+
+        let seed = [0x07u8; 32];
+        let mut imp = vec![0x07, 32];
+        imp.extend_from_slice(&seed);
+        let (sw, _) = run(&mut app, &mut fs, INS_IMPORT_ASYM, ALGO_ED25519, 0x9A, &imp);
+        assert_eq!(sw, Sw::OK);
+        let vk = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
+        let message = [0x11u8; 32];
+        let mut msg = vec![0x7C, 0x24, 0x82, 0x00, 0x81, 0x20];
+        msg.extend_from_slice(&message);
+        let (sw, sig) = run(
+            &mut app,
+            &mut fs,
+            INS_AUTHENTICATE,
+            ALGO_ED25519,
+            0x9A,
+            &msg,
+        );
+        assert_eq!(sw, Sw::OK);
+        let raw = find_tag(find_tag(&sig, 0x7C).unwrap(), 0x82).unwrap();
+        let sigbytes: [u8; 64] = raw.try_into().unwrap();
+        vk.verify_strict(&message, &ed25519_dalek::Signature::from_bytes(&sigbytes))
+            .unwrap();
+
+        // X25519 import into 9D; agree against the card's own reported public key
+        // (GET METADATA) so the test is agnostic to the internal scalar endianness.
+        let mut x_scalar = [0u8; 32];
+        for (i, b) in x_scalar.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(7).wrapping_add(1);
+        }
+        let mut imp = vec![0x08, 32];
+        imp.extend_from_slice(&x_scalar);
+        let (sw, _) = run(&mut app, &mut fs, INS_IMPORT_ASYM, ALGO_X25519, 0x9D, &imp);
+        assert_eq!(sw, Sw::OK);
+        let (sw, md) = run(&mut app, &mut fs, INS_GET_METADATA, 0, 0x9D, &[]);
+        assert_eq!(sw, Sw::OK);
+        let card_pub = find_tag(find_tag(&md, 0x04).unwrap(), 0x86)
+            .unwrap()
+            .to_vec();
+        let host_scalar = [0x55u8; 32];
+        let host_pub = x25519_dalek::x25519(host_scalar, x25519_dalek::X25519_BASEPOINT_BYTES);
+        let mut msg = vec![0x7C, 0x22, 0x85, 0x20];
+        msg.extend_from_slice(&host_pub);
+        let (sw, secret) = run(&mut app, &mut fs, INS_AUTHENTICATE, ALGO_X25519, 0x9D, &msg);
+        assert_eq!(sw, Sw::OK);
+        let shared = find_tag(find_tag(&secret, 0x7C).unwrap(), 0x82).unwrap();
+        let cardpk: [u8; 32] = card_pub.as_slice().try_into().unwrap();
+        assert_eq!(shared, &x25519_dalek::x25519(host_scalar, cardpk)[..]);
+    }
+
+    /// An Ed25519 slot attests: the cert chains to F9 (P-384 ECDSA over the TBS)
+    /// and carries the RFC 8410 Ed25519 SPKI.
+    #[test]
+    fn ed25519_attestation_chains_to_f9() {
+        let rng = RefCell::new(TestRng(7));
+        let pres = RefCell::new(AlwaysConfirm);
+        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
+        let mut fs = new_fs();
+        select(&mut app, &mut fs);
+        auth_mgm(&mut app, &mut fs);
+        verify_pin(&mut app, &mut fs);
+        let (sw, _) = run(
+            &mut app,
+            &mut fs,
+            INS_ASYM_KEYGEN,
+            0,
+            0x9A,
+            &gen_template(ALGO_ED25519),
+        );
+        assert_eq!(sw, Sw::OK);
+        let (sw, att) = run(&mut app, &mut fs, INS_ATTESTATION, 0x9A, 0, &[]);
+        assert_eq!(sw, Sw::OK);
+        let (_, att_cert) = x509_parser::parse_x509_certificate(&att).unwrap();
+        assert!(
+            att_cert
+                .subject()
+                .to_string()
+                .contains("CN=RS-Key PIV Attestation 9A")
+        );
+        // The attested SPKI is the 32-byte Ed25519 key.
+        assert_eq!(
+            att_cert
+                .tbs_certificate
+                .subject_pki
+                .subject_public_key
+                .data
+                .len(),
+            32
+        );
+        // F9 (P-384) signs the attestation TBS.
+        let (sw, f9obj) = run(
+            &mut app,
+            &mut fs,
+            INS_GET_DATA,
+            0x3F,
+            0xFF,
+            &[0x5C, 0x03, 0x5F, 0xFF, 0x01],
+        );
+        assert_eq!(sw, Sw::OK);
+        let f9cert = find_tag(find_tag(&f9obj, 0x53).unwrap(), 0x70).unwrap();
+        let (_, f9) = x509_parser::parse_x509_certificate(f9cert).unwrap();
+        let spk = &f9.tbs_certificate.subject_pki.subject_public_key.data;
+        let vk = p384::ecdsa::VerifyingKey::from_sec1_bytes(spk).unwrap();
+        let digest: [u8; 32] = sha2::Sha256::digest(att_cert.tbs_certificate.as_ref()).into();
+        let sig = p384::ecdsa::Signature::from_der(&att_cert.signature_value.data).unwrap();
+        use p384::ecdsa::signature::hazmat::PrehashVerifier as _;
+        vk.verify_prehash(&digest, &sig).unwrap();
+    }
+
+    /// The on-device RSA store path (the display's `Generate key` → RSA 2048): persist a
+    /// firmware-generated key into an empty retired slot, with the same add-never-overwrite
+    /// fence as the EC path. The slow prime search is the firmware's job; here we hand
+    /// `store_retired_rsa` a ready key.
+    #[test]
+    fn on_device_rsa_stores_into_empty_retired_slot() {
+        let rng = RefCell::new(TestRng(7));
+        let pres = RefCell::new(AlwaysConfirm);
+        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
+        let mut fs = new_fs();
+        select(&mut app, &mut fs);
+        let dev = Device {
+            serial_hash: &HASH,
+            serial_id: &SERIAL,
+            otp_key: None,
+        };
+        let key = rsk_openpgp::keys::generate_rsa(&mut TestRng(99), 1024).unwrap();
+        let slot = info::next_free_retired(&mut fs).unwrap();
+        assert!(info::store_retired_rsa(&dev, &mut fs, &mut TestRng(5), slot, &key).is_ok());
+        // Reads back like a host-generated RSA slot: key + cert present, RSA meta, generated.
+        assert!(fs.has_key(key_fid(slot)));
+        assert!(fs.has_data(cert_fid_for_slot(slot).unwrap()));
+        let mut meta = [0u8; 8];
+        let n = fs.meta_find(key_fid(slot).get(), &mut meta).unwrap();
+        assert!(n >= 4);
+        assert_eq!(meta[0], ALGO_RSA1024); // a 1024-bit test key
+        assert_eq!(meta[3], ORIGIN_GENERATED);
+        // Add-never-overwrite: the now-occupied slot, and any non-retired slot, are refused.
+        assert!(info::store_retired_rsa(&dev, &mut fs, &mut TestRng(5), slot, &key).is_err());
+        assert!(
+            info::store_retired_rsa(&dev, &mut fs, &mut TestRng(5), SLOT_AUTHENTICATION, &key)
+                .is_err()
+        );
+    }
+
+    /// Buffer-sizing proof for the largest key: a real RSA-4096 key seals, gets a self-signed
+    /// cert that fits `MAX_CERT` and parses, and reads back as RSA-4096. Slow on host
+    /// (num-bigint, no asm), so `#[ignore]`d — run with `--ignored`.
+    #[test]
+    #[ignore = "full on-host RSA-4096 keygen — slow; run with --ignored"]
+    fn on_device_rsa4096_buffers_round_trip() {
+        let rng = RefCell::new(TestRng(7));
+        let pres = RefCell::new(AlwaysConfirm);
+        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
+        let mut fs = new_fs();
+        select(&mut app, &mut fs);
+        let dev = Device {
+            serial_hash: &HASH,
+            serial_id: &SERIAL,
+            otp_key: None,
+        };
+        let key = rsk_openpgp::keys::generate_rsa(&mut TestRng(99), 4096).unwrap();
+        let slot = info::next_free_retired(&mut fs).unwrap();
+        assert!(info::store_retired_rsa(&dev, &mut fs, &mut TestRng(5), slot, &key).is_ok());
+        let mut meta = [0u8; 8];
+        fs.meta_find(key_fid(slot).get(), &mut meta).unwrap();
+        assert_eq!(meta[0], ALGO_RSA4096);
+        // The self-signed cert fits MAX_CERT (the DER writer is bounds-checked) and parses; its
+        // SPKI carries the 4096-bit key (≈526-byte RSAPublicKey, far larger than a 2048's ≈270).
+        let mut obj = [0u8; 2048];
+        let n = fs.read(cert_fid_for_slot(slot).unwrap(), &mut obj).unwrap();
+        let cert = find_tag(&obj[..n], 0x70).unwrap();
+        let (_, parsed) = x509_parser::parse_x509_certificate(cert).unwrap();
+        assert!(parsed.subject().to_string().contains("Slot"));
+        assert!(
+            parsed
+                .tbs_certificate
+                .subject_pki
+                .subject_public_key
+                .data
+                .len()
+                > 400
+        );
+        // Regression: the firmware fast-path (rsa_generate_finish) must tag a 4096 key as
+        // RSA-4096, not silently RSA-2048.
+        let mut resp = [0u8; 1024];
+        let (_, sw) = app.rsa_generate_finish(
+            &mut fs,
+            &mut TestRng(5),
+            0x83,
+            [PINPOLICY_ONCE, TOUCHPOLICY_ALWAYS],
+            &key,
+            &mut resp,
+        );
+        assert_eq!(sw, Sw::OK);
+        let mut m2 = [0u8; 8];
+        fs.meta_find(key_fid(0x83).get(), &mut m2).unwrap();
+        assert_eq!(m2[0], ALGO_RSA4096);
+        // Regression: MOVE KEY's blob buffer must hold a 4096 sealed record (540 B), not panic
+        // at the old 300-byte size. Move the stored 4096 key to another retired slot.
+        auth_mgm(&mut app, &mut fs);
+        let (sw, _) = run(&mut app, &mut fs, INS_MOVE_KEY, 0x84, slot, &[]);
+        assert_eq!(sw, Sw::OK);
+        assert!(fs.has_key(key_fid(0x84)));
+    }
+
     #[test]
     fn ecdh_on_key_management_slot() {
         let rng = RefCell::new(TestRng(7));
@@ -2052,9 +2394,10 @@ mod tests {
         assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
         let (sw, _) = run(&mut app, &mut fs, INS_MOVE_KEY, 0x82, 0x9A, &[]);
         assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
-        // X25519 generation is rejected, not silently OK.
+        // X25519 generates a key and returns its 32-byte public point (no
+        // self-signed cert — it can't sign).
         auth_mgm(&mut app, &mut fs);
-        let (sw, _) = run(
+        let (sw, resp) = run(
             &mut app,
             &mut fs,
             INS_ASYM_KEYGEN,
@@ -2062,7 +2405,8 @@ mod tests {
             0x9A,
             &gen_template(ALGO_X25519),
         );
-        assert_eq!(sw, WRONG_DATA);
+        assert_eq!(sw, Sw::OK);
+        assert_eq!(ec_point_of(&resp).len(), 32);
         // Unknown INS.
         let (sw, _) = run(&mut app, &mut fs, 0x01, 0, 0, &[]);
         assert_eq!(sw, Sw::INS_NOT_SUPPORTED);

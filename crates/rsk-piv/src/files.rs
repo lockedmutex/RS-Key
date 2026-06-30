@@ -27,6 +27,7 @@ pub const ALGO_AES256: u8 = 0x0C;
 pub const ALGO_ECCP256: u8 = 0x11;
 pub const ALGO_ECCP384: u8 = 0x14;
 pub const ALGO_RSA4096: u8 = 0x16;
+pub const ALGO_ED25519: u8 = 0xE0;
 pub const ALGO_X25519: u8 = 0xE1;
 
 // PIN / touch policies (Yubico metadata values).

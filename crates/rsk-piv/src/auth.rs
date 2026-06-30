@@ -205,7 +205,7 @@ pub(crate) fn general_authenticate<S: Storage>(
                 return Ok(());
             }
             match algo {
-                ALGO_RSA1024 | ALGO_RSA2048 => {
+                ALGO_RSA1024 | ALGO_RSA2048 | ALGO_RSA3072 | ALGO_RSA4096 => {
                     check_touch(touch_policy, presence)?;
                     let mut key = seal::load_rsa_key(dev, fs, key_fid(key_ref))?;
                     let _ = key.precompute();
@@ -216,7 +216,7 @@ pub(crate) fn general_authenticate<S: Storage>(
                     let mut ad = RngAdapter(rng);
                     let pt = rsa::hazmat::rsa_decrypt_and_check(&key, Some(&mut ad), &m)
                         .map_err(|_| Sw::EXEC_ERROR)?;
-                    let mut out = [0u8; 256];
+                    let mut out = [0u8; 512];
                     let bytes = pt.to_bytes_be();
                     let off = key.size() - bytes.len();
                     out[..off].fill(0);
@@ -240,6 +240,18 @@ pub(crate) fn general_authenticate<S: Storage>(
                     let mut der = [0u8; 112];
                     let dn = x509::ecdsa_sig_der(&raw[..rn], &mut der)?;
                     dyn_auth_resp(res, 0x82, &der[..dn])?;
+                }
+                ALGO_ED25519 => {
+                    check_touch(touch_policy, presence)?;
+                    let key = seal::load_ec_key(dev, fs, key_fid(key_ref))?;
+                    if key.curve() != Curve::Ed25519 {
+                        return Err(Sw::INCORRECT_P1P2);
+                    }
+                    // PureEdDSA signs the raw message `c`; the 64-byte signature is
+                    // returned bare (no ASN.1 wrapping).
+                    let mut sig = [0u8; 64];
+                    let n = key.sign(c, rng, &mut sig)?;
+                    dyn_auth_resp(res, 0x82, &sig[..n])?;
                 }
                 ALGO_3DES | ALGO_AES128 | ALGO_AES192 | ALGO_AES256 => {
                     if key_ref != SLOT_CARDMGM {
@@ -295,19 +307,20 @@ pub(crate) fn general_authenticate<S: Storage>(
         }
 
         if let Some(pp) = t85.filter(|p| !p.is_empty()) {
-            // ECDH (tag 0x85, "exponentiation") for the key-management slots.
+            // ECDH (tag 0x85, "exponentiation") for the key-management slots —
+            // NIST ECDH or X25519 (`ykman calculate_secret`).
             if !is_key(key_ref) {
                 return Err(Sw::INCORRECT_P1P2);
             }
-            if !matches!(algo, ALGO_ECCP256 | ALGO_ECCP384) {
+            if !matches!(algo, ALGO_ECCP256 | ALGO_ECCP384 | ALGO_X25519) {
                 return Err(Sw::INCORRECT_P1P2);
             }
             check_touch(touch_policy, presence)?;
             let key = seal::load_ec_key(dev, fs, key_fid(key_ref))?;
-            let want = if algo == ALGO_ECCP256 {
-                Curve::P256
-            } else {
-                Curve::P384
+            let want = match algo {
+                ALGO_ECCP256 => Curve::P256,
+                ALGO_ECCP384 => Curve::P384,
+                _ => Curve::X25519,
             };
             if key.curve() != want {
                 return Err(Sw::INCORRECT_P1P2);

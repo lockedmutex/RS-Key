@@ -29,10 +29,10 @@ pub use render::{
     render_hold_fill, render_locked_breathe, render_oath, render_oath_cred, render_openpgp,
     render_openpgp_cardholder, render_openpgp_key, render_passkeys_list, render_pin_blocked,
     render_pin_dots, render_pin_title, render_piv, render_piv_extra, render_piv_keygen_confirm,
-    render_piv_keygen_pick, render_piv_slot, render_rebooting, render_rename, render_rename_caret,
-    render_reveal_warning, render_seal_confirm, render_seed_phrase, render_service,
-    render_share_picker, render_slip39_share, render_status_arc, render_success,
-    render_success_circle,
+    render_piv_keygen_pick, render_piv_keygen_rsa_pick, render_piv_keygen_working, render_piv_slot,
+    render_rebooting, render_rename, render_rename_caret, render_reveal_warning,
+    render_seal_confirm, render_seed_phrase, render_service, render_share_picker,
+    render_slip39_share, render_status_arc, render_success, render_success_circle,
 };
 
 /// Panel geometry (Waveshare RP2350-Touch-LCD-2.8, ST7789T3, portrait).

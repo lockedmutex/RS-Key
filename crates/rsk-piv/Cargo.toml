@@ -23,6 +23,9 @@ rsk-fs = { workspace = true, features = ["test-util"] }
 p256 = { workspace = true }
 p384 = { workspace = true }
 sha2 = { workspace = true }
+# Independent Ed25519 / X25519 to cross-check signatures and key agreement.
+ed25519-dalek = { workspace = true }
+x25519-dalek = { workspace = true }
 # Independent X.509 parser to cross-check the hand-built DER certs (host only).
 x509-parser = "0.16"
 
