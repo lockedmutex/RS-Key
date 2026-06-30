@@ -1224,6 +1224,104 @@ where
     )
 }
 
+/// The PIV PIN/PUK sub-menu (Settings → Security → "PIV PIN"): change the PIV PIN, change the
+/// PUK, or unblock a blocked PIN with the PUK. A chrome modal like the keygen picker — the
+/// title-bar chevron backs out to the Security list; rows hit-test via [`crate::hit_list`] at
+/// [`PIV_KEYGEN_PICK_TOP`].
+pub fn render_piv_pin_menu<D>(t: &mut D) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    t.clear(BG)?;
+    status_bar(t)?;
+    title_bar_wide(t, "PIV PIN", theme::ACCENT, true)?;
+    group_card(t, PIV_KEYGEN_PICK_TOP, 4)?;
+    row_body(
+        t,
+        crate::row_rect(PIV_KEYGEN_PICK_TOP, 0),
+        Glyph::Lock,
+        "Change PIN",
+        None,
+        true,
+        true,
+    )?;
+    row_body(
+        t,
+        crate::row_rect(PIV_KEYGEN_PICK_TOP, 1),
+        Glyph::Key,
+        "Change PUK",
+        None,
+        true,
+        true,
+    )?;
+    row_body(
+        t,
+        crate::row_rect(PIV_KEYGEN_PICK_TOP, 2),
+        Glyph::Lifebuoy,
+        "Unblock PIN",
+        Some(("with PUK", theme::CAPTION)),
+        true,
+        true,
+    )?;
+    row_body(
+        t,
+        crate::row_rect(PIV_KEYGEN_PICK_TOP, 3),
+        Glyph::Shield,
+        "Protect mgmt key",
+        Some(("random, PIN-unlocked", theme::CAPTION)),
+        true,
+        true,
+    )?;
+    text_left(
+        t,
+        "PIN / PUK / management key",
+        EgPoint::new(14, PANEL_H as i32 - 18),
+        Role::MonoSmall,
+        theme::CAPTION,
+    )
+}
+
+/// The hold-to-confirm for "Protect management key" (ykman `--protect`): a chrome-less modal
+/// like the keygen / delete holds. It states the consequence honestly on the trusted screen —
+/// a random key replaces the current one and the PIV PIN alone then grants admin — before the
+/// deliberate hold commits it.
+pub fn render_piv_protect_confirm<D>(t: &mut D) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    t.clear(BG)?;
+    back_button(t, PK_BACK_RECT, theme::ACCENT)?;
+    text(
+        t,
+        "Protect mgmt key?",
+        EgPoint::new(MIDX, 84),
+        Role::Strong,
+        FG,
+    )?;
+    text(
+        t,
+        "Sets a random management key,",
+        EgPoint::new(MIDX, 116),
+        Role::Body,
+        MUTED,
+    )?;
+    text(
+        t,
+        "unlocked by your PIV PIN.",
+        EgPoint::new(MIDX, 138),
+        Role::Body,
+        MUTED,
+    )?;
+    text(
+        t,
+        "The PIN alone then grants admin.",
+        EgPoint::new(MIDX, 170),
+        Role::MonoSmall,
+        theme::WARN,
+    )?;
+    render_hold_button(t, DEL_HOLD_RECT, "Hold to protect", theme::ACCENT_FILL)
+}
+
 /// The generate confirm screen: a deliberate hold (driven by the firmware on
 /// [`crate::DEL_HOLD_RECT`], the chrome-less [`crate::PK_BACK_RECT`] chevron cancels)
 /// before an EC key is written into the named retired slot.
@@ -3794,9 +3892,12 @@ fn settings_security<D: DrawTarget<Color = Rgb565>>(
         None,
         true,
     )?;
+    // The PIV applet's own PIN/PUK — a drill-in to its sub-menu ([`render_piv_pin_menu`]),
+    // grouped with the other two credential PINs above the audit/backup/reset rows.
+    render_row(t, settings_row_rect(2), Glyph::Lock, "PIV PIN", None, true)?;
     render_row(
         t,
-        settings_row_rect(2),
+        settings_row_rect(3),
         Glyph::Clock,
         "Audit log",
         None,
@@ -3807,7 +3908,7 @@ fn settings_security<D: DrawTarget<Color = Rgb565>>(
     // also reads `has_seed` + the build profile. The row deliberately skips that extra lookup.
     render_row(
         t,
-        settings_row_rect(3),
+        settings_row_rect(4),
         Glyph::Lifebuoy,
         "Backup",
         Some(if backup_sealed {
@@ -3817,7 +3918,7 @@ fn settings_security<D: DrawTarget<Color = Rgb565>>(
         }),
         true,
     )?;
-    danger_row(t, settings_row_rect(4), "Factory reset")
+    danger_row(t, settings_row_rect(5), "Factory reset")
 }
 
 /// A destructive option row: the [`render_row`] card, but red-tinted (the [`theme::DANGER_BG`]
@@ -5013,14 +5114,30 @@ mod tests {
                 !d.oob,
                 "security (pin_set={pin_set}) drew outside the panel"
             );
-            // Every Security row (Device PIN, FIDO PIN, Audit log, Backup, Factory reset) is
-            // painted in the rect `hit_security` maps its tap to.
+            // Every Security row (Device PIN, FIDO PIN, PIV PIN, Audit log, Backup, Factory
+            // reset) is painted in the rect `hit_security` maps its tap to; the bottom row
+            // (now six) must stay on-panel (the `!oob` check above).
             for i in 0..crate::SECURITY_ROWS {
                 assert!(
                     d.any_non_bg_in(settings_row_rect(i)),
                     "security row {i} unpainted (pin_set={pin_set})"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn piv_pin_menu_paints_four_rows_on_panel() {
+        let mut d = Rec::new();
+        render_piv_pin_menu(&mut d).unwrap();
+        assert!(!d.oob && d.drew_anything(), "PIV PIN menu off-panel");
+        // The four op rows (Change PIN / Change PUK / Unblock PIN / Protect mgmt key) each
+        // paint where `hit_list(_, PIV_KEYGEN_PICK_TOP, _)` maps a tap.
+        for i in 0..4u16 {
+            assert!(
+                d.any_non_bg_in(crate::row_rect(PIV_KEYGEN_PICK_TOP, i)),
+                "PIV PIN menu row {i} unpainted"
+            );
         }
     }
 
@@ -5555,6 +5672,10 @@ mod tests {
         let mut d = Rec::new();
         render_piv_keygen_confirm(&mut d, 0x82, "NIST P-256").unwrap();
         assert!(!d.oob && d.drew_anything(), "keygen confirm spilled");
+
+        let mut d = Rec::new();
+        render_piv_protect_confirm(&mut d).unwrap();
+        assert!(!d.oob && d.drew_anything(), "protect-mgm confirm spilled");
 
         let mut d = Rec::new();
         render_piv_slot(

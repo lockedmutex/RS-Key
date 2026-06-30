@@ -98,17 +98,25 @@ pub fn cert_fid_for_slot(slot: u8) -> Option<u16> {
 
 /// The F9 attestation certificate object (`5FFF01`).
 pub const EF_ATTESTATION_CERT: u16 = 0xD2F1;
+/// YubiKey "ADMIN DATA" object (`5FFF00`, a.k.a. PivmanData) — the protection
+/// flags (e.g. "management key is PIN-protected"). Plaintext, always-readable.
+pub const EF_PIVMAN_DATA: u16 = 0xD2F0;
 
 /// Map a GET/PUT DATA object id (the `5C` tag value, 1–3 bytes big-endian) to
 /// its file — the GET DATA allow-list: the `5FC1xx` objects, the discovery
 /// object (`0x7E`, dynamic — `None` here), the BIT group template (`0x7F61`,
-/// never populated) and the Yubico attestation cert (low 16 bits `0xFF01`).
+/// never populated), the Yubico attestation cert (`5FFF01`) and the ADMIN DATA
+/// object (`5FFF00`). The PRINTED object (`5FC109`) is handled specially in
+/// GET/PUT DATA (the PIN-protected mgmt key), not through this generic table.
 pub fn object_fid(id: u32) -> Option<u16> {
-    if id & 0xFFFF00 == 0x5FC100 {
+    // `5FC100..5FC1EF` only — the `0xD2F0`/`0xD2F1` fids are reserved for the
+    // ADMIN-DATA / attestation objects, so a `5FC1F0/F1` id must not alias them.
+    if id & 0xFFFF00 == 0x5FC100 && (id & 0xFF) < 0xF0 {
         return Some(0xD200 | (id & 0xFF) as u16);
     }
     match id & 0xFFFF {
         0xFF01 => Some(EF_ATTESTATION_CERT),
+        0xFF00 => Some(EF_PIVMAN_DATA),
         0x7F61 => Some(0xD2B6), // BITGT: a valid id with no data → 6A82
         _ => None,
     }

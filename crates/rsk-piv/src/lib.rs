@@ -66,6 +66,20 @@ const INS_VERSION: u8 = 0xFD;
 const INS_IMPORT_ASYM: u8 = 0xFE;
 const INS_SET_MGMKEY: u8 = 0xFF;
 
+/// YubiKey "PRINTED INFORMATION" object — repurposed to hold the PIN-protected
+/// management key (readable only after a PIN VERIFY, and only once protection is
+/// enabled). The key itself is synthesized from the sealed 0x9B auth slot, never
+/// stored a second time.
+const PRINTED_ID: u32 = 0x5FC109;
+/// PivmanData (ADMIN DATA) TLV: outer `0x80 { 0x81 = flags }`; flag bit `0x02`
+/// means the management key is PIN-protected (a host reads it back from PRINTED).
+const PIVMAN_TAG: u8 = 0x80;
+const PIVMAN_FLAGS_TAG: u8 = 0x81;
+const PIVMAN_FLAG_MGM_PROTECTED: u8 = 0x02;
+/// PivmanProtectedData TLV: outer `0x88 { 0x89 = raw management key }`.
+const PROTECTED_TAG: u8 = 0x88;
+const PROTECTED_MGM_TAG: u8 = 0x89;
+
 /// Volatile per-selection security state.
 #[derive(Default)]
 pub(crate) struct Session {
@@ -349,11 +363,12 @@ impl PivApplet<'_> {
         if apdu.p1 != 0x00 {
             return Sw::INCORRECT_P1P2;
         }
-        let (fid, retry) = match apdu.p2 {
-            0x80 => (EF_PIN, RETRY_PIN),
-            0x81 => (EF_PUK, RETRY_PUK),
+        let which = match apdu.p2 {
+            0x80 => PinRef::Pin,
+            0x81 => PinRef::Puk,
             _ => return Sw::INCORRECT_P1P2,
         };
+        let (fid, _) = which.fid_retry();
         let old_len = match stored_pin_len(fs, fid) {
             Ok(n) => n,
             Err(sw) => return sw,
@@ -361,18 +376,7 @@ impl PivApplet<'_> {
         if apdu.nc <= old_len {
             return Sw::WRONG_LENGTH;
         }
-        let new = &apdu.data[old_len..];
-        if new.len() > 8 {
-            return Sw::WRONG_LENGTH;
-        }
-        match check_ref(dev, fs, fid, retry, &apdu.data[..old_len]) {
-            Sw::OK => {}
-            sw => return sw,
-        }
-        if put_pin_verifier(dev, fs, fid, new).is_err() {
-            return Sw::MEMORY_FAILURE;
-        }
-        Sw::OK
+        change_reference(dev, fs, which, &apdu.data[..old_len], &apdu.data[old_len..])
     }
 
     /// RESET RETRY COUNTER (INS 0x2C): unblock/replace the PIN with the PUK.
@@ -387,18 +391,7 @@ impl PivApplet<'_> {
         if apdu.nc <= puk_len {
             return Sw::WRONG_LENGTH;
         }
-        let new = &apdu.data[puk_len..];
-        if new.len() > 8 {
-            return Sw::WRONG_LENGTH;
-        }
-        match check_ref(dev, fs, EF_PUK, RETRY_PUK, &apdu.data[..puk_len]) {
-            Sw::OK => {}
-            sw => return sw,
-        }
-        if put_pin_verifier(dev, fs, EF_PIN, new).is_err() {
-            return Sw::MEMORY_FAILURE;
-        }
-        reset_counter(fs, RETRY_PIN)
+        unblock_pin_with_puk(dev, fs, &apdu.data[..puk_len], &apdu.data[puk_len..])
     }
 
     /// SET RETRIES (INS 0xFA, management-gated): resets both references to
@@ -507,6 +500,9 @@ impl PivApplet<'_> {
             res.extend(DISCOVERY);
             return Sw::OK;
         }
+        if id == PRINTED_ID {
+            return self.get_protected_mgm(fs, res);
+        }
         let Some(fid) = object_fid(id) else {
             return Sw::FILE_NOT_FOUND;
         };
@@ -519,6 +515,45 @@ impl PivApplet<'_> {
             return Sw::WRONG_LENGTH;
         }
         Sw::OK
+    }
+
+    /// GET DATA for the PRINTED object (`5FC109`) — the PIN-protected management
+    /// key. Returns it only when protection is enabled (the ADMIN-DATA flag) AND
+    /// the PIN is verified; a default or plain mgmt key reads as absent, so the
+    /// key is never PIN-disclosed unless the user opted in. The key is synthesized
+    /// from the sealed 0x9B auth slot — there is no second copy at rest.
+    fn get_protected_mgm<S: Storage>(&mut self, fs: &mut Fs<S>, res: &mut ResBuf) -> Sw {
+        if !mgm_is_protected(fs) {
+            return Sw::FILE_NOT_FOUND;
+        }
+        if !self.sess.has_pin {
+            return Sw::SECURITY_STATUS_NOT_SATISFIED;
+        }
+        let dev = Device {
+            serial_hash: &self.serial_hash,
+            serial_id: &self.serial_id,
+            otp_key: self.otp_key.as_ref(),
+        };
+        let mut key = [0u8; 32];
+        let klen = match seal::seal_read(&dev, fs, key_fid(SLOT_CARDMGM), &mut key) {
+            Ok(n) => n,
+            Err(sw) => return sw,
+        };
+        // PivmanProtectedData: 88 { 89 <key> }, wrapped in the 53 response object.
+        let mut body = [0u8; 4 + 32];
+        body[0] = PROTECTED_TAG;
+        body[1] = (2 + klen) as u8;
+        body[2] = PROTECTED_MGM_TAG;
+        body[3] = klen as u8;
+        body[4..4 + klen].copy_from_slice(&key[..klen]);
+        key.zeroize();
+        let r = if push_tlv(res, 0x53, &body[..4 + klen]).is_err() {
+            Sw::WRONG_LENGTH
+        } else {
+            Sw::OK
+        };
+        body.zeroize();
+        r
     }
 
     /// PUT DATA (INS 0xDB, management-gated).
@@ -536,10 +571,21 @@ impl PivApplet<'_> {
         let (Some(path), Some(obj)) = (find_tag(apdu.data, 0x5C), find_tag(apdu.data, 0x53)) else {
             return WRONG_DATA;
         };
-        if path.len() != 3 || path[0] != 0x5F || path[1] != 0xC1 {
+        if path.len() != 3 {
             return WRONG_DATA;
         }
-        let fid = 0xD200 | path[2] as u16;
+        let fid = match (path[0], path[1], path[2]) {
+            // ADMIN DATA (5FFF00): the protection flags. Plaintext (non-secret).
+            (0x5F, 0xFF, 0x00) => EF_PIVMAN_DATA,
+            // PRINTED (5FC109): the PIN-protected mgmt key is virtual — backed by
+            // the sealed 0x9B auth slot (set via SET MANAGEMENT KEY); the host's
+            // copy isn't persisted (GET DATA synthesizes it), so acknowledge the
+            // write without storing the key plaintext at rest.
+            (0x5F, 0xC1, 0x09) => return Sw::OK,
+            // `5FC100..5FC1EF` only — F0/F1 are reserved for the ADMIN/attestation fids.
+            (0x5F, 0xC1, b) if b < 0xF0 => 0xD200 | b as u16,
+            _ => return WRONG_DATA,
+        };
         if obj.is_empty() {
             let _ = fs.delete(fid);
             return Sw::OK;
@@ -891,6 +937,167 @@ fn check_ref<S: Storage>(dev: &Device, fs: &mut Fs<S>, fid: u16, retry: usize, p
     } else {
         Sw::new(0x63, 0xC0 | left)
     }
+}
+
+/// Which PIV reference a change/verify targets — the application PIN or the PUK.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PinRef {
+    Pin,
+    Puk,
+}
+
+impl PinRef {
+    fn fid_retry(self) -> (u16, usize) {
+        match self {
+            PinRef::Pin => (EF_PIN, RETRY_PIN),
+            PinRef::Puk => (EF_PUK, RETRY_PUK),
+        }
+    }
+}
+
+/// Pad a collected numeric PIN/PUK (`1..=8` bytes) to the 8-byte PIV wire form
+/// (trailing `0xFF`), matching ykman / yubico-piv-tool. On-device (panel) entry
+/// MUST store the verifier over this padded form, or a host `VERIFY` — which
+/// always pads — will not match. `None` for empty / over-long input.
+pub fn pad_pin(entered: &[u8]) -> Option<[u8; 8]> {
+    if entered.is_empty() || entered.len() > 8 {
+        return None;
+    }
+    let mut out = [0xFFu8; 8];
+    out[..entered.len()].copy_from_slice(entered);
+    Some(out)
+}
+
+/// Change a PIN or PUK: verify `old` (burns a retry on mismatch, exactly like the
+/// CHANGE REFERENCE DATA APDU), then store `new`. Shared by that handler and the
+/// on-device panel flow; panel callers pad both via [`pad_pin`] first so the
+/// stored verifier matches the host's padded wire form.
+pub fn change_reference<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    which: PinRef,
+    old: &[u8],
+    new: &[u8],
+) -> Sw {
+    if new.is_empty() || new.len() > 8 {
+        return Sw::WRONG_LENGTH;
+    }
+    let (fid, retry) = which.fid_retry();
+    match check_ref(dev, fs, fid, retry, old) {
+        Sw::OK => {}
+        sw => return sw,
+    }
+    if put_pin_verifier(dev, fs, fid, new).is_err() {
+        return Sw::MEMORY_FAILURE;
+    }
+    Sw::OK
+}
+
+/// Unblock the PIN with the PUK (RESET RETRY COUNTER): verify `puk`, set the PIN to
+/// `new`, and reset the PIN retry counter. Shared by the APDU handler and the panel.
+pub fn unblock_pin_with_puk<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    puk: &[u8],
+    new: &[u8],
+) -> Sw {
+    if new.is_empty() || new.len() > 8 {
+        return Sw::WRONG_LENGTH;
+    }
+    match check_ref(dev, fs, EF_PUK, RETRY_PUK, puk) {
+        Sw::OK => {}
+        sw => return sw,
+    }
+    if put_pin_verifier(dev, fs, EF_PIN, new).is_err() {
+        return Sw::MEMORY_FAILURE;
+    }
+    reset_counter(fs, RETRY_PIN)
+}
+
+/// Remaining verify attempts for the PIN or PUK — for on-panel status display.
+pub fn reference_retries_left<S: Storage>(fs: &mut Fs<S>, which: PinRef) -> Option<u8> {
+    let (_, retry) = which.fid_retry();
+    retries_left(fs, retry).ok()
+}
+
+/// Verify the PIN or PUK against its stored verifier — the retry dance (burns an attempt on
+/// mismatch → `63Cx` / `6983`, resets on success). For the on-panel change/unblock flows to
+/// gate on the *current* secret before collecting the new one; the host VERIFY APDU stays
+/// its own path. Callers mirroring the host wire pad via [`pad_pin`] first.
+pub fn verify_reference<S: Storage>(dev: &Device, fs: &mut Fs<S>, which: PinRef, pin: &[u8]) -> Sw {
+    let (fid, retry) = which.fid_retry();
+    check_ref(dev, fs, fid, retry, pin)
+}
+
+/// Whether the management key is marked PIN-protected (the ADMIN-DATA `0x02`
+/// flag). The PRINTED object only yields the key when this is set, so a default
+/// or plain management key is never PIN-readable.
+fn mgm_is_protected<S: Storage>(fs: &mut Fs<S>) -> bool {
+    // Sized to hold a real ykman PivmanData (flags + 16-byte salt + 4-byte timestamp ≈ 29B);
+    // `Storage::read` returns the value's FULL stored length, so clamp to the bytes we hold
+    // before slicing — a larger record must not panic, and an unparsable one fails closed
+    // (read as not protected), the safe direction.
+    let mut obj = [0u8; 64];
+    let Some(n) = fs.read(EF_PIVMAN_DATA, &mut obj) else {
+        return false;
+    };
+    let body = &obj[..n.min(obj.len())];
+    if body.len() < 2 || body[0] != PIVMAN_TAG {
+        return false;
+    }
+    let inner_len = (body[1] as usize).min(body.len() - 2);
+    matches!(
+        find_tag(&body[2..2 + inner_len], PIVMAN_FLAGS_TAG as u16),
+        Some(f) if !f.is_empty() && f[0] & PIVMAN_FLAG_MGM_PROTECTED != 0
+    )
+}
+
+/// Replace the PIV management key with a fresh random AES-256 key and mark it
+/// PIN-protected (the ykman `--protect` model): the key is sealed in the 0x9B
+/// auth slot and the ADMIN-DATA flag is set, so a host reads it back from the
+/// PRINTED object (`5FC109`) after a PIN VERIFY. The user never sees the key.
+/// Shared by the on-panel "Protect management key" action — physical presence at
+/// the trusted panel is the authorisation (no prior management-key auth).
+///
+/// SECURITY: after this, the PIV PIN **alone** grants management access (it
+/// unlocks the random mgmt key), exactly as YubiKey's `--protect`. Caller-gated
+/// behind the device PIN + a deliberate hold on the panel.
+///
+/// Power-cut ordering: the key+meta are written before the ADMIN flag, so a torn
+/// write leaves the flag clear → PRINTED reads absent (fail-closed, no half-key
+/// disclosure). Re-running this (or a PIV factory reset) recovers — it depends on
+/// no prior state, just overwriting the slot.
+pub fn protect_mgm_key<S: Storage>(dev: &Device, fs: &mut Fs<S>, rng: &mut dyn Rng) -> Sw {
+    let mut key = [0u8; 32];
+    rng.fill(&mut key);
+    let sealed = seal::seal_put(dev, fs, rng, key_fid(SLOT_CARDMGM), &key);
+    key.zeroize();
+    if sealed.is_err() {
+        return Sw::MEMORY_FAILURE;
+    }
+    // pin-policy NEVER matches a real YubiKey's protected mgmt key (9B is not
+    // PIN-gated at the APDU level; `is_key(0x9B)` is false so auth ignores it).
+    if fs
+        .meta_add(
+            key_fid(SLOT_CARDMGM).get(),
+            &[ALGO_AES256, PINPOLICY_NEVER, TOUCHPOLICY_NEVER],
+        )
+        .is_err()
+    {
+        return Sw::MEMORY_FAILURE;
+    }
+    // ADMIN DATA = PivmanData { flags: MGM_PROTECTED } = 80 03 81 01 02.
+    let admin = [
+        PIVMAN_TAG,
+        0x03,
+        PIVMAN_FLAGS_TAG,
+        0x01,
+        PIVMAN_FLAG_MGM_PROTECTED,
+    ];
+    if fs.put(EF_PIVMAN_DATA, &admin).is_err() {
+        return Sw::MEMORY_FAILURE;
+    }
+    Sw::OK
 }
 
 /// Constant-time slice equality (length public).
@@ -1273,6 +1480,176 @@ mod tests {
         msg.extend_from_slice(b"87654321");
         let (sw, _) = run(&mut app, &mut fs, INS_CHANGE_PIN, 0, 0x81, &msg);
         assert_eq!(sw, Sw::OK);
+    }
+
+    /// The on-device (panel) PIN/PUK/unblock path: `pad_pin` + the shared
+    /// `change_reference` / `unblock_pin_with_puk` library fns must produce a state
+    /// a host (ykman / yubico-piv-tool, which always pads to 8 with 0xFF) accepts.
+    #[test]
+    fn panel_pin_ops_match_host_wire() {
+        let rng = RefCell::new(TestRng(7));
+        let pres = RefCell::new(AlwaysConfirm);
+        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
+        let mut fs = new_fs();
+        select(&mut app, &mut fs);
+        let dev = Device {
+            serial_hash: &HASH,
+            serial_id: &SERIAL,
+            otp_key: None,
+        };
+
+        // pad_pin builds the 8-byte PIV wire form (matches the stored defaults).
+        assert_eq!(pad_pin(b"123456"), Some(DEFAULT_PIN));
+        assert_eq!(pad_pin(b"12345678"), Some(DEFAULT_PUK));
+        assert_eq!(pad_pin(b""), None);
+        assert_eq!(pad_pin(b"123456789"), None);
+
+        // Panel change-PIN: "123456" -> "654321", both padded as the panel will.
+        let old = pad_pin(b"123456").unwrap();
+        let new = pad_pin(b"654321").unwrap();
+        assert_eq!(
+            change_reference(&dev, &mut fs, PinRef::Pin, &old, &new),
+            Sw::OK
+        );
+        // A host VERIFY (always padded) accepts the panel-set PIN...
+        let (sw, _) = run(&mut app, &mut fs, INS_VERIFY, 0, 0x80, &new);
+        assert_eq!(sw, Sw::OK);
+        // ...and the unpadded 6-byte form does NOT — padding is load-bearing.
+        let (sw, _) = run(&mut app, &mut fs, INS_VERIFY, 0, 0x80, b"654321");
+        assert_ne!(sw, Sw::OK);
+        let (sw, _) = run(&mut app, &mut fs, INS_VERIFY, 0, 0x80, &new); // reset the burned retry
+        assert_eq!(sw, Sw::OK);
+
+        // Wrong old PIN burns a retry and leaves the PIN unchanged.
+        let wrong = pad_pin(b"000000").unwrap();
+        assert_eq!(
+            change_reference(&dev, &mut fs, PinRef::Pin, &wrong, &old),
+            Sw::new(0x63, 0xC2)
+        );
+        assert_eq!(reference_retries_left(&mut fs, PinRef::Pin), Some(2));
+        let (sw, _) = run(&mut app, &mut fs, INS_VERIFY, 0, 0x80, &new);
+        assert_eq!(sw, Sw::OK);
+
+        // Panel change-PUK.
+        let newpuk = pad_pin(b"87654321").unwrap();
+        assert_eq!(
+            change_reference(&dev, &mut fs, PinRef::Puk, &DEFAULT_PUK, &newpuk),
+            Sw::OK
+        );
+
+        // Panel unblock: block the PIN, then reset it with the new PUK.
+        for _ in 0..3 {
+            let _ = run(&mut app, &mut fs, INS_VERIFY, 0, 0x80, &wrong);
+        }
+        let (sw, _) = run(&mut app, &mut fs, INS_VERIFY, 0, 0x80, &new);
+        assert_eq!(sw, Sw::PIN_BLOCKED);
+        let fresh = pad_pin(b"111111").unwrap();
+        assert_eq!(unblock_pin_with_puk(&dev, &mut fs, &newpuk, &fresh), Sw::OK);
+        let (sw, _) = run(&mut app, &mut fs, INS_VERIFY, 0, 0x80, &fresh);
+        assert_eq!(sw, Sw::OK);
+        // Wrong PUK on unblock burns a PUK retry.
+        let badpuk = pad_pin(b"00000000").unwrap();
+        assert_eq!(
+            unblock_pin_with_puk(&dev, &mut fs, &badpuk, &fresh),
+            Sw::new(0x63, 0xC2)
+        );
+    }
+
+    /// The PIN-protected management key (ykman `--protect`): a random AES-256 key
+    /// sealed in 0x9B, the ADMIN-DATA flag set, the key readable from PRINTED only
+    /// after a PIN VERIFY — and NOT readable at all until protection is enabled.
+    #[test]
+    fn pin_protected_mgm_key_roundtrip() {
+        let rng = RefCell::new(TestRng(7));
+        let pres = RefCell::new(AlwaysConfirm);
+        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
+        let mut fs = new_fs();
+        select(&mut app, &mut fs);
+        let dev = Device {
+            serial_hash: &HASH,
+            serial_id: &SERIAL,
+            otp_key: None,
+        };
+        let get = |id: [u8; 3]| [0x5C, 0x03, id[0], id[1], id[2]];
+        const PRINTED: [u8; 3] = [0x5F, 0xC1, 0x09];
+        const ADMIN: [u8; 3] = [0x5F, 0xFF, 0x00];
+
+        // No leak: before protection PRINTED reads as absent (even though the
+        // default mgmt key exists in 0x9B) — protection is opt-in.
+        let (sw, _) = run(&mut app, &mut fs, INS_GET_DATA, 0x3F, 0xFF, &get(PRINTED));
+        assert_eq!(sw, Sw::FILE_NOT_FOUND);
+
+        // Protect: fresh random AES-256 key, sealed + flagged.
+        assert_eq!(protect_mgm_key(&dev, &mut fs, &mut TestRng(42)), Sw::OK);
+
+        // ADMIN DATA is readable WITHOUT a PIN, carrying the protected flag.
+        let (sw, admin) = run(&mut app, &mut fs, INS_GET_DATA, 0x3F, 0xFF, &get(ADMIN));
+        assert_eq!(sw, Sw::OK);
+        assert_eq!(&admin, &[0x53, 0x05, 0x80, 0x03, 0x81, 0x01, 0x02]);
+
+        // PRINTED is now flagged but PIN-gated.
+        let (sw, _) = run(&mut app, &mut fs, INS_GET_DATA, 0x3F, 0xFF, &get(PRINTED));
+        assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
+
+        // After a PIN VERIFY, PRINTED yields the wrapped 32-byte key.
+        verify_pin(&mut app, &mut fs);
+        let (sw, printed) = run(&mut app, &mut fs, INS_GET_DATA, 0x3F, 0xFF, &get(PRINTED));
+        assert_eq!(sw, Sw::OK);
+        assert_eq!(
+            &printed[..6],
+            &[0x53, 0x24, PROTECTED_TAG, 0x22, PROTECTED_MGM_TAG, 0x20]
+        );
+        let host_key: [u8; 32] = printed[6..38].try_into().unwrap();
+
+        // The synthesized key equals the sealed 0x9B auth key (single source).
+        let mut sealed = [0u8; 32];
+        assert_eq!(
+            seal::seal_read(&dev, &mut fs, key_fid(SLOT_CARDMGM), &mut sealed),
+            Ok(32)
+        );
+        assert_eq!(host_key, sealed);
+
+        // And the host-read key authenticates via AES-256 mutual auth.
+        let (sw, wit) = run(
+            &mut app,
+            &mut fs,
+            INS_AUTHENTICATE,
+            ALGO_AES256,
+            0x9B,
+            &[0x7C, 0x02, 0x80, 0x00],
+        );
+        assert_eq!(sw, Sw::OK);
+        let mut w: [u8; 16] = wit[4..20].try_into().unwrap();
+        rsk_crypto::aes_ecb_decrypt_block(&host_key, &mut w).unwrap();
+        let host_chal = [0xA5u8; 16];
+        let mut msg = vec![0x7C, 0x24, 0x80, 0x10];
+        msg.extend_from_slice(&w);
+        msg.extend_from_slice(&[0x81, 0x10]);
+        msg.extend_from_slice(&host_chal);
+        let (sw, resp) = run(&mut app, &mut fs, INS_AUTHENTICATE, ALGO_AES256, 0x9B, &msg);
+        assert_eq!(sw, Sw::OK);
+        let mut expect = host_chal;
+        rsk_crypto::aes_ecb_encrypt_block(&host_key, &mut expect).unwrap();
+        assert_eq!(&resp[4..20], &expect);
+    }
+
+    /// A real ykman PivmanData carries a 16-byte salt + timestamp (~29 bytes), over the
+    /// parse buffer; `mgm_is_protected` must read its full stored length (`Storage::read`
+    /// returns the full length, not the copied count) without panicking and still find the
+    /// protected flag.
+    #[test]
+    fn mgm_is_protected_tolerates_oversized_admin_data() {
+        let mut fs = new_fs();
+        let mut inner = vec![PIVMAN_FLAGS_TAG, 0x01, PIVMAN_FLAG_MGM_PROTECTED];
+        inner.extend_from_slice(&[0x82, 0x10]);
+        inner.extend_from_slice(&[0u8; 16]); // salt
+        inner.extend_from_slice(&[0x83, 0x04]);
+        inner.extend_from_slice(&[0u8; 4]); // timestamp
+        let mut admin = vec![PIVMAN_TAG, inner.len() as u8];
+        admin.extend_from_slice(&inner);
+        assert!(admin.len() > 16);
+        fs.put(EF_PIVMAN_DATA, &admin).unwrap();
+        assert!(mgm_is_protected(&mut fs));
     }
 
     #[test]

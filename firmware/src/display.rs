@@ -74,6 +74,10 @@ const SPIN_STEP_DEG: i32 = 24;
 /// (once per prime candidate); time-gating to ~100ms keeps the panel repaint off the keygen's
 /// hot path so the search isn't slowed by SPI traffic.
 const KEYGEN_SPIN_MS: u64 = 100;
+/// PIV PIN/PUK length floor for the on-panel change/unblock pads — the PIV minimum (the
+/// default PIN `123456` is six). The applet stores up to eight; `rsk_piv::pad_pin` pads the
+/// rest to the 8-byte `0xFF` wire form so a host VERIFY (which always pads) matches.
+const PIV_PIN_MIN: usize = 6;
 /// The locked-hint breathe advances one shade every this many ~100ms status-loop ticks, so
 /// the 8-shade ramp cycles in ~2.4s (the design's breathe period).
 const BREATHE_TICKS: u32 = 3;
@@ -762,6 +766,10 @@ impl Ui {
                                 }
                                 Some(SecurityEntry::FidoPin) => {
                                     self.run_set_pin(PinScope::Fido);
+                                    last = Instant::now();
+                                }
+                                Some(SecurityEntry::PivPin) => {
+                                    self.run_piv_pins();
                                     last = Instant::now();
                                 }
                                 Some(SecurityEntry::AuditLog) => {
@@ -2955,6 +2963,286 @@ impl Ui {
         new.zeroize();
         confirm.zeroize();
         self.end_modal();
+    }
+
+    /// The PIV PIN/PUK sub-menu (Settings → Security → "PIV PIN"): change the PIV PIN, change
+    /// the PUK, or unblock a blocked PIN with the PUK. A modal picker like the keygen chooser;
+    /// the title-bar chevron backs out to the Security list. Each op is gated by knowledge of
+    /// the current PIN/PUK — exactly the host APDU's authorisation, no device-PIN gate.
+    fn run_piv_pins(&mut self) {
+        let idle = Duration::from_millis(MENU_INACTIVITY_MS);
+        self.touch.wait_release(Instant::now(), idle);
+        // Materialise the PIV defaults if no host has ever selected the applet — a display
+        // unit used only for FIDO never triggers the lazy first-SELECT scan, so EF_PIN / EF_PUK
+        // / EF_RETRIES wouldn't exist for the gate to verify against (it would dead-end on the
+        // missing retry counter). Idempotent: every step is has-data guarded.
+        {
+            let dev = self.keys.device();
+            let mut rng = self.rng.borrow_mut();
+            let mut fs = self.fs.borrow_mut();
+            let _ = rsk_piv::files::scan_files(&dev, &mut fs, &mut *rng);
+        }
+        loop {
+            let _ = rsk_ui::render_piv_pin_menu(&mut self.panel);
+            self.shown = None;
+            self.touch.wait_release(Instant::now(), idle);
+            let mut last = Instant::now();
+            let pick = loop {
+                if self.sleep_button_pressed() {
+                    return;
+                }
+                if let Some(p) = self.touch.read() {
+                    last = Instant::now();
+                    if rsk_ui::hit_title_back(p) {
+                        return;
+                    }
+                    if let Some(i) = rsk_ui::hit_list(p, rsk_ui::PIV_KEYGEN_PICK_TOP, 4) {
+                        break i;
+                    }
+                    self.touch.wait_release(last, idle);
+                }
+                if crate::worker::host_request_pending() || last.elapsed() >= idle {
+                    return;
+                }
+                block_for(Duration::from_millis(TOUCH_POLL_MS));
+            };
+            match pick {
+                0 => self.run_change_piv_ref(
+                    rsk_piv::PinRef::Pin,
+                    "Current PIN",
+                    "New PIN",
+                    "Confirm PIN",
+                ),
+                1 => self.run_change_piv_ref(
+                    rsk_piv::PinRef::Puk,
+                    "Current PUK",
+                    "New PUK",
+                    "Confirm PUK",
+                ),
+                2 => self.run_unblock_piv_pin(),
+                _ => self.run_protect_mgm_key(),
+            }
+            // Each sub-flow ends in a success pop or a cancel; re-show this menu afterwards.
+        }
+    }
+
+    /// Collect and verify the current PIV PIN or PUK on the pad, re-prompting with the
+    /// remaining-attempts caption until it's right, the user backs out, or the counter is
+    /// spent. Returns the secret padded to the 8-byte PIV wire form on success (for the
+    /// following change/unblock), or `None` on cancel / timeout / blocked (the latter shows
+    /// the lockout notice). The retry counter is the PIV applet's own (`EF_RETRIES`).
+    fn gate_piv_ref(
+        &mut self,
+        which: rsk_piv::PinRef,
+        title: &'static str,
+        buf: &mut [u8],
+    ) -> Option<[u8; 8]> {
+        let mut caption = rsk_piv::reference_retries_left(&mut self.fs.borrow_mut(), which)
+            .map(|left| PinCaption::TriesRemaining { left });
+        loop {
+            let n =
+                match self.collect_pin(title, caption, PIV_PIN_MIN, PIV_PIN_MIN as u8, buf, true) {
+                    rsk_fido::PinEntry::Entered(n) => n.min(buf.len()),
+                    _ => return None,
+                };
+            // `n <= buf.len() == 8`, so `pad_pin` only returns `None` defensively. The padded
+            // copy is the cleartext current secret — zeroize it on every path (the PUK is the
+            // recovery secret), matching `run_set_pin` / `collect_new_piv_pin` hygiene.
+            let mut pad = rsk_piv::pad_pin(&buf[..n])?;
+            let sw = {
+                let dev = self.keys.device();
+                rsk_piv::verify_reference(&dev, &mut self.fs.borrow_mut(), which, &pad)
+            };
+            if sw == rsk_sdk::Sw::OK {
+                let out = pad;
+                pad.zeroize();
+                return Some(out);
+            }
+            if sw == rsk_sdk::Sw::PIN_BLOCKED {
+                pad.zeroize();
+                self.show_pin_blocked();
+                return None;
+            }
+            let left =
+                rsk_piv::reference_retries_left(&mut self.fs.borrow_mut(), which).unwrap_or(0);
+            caption = Some(PinCaption::WrongPin { retries_left: left });
+            pad.zeroize();
+        }
+    }
+
+    /// Collect a new PIV PIN twice on the pad and return it padded to the wire form, or `None`
+    /// on cancel / timeout / host-yield. A New ≠ Confirm mismatch re-prompts in place; both
+    /// pad buffers are zeroized on every iteration and at exit.
+    fn collect_new_piv_pin(
+        &mut self,
+        title: &'static str,
+        confirm_title: &'static str,
+    ) -> Option<[u8; 8]> {
+        let mut new = [0u8; 8];
+        let mut confirm = [0u8; 8];
+        let mut new_caption = Some(PinCaption::ChoosePin);
+        let out = loop {
+            new.zeroize();
+            confirm.zeroize();
+            let n1 = match self.collect_pin(
+                title,
+                new_caption,
+                PIV_PIN_MIN,
+                PIV_PIN_MIN as u8,
+                &mut new,
+                true,
+            ) {
+                rsk_fido::PinEntry::Entered(n) => n.min(new.len()),
+                _ => break None,
+            };
+            let n2 = match self.collect_pin(
+                confirm_title,
+                Some(PinCaption::Reenter),
+                PIV_PIN_MIN,
+                PIV_PIN_MIN as u8,
+                &mut confirm,
+                true,
+            ) {
+                rsk_fido::PinEntry::Entered(n) => n.min(confirm.len()),
+                _ => break None,
+            };
+            if n1 == n2 && rsk_crypto::ct_eq(&new[..n1], &confirm[..n2]) {
+                break rsk_piv::pad_pin(&new[..n1]);
+            }
+            new_caption = Some(PinCaption::Mismatch);
+        };
+        new.zeroize();
+        confirm.zeroize();
+        out
+    }
+
+    /// Change the PIV application PIN or PUK from the panel: verify the current value, then
+    /// collect the new one twice. Both are padded to the PIV wire form so a host VERIFY (which
+    /// always pads to 8 with `0xFF`) accepts the result. Mirrors [`Self::run_set_pin`] but
+    /// against the PIV applet's own PIN/PUK records, not the device/FIDO PIN.
+    fn run_change_piv_ref(
+        &mut self,
+        which: rsk_piv::PinRef,
+        cur_title: &'static str,
+        new_title: &'static str,
+        confirm_title: &'static str,
+    ) {
+        self.touch
+            .wait_release(Instant::now(), Duration::from_millis(MENU_INACTIVITY_MS));
+        let mut cur = [0u8; 8];
+        let gated = self.gate_piv_ref(which, cur_title, &mut cur);
+        cur.zeroize();
+        let mut cur_pad = match gated {
+            Some(p) => p,
+            None => {
+                self.end_modal();
+                return;
+            }
+        };
+        let applied = match self.collect_new_piv_pin(new_title, confirm_title) {
+            Some(mut new_pad) => {
+                let sw = {
+                    let dev = self.keys.device();
+                    rsk_piv::change_reference(
+                        &dev,
+                        &mut self.fs.borrow_mut(),
+                        which,
+                        &cur_pad,
+                        &new_pad,
+                    )
+                };
+                new_pad.zeroize();
+                sw == rsk_sdk::Sw::OK
+            }
+            None => false,
+        };
+        cur_pad.zeroize();
+        if applied {
+            self.show_success(SuccessKind::Approved, Some(1100));
+        } else {
+            self.end_modal();
+        }
+    }
+
+    /// Unblock a blocked PIV PIN with the PUK (Settings → Security → PIV PIN → Unblock PIN):
+    /// verify the PUK, then set a new PIN — the on-device RESET RETRY COUNTER. The shared
+    /// `unblock_pin_with_puk` resets the PIN's retry counter on success.
+    fn run_unblock_piv_pin(&mut self) {
+        self.touch
+            .wait_release(Instant::now(), Duration::from_millis(MENU_INACTIVITY_MS));
+        let mut puk = [0u8; 8];
+        let gated = self.gate_piv_ref(rsk_piv::PinRef::Puk, "PUK", &mut puk);
+        puk.zeroize();
+        let mut puk_pad = match gated {
+            Some(p) => p,
+            None => {
+                self.end_modal();
+                return;
+            }
+        };
+        let applied = match self.collect_new_piv_pin("New PIN", "Confirm PIN") {
+            Some(mut new_pad) => {
+                let sw = {
+                    let dev = self.keys.device();
+                    rsk_piv::unblock_pin_with_puk(
+                        &dev,
+                        &mut self.fs.borrow_mut(),
+                        &puk_pad,
+                        &new_pad,
+                    )
+                };
+                new_pad.zeroize();
+                sw == rsk_sdk::Sw::OK
+            }
+            None => false,
+        };
+        puk_pad.zeroize();
+        if applied {
+            self.show_success(SuccessKind::Approved, Some(1100));
+        } else {
+            self.end_modal();
+        }
+    }
+
+    /// "Protect management key" (Settings → Security → PIV PIN → Protect mgmt key): generate a
+    /// fresh random AES-256 management key, seal it, and mark it PIN-protected (ykman
+    /// `--protect`) so a host can use it with just the PIV PIN. Gated by the device PIN (when
+    /// set) and a deliberate hold — physical presence at the trusted panel is the authorisation
+    /// (no management-key auth). It REPLACES the current management key, and afterwards the PIV
+    /// PIN alone grants PIV admin (the confirm screen states this).
+    fn run_protect_mgm_key(&mut self) {
+        let idle = Duration::from_millis(MENU_INACTIVITY_MS);
+        self.touch.wait_release(Instant::now(), idle);
+        // Materialise the PIV defaults first (a never-host-selected display unit) so the host
+        // can later VERIFY the PIN to read the protected key. Idempotent.
+        {
+            let dev = self.keys.device();
+            let mut rng = self.rng.borrow_mut();
+            let mut fs = self.fs.borrow_mut();
+            let _ = rsk_piv::files::scan_files(&dev, &mut fs, &mut *rng);
+        }
+        if !self.local_pin_gate("Enter PIN", PinScope::Device) {
+            return;
+        }
+        let _ = rsk_ui::render_piv_protect_confirm(&mut self.panel);
+        self.shown = None;
+        self.touch.wait_release(Instant::now(), idle);
+        if !self.hold_to_confirm("Hold to protect", rsk_ui::theme::ACCENT_FILL) {
+            return;
+        }
+        // The generate + seal holds the dev/rng/fs borrows across a synchronous, no-await span
+        // (no key search — AES key gen is instant), so the worker can't preempt.
+        let ok = {
+            let dev = self.keys.device();
+            let mut rng = self.rng.borrow_mut();
+            let mut fs = self.fs.borrow_mut();
+            rsk_piv::protect_mgm_key(&dev, &mut fs, &mut *rng) == rsk_sdk::Sw::OK
+        };
+        if ok {
+            self.show_success(SuccessKind::Approved, Some(1100));
+        } else {
+            self.end_modal();
+        }
     }
 }
 

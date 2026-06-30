@@ -30,10 +30,11 @@ pub use render::{
     render_hold_fill, render_locked_breathe, render_oath, render_oath_cred, render_openpgp,
     render_openpgp_cardholder, render_openpgp_key, render_passkeys_list, render_pin_blocked,
     render_pin_dots, render_pin_title, render_piv, render_piv_extra, render_piv_keygen_confirm,
-    render_piv_keygen_pick, render_piv_keygen_rsa_pick, render_piv_keygen_working, render_piv_slot,
-    render_rebooting, render_rename, render_rename_caret, render_reveal_warning,
-    render_seal_confirm, render_seed_phrase, render_service, render_share_picker,
-    render_slip39_share, render_status_arc, render_success, render_success_circle,
+    render_piv_keygen_pick, render_piv_keygen_rsa_pick, render_piv_keygen_working,
+    render_piv_pin_menu, render_piv_protect_confirm, render_piv_slot, render_rebooting,
+    render_rename, render_rename_caret, render_reveal_warning, render_seal_confirm,
+    render_seed_phrase, render_service, render_share_picker, render_slip39_share,
+    render_status_arc, render_success, render_success_circle,
 };
 pub use settings_store::{CONF_LEN as DISPLAY_CONF_LEN, DisplayConfig};
 
@@ -513,6 +514,10 @@ pub enum SecurityEntry {
     /// Set / change the **FIDO clientPIN** — the WebAuthn/built-in-UV PIN, independent of
     /// the device PIN. A change verifies the current FIDO PIN first.
     FidoPin,
+    /// Manage the **PIV application PIN / PUK** — opens a sub-menu (change PIN, change PUK,
+    /// or unblock a blocked PIN with the PUK). Independent of the device and FIDO PINs; each
+    /// op is gated by knowledge of the current PIN/PUK, exactly like the host APDU path.
+    PivPin,
     /// Open the read-only on-device audit log (the recent journal events).
     AuditLog,
     /// Open the read-only seed-backup status screen (whether the recovery seed is present
@@ -533,7 +538,7 @@ pub enum AdjustKey {
 
 /// Settings list rows, shared by the Root list and its Display / Security sub-pages — each
 /// is a full-width row in `settings_row_rect(i)`. The Root has three (Display / Security /
-/// Firmware); Security has the most (five). Sized so the longest list (Security) fits below
+/// Firmware); Security has the most (six). Sized so the longest list (Security) fits below
 /// the chrome and above the panel bottom (a const-assert validates it) at a touch-comfortable
 /// row height, with a clear gap below the title-bar back chevron so a stray reach for it can't
 /// land on the first row.
@@ -588,17 +593,19 @@ pub fn hit_display(p: Point) -> Option<DisplayEntry> {
     None
 }
 
-/// Number of Security sub-page rows (Device PIN, FIDO PIN, Audit log, Backup, Factory
-/// reset) — the longest settings list, so the shared row geometry is sized to fit it.
-pub const SECURITY_ROWS: u16 = 5;
+/// Number of Security sub-page rows (Device PIN, FIDO PIN, PIV PIN, Audit log, Backup,
+/// Factory reset) — the longest settings list, so the shared row geometry is sized to fit it.
+pub const SECURITY_ROWS: u16 = 6;
 
-/// The Security entry on row `i`, in list order (the danger Factory reset stays last).
+/// The Security entry on row `i`, in list order (the three credential PINs first, the danger
+/// Factory reset stays last).
 pub const fn security_row_entry(i: u16) -> SecurityEntry {
     match i {
         0 => SecurityEntry::DevicePin,
         1 => SecurityEntry::FidoPin,
-        2 => SecurityEntry::AuditLog,
-        3 => SecurityEntry::Backup,
+        2 => SecurityEntry::PivPin,
+        3 => SecurityEntry::AuditLog,
+        4 => SecurityEntry::Backup,
         _ => SecurityEntry::FactoryReset,
     }
 }
@@ -627,18 +634,23 @@ pub const ADJ_MINUS_RECT: Rect = Rect::new(16, ADJ_Y, ADJ_W, ADJ_H);
 pub const ADJ_PLUS_RECT: Rect = Rect::new(PANEL_W - 16 - ADJ_W, ADJ_Y, ADJ_W, ADJ_H);
 
 // Compile-time layout invariants (paint and hit-test share these rects): the longest
-// settings list (Security, five rows) fits above the bottom nav bar with a real gap; the
-// −/+ controls are disjoint with a gap and sit above Back. A bad geometry edit fails the
-// build. The Root page paints the four-tab nav (its peer tabs do) and the no-nav sub-pages
-// reuse the same rows below a back chevron — bounding the five-row case by `NAV_TOP` keeps
-// every list clear of the nav and on-panel.
+// settings list (Security, six rows) fits on-panel; the −/+ controls are disjoint with a gap
+// and sit above Back. A bad geometry edit fails the build. The Root page paints the four-tab
+// nav (its peer tabs do) and the no-nav sub-pages reuse the same rows below a back chevron —
+// so the Root list is bounded by `NAV_TOP` (clear of the nav) while the no-nav Security list,
+// the longest, is bounded by the panel bottom (`PANEL_H`).
 const _: () = {
     assert!(ROW_GAP > 0);
     // At least one brightness step (the level-bar math would underflow at 0).
     assert!(BRIGHTNESS_LEVELS >= 1);
     assert!(SETTINGS_ROWS <= SECURITY_ROWS && DISPLAY_ROWS <= SECURITY_ROWS);
+    // The settings sub-pages (Display / Security) are no-nav — a back chevron, no bottom
+    // nav bar — so the longest list (Security) is bounded by the panel bottom, not NAV_TOP.
+    // The Root settings list IS a nav tab, so it must still clear the nav bar.
+    let root_last = settings_row_rect(SETTINGS_ROWS - 1);
+    assert!(root_last.y + root_last.h <= NAV_TOP);
     let last = settings_row_rect(SECURITY_ROWS - 1);
-    assert!(last.x + last.w <= PANEL_W && last.y + last.h <= NAV_TOP);
+    assert!(last.x + last.w <= PANEL_W && last.y + last.h <= PANEL_H);
     assert!(ADJ_MINUS_RECT.x + ADJ_MINUS_RECT.w < ADJ_PLUS_RECT.x);
     assert!(ADJ_PLUS_RECT.x + ADJ_PLUS_RECT.w <= PANEL_W);
     assert!(ADJ_MINUS_RECT.y + ADJ_MINUS_RECT.h <= PANEL_H);
@@ -1926,6 +1938,7 @@ mod tests {
         let want = [
             SecurityEntry::DevicePin,
             SecurityEntry::FidoPin,
+            SecurityEntry::PivPin,
             SecurityEntry::AuditLog,
             SecurityEntry::Backup,
             SecurityEntry::FactoryReset,

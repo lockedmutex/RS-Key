@@ -43,6 +43,32 @@ The applet accepts AES-128/192/256 management keys; under the FIPS-style build
 it refuses to *set* a new 3DES key, though an existing 3DES key still
 authenticates so a reflashed device can migrate itself to AES.
 
+**On the panel (trusted-display builds).** The PIV PIN and PUK can be changed —
+and a blocked PIN unblocked with the PUK — on the device, no host needed:
+Settings → Security → **PIV PIN** → *Change PIN* / *Change PUK* / *Unblock PIN*.
+Each verifies the current PIN/PUK against the applet's own retry counter (shown
+on the pad) and stores the new value in the 8-byte `0xFF`-padded wire form, so a
+later `ykman` / `yubico-piv-tool` VERIFY accepts it.
+
+A 24-byte **management key** can't be typed on a numeric pad, so the panel sets a
+**random, PIN-protected** one instead — Settings → Security → **PIV PIN** →
+*Protect mgmt key*. The device generates a random AES-256 management key, seals
+it, and marks it PIN-protected (the ykman `--protect` scheme), so a host then
+uses it with just the PIV PIN — `ykman piv info` shows it as protected and
+`ykman piv` operations no longer need the hex key. **Security:** once protected,
+the PIV PIN **alone** grants management access (it unlocks the random key), so
+treat the PIN accordingly; the panel states this and gates the action behind the
+device PIN and a hold. (`ykman piv access change-management-key --generate
+--protect` does the same thing from the host.)
+
+The panel manages PINs/PUKs that follow the standard PIV convention — **6–8
+digits, padded to 8 bytes with `0xFF`** — which is what `ykman`, `yubico-piv-tool`
+and OpenSC all use. A PIN or PUK provisioned *outside* that convention (e.g.
+hand-crafted raw `CHANGE REFERENCE DATA` / `RESET RETRY` APDUs that store an
+unpadded or sub-6-digit value) can't be verified on the panel; re-set it with
+`ykman` first. The factory defaults follow the convention, so the panel works
+out of the box.
+
 > The defaults are public. Until you change the PIN, PUK and management key,
 > anyone with physical access can generate, import or delete keys. Treat a
 > default-credential card as unprovisioned.

@@ -15,6 +15,30 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Added
 
+- **Trusted-display + PIV: set a PIN-protected random management key on the panel (ykman
+  `--protect`).** Settings → Security → PIV PIN gains a **Protect mgmt key** action: the device
+  generates a fresh random AES-256 management key, seals it, and marks it PIN-protected, so a
+  host (`ykman piv …`) can then use it with just the PIV PIN — you never have to carry the
+  24-byte key. The applet now serves the YubiKey ADMIN-DATA (`5FFF00`) and PRINTED (`5FC109`)
+  objects: the management key is read back from PRINTED only after a PIN VERIFY **and** only once
+  protected (a default/plain key is never PIN-readable), and it is synthesized from the sealed
+  auth slot — there is no second copy at rest. `ykman piv access change-management-key --generate
+  --protect` now works over USB too. **Security:** once protected, the PIV PIN alone grants PIV
+  admin (it unlocks the random key) — the panel states this plainly and gates the action behind
+  the device PIN and a deliberate hold. bcdDevice 0x07CA → 0x07CB.
+
+- **Trusted-display: change the PIV PIN and PUK, and unblock a blocked PIN, on the panel.**
+  Settings → Security gains a **PIV PIN** entry that opens a sub-menu — *Change PIN*,
+  *Change PUK*, and *Unblock PIN* (reset a PIN blocked by too many wrong tries, using the PUK),
+  so PIV PIN management no longer needs a host. Each op is gated by the current PIN/PUK exactly
+  like the host CHANGE REFERENCE DATA / RESET RETRY APDUs (no management key); the PIV applet's
+  own retry counter is shown and enforced, and a blocked PIN/PUK shows the lockout notice. The
+  PIN/PUK are stored padded to the 8-byte `0xFF` PIV wire form, so a host VERIFY (ykman /
+  yubico-piv-tool, which always pad) accepts a panel-set value — a host-tested round-trip locks
+  this in. The change / unblock logic moved into host-tested `rsk-piv` functions shared with the
+  APDU handlers. The PIV *management key* stays host-only for now (a 24-byte AES key can't be
+  typed on a numeric pad). bcdDevice 0x07C9 → 0x07CA.
+
 - **Trusted-display: the brightness, display-sleep and touch-timeout settings persist across
   reboots.** Edits made in Settings → Display used to reset to their defaults on the next power
   cycle; they now survive it. Brightness and the display-sleep timeout are stored in a new
