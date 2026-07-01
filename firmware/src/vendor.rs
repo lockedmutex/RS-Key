@@ -5,9 +5,11 @@
 //! persisted in `EF_LED_CONF` and applied live), and the reboot command — which
 //! is only queued here and run by the worker after the response has flushed.
 
+use core::cell::RefCell;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use rsk_fs::{Fs, Storage};
+use rsk_rescue::{Confirm, Presence, UserPresence};
 use rsk_sdk::{Apdu, Applet, ResBuf, Sw};
 
 /// Vendor AID (RID `F0 00 00 00`, app `01`).
@@ -75,9 +77,21 @@ pub fn reboot_pending() -> bool {
     REBOOT.load(Ordering::Relaxed) != 0
 }
 
-pub struct VendorApplet;
+pub struct VendorApplet<'a> {
+    /// Gates the reboot-to-BOOTSEL command (P1=01). The same physical presence
+    /// source the rescue applet uses, so a hostile host cannot drop the device
+    /// into the mass-storage bootloader without the operator via *either*
+    /// transport (this applet is reachable over both CCID and CTAPHID).
+    presence: &'a RefCell<dyn UserPresence>,
+}
 
-impl<S: Storage> Applet<Fs<S>> for VendorApplet {
+impl<'a> VendorApplet<'a> {
+    pub fn new(presence: &'a RefCell<dyn UserPresence>) -> Self {
+        Self { presence }
+    }
+}
+
+impl<S: Storage> Applet<Fs<S>> for VendorApplet<'_> {
     fn aid(&self) -> &'static [u8] {
         VENDOR_AID
     }
@@ -161,7 +175,22 @@ impl<S: Storage> Applet<Fs<S>> for VendorApplet {
                 }
                 match apdu.p1 {
                     0x00 => request_reboot(false),
-                    0x01 => request_reboot(true),
+                    0x01 => {
+                        // Reboot-to-BOOTSEL aids an at-rest flash/OTP dump; gate it
+                        // behind the operator, matching the rescue applet's
+                        // REBOOT_BOOTSEL — otherwise this ungated twin would let a
+                        // hostile host bypass that gate. A warm restart (P1=00)
+                        // stays ungated.
+                        if self
+                            .presence
+                            .borrow_mut()
+                            .request(Confirm::titled("Reboot to BOOTSEL?"))
+                            != Presence::Confirmed
+                        {
+                            return Sw::CONDITIONS_NOT_SATISFIED;
+                        }
+                        request_reboot(true)
+                    }
                     _ => return Sw::INCORRECT_P1P2,
                 }
                 Sw::OK

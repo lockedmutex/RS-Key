@@ -340,6 +340,10 @@ firmware predates the rescue applet.
 > sign), `10/03` (store cert), `1C/01` (WRITE phy record) and `1F/01` (reboot to
 > BOOTSEL) against a hostile USB host. Read-only status (`1E/*`), the pubkey read
 > (`10/02`), SET RTC (`1C/02`) and a warm reboot (`1F/00`) stay ungated.
+>
+> The **vendor** applet (§8) exposes the same reboot verb, reachable over both the
+> CCID and CTAPHID transports; its `1F/01` (BOOTSEL) is gated identically, so the
+> gate cannot be bypassed via the vendor AID. Its warm reboot (`1F/00`) is ungated.
 
 ### 7.1 The phy record (`EF_PHY`) — **PicoForge-compatible**
 
@@ -398,7 +402,7 @@ per device status), persisted in flash and applied immediately. Source:
 | `02` | — | — | — | counter (BE4) | GET test counter |
 | `10` | brightness `0..255` | `color \| steady \| status<<4` | `[effect[, speed]]` opt. | — | SET LED for one status |
 | `11` | `00` | `00` | — | 17-byte config block | GET LED config |
-| `1F` | `00`/`01` | `00` | — | — | REBOOT (warm / BOOTSEL) |
+| `1F` | `00`/`01` | `00` | — | — | REBOOT (warm / BOOTSEL). `01` is user-presence-gated (`6985` if declined; see §7) |
 
 `INS 12` (CORE1_STATS) and `INS 13` (KEYGEN_BENCH) exist only in debug/bench
 builds and are not part of the stable surface.

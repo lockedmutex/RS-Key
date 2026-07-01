@@ -589,13 +589,15 @@ pub(crate) fn read_slot<S: Storage>(
     (n >= CONFIG_SIZE).then_some(n)
 }
 
-/// Boot pass: seal any slot config still stored as legacy plaintext. A blob that
-/// already unseals is left alone; one that does not, and is plaintext-sized, is
-/// taken to be a pre-seal slot and re-sealed in place. Idempotent and crash-safe
-/// per slot — GCM authentication tells the sealed and plaintext generations
-/// apart — so it runs unconditionally at every boot (see `firmware/src/main.rs`),
-/// before any host command or [`power_up_bump`] touches a slot. Closes the one
-/// applet that historically stored its secrets in the clear.
+/// Boot pass: bring every slot to a seal under the current kbase arm. A blob that
+/// already unseals is left alone; a slot sealed under the pre-OTP (NO-OTP) arm is
+/// recovered and re-sealed under the OTP arm once the fuse key is present; a
+/// legacy plaintext config is sealed in place. Idempotent and crash-safe per slot
+/// — GCM authentication tells the generations apart — so it runs unconditionally
+/// at every boot (see `firmware/src/main.rs`), before any host command or
+/// [`power_up_bump`] touches a slot. Closes the one applet that historically
+/// stored its secrets in the clear, and (via the pre-OTP arm, mirroring
+/// keydev/PIV/seed) keeps an OTP burn from orphaning a slot provisioned before it.
 pub fn migrate_seal<S: Storage>(dev: &Device, fs: &mut Fs<S>, rng: &mut dyn Rng) {
     let mut out = [0u8; SLOT_SIZE];
     // Sized to hold a full sealed blob so a sealed-but-unauthenticating slot
@@ -605,7 +607,16 @@ pub fn migrate_seal<S: Storage>(dev: &Device, fs: &mut Fs<S>, rng: &mut dyn Rng)
     for i in 0..4u16 {
         let fid = KeyFid::new(EF_OTP_SLOT1 + i);
         if seal::seal_read(dev, fs, fid, &mut out).is_some() {
-            continue; // already sealed
+            continue; // already sealed under the current arm
+        }
+        // A slot sealed before the OTP MKEK was burned is under the NO-OTP kbase;
+        // recover it via the pre-OTP arm and re-seal under the current (OTP) arm,
+        // so a burn never silently orphans an existing slot.
+        if dev.otp_key.is_some()
+            && let Some(n) = seal::seal_read(&dev.without_otp(), fs, fid, &mut out)
+        {
+            let _ = seal::seal_put(dev, fs, rng, fid, &out[..n]);
+            continue;
         }
         if let Some(n) = fs.read_key(fid, &mut raw) {
             // Only re-seal a genuine plaintext config; anything longer is not a
@@ -771,6 +782,43 @@ mod tests {
             TKT_CHAL_RESP,
             CFG_CHAL_HMAC | cfg_extra,
         )
+    }
+
+    #[test]
+    fn slot_sealed_before_otp_burn_survives_the_burn() {
+        // #12 regression: a slot programmed while the OTP MKEK is unburned is
+        // sealed under the NO-OTP kbase. After the burn migrate_seal must recover
+        // it via the pre-OTP arm and re-seal under the OTP arm — else the slot is
+        // silently orphaned (the failure the other four applets already avoid).
+        let mut fs = new_fs();
+        let mut rng = CountRng(7);
+        let nootp = Device {
+            serial_hash: &SERIAL_HASH,
+            serial_id: &SERIAL,
+            otp_key: None,
+        };
+        let otp_key = [0x55u8; 32];
+        let otp = Device {
+            otp_key: Some(&otp_key),
+            ..nootp
+        };
+        // Seal a real config under the pre-OTP (NO-OTP) arm.
+        let cfg = chalresp_config(&[0xAB; 20], &[0; 6], 0);
+        let fid = KeyFid::new(EF_OTP_SLOT1);
+        assert!(seal::seal_put(&nootp, &mut fs, &mut rng, fid, &cfg));
+
+        // The OTP-armed device cannot read it yet (different kbase)…
+        let mut buf = [0u8; SLOT_SIZE];
+        assert!(read_slot(&otp, &mut fs, EF_OTP_SLOT1, &mut buf).is_none());
+
+        // …migrate_seal recovers and re-seals it under the OTP arm.
+        migrate_seal(&otp, &mut fs, &mut rng);
+        assert!(read_slot(&otp, &mut fs, EF_OTP_SLOT1, &mut buf).is_some());
+        assert_eq!(&buf[..CONFIG_SIZE], &cfg[..]);
+
+        // Idempotent: a second pass is a no-op and the slot still reads.
+        migrate_seal(&otp, &mut fs, &mut rng);
+        assert!(read_slot(&otp, &mut fs, EF_OTP_SLOT1, &mut buf).is_some());
     }
 
     fn configure(

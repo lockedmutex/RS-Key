@@ -19,6 +19,8 @@ issued unless --no-reboot. (Per-status COLOURS are a separate, live setting that
 persists in a different record — see `rsk led`.)
 """
 
+import sys
+
 from . import ccid
 from .status import RESCUE_AID
 
@@ -173,9 +175,20 @@ def run(args):
         _upsert(tlvs, TAG_PRESENCE_TIMEOUT, args.touch_timeout)
 
     blob = _serialize_tlv(tlvs)
+    # The phy write is device identity, so the firmware gates it behind an
+    # on-device confirmation — prompt for it, and explain a decline (6985).
+    print(
+        "approve on the device (touch / on-screen Approve) to write the config…",
+        file=sys.stderr,
+    )
     _, s1, s2 = ccid.transmit(
         conn, [0x80, 0x1C, 0x01, 0x00, len(blob)] + list(blob) + [0x00]
     )
+    if (s1, s2) == (0x69, 0x85):
+        raise SystemExit(
+            "phy write declined on the device (no confirmation). Approve on the "
+            "device when prompted, then retry."
+        )
     if (s1, s2) != (0x90, 0x00):
         raise SystemExit(f"WRITE phy failed: {s1:02X}{s2:02X}")
     print("phy LED config written ✓")

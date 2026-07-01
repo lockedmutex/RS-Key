@@ -77,9 +77,11 @@ fn generate<S: Storage>(
     out: &mut [u8],
 ) -> Result<usize, Sw> {
     // The algorithm attribute (slot FID − 0x10) decides RSA vs EC and the curve.
+    // Clamp to the buffer: `Storage::read` reports the DO's full stored length and
+    // PUT DATA caps nothing, so an over-long C1/C2/C3 must not slice OOB = brick.
     let mut algo_buf = [0u8; 16];
     let algo: &[u8] = match fs.read(fid.get() - 0x10, &mut algo_buf) {
-        Some(n) if n > 0 => &algo_buf[..n],
+        Some(n) if n > 0 => &algo_buf[..n.min(algo_buf.len())],
         _ => DEFAULT_ALGO,
     };
 
@@ -191,7 +193,8 @@ pub fn rsa_generate_params<S: Storage>(
     };
     let mut algo_buf = [0u8; 16];
     let algo: &[u8] = match fs.read(fid.get() - 0x10, &mut algo_buf) {
-        Some(n) if n > 0 => &algo_buf[..n],
+        // Clamp: full stored length may exceed the buffer (see `generate`).
+        Some(n) if n > 0 => &algo_buf[..n.min(algo_buf.len())],
         _ => DEFAULT_ALGO,
     };
     if algo[0] != ALGO_RSA {
@@ -224,5 +227,33 @@ pub fn rsa_generate_finish<S: Storage>(
     match r {
         Ok(n) => (n, Sw::OK),
         Err(sw) => (0, sw),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rsk_fs::storage::ram::RamStorage;
+
+    use super::*;
+
+    #[test]
+    fn over_long_algo_do_does_not_panic() {
+        // `Storage::read` reports the DO's FULL stored length and PUT DATA caps
+        // nothing, so a PW3 host can leave an over-16-byte C1/C2/C3 algorithm
+        // attribute. The read+slice in generate / rsa_generate_params must clamp
+        // to the fixed buffer — an index-OOB panic on device is a brick.
+        let mut fs = Fs::new(RamStorage::new(), &[]);
+        fs.scan();
+        let mut algo = [0u8; 48]; // > the 16-byte reader buffer
+        algo[0] = ALGO_RSA;
+        algo[1] = 0x08; // 2048-bit
+        fs.put(EF_ALGO_PRIV1, &algo).unwrap();
+        let mut sess = Session::new();
+        sess.has_pw3 = true; // GENERATE is a PW3 op; reach the algo read past the gate
+        // Must not panic; the clamped 16-byte prefix still parses as RSA-2048.
+        assert_eq!(
+            rsa_generate_params(&mut fs, &sess, 0x80, 0x00, &[0xB6, 0x00]),
+            Ok(Some((EF_PK_SIG, 2048)))
+        );
     }
 }

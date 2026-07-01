@@ -36,7 +36,7 @@ pub struct CcidApplets<'a> {
     fs: &'a RefCell<Store>,
     rng: &'a RefCell<FidoRng>,
     disp: Dispatcher,
-    vendor: VendorApplet,
+    vendor: VendorApplet<'a>,
     openpgp: OpenpgpApplet<'a>,
     management: ManagementApplet,
     oath: OathApplet<'a>,
@@ -71,7 +71,9 @@ impl<'a> CcidApplets<'a> {
             fs,
             rng,
             disp: Dispatcher::new(),
-            vendor: VendorApplet,
+            // The vendor reboot-to-BOOTSEL (P1=01) is gated by the same presence
+            // as the rescue applet, closing the cross-AID bypass of that gate.
+            vendor: VendorApplet::new(rescue_presence),
             openpgp: OpenpgpApplet::new(serial_id, serial_hash, otp_key, rng, presence),
             management: ManagementApplet::new(serial_id),
             // Touch-flagged OATH credentials gate CALCULATE on the same button.

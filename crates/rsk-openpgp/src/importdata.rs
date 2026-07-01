@@ -151,7 +151,9 @@ fn try_import<S: Storage>(
     let algo_fid = fid.get() - 0x10;
     let mut algo_buf = [0u8; 16];
     let algo: &[u8] = match fs.read(algo_fid, &mut algo_buf) {
-        Some(n) if n > 0 => &algo_buf[..n],
+        // Clamp: `Storage::read` reports the DO's full stored length and PUT DATA
+        // caps nothing, so an over-long C1/C2/C3 must not slice OOB = brick.
+        Some(n) if n > 0 => &algo_buf[..n.min(algo_buf.len())],
         _ => DEFAULT_ALGO,
     };
     match algo[0] {

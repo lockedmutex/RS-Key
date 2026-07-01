@@ -58,6 +58,11 @@ impl rsk_oath::Rng for SeqRng {
         self.next(buf)
     }
 }
+impl rsk_otp::Rng for SeqRng {
+    fn fill(&mut self, buf: &mut [u8]) {
+        self.next(buf)
+    }
+}
 
 fuzz_target!(|data: &[u8]| {
     const SERIAL_ID: [u8; 8] = [0x12, 0x34, 0x56, 0x78, 1, 2, 3, 4];
@@ -76,7 +81,7 @@ fuzz_target!(|data: &[u8]| {
     let mut openpgp = OpenpgpApplet::new(SERIAL_ID, SERIAL_HASH, None, &rng, &pgp_pres);
     let mut management = ManagementApplet::new(SERIAL_ID);
     let mut oath = OathApplet::new(SERIAL_ID, SERIAL_HASH, None, &rng, &oath_pres);
-    let mut otp = OtpApplet::new(SERIAL_ID, &otp_pres);
+    let mut otp = OtpApplet::new(SERIAL_ID, SERIAL_HASH, None, &rng, &otp_pres);
     let mut piv = PivApplet::new(SERIAL_ID, SERIAL_HASH, None, &rng, &pgp_pres);
 
     let mut disp = Dispatcher::new();

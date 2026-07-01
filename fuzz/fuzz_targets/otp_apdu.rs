@@ -14,8 +14,18 @@ use core::cell::RefCell;
 use libfuzzer_sys::fuzz_target;
 use rsk_fs::Fs;
 use rsk_fs::storage::ram::RamStorage;
-use rsk_otp::{AlwaysConfirm, OtpApplet};
+use rsk_otp::{AlwaysConfirm, OtpApplet, Rng};
 use rsk_sdk::{Apdu, Applet, ResBuf};
+
+struct CountRng(u8);
+impl Rng for CountRng {
+    fn fill(&mut self, b: &mut [u8]) {
+        for x in b.iter_mut() {
+            *x = self.0;
+            self.0 = self.0.wrapping_add(1);
+        }
+    }
+}
 
 fn run(app: &mut OtpApplet, fs: &mut Fs<RamStorage>, raw: &[u8]) {
     if let Ok(apdu) = Apdu::parse(raw) {
@@ -45,7 +55,8 @@ fuzz_target!(|data: &[u8]| {
     let mut fs = Fs::new(RamStorage::new(), &[]);
     fs.scan();
     let presence = RefCell::new(AlwaysConfirm);
-    let mut app = OtpApplet::new([1, 2, 3, 4, 5, 6, 7, 8], &presence);
+    let rng = RefCell::new(CountRng(0));
+    let mut app = OtpApplet::new([1, 2, 3, 4, 5, 6, 7, 8], [0x22; 32], None, &rng, &presence);
 
     // Seed slot 1: HMAC chal-resp config (tkt 0x40, cfg 0x22) + valid CRC.
     let mut cfg = [0u8; 52];

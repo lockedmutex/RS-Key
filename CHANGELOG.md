@@ -15,6 +15,42 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Security
 
+- **Pre-release cross-review hardening.** An adversarial re-review of the two
+  unreleased hardening commits (the trusted-display arc and the pico-keys
+  carry-over below) — the ones that had not yet been cross-reviewed before a
+  release tag — found and fixed:
+  - **OpenPGP over-long-DO brick, two remaining sites.** `GENERATE`,
+    `rsa_generate_params` and key `IMPORT` read the algorithm-attribute DO into a
+    fixed 16-byte buffer and sliced it by the value's *full* stored length; a
+    PW3 host can `PUT DATA` an over-16-byte `C1/C2/C3`, so the slice panicked
+    (device brick). Clamped to the buffer, matching the earlier `info.rs` fix.
+  - **OTP slots and OATH credentials now survive a later OTP-MKEK burn.** Both
+    seal under the device root key, which changes when the fuse MKEK is burned;
+    neither had the pre-OTP recovery arm the FIDO seed / PIV / attestation key
+    already use, so a secret provisioned *before* a burn became unreadable (OTP)
+    or was double-encrypted and destroyed (OATH) on the first post-burn boot. The
+    boot migrations now trial-decrypt under the pre-OTP arm and re-seal under the
+    OTP arm.
+  - **OATH OTP-PIN survives an OTP-MKEK burn.** The new OTP-rooted verifier gained
+    the same `without_otp()` match-and-re-store fallback the PIV / OpenPGP / FIDO
+    PINs use, so a PIN set before a burn still verifies afterwards — restoring the
+    burn-immunity the legacy serial-only hash happened to have.
+  - **The reboot-to-BOOTSEL user-presence gate can no longer be bypassed.** The
+    vendor applet exposes the same reboot verb as the (gated) rescue applet, over
+    both the CCID and CTAPHID transports; its `1F/01` (BOOTSEL) is now gated
+    identically. A warm restart (`1F/00`) stays ungated.
+  - **Trusted-display: the Add-passkey (enrollment) screen marks a truncated
+    relying-party id.** The makeCredential screen dropped the truncation marker
+    for a clamped look-alike id whose prefix fit the box — the phishing vector the
+    Approve screen already closed. It now forces the marker like the Approve path.
+  - **`rsk-wipe` rejects a degenerate `FLASH_SIZE`.** `FLASH_SIZE=0` passed the
+    remaining build asserts and made the erase a silent no-op that still signalled
+    success; a lower bound now rejects it.
+
+  bcdDevice 0x07D3 → 0x07D4. Host CLI (`tools/rsk`) 0.2.0 → 0.3.0: `rsk hw` and
+  `rsk reboot bootsel` now prompt for the on-device approval the firmware requires
+  and explain a `6985` decline instead of failing cryptically.
+
 - **Carry-over hardening from a pico-keys upstream audit.** A review of the upstream
   pico-keys C firmware surfaced design flaws; each was re-verified against the RS-Key
   Rust source. The overwhelming majority were already handled by the port (OATH gate,

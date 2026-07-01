@@ -38,6 +38,13 @@ fn resolve_flash_size() -> u32 {
         bytes.is_multiple_of(4096),
         "FLASH_SIZE={bytes} must be a multiple of 4096 (the QSPI erase sector)"
     );
+    // Lower bound: `0` (and `0x0`/`0K`/`0M`) passes the other asserts and makes
+    // flash_range_erase a count-0 no-op — a "successful" wipe that erases nothing
+    // and leaves sealed secrets on the chip. Reject any degenerate sub-chip size.
+    assert!(
+        bytes >= 64 * 1024,
+        "FLASH_SIZE={bytes} too small — a 0/degenerate value would erase nothing"
+    );
     assert!(
         bytes <= 16 * 1024 * 1024,
         "FLASH_SIZE={bytes} exceeds the supported 16 MiB"

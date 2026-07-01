@@ -114,7 +114,7 @@ impl rsk_rescue::Rng for FidoRng {
 pub struct AppletHandler<'a> {
     fs: &'a RefCell<Store>,
     disp: Dispatcher,
-    vendor: VendorApplet,
+    vendor: VendorApplet<'a>,
     /// The hardware TRNG, shared with the CCID/OpenPGP transport through a
     /// `RefCell` (borrowed only for one synchronous dispatch, never across an
     /// `.await`), like the flash `Fs`.
@@ -134,10 +134,14 @@ pub struct AppletHandler<'a> {
 }
 
 impl<'a> AppletHandler<'a> {
+    #[allow(clippy::too_many_arguments)] // one-time wiring from the worker
     pub fn new(
         fs: &'a RefCell<Store>,
         rng: &'a RefCell<FidoRng>,
         presence: &'a RefCell<dyn rsk_fido::UserPresence>,
+        // Same physical presence, as the rescue trait, for the vendor applet's
+        // gated reboot-to-BOOTSEL (this transport also dispatches the vendor AID).
+        vendor_presence: &'a RefCell<dyn rsk_rescue::UserPresence>,
         serial_id: [u8; 8],
         serial_hash: [u8; 32],
         otp_key: Option<[u8; 32]>,
@@ -150,7 +154,7 @@ impl<'a> AppletHandler<'a> {
         Self {
             fs,
             disp: Dispatcher::new(),
-            vendor: VendorApplet,
+            vendor: VendorApplet::new(vendor_presence),
             rng,
             fido_state,
             presence,

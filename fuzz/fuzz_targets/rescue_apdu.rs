@@ -16,7 +16,7 @@ use libfuzzer_sys::fuzz_target;
 use rsk_fs::Fs;
 use rsk_fs::storage::ram::RamStorage;
 use rsk_rescue::rollback::{ROLLBACK_REQUIRED_BIT, RollbackRaw};
-use rsk_rescue::{Platform, RescueApplet, Rng, SecureBootStatus};
+use rsk_rescue::{Confirm, Platform, Presence, RescueApplet, Rng, SecureBootStatus, UserPresence};
 use rsk_sdk::{Apdu, Applet, ResBuf};
 
 const SERIAL_ID: [u8; 8] = [0xAA, 0xBB, 0xCC, 0xDD, 5, 6, 7, 8];
@@ -29,6 +29,15 @@ impl Rng for CountRng {
             *x = self.0;
             self.0 = self.0.wrapping_add(1);
         }
+    }
+}
+
+// Always confirm so the presence-gated commands (attestation sign / cert / phy
+// write / BOOTSEL) stay reachable for the fuzzer.
+struct AlwaysConfirm;
+impl UserPresence for AlwaysConfirm {
+    fn request(&mut self, _c: Confirm<'_>) -> Presence {
+        Presence::Confirmed
     }
 }
 
@@ -81,6 +90,7 @@ fuzz_target!(|data: &[u8]| {
         time: None,
         flags0: [0; 3],
     });
+    let presence = RefCell::new(AlwaysConfirm);
     let mut app = RescueApplet::new(
         SERIAL_ID,
         SERIAL_HASH,
@@ -88,6 +98,7 @@ fuzz_target!(|data: &[u8]| {
         None,
         &rng,
         &platform,
+        &presence,
         64 * 1024,
         4 * 1024 * 1024,
     );

@@ -712,11 +712,21 @@ impl<'a> OathApplet<'a> {
     /// hash (which [`Self::cmd_verify_otp_pin`] / [`Self::cmd_change_otp_pin`]
     /// upgrade to v1 on success).
     fn otp_pin_matches(&self, rec: &[u8], pw: &[u8]) -> bool {
+        let dev = self.device();
         match rec.len() {
             34 if rec[1] == OTP_PIN_FMT_V1 => {
-                ct_eq(&self.device().pin_derive_verifier(pw), &rec[2..34])
+                let stored = &rec[2..34];
+                ct_eq(&dev.pin_derive_verifier(pw), stored)
+                    // kbase-migration fallback: a v1 verifier stored before the
+                    // OTP key was provisioned. On a match the caller re-stores it
+                    // under the OTP arm (verify/change rewrite v1 on success), so
+                    // the PIN survives an OTP burn — mirrors the PIV/OpenPGP/FIDO
+                    // PIN checks. Without this the legacy double_hash_pin was
+                    // serial-only and burn-immune; v1 must not regress that.
+                    || (dev.otp_key.is_some()
+                        && ct_eq(&dev.without_otp().pin_derive_verifier(pw), stored))
             }
-            33 => ct_eq(&self.device().double_hash_pin(pw), &rec[1..33]),
+            33 => ct_eq(&dev.double_hash_pin(pw), &rec[1..33]),
             _ => false,
         }
     }
@@ -1051,8 +1061,11 @@ pub fn migrate_seal<S: Storage>(dev: &Device, fs: &mut Fs<S>, rng: &mut dyn Rng)
     raw.zeroize();
 }
 
-/// Re-seal `fid` iff its stored bytes do not already authenticate as a sealed
-/// blob (legacy plaintext). No-op when the slot is absent or already sealed.
+/// Bring `fid` to a seal under the current kbase arm. No-op if it already
+/// authenticates there. A secret sealed under the pre-OTP (NO-OTP) arm is
+/// recovered and re-sealed under the OTP arm; otherwise the stored bytes are
+/// taken to be legacy plaintext and sealed in place. No-op when the slot is
+/// absent.
 fn reseal_if_plaintext<S: Storage>(
     dev: &Device,
     fs: &mut Fs<S>,
@@ -1062,7 +1075,20 @@ fn reseal_if_plaintext<S: Storage>(
     raw: &mut [u8],
 ) {
     if seal::seal_read(dev, fs, fid, out).is_some() {
-        return; // already sealed
+        return; // already sealed under the current arm
+    }
+    // A credential sealed before the OTP MKEK was burned is under the NO-OTP
+    // kbase. Recover it via the pre-OTP arm and re-seal under the current (OTP)
+    // arm — else the fall-through below would re-seal the *ciphertext* as if it
+    // were plaintext (double-encrypting and destroying the secret). Plaintext and
+    // sealed OATH blobs overlap in length (a cred TLV is variable-length), so
+    // unlike the OTP applet this cannot be a size guard — it must be the AEAD
+    // trial-decrypt. Mirrors keydev/PIV/seed.
+    if dev.otp_key.is_some()
+        && let Some(n) = seal::seal_read(&dev.without_otp(), fs, fid, out)
+    {
+        let _ = seal::seal_put(dev, fs, rng, fid, &out[..n]);
+        return;
     }
     if let Some(n) = fs.read_key(fid, raw) {
         let n = n.min(raw.len());
@@ -1931,6 +1957,101 @@ mod tests {
             &apdu(INS_SET_PIN, 0, 0, &tlv(TAG_PASSWORD, b"5678")),
         );
         assert_eq!(sw, Sw::OK);
+    }
+
+    #[test]
+    fn cred_sealed_before_otp_burn_survives_the_burn() {
+        // #3 regression: a credential sealed while the OTP MKEK is unburned is
+        // under the NO-OTP kbase. After the burn migrate_seal must recover it via
+        // the pre-OTP arm and re-seal under the OTP arm — NOT re-wrap the
+        // ciphertext as plaintext (which would double-encrypt and destroy it).
+        let mut fs = new_fs();
+        let mut rng = CountRng(7);
+        let nootp = Device {
+            serial_hash: &[0x22; 32],
+            serial_id: &SERIAL,
+            otp_key: None,
+        };
+        let otp_key = [0x55u8; 32];
+        let otp = Device {
+            otp_key: Some(&otp_key),
+            ..nootp
+        };
+        // Seal a credential blob under the pre-OTP arm (content is opaque to the
+        // migration — it re-seals bytes, so a fixed payload suffices).
+        let secret = b"a-totp-cred-tlv-blob\x00\x01\x02";
+        let fid = KeyFid::new(EF_OATH_CRED);
+        assert!(seal::seal_put(&nootp, &mut fs, &mut rng, fid, secret));
+
+        // The OTP-armed device cannot read it yet…
+        let mut buf = [0u8; CRED_MAX];
+        assert!(seal::seal_read(&otp, &mut fs, fid, &mut buf).is_none());
+
+        // …migrate_seal recovers and re-seals it under the OTP arm, byte-identical.
+        migrate_seal(&otp, &mut fs, &mut rng);
+        let n = seal::seal_read(&otp, &mut fs, fid, &mut buf).expect("cred survives the burn");
+        assert_eq!(&buf[..n], secret);
+
+        // Idempotent, and it is no longer readable under the pre-OTP arm.
+        migrate_seal(&otp, &mut fs, &mut rng);
+        assert!(seal::seal_read(&otp, &mut fs, fid, &mut buf).is_some());
+        assert!(seal::seal_read(&nootp, &mut fs, fid, &mut buf).is_none());
+    }
+
+    #[test]
+    fn otp_pin_set_before_burn_still_verifies_after_burn() {
+        // #4 regression: v1 is OTP-rooted, so a PIN set before the OTP burn is
+        // stored under the NO-OTP kbase. After the burn otp_pin_matches must fall
+        // back to the pre-OTP arm (and the success re-stores under the OTP arm),
+        // so the PIN is not permanently locked out. The legacy double_hash_pin
+        // survived a burn; v1 must not regress that.
+        let mut fs = new_fs();
+        let rng = RefCell::new(CountRng(7));
+        let touch = RefCell::new(AlwaysConfirm);
+        let otp_key = [0x55u8; 32];
+
+        // Pre-burn: set the OTP-PIN (v1 under the NO-OTP kbase).
+        {
+            let mut app = OathApplet::new(SERIAL, [0x22; 32], None, &rng, &touch);
+            let (sw, _) = run(
+                &mut app,
+                &mut fs,
+                &apdu(INS_SET_PIN, 0, 0, &tlv(TAG_PASSWORD, b"1234")),
+            );
+            assert_eq!(sw, Sw::OK);
+        }
+
+        // Post-burn: the same PIN must still verify, via the without_otp fallback.
+        let mut app = OathApplet::new(SERIAL, [0x22; 32], Some(otp_key), &rng, &touch);
+        let (sw, _) = run(
+            &mut app,
+            &mut fs,
+            &apdu(INS_VERIFY_PIN, 0, 0, &tlv(TAG_PASSWORD, b"1234")),
+        );
+        assert_eq!(sw, Sw::OK);
+
+        // The success re-stored the verifier under the OTP arm (self-heal).
+        let otp_dev = Device {
+            serial_hash: &[0x22; 32],
+            serial_id: &SERIAL,
+            otp_key: Some(&otp_key),
+        };
+        let mut rec = [0u8; 34];
+        assert_eq!(fs.read(EF_OTP_PIN, &mut rec), Some(34));
+        assert_eq!(rec[1], OTP_PIN_FMT_V1);
+        assert_eq!(
+            &rec[2..],
+            &otp_dev.pin_derive_verifier(b"1234")[..],
+            "verifier re-stored under the OTP arm"
+        );
+
+        // A wrong PIN post-burn still fails.
+        let (sw, _) = run(
+            &mut app,
+            &mut fs,
+            &apdu(INS_VERIFY_PIN, 0, 0, &tlv(TAG_PASSWORD, b"nope")),
+        );
+        assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
     }
 
     #[test]

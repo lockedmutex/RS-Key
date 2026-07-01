@@ -2697,6 +2697,14 @@ const CEREMONY_PLATE_H: u16 = 46;
 /// hard-clipped at the boundary. So a short relying party stays nicely centred (the
 /// design), but a long, attacker-influenced rp id can never overrun the panel and is
 /// cut from one side (head readable) rather than centred with both ends hidden.
+///
+/// `mark` = the label was already clamped upstream (`Label.truncated`): force the
+/// ellipsis even when the (clamped) prefix happens to fit the pixel clip, so a padded
+/// look-alike id can't present a complete-looking prefix on a trust screen.
+// A low-level text-draw primitive: target, string, x, y, role, colour, clip and the
+// truncation flag are all irreducible draw inputs — a bundling struct would only
+// obscure the call sites.
+#[allow(clippy::too_many_arguments)]
 fn centered_clipped<D: DrawTarget<Color = Rgb565>>(
     t: &mut D,
     s: &str,
@@ -2705,9 +2713,10 @@ fn centered_clipped<D: DrawTarget<Color = Rgb565>>(
     role: Role,
     color: Rgb565,
     clip: Rect,
+    mark: bool,
 ) -> Result<(), D::Error> {
     let w = font::width(s, role).unwrap_or(clip.w as u32);
-    if w <= clip.w as u32 {
+    if w <= clip.w as u32 && !mark {
         text(t, s, EgPoint::new(cx, y), role, color)
     } else {
         text_left_ellipsized(
@@ -2717,7 +2726,7 @@ fn centered_clipped<D: DrawTarget<Color = Rgb565>>(
             role,
             color,
             clip,
-            false,
+            mark,
         )
     }
 }
@@ -2931,6 +2940,7 @@ where
         Role::Strong,
         theme::TEXT,
         Rect::new(6, (rp_y - 11) as u16, PANEL_W - 12, 22),
+        rp.truncated,
     )?;
     if !account.as_str().is_empty() {
         centered_clipped(
@@ -2941,6 +2951,7 @@ where
             Role::Body,
             theme::GREY,
             Rect::new(6, (acct_y - 11) as u16, PANEL_W - 12, 22),
+            account.truncated,
         )?;
     }
     text(
@@ -4670,6 +4681,50 @@ mod tests {
         assert!(
             rightmost(&marked) > rightmost(&plain),
             "force_mark must append a visible truncation marker even when the text fits"
+        );
+    }
+
+    #[test]
+    fn centered_clipped_marks_a_truncated_fitting_label() {
+        // #5: the Add-passkey (makeCredential) screen draws the rp/account via
+        // centered_clipped. A clamped rp id (Label.truncated) whose prefix fits the
+        // clip must not render as a complete-looking centred string — with `mark`
+        // set it routes through the left-ellipsized path so the marker appears, the
+        // same anti-phishing guarantee the Approve screen already had.
+        let clip = Rect::new(0, 0, PANEL_W, 24);
+        let leftmost = |d: &Rec| (0..PANEL_W).find(|&x| (0..24).any(|y| d.at(x, y) != BG));
+
+        let mut plain = Rec::new();
+        centered_clipped(
+            &mut plain,
+            "paypal.com",
+            MIDX,
+            16,
+            Role::Strong,
+            theme::TEXT,
+            clip,
+            false,
+        )
+        .unwrap();
+        let mut marked = Rec::new();
+        centered_clipped(
+            &mut marked,
+            "paypal.com",
+            MIDX,
+            16,
+            Role::Strong,
+            theme::TEXT,
+            clip,
+            true,
+        )
+        .unwrap();
+
+        assert!(plain.drew_anything() && marked.drew_anything());
+        // Unmarked + fits → centred (starts well right of the edge); marked → left-
+        // aligned + ellipsized (starts at the clip edge), so the marker is shown.
+        assert!(
+            leftmost(&marked).unwrap() < leftmost(&plain).unwrap(),
+            "a truncated (marked) label must render left-ellipsized, not centred-complete"
         );
     }
 
