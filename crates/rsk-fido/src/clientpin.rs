@@ -1786,7 +1786,7 @@ mod tests {
 
         // A legacy PIN-wrapped blob is unreadable (the UP-only failure window)…
         let pin_hash = sha256(b"1234");
-        crate::seed::wrap_keydev_legacy(&dev(), &mut fs, &pin_hash[..16]);
+        crate::seed::wrap_keydev_legacy(&dev(), &mut fs, &seed0, &pin_hash[..16]);
         assert_eq!(load_keydev(&dev(), &mut fs), None);
 
         // …until the first successful PIN op of any boot migrates it back.
@@ -2001,13 +2001,13 @@ mod tests {
             store_new_pin(&mut ctx, &padded).unwrap();
         }
         let pin_hash = sha256(b"9246");
-        crate::seed::wrap_keydev_legacy(&dev(), &mut fs, &pin_hash[..16]);
+        crate::seed::wrap_keydev_legacy(&dev(), &mut fs, &seed0, &pin_hash[..16]);
         let mut raw = [0u8; 61];
         assert_eq!(fs.read(EF_KEY_DEV.get(), &mut raw), Some(61));
         assert_eq!(raw[0], 0x03);
 
         // The OTP build: first verify migrates the verifier and unwraps the
-        // seed straight to a plain 0x11, costing no retry.
+        // seed straight to a plain 0x12, costing no retry.
         let mut state2 = FidoState::new();
         let mut presence = crate::AlwaysConfirm;
         let mut ctx = Ctx {
@@ -2022,8 +2022,8 @@ mod tests {
         let mut pin_rec = [0u8; PIN_FILE_LEN];
         ctx.fs.read(EF_PIN, &mut pin_rec).unwrap();
         assert_eq!(pin_rec[0], MAX_PIN_RETRIES);
-        assert_eq!(ctx.fs.read(EF_KEY_DEV.get(), &mut raw), Some(33));
-        assert_eq!(raw[0], 0x11);
+        assert_eq!(ctx.fs.read(EF_KEY_DEV.get(), &mut raw), Some(61));
+        assert_eq!(raw[0], 0x12);
         assert_eq!(load_keydev(&otp_dev(), ctx.fs), Some(seed0));
 
         // Second verify takes the direct path (verifier already re-stored).

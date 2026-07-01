@@ -53,6 +53,19 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
     and publishes only the four touch-required flavors, with a guard that fails
     the release if any `no-touch` asset is present.
 
+- **FIDO master seed sealed with authenticated ChaCha20-Poly1305.** The device
+  master seed and the org attestation scalar (`EF_KEY_DEV` / `EF_ATT_KEY`) were
+  sealed with AES-256-CBC under one fixed serial-hash IV shared across both
+  slots, and carried no MAC — the same fixed-IV / no-authentication class as the
+  OpenPGP DEK above, but at the root of the FIDO identity. They are now
+  ChaCha20-Poly1305-sealed (new tags `0x02` pre-OTP / `0x12` OTP-arm) under a
+  synthetic per-record nonce (`HMAC(HMAC(nonce_key, fid), value)`), so the seed
+  and the attestation key never share a nonce and a flash fault or tamper is
+  detected rather than silently decrypting to a corrupted seed. Records in the
+  legacy CBC (`0x01`/`0x11`) and PIN-wrapped (`0x03`/`0x13`) formats still load
+  and are re-sealed forward at boot / the first PIN verify — no reprovisioning,
+  and every passkey survives the upgrade.
+
 - **Pre-release cross-review hardening.** An adversarial re-review of the two
   unreleased hardening commits (the trusted-display arc and the pico-keys
   carry-over below) — the ones that had not yet been cross-reviewed before a
