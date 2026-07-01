@@ -296,6 +296,19 @@ pub fn make_credential<S: Storage, R: Rng>(
     if req.hmac_secret_mc.present && !req.ext_hmac_secret {
         return Err(CtapError::MissingParameter);
     }
+    // hmac-secret-mc carries the same salt fields as getAssertion's hmac-secret;
+    // reject an empty salt up front for parity with `get_assertion` rather than
+    // relying only on the downstream length check in `hmacsecret::eval`.
+    if req.hmac_secret_mc.present
+        && (req.hmac_secret_mc.salt_enc.is_empty() || req.hmac_secret_mc.salt_auth.is_empty())
+    {
+        return Err(CtapError::MissingParameter);
+    }
+    // credProtect (§12.1) defines only levels 1/2/3; reject an out-of-range value
+    // (CTAP2_ERR_INVALID_OPTION) instead of silently degrading it to no-protection.
+    if req.ext_cred_protect > CRED_PROT_UV_REQUIRED {
+        return Err(CtapError::InvalidOption);
+    }
     // Enterprise attestation (§6.1.2): only when enabled via authenticatorConfig,
     // and only levels 1/2. Whether it is actually performed (and the `ep` flag set)
     // is decided later: type 2 for any RP, type 1 only for a vendor-listed RP — see
@@ -1436,6 +1449,70 @@ mod tests {
         .unwrap();
         assert_eq!(c.ext.cred_protect, 2);
         assert_eq!(c.ext.cred_blob, &[0xAA, 0xBB, 0xCC]);
+    }
+
+    // A resident makeCredential whose only extension is credProtect = `level`.
+    fn mc_request_credprotect(level: u64) -> std::vec::Vec<u8> {
+        let mut buf = [0u8; 256];
+        let n = {
+            let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+            e.map(6).unwrap();
+            e.u8(1).unwrap().bytes(&[0xCDu8; 32]).unwrap();
+            e.u8(2).unwrap().map(1).unwrap();
+            e.str("id").unwrap().str("example.com").unwrap();
+            e.u8(3).unwrap().map(2).unwrap();
+            e.str("id").unwrap().bytes(&[1, 2, 3, 4]).unwrap();
+            e.str("name").unwrap().str("alice").unwrap();
+            e.u8(4).unwrap().array(1).unwrap().map(2).unwrap();
+            e.str("alg").unwrap().i64(ALG_ES256).unwrap();
+            e.str("type").unwrap().str("public-key").unwrap();
+            e.u8(6).unwrap().map(1).unwrap();
+            e.str("credProtect").unwrap().u64(level).unwrap();
+            e.u8(7).unwrap().map(1).unwrap();
+            e.str("rk").unwrap().bool(true).unwrap();
+            e.writer().position()
+        };
+        buf[..n].to_vec()
+    }
+
+    #[test]
+    fn credprotect_out_of_range_rejected() {
+        // Only levels 1/2/3 are defined (§12.1). A level of 4 must be rejected
+        // with INVALID_OPTION, not silently degraded to no-protection.
+        assert_eq!(
+            run_err(&mc_request_credprotect(4)),
+            CtapError::InvalidOption
+        );
+        // A valid level still registers.
+        assert!(!run(&mc_request_credprotect(3)).0.is_empty());
+    }
+
+    #[test]
+    fn hmac_secret_mc_empty_salt_rejected() {
+        // hmac-secret-mc present (with the required hmac-secret flag) but carrying
+        // no salt must be rejected up front (MissingParameter), matching the
+        // getAssertion hmac-secret empty-salt guard.
+        let mut buf = [0u8; 256];
+        let n = {
+            let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+            e.map(6).unwrap();
+            e.u8(1).unwrap().bytes(&[0xCDu8; 32]).unwrap();
+            e.u8(2).unwrap().map(1).unwrap();
+            e.str("id").unwrap().str("example.com").unwrap();
+            e.u8(3).unwrap().map(2).unwrap();
+            e.str("id").unwrap().bytes(&[1, 2, 3, 4]).unwrap();
+            e.str("name").unwrap().str("alice").unwrap();
+            e.u8(4).unwrap().array(1).unwrap().map(2).unwrap();
+            e.str("alg").unwrap().i64(ALG_ES256).unwrap();
+            e.str("type").unwrap().str("public-key").unwrap();
+            e.u8(6).unwrap().map(2).unwrap();
+            e.str("hmac-secret").unwrap().bool(true).unwrap();
+            e.str("hmac-secret-mc").unwrap().map(0).unwrap(); // no salt fields
+            e.u8(7).unwrap().map(1).unwrap();
+            e.str("rk").unwrap().bool(true).unwrap();
+            e.writer().position()
+        };
+        assert_eq!(run_err(&buf[..n]), CtapError::MissingParameter);
     }
 
     #[test]

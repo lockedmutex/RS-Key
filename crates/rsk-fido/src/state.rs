@@ -95,10 +95,13 @@ impl AssertionState {
 /// The *Begin* subcommands reset the counters; the *Next* variants read them.
 /// `FidoState::reset` clears it.
 pub struct CredMgmtState {
-    pub rp_counter: u8,
-    pub rp_total: u8,
-    pub cred_counter: u8,
-    pub cred_total: u8,
+    // u16 so a fully-provisioned store (MAX_RESIDENT_CREDENTIALS = 256) can be
+    // counted and walked to the last slot; a u8 saturated at 255, hiding the
+    // 256th RP/credential from enumeration.
+    pub rp_counter: u16,
+    pub rp_total: u16,
+    pub cred_counter: u16,
+    pub cred_total: u16,
     pub rp_id_hash: [u8; 32],
 }
 

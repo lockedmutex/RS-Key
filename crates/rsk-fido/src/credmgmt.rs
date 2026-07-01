@@ -276,8 +276,8 @@ fn enumerate_rps<S: Storage, R: Rng>(
     }
     let target = ctx.state.cm.rp_counter;
 
-    let mut skip = 0u8;
-    let mut total = 0u8;
+    let mut skip = 0u16;
+    let mut total = 0u16;
     let mut found = false;
     let mut rp = [0u8; 256];
     let mut rp_len = 0usize;
@@ -332,7 +332,7 @@ fn enumerate_rps<S: Storage, R: Rng>(
         .map_err(|_| CtapError::Other)?;
     if begin {
         enc.u8(5)
-            .and_then(|e| e.u8(total))
+            .and_then(|e| e.u16(total))
             .map_err(|_| CtapError::Other)?;
     }
     Ok(enc.writer().position())
@@ -354,8 +354,8 @@ fn enumerate_creds<S: Storage, R: Rng>(
     }
     let target = ctx.state.cm.cred_counter;
 
-    let mut skip = 0u8;
-    let mut total = 0u8;
+    let mut skip = 0u16;
+    let mut total = 0u16;
     let mut found = false;
     let mut rec = [0u8; 1024];
     let mut rec_len = 0usize;
@@ -406,7 +406,7 @@ fn enumerate_creds_response(
     rec: &[u8],
     rp_id_hash: &[u8; 32],
     begin: bool,
-    total: u8,
+    total: u16,
     seed: &[u8; 32],
     out: &mut [u8],
 ) -> CtapResult {
@@ -481,7 +481,7 @@ fn enumerate_creds_response(
     // 0x09 totalCredentials — Begin only.
     if begin {
         enc.u8(9)
-            .and_then(|e| e.u8(total))
+            .and_then(|e| e.u16(total))
             .map_err(|_| CtapError::Other)?;
     }
 

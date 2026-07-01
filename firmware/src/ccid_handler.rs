@@ -134,14 +134,17 @@ impl<'a> CcidApplets<'a> {
     /// everything else goes straight to the applet dispatcher.
     pub fn handle_apdu(&mut self, apdu: &[u8]) -> &[u8] {
         // The keygen fast paths bypass `Dispatcher::process`, which is what would
-        // normally drop a stale GET RESPONSE remainder; a GENERATE is never a
-        // 0xC0, so clearing it here matches the ordinary dispatch (applet.rs).
+        // normally drop a stale GET RESPONSE remainder and reset an interrupted
+        // command chain; a GENERATE is neither a 0xC0 nor a chain segment, so
+        // clearing both here matches the ordinary dispatch (applet.rs).
         if let Some(n) = self.try_rsa_keygen(apdu) {
             self.disp.clear_pending();
+            self.disp.clear_chaining();
             return &self.resp[..n];
         }
         if let Some(n) = self.try_piv_rsa_keygen(apdu) {
             self.disp.clear_pending();
+            self.disp.clear_chaining();
             return &self.resp[..n];
         }
         let (sw, n) = {

@@ -268,6 +268,19 @@ impl Dispatcher {
         self.pending_off = 0;
     }
 
+    /// Drop any half-accumulated incoming command chain, scrubbing it (chained
+    /// segments can hold private-key IMPORT data). Public for the same reason as
+    /// [`Self::clear_pending`]: a transport that short-circuits [`Self::process`]
+    /// (the RSA-keygen fast path) must reset the incoming chaining state too, so a
+    /// stale chain cannot concatenate onto a later command.
+    pub fn clear_chaining(&mut self) {
+        if self.chain_len > 0 {
+            self.chain[..self.chain_len].zeroize();
+        }
+        self.chain_len = 0;
+        self.chaining = false;
+    }
+
     /// Serve the next chunk of a chained response to a GET RESPONSE (`0xC0`).
     /// Returns `61xx` while bytes remain, then the original status word.
     fn serve_pending(&mut self, ne: usize, res: &mut ResBuf) -> Sw {
@@ -431,6 +444,48 @@ mod tests {
             Sw::OK
         );
         assert_eq!(res.as_slice(), &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE]);
+    }
+
+    #[test]
+    fn clear_chaining_drops_a_stale_incoming_chain() {
+        // Models the RSA-keygen fast path: it short-circuits `process` for a
+        // GENERATE, so an interrupted incoming command chain must be reset — else
+        // the stale segments would prepend onto the next command.
+        let mut echo = Echo { selected: false };
+        let mut applets: [&mut dyn Applet<()>; 1] = [&mut echo];
+        let mut disp = Dispatcher::new();
+        let mut out = [0u8; 64];
+        let mut res = ResBuf::new(&mut out);
+
+        let mut sel = vec![0x00, 0xA4, 0x04, 0x00, 0x08];
+        sel.extend_from_slice(&[0xA0, 0x00, 0x00, 0x06, 0x47, 0x2F, 0x00, 0x01]);
+        assert_eq!(disp.process(&sel, &mut applets, &mut (), &mut res), Sw::OK);
+
+        // A chaining segment accumulates 0xAA 0xBB…
+        assert_eq!(
+            disp.process(
+                &[0x10, 0x10, 0, 0, 0x02, 0xAA, 0xBB],
+                &mut applets,
+                &mut (),
+                &mut res
+            ),
+            Sw::OK
+        );
+        // …then a fast-path interruption resets the incoming chain.
+        disp.clear_chaining();
+
+        // The next non-chained echo returns ONLY its own byte — the stale 0xAA 0xBB
+        // is gone (without the reset it would echo 0xAA 0xBB 0xEE).
+        assert_eq!(
+            disp.process(
+                &[0x00, 0x10, 0, 0, 0x01, 0xEE],
+                &mut applets,
+                &mut (),
+                &mut res
+            ),
+            Sw::OK
+        );
+        assert_eq!(res.as_slice(), &[0xEE]);
     }
 
     #[test]

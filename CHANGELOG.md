@@ -15,6 +15,26 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Security
 
+- **Security-audit run-8 hardening notes.** Four defense-in-depth items from the
+  run-8 audit, none independently exploitable, applied on top of the two run-8
+  fixes (bcdDevice `0x07DD` → `0x07DE`):
+  - **credProtect is now range-checked.** makeCredential rejected nothing for a
+    credProtect value outside `{1,2,3}` and stored it verbatim; `getAssertion`
+    enforces protection by exact match, so an out-of-range value silently meant
+    *no* protection. It now returns `CTAP2_ERR_INVALID_OPTION` (§12.1).
+  - **hmac-secret-mc empty-salt parity.** makeCredential now rejects an
+    hmac-secret-mc request with an empty salt up front (`MissingParameter`),
+    matching the existing `getAssertion` hmac-secret guard (previously this was
+    only caught later by the length check in `hmacsecret::eval`).
+  - **credentialManagement enumeration counters widened to `u16`.** The `skip` /
+    `total` / begin-next counters were `u8` and saturated at 255, so on a fully
+    provisioned store (`MAX_RESIDENT_CREDENTIALS = 256`) the 256th RP/credential
+    was invisible to (and undeletable via) enumeration. The wire encoding is
+    unchanged for ≤255 (canonical CBOR).
+  - **RSA-keygen fast path resets the incoming command chain.** The CCID keygen
+    fast path already dropped a stale GET RESPONSE tail (`clear_pending`); it now
+    also resets a half-accumulated CLA-`0x10` command chain (`clear_chaining`,
+    scrubbing it) so an interrupted chain cannot prepend onto a later command.
 - **Security-audit run-8 fixes.** An eighth agentic audit against `db1391a`
   re-weighted onto the least-audited ground (the FIDO CTAP2 internals and the
   never-before-audited Yubico-management and rescue applets). All run-1…7 fixes
