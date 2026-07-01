@@ -38,7 +38,7 @@ pub struct CcidApplets<'a> {
     disp: Dispatcher,
     vendor: VendorApplet<'a>,
     openpgp: OpenpgpApplet<'a>,
-    management: ManagementApplet,
+    management: ManagementApplet<'a>,
     oath: OathApplet<'a>,
     otp: OtpApplet<'a>,
     piv: PivApplet<'a>,
@@ -60,6 +60,7 @@ impl<'a> CcidApplets<'a> {
         otp_presence: &'a RefCell<dyn rsk_otp::UserPresence>,
         oath_presence: &'a RefCell<dyn rsk_oath::UserPresence>,
         rescue_presence: &'a RefCell<dyn rsk_rescue::UserPresence>,
+        mgmt_presence: &'a RefCell<dyn rsk_mgmt::UserPresence>,
         platform: &'a RefCell<dyn rsk_rescue::Platform>,
         serial_id: [u8; 8],
         serial_hash: [u8; 32],
@@ -75,7 +76,7 @@ impl<'a> CcidApplets<'a> {
             // as the rescue applet, closing the cross-AID bypass of that gate.
             vendor: VendorApplet::new(rescue_presence),
             openpgp: OpenpgpApplet::new(serial_id, serial_hash, otp_key, rng, presence),
-            management: ManagementApplet::new(serial_id),
+            management: ManagementApplet::new(serial_id, mgmt_presence),
             // Touch-flagged OATH credentials gate CALCULATE on the same button.
             oath: OathApplet::new(serial_id, serial_hash, otp_key, rng, oath_presence),
             otp: OtpApplet::new(serial_id, serial_hash, otp_key, rng, otp_presence),

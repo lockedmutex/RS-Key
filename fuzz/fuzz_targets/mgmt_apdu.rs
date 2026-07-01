@@ -9,16 +9,18 @@
 //! persists to `EF_DEV_CONF` (then READ CONFIG echoes it back). A stream of raw
 //! APDUs is replayed against the live applet + flash; none may panic.
 
+use core::cell::RefCell;
 use libfuzzer_sys::fuzz_target;
 use rsk_fs::Fs;
 use rsk_fs::storage::ram::RamStorage;
-use rsk_mgmt::ManagementApplet;
+use rsk_mgmt::{AlwaysConfirm, ManagementApplet};
 use rsk_sdk::{Apdu, Applet, ResBuf};
 
 fuzz_target!(|data: &[u8]| {
     let mut fs = Fs::new(RamStorage::new(), &[]);
     fs.scan();
-    let mut app = ManagementApplet::new([0x12, 0x34, 0x56, 0x78, 1, 2, 3, 4]);
+    let presence = RefCell::new(AlwaysConfirm);
+    let mut app = ManagementApplet::new([0x12, 0x34, 0x56, 0x78, 1, 2, 3, 4], &presence);
 
     // Split the input into length-prefixed APDUs and replay each.
     let mut i = 0;

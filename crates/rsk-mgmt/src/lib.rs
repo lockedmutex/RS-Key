@@ -6,7 +6,9 @@
 //! READ CONFIG (0x1D) returns the DeviceInfo TLV; WRITE CONFIG (0x1C) persists it.
 #![cfg_attr(not(test), no_std)]
 
+use core::cell::RefCell;
 use rsk_fs::{Fs, Storage};
+pub use rsk_sdk::Confirm;
 use rsk_sdk::{Apdu, Applet, ResBuf, Sw};
 
 /// Management applet AID.
@@ -54,9 +56,35 @@ const EF_DEV_CONF: u16 = 0x1122;
 /// a handful of small TLVs), so a read can never slice past the buffer.
 const EF_DEV_CONF_MAX: usize = 64;
 
-pub struct ManagementApplet {
+/// Outcome of a user-presence request for a privileged management operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presence {
+    Confirmed,
+    Timeout,
+    Declined,
+}
+
+/// Physical user presence, gating WRITE CONFIG against a hostile USB host —
+/// same shape as the sibling applets' `UserPresence`. On the trusted-display
+/// build the `confirm` names the operation; the BOOTSEL backend waits for a press.
+pub trait UserPresence {
+    fn request(&mut self, confirm: Confirm<'_>) -> Presence;
+}
+
+/// A [`UserPresence`] that confirms instantly — the host-test / fuzz stand-in.
+pub struct AlwaysConfirm;
+
+impl UserPresence for AlwaysConfirm {
+    fn request(&mut self, _confirm: Confirm<'_>) -> Presence {
+        Presence::Confirmed
+    }
+}
+
+pub struct ManagementApplet<'a> {
     /// First 4 bytes of the chip id → the 8-digit serial.
     serial: [u8; 4],
+    /// Touch/approval gate for the privileged WRITE CONFIG.
+    presence: &'a RefCell<dyn UserPresence>,
 }
 
 /// First 4 bytes of the chip id with the top 6 bits cleared (`&= ~0xFC`) — the
@@ -122,12 +150,19 @@ pub fn config_tlv<S: Storage>(serial: &[u8; 4], fs: &mut Fs<S>, res: &mut ResBuf
     Sw::OK
 }
 
-impl ManagementApplet {
+impl<'a> ManagementApplet<'a> {
     /// `serial_id` is the device chip id; its first 4 bytes form the serial.
-    pub fn new(serial_id: [u8; 8]) -> Self {
+    pub fn new(serial_id: [u8; 8], presence: &'a RefCell<dyn UserPresence>) -> Self {
         Self {
             serial: serial4(serial_id),
+            presence,
         }
+    }
+
+    /// Require a physical user-presence confirmation before a privileged op.
+    /// `true` only on Confirmed — a hostile USB host cannot drive it alone.
+    fn require_presence(&self, confirm: Confirm<'_>) -> bool {
+        self.presence.borrow_mut().request(confirm) == Presence::Confirmed
     }
 
     /// Serve READ CONFIG to a non-CCID transport — the same DeviceInfo TLV as the
@@ -150,6 +185,13 @@ impl ManagementApplet {
         if apdu.nc - 1 > EF_DEV_CONF_MAX {
             return Sw::INCORRECT_PARAMS;
         }
+        // Rewriting the reported DeviceInfo is a privileged, sticky change; gate
+        // it on the operator, not just the USB host. There is no config-lock code
+        // to enforce (the CONFIG_LOCK byte is only reported), so presence is the
+        // authentication of record — matching every sibling applet's write path.
+        if !self.require_presence(Confirm::titled("Write device config?")) {
+            return Sw::CONDITIONS_NOT_SATISFIED;
+        }
         match fs.put(EF_DEV_CONF, &apdu.data[1..apdu.nc]) {
             Ok(()) => Sw::OK,
             Err(_) => Sw::MEMORY_FAILURE,
@@ -157,7 +199,7 @@ impl ManagementApplet {
     }
 }
 
-impl<S: Storage> Applet<Fs<S>> for ManagementApplet {
+impl<S: Storage> Applet<Fs<S>> for ManagementApplet<'_> {
     fn aid(&self) -> &'static [u8] {
         MANAGEMENT_AID
     }
@@ -218,18 +260,29 @@ mod tests {
     use rsk_fs::storage::ram::RamStorage;
     use rsk_sdk::Apdu;
 
+    struct DenyPresence;
+    impl UserPresence for DenyPresence {
+        fn request(&mut self, _c: Confirm<'_>) -> Presence {
+            Presence::Declined
+        }
+    }
+
     fn fs() -> Fs<RamStorage> {
         Fs::new(RamStorage::new(), &[])
     }
 
-    fn select(app: &mut ManagementApplet, fs: &mut Fs<RamStorage>) -> (Sw, Vec<u8>) {
+    fn select(app: &mut ManagementApplet<'_>, fs: &mut Fs<RamStorage>) -> (Sw, Vec<u8>) {
         let mut out = [0u8; 256];
         let mut res = ResBuf::new(&mut out);
         let sw = Applet::select(app, false, fs, &mut res);
         (sw, res.as_slice().to_vec())
     }
 
-    fn process(app: &mut ManagementApplet, fs: &mut Fs<RamStorage>, raw: &[u8]) -> (Sw, Vec<u8>) {
+    fn process(
+        app: &mut ManagementApplet<'_>,
+        fs: &mut Fs<RamStorage>,
+        raw: &[u8],
+    ) -> (Sw, Vec<u8>) {
         let mut out = [0u8; 256];
         let mut res = ResBuf::new(&mut out);
         let apdu = Apdu::parse(raw).unwrap();
@@ -256,7 +309,8 @@ mod tests {
 
     #[test]
     fn select_returns_version_string() {
-        let mut app = ManagementApplet::new([0; 8]);
+        let presence = RefCell::new(AlwaysConfirm);
+        let mut app = ManagementApplet::new([0; 8], &presence);
         let mut fs = fs();
         let (sw, body) = select(&mut app, &mut fs);
         assert_eq!(sw, Sw::OK);
@@ -265,7 +319,8 @@ mod tests {
 
     #[test]
     fn read_config_reports_version_caps_serial() {
-        let mut app = ManagementApplet::new([0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0]);
+        let presence = RefCell::new(AlwaysConfirm);
+        let mut app = ManagementApplet::new([0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0], &presence);
         let mut fs = fs();
         let (sw, body) = process(&mut app, &mut fs, &[0x00, INS_READ_CONFIG, 0, 0, 0x00]);
         assert_eq!(sw, Sw::OK);
@@ -294,7 +349,8 @@ mod tests {
     fn read_config_matches_ccid_read_config() {
         // `read_config` must be byte-identical to the CCID INS_READ_CONFIG
         // DeviceInfo so ykman sees the same key on every interface.
-        let mut app = ManagementApplet::new([0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0]);
+        let presence = RefCell::new(AlwaysConfirm);
+        let mut app = ManagementApplet::new([0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0], &presence);
         let mut fs = fs();
         let (_, ccid) = process(&mut app, &mut fs, &[0x00, INS_READ_CONFIG, 0, 0, 0x00]);
         let mut out = [0u8; 256];
@@ -305,7 +361,8 @@ mod tests {
 
     #[test]
     fn write_then_read_config_roundtrips() {
-        let mut app = ManagementApplet::new([0; 8]);
+        let presence = RefCell::new(AlwaysConfirm);
+        let mut app = ManagementApplet::new([0; 8], &presence);
         let mut fs = fs();
         // Enable only FIDO2 + U2F (TAG_USB_ENABLED = 0x0202).
         let blob = [TAG_USB_ENABLED, 0x02, 0x02, 0x02];
@@ -334,7 +391,8 @@ mod tests {
     fn write_config_rejects_oversized_blob() {
         // An inner blob larger than the read buffer must be refused, so it can
         // never become a sticky DoS that panics every later READ CONFIG.
-        let mut app = ManagementApplet::new([0; 8]);
+        let presence = RefCell::new(AlwaysConfirm);
+        let mut app = ManagementApplet::new([0; 8], &presence);
         let mut fs = fs();
         let inner = EF_DEV_CONF_MAX + 1;
         let mut cmd = std::vec![
@@ -359,7 +417,8 @@ mod tests {
         // panicked. write_config now rejects one, so seed it directly to model a
         // blob left by an older build or a corrupt flash — the read must clamp,
         // not panic.
-        let mut app = ManagementApplet::new([0; 8]);
+        let presence = RefCell::new(AlwaysConfirm);
+        let mut app = ManagementApplet::new([0; 8], &presence);
         let mut fs = fs();
         fs.put(EF_DEV_CONF, &[0xAB; EF_DEV_CONF_MAX + 16]).unwrap();
         let (sw, body) = process(&mut app, &mut fs, &[0x00, INS_READ_CONFIG, 0, 0, 0x00]);
@@ -405,7 +464,8 @@ mod tests {
 
     #[test]
     fn write_config_rejects_bad_length() {
-        let mut app = ManagementApplet::new([0; 8]);
+        let presence = RefCell::new(AlwaysConfirm);
+        let mut app = ManagementApplet::new([0; 8], &presence);
         let mut fs = fs();
         // First byte (3) disagrees with the actual remaining length (2).
         let (sw, _) = process(
@@ -417,8 +477,34 @@ mod tests {
     }
 
     #[test]
+    fn write_config_requires_user_presence() {
+        // A well-formed WRITE CONFIG is refused without a physical confirmation,
+        // and nothing is persisted — a hostile USB host cannot rewrite DeviceInfo.
+        let presence = RefCell::new(DenyPresence);
+        let mut app = ManagementApplet::new([0; 8], &presence);
+        let mut fs = fs();
+        let blob = [TAG_USB_ENABLED, 0x02, 0x02, 0x02];
+        let mut cmd = std::vec![
+            0x00,
+            INS_WRITE_CONFIG,
+            0,
+            0,
+            (blob.len() + 1) as u8,
+            blob.len() as u8
+        ];
+        cmd.extend_from_slice(&blob);
+        let (sw, _) = process(&mut app, &mut fs, &cmd);
+        assert_eq!(sw, Sw::CONDITIONS_NOT_SATISFIED);
+        assert!(
+            fs.read(EF_DEV_CONF, &mut [0u8; 8]).is_none(),
+            "nothing persisted without presence"
+        );
+    }
+
+    #[test]
     fn bad_cla_and_ins_rejected() {
-        let mut app = ManagementApplet::new([0; 8]);
+        let presence = RefCell::new(AlwaysConfirm);
+        let mut app = ManagementApplet::new([0; 8], &presence);
         let mut fs = fs();
         let (sw, _) = process(&mut app, &mut fs, &[0x10, INS_READ_CONFIG, 0, 0, 0x00]);
         assert_eq!(sw, Sw::CLA_NOT_SUPPORTED);

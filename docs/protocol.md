@@ -245,7 +245,7 @@ applications are enabled. Source:
 | INS | Name | Request | Response |
 |---|---|---|---|
 | `1D` | READ CONFIG | — | DeviceInfo TLV (see below) |
-| `1C` | WRITE CONFIG | `data[0]` = inner length `n`, then `n` bytes of enabled-apps TLV (`n ≤ 64`) | — |
+| `1C` | WRITE CONFIG | `data[0]` = inner length `n`, then `n` bytes of enabled-apps TLV (`n ≤ 64`) | — (user-presence-gated) |
 | `1E` | RESET | — | `6D00` (device-wide reset not implemented; reset FIDO over CTAP) |
 
 ### 6.1 DeviceInfo TLV (READ CONFIG `0x1D`)
@@ -284,7 +284,10 @@ FIDO2+U2F → inner blob `03 02 02 02`, full APDU
 `00 1C 00 00 05 04 03 02 02 02`.
 
 > WRITE CONFIG refuses an inner blob > 64 bytes (`6A80`) so a malformed config
-> can't wedge later reads.
+> can't wedge later reads. It also requires an **on-device user-presence
+> confirmation** (Approve on the trusted-display build, a BOOTSEL press
+> otherwise) — a hostile USB host cannot rewrite the reported config on its own;
+> declined/timed-out → `6985`. There is no separate config-lock code.
 
 ---
 
@@ -316,8 +319,8 @@ firmware predates the rescue applet.
 | `1E` | `04` | `01` | — | `YYYY(BE2) Mon Day Wday Hour Min Sec` (8 B) | READ RTC (civil); `6985` if unset |
 | `1E` | `04` | `02` | — | epoch seconds (BE4) | READ RTC (Unix); `6985` if unset |
 | `1E` | `06` | `00` | — | `required(1) ‖ version(1) ‖ capacity(1)` | READ anti-rollback state |
-| `1B` | `58` | `00` | `"LOCK58"` | — | ⚠️ **IRREVERSIBLE** — burn page-58 access lock |
-| `1B` | `48` | `00` | `"ROLLBK"` | — | ⚠️ **IRREVERSIBLE** — set ROLLBACK_REQUIRED fuse |
+| `1B` | `58` | `00` | `"LOCK58"` | — | ⚠️ **IRREVERSIBLE** — burn page-58 access lock (user-presence-gated) |
+| `1B` | `48` | `00` | `"ROLLBK"` | — | ⚠️ **IRREVERSIBLE** — set ROLLBACK_REQUIRED fuse (user-presence-gated) |
 | `1F` | `00` | `00` | — | — | REBOOT (warm; device drops off bus) |
 | `1F` | `01` | `00` | — | — | REBOOT to BOOTSEL bootloader |
 
@@ -326,9 +329,11 @@ firmware predates the rescue applet.
 > permanently sets the anti-rollback-required fuse. **Both are one-way fuse burns
 > that cannot be undone and can brick a device if misapplied.** The firmware
 > triple-guards each (exact P1, exact magic payload, and a provisioning
-> precondition) and both are idempotent, but a config tool **must** put these
-> behind an explicit, clearly-worded user confirmation — never a default action,
-> never a bulk "apply". Most management tools should not expose them at all.
+> precondition), both are idempotent, and the firmware now also requires an
+> **on-device user-presence confirmation** before the burn (the magic payload is
+> a source-visible constant, not authentication). A config tool **must** still put
+> these behind an explicit, clearly-worded user confirmation — never a default
+> action, never a bulk "apply". Most management tools should not expose them at all.
 > `1F/01` (BOOTSEL) drops the device into the bootloader for reflashing; also
 > confirm.
 
@@ -337,9 +342,12 @@ firmware predates the rescue applet.
 > confirmation** — a button touch, or an Approve on the trusted-display build —
 > before the firmware acts, and return `6985` (CONDITIONS_NOT_SATISFIED) if the
 > operator declines or the wait times out. This gates `10/01` (attestation
-> sign), `10/03` (store cert), `1C/01` (WRITE phy record) and `1F/01` (reboot to
-> BOOTSEL) against a hostile USB host. Read-only status (`1E/*`), the pubkey read
-> (`10/02`), SET RTC (`1C/02`) and a warm reboot (`1F/00`) stay ungated.
+> sign), `10/03` (store cert), `1C/01` (WRITE phy record), the irreversible OTP
+> fuse burns `1B/58` and `1B/48`, and `1F/01` (reboot to BOOTSEL) against a
+> hostile USB host. Read-only status (`1E/*`), the pubkey read (`10/02`), SET RTC
+> (`1C/02`) and a warm reboot (`1F/00`) stay ungated.
+>
+> The **Management** applet's WRITE CONFIG (`§6`, INS `1C`) is gated the same way.
 >
 > The **vendor** applet (§8) exposes the same reboot verb, reachable over both the
 > CCID and CTAPHID transports; its `1F/01` (BOOTSEL) is gated identically, so the

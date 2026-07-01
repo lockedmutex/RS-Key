@@ -928,7 +928,8 @@ fn miri_pqc() {
 
 #[test]
 fn miri_mgmt_apdu() {
-    use rsk_mgmt::ManagementApplet;
+    use rsk_mgmt::{AlwaysConfirm, ManagementApplet};
+    let presence = RefCell::new(AlwaysConfirm);
     for data in [
         &b"\x00\xa4\x04\x00"[..],
         b"\x00\xcb\x00\x00",
@@ -937,7 +938,7 @@ fn miri_mgmt_apdu() {
     ] {
         let mut fs = Fs::new(RamStorage::new(), &[]);
         fs.scan();
-        let mut app = ManagementApplet::new([0x12, 0x34, 0x56, 0x78, 1, 2, 3, 4]);
+        let mut app = ManagementApplet::new([0x12, 0x34, 0x56, 0x78, 1, 2, 3, 4], &presence);
         if let Ok(apdu) = Apdu::parse(data) {
             let mut buf = [0u8; 256];
             let mut res = ResBuf::new(&mut buf);
@@ -952,9 +953,9 @@ fn miri_mgmt_apdu() {
 
 #[test]
 fn miri_mgmt_config() {
-    use rsk_mgmt::ManagementApplet;
+    use rsk_mgmt::{AlwaysConfirm, ManagementApplet};
 
-    fn run(app: &mut ManagementApplet, fs: &mut Fs<RamStorage>, raw: &[u8]) {
+    fn run(app: &mut ManagementApplet<'_>, fs: &mut Fs<RamStorage>, raw: &[u8]) {
         if let Ok(apdu) = Apdu::parse(raw) {
             let mut buf = [0u8; 256];
             let mut res = ResBuf::new(&mut buf);
@@ -964,7 +965,8 @@ fn miri_mgmt_config() {
 
     let mut fs = Fs::new(RamStorage::new(), &[]);
     fs.scan();
-    let mut app = ManagementApplet::new([0x12, 0x34, 0x56, 0x78, 1, 2, 3, 4]);
+    let presence = RefCell::new(AlwaysConfirm);
+    let mut app = ManagementApplet::new([0x12, 0x34, 0x56, 0x78, 1, 2, 3, 4], &presence);
     // Write blobs of several lengths — including past the 64-byte read buffer,
     // the case that used to panic READ CONFIG — then read each back.
     for inner in [0usize, 4, 64, 65, 200] {
@@ -1022,8 +1024,9 @@ fn miri_cross_applet() {
     let pgp_pres = RefCell::new(rsk_openpgp::AlwaysConfirm);
     let oath_pres = RefCell::new(rsk_oath::AlwaysConfirm);
     let otp_pres = RefCell::new(rsk_otp::AlwaysConfirm);
+    let mgmt_pres = RefCell::new(rsk_mgmt::AlwaysConfirm);
     let mut openpgp = OpenpgpApplet::new(SID, SH, None, &rng, &pgp_pres);
-    let mut management = ManagementApplet::new(SID);
+    let mut management = ManagementApplet::new(SID, &mgmt_pres);
     let mut oath = OathApplet::new(SID, SH, None, &rng, &oath_pres);
     let mut otp = OtpApplet::new(SID, &otp_pres);
     let mut piv = PivApplet::new(SID, SH, None, &rng, &pgp_pres);

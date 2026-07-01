@@ -15,6 +15,25 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Security
 
+- **Security-audit run-8 fixes.** An eighth agentic audit against `db1391a`
+  re-weighted onto the least-audited ground (the FIDO CTAP2 internals and the
+  never-before-audited Yubico-management and rescue applets). All run-1…7 fixes
+  were re-verified to hold; two missing-authorization defects were found and
+  fixed in the two utility applets (bcdDevice `0x07DC` → `0x07DD`):
+  - **Rescue OTP-fuse writes now require an on-device user-presence confirmation.**
+    The two irreversible fuse burns — page-58 access lock (`INS 0x1B` `P1=0x58`,
+    `"LOCK58"`) and `ROLLBACK_REQUIRED` (`P1=0x48`, `"ROLLBK"`) — were the only
+    privileged rescue commands without the `require_presence` gate every sibling
+    op (attestation sign, cert/phy write, reboot-to-BOOTSEL) enforces. Their magic
+    payload is a source-visible constant, not authentication, so an unauthenticated
+    USB host could permanently burn a fuse with no operator consent. Both now
+    prompt (`6985` if declined); idempotent no-ops still return `OK` without a
+    prompt. (`crates/rsk-rescue/src/lib.rs`.)
+  - **Management WRITE CONFIG (`INS 0x1C`) now requires user presence.** It was
+    entirely unauthenticated and the `CONFIG_LOCK` byte it stores was never
+    enforced, so a USB host could persistently spoof the reported DeviceInfo. The
+    write now prompts for on-device confirmation (`6985` if declined), matching
+    every sibling applet's write path. (`crates/rsk-mgmt/src/lib.rs`.)
 - **Security-audit run-7 hardening.** A seventh agentic audit against `8506a42`
   found **no exploitable vulnerabilities** — all run-1…6 fixes were re-verified
   to hold, and the PIV `GENERAL AUTHENTICATE` state machine and the trusted-

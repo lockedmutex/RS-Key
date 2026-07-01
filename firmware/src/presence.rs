@@ -304,3 +304,21 @@ impl rsk_rescue::UserPresence for ButtonPresence {
         }
     }
 }
+
+#[cfg(not(feature = "display"))]
+impl rsk_mgmt::UserPresence for ButtonPresence {
+    fn request(&mut self, _confirm: rsk_mgmt::Confirm<'_>) -> rsk_mgmt::Presence {
+        #[cfg(not(feature = "no-touch"))]
+        {
+            match self.wait() {
+                Outcome::Confirmed => rsk_mgmt::Presence::Confirmed,
+                // CCID-only applet: no CTAPHID_CANCEL reaches it.
+                Outcome::Timeout | Outcome::Cancelled => rsk_mgmt::Presence::Timeout,
+            }
+        }
+        #[cfg(feature = "no-touch")]
+        {
+            rsk_mgmt::Presence::Confirmed
+        }
+    }
+}

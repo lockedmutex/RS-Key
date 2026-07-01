@@ -3877,3 +3877,13 @@ impl rsk_rescue::UserPresence for TouchPresence {
         }
     }
 }
+
+impl rsk_mgmt::UserPresence for TouchPresence {
+    fn request(&mut self, confirm: rsk_mgmt::Confirm<'_>) -> rsk_mgmt::Presence {
+        match self.confirm_wait(confirm) {
+            Outcome::Confirmed => rsk_mgmt::Presence::Confirmed,
+            Outcome::Declined => rsk_mgmt::Presence::Declined,
+            Outcome::Timeout | Outcome::Cancelled => rsk_mgmt::Presence::Timeout,
+        }
+    }
+}

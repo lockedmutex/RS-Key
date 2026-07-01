@@ -384,6 +384,12 @@ impl<'a> RescueApplet<'a> {
             otp_lock::LockDecision::AlreadyLocked => Sw::OK,
             otp_lock::LockDecision::Unexpected => Sw::CONDITIONS_NOT_SATISFIED,
             otp_lock::LockDecision::Write => {
+                // Irreversible fuse burn: gate on the operator like every other
+                // privileged rescue op — the magic payload is a source-visible
+                // constant, not authentication against a hostile USB host.
+                if !self.require_presence(Confirm::titled("Lock OTP page 58?")) {
+                    return Sw::CONDITIONS_NOT_SATISFIED;
+                }
                 if !self.platform.borrow_mut().lock_page58() {
                     return Sw::EXEC_ERROR;
                 }
@@ -417,6 +423,11 @@ impl<'a> RescueApplet<'a> {
         };
         if rollback::required(rollback::majority(raw.flags0)) {
             return Sw::OK;
+        }
+        // Irreversible fuse burn: gate on the operator like every other
+        // privileged rescue op (the magic payload is not authentication).
+        if !self.require_presence(Confirm::titled("Require anti-rollback?")) {
+            return Sw::CONDITIONS_NOT_SATISFIED;
         }
         if !self.platform.borrow_mut().set_rollback_required() {
             return Sw::EXEC_ERROR;
@@ -1327,5 +1338,54 @@ mod tests {
         let (sw, _) = run(&mut app, &mut fs, &apdu(0x80, INS_READ, 0x03, 0, &[]));
         assert_eq!(sw, Sw::OK);
         assert_eq!(platform.borrow().reboots, vec![false]);
+    }
+
+    #[test]
+    fn otp_fuse_writes_require_user_presence() {
+        // Both irreversible OTP fuse burns must be refused without a physical
+        // confirmation, even with the correct magic payload and device posture.
+        let rng = RefCell::new(LcgRng(7));
+
+        // page-58 lock: provisioned MKEK + blank row, presence denied.
+        let platform = RefCell::new(FakePlatform::default());
+        let presence = RefCell::new(DenyPresence);
+        let mut app = RescueApplet::new(
+            SERIAL_ID,
+            SERIAL_HASH,
+            Some([0x11; 32]),
+            None,
+            &rng,
+            &platform,
+            &presence,
+            KV_TOTAL,
+            FLASH_SIZE,
+        );
+        let mut fs = Fs::new(RamStorage::new(), &[]);
+        let (sw, _) = run(&mut app, &mut fs, &lock_apdu());
+        assert_eq!(sw, Sw::CONDITIONS_NOT_SATISFIED);
+        assert_eq!(platform.borrow().lock_writes, 0, "no burn without presence");
+
+        // ROLLBACK_REQUIRED: secure boot on, not yet fused, presence denied.
+        let platform = RefCell::new(secure_platform());
+        let presence = RefCell::new(DenyPresence);
+        let mut app = RescueApplet::new(
+            SERIAL_ID,
+            SERIAL_HASH,
+            Some([0x11; 32]),
+            None,
+            &rng,
+            &platform,
+            &presence,
+            KV_TOTAL,
+            FLASH_SIZE,
+        );
+        let mut fs = Fs::new(RamStorage::new(), &[]);
+        let (sw, _) = run(&mut app, &mut fs, &rollback_apdu());
+        assert_eq!(sw, Sw::CONDITIONS_NOT_SATISFIED);
+        assert_eq!(
+            platform.borrow().rollback_writes,
+            0,
+            "no burn without presence"
+        );
     }
 }

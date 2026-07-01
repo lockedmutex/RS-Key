@@ -77,9 +77,10 @@ fuzz_target!(|data: &[u8]| {
     let pgp_pres = RefCell::new(rsk_openpgp::AlwaysConfirm);
     let oath_pres = RefCell::new(rsk_oath::AlwaysConfirm);
     let otp_pres = RefCell::new(rsk_otp::AlwaysConfirm);
+    let mgmt_pres = RefCell::new(rsk_mgmt::AlwaysConfirm);
 
     let mut openpgp = OpenpgpApplet::new(SERIAL_ID, SERIAL_HASH, None, &rng, &pgp_pres);
-    let mut management = ManagementApplet::new(SERIAL_ID);
+    let mut management = ManagementApplet::new(SERIAL_ID, &mgmt_pres);
     let mut oath = OathApplet::new(SERIAL_ID, SERIAL_HASH, None, &rng, &oath_pres);
     let mut otp = OtpApplet::new(SERIAL_ID, SERIAL_HASH, None, &rng, &otp_pres);
     let mut piv = PivApplet::new(SERIAL_ID, SERIAL_HASH, None, &rng, &pgp_pres);
