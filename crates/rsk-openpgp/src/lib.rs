@@ -217,7 +217,10 @@ impl<S: Storage> Applet<Fs<S>> for OpenpgpApplet<'_> {
                     // occurrence (EF_CH_1/2/3). A free read; an unset cert is empty.
                     let stor = consts::EF_CH_1 + self.sess.cert_occ as u16;
                     if let Some(n) = fs.read(stor, &mut self.scratch) {
-                        res.extend(&self.scratch[..n]);
+                        // `fs.read` returns the value's FULL stored length while the
+                        // backend copies only what fit; clamp before slicing so an
+                        // over-long stored cert cannot force an OOB panic (reset).
+                        res.extend(&self.scratch[..n.min(self.scratch.len())]);
                     }
                     return Sw::OK;
                 }

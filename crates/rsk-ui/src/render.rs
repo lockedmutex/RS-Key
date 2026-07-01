@@ -2363,19 +2363,27 @@ where
         theme::MUTED,
     )?;
     let tx = card.x as i32 + 40;
-    text_left(
+    // Clip + ellipsize the untrusted rp/account to the card, marking any truncation —
+    // an anti-phishing screen must never show a silently-cut look-alike identity
+    // (matches the getAssertion-approve and add-passkey ceremonies).
+    let clip = Rect::new(tx as u16, card.y, (card.x + card.w) - tx as u16, card.h);
+    text_left_ellipsized(
         t,
         rp.as_str(),
         EgPoint::new(tx, card.y as i32 + 16),
         Role::Body,
         theme::TEXT,
+        clip,
+        rp.truncated,
     )?;
-    text_left(
+    text_left_ellipsized(
         t,
         account.as_str(),
         EgPoint::new(tx, card.y as i32 + 32),
         Role::Body,
         theme::MUTED,
+        clip,
+        account.truncated,
     )?;
     // Plain-language warning — including the honest caveat that the site is not told.
     text_left(
@@ -5154,6 +5162,17 @@ mod tests {
         let mut d = Rec::new();
         render_add_passkey(&mut d, &rp, &account).unwrap();
         assert!(!d.oob, "wide add-passkey rp/account overran the panel");
+    }
+
+    #[test]
+    fn confirm_delete_clips_a_wide_rp_and_account() {
+        // The delete-confirmation identity must clip like the approve/add screens, so a
+        // padded look-alike rpId cannot overflow the card unmarked (anti-phishing).
+        let rp = Label::clamp(&[b'W'; 48]);
+        let account = Label::clamp(b"login.corp.example-company.com");
+        let mut d = Rec::new();
+        render_confirm_delete(&mut d, &rp, &account).unwrap();
+        assert!(!d.oob, "wide delete-confirm rp/account overran the card");
     }
 
     #[test]

@@ -15,6 +15,44 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Security
 
+- **Security-audit hardening (six-phase agentic audit).** A fresh full-tree audit
+  found and fixed:
+  - **PIV management-key authentication bypass (critical).** `GENERAL
+    AUTHENTICATE` shared one session challenge field between the single-auth
+    (plaintext challenge) and mutual-auth (encrypted witness) handshakes, so a
+    host could read the plaintext single-auth challenge and replay it as the
+    mutual-auth witness to authenticate as the card administrator with no
+    knowledge of the management key — no PIN, no touch. The challenge is now
+    tagged with the flow that issued it and can only be consumed by that same
+    flow.
+  - **OpenPGP `GET DATA` over-long-DO brick (two more sites).** The cardholder
+    certificate (`7F21`) read-out and the generic `DoWriter` flash-DO builder
+    sliced/advanced a fixed 1024-byte buffer by the value's *full* stored length;
+    a PW3 host can `PUT DATA` an over-long cardholder cert/name, so a later `GET
+    DATA 65/6E/7F21` (issued by `gpg --card-status`) panicked — a persistent
+    brick. Both are now clamped to the buffer, matching the earlier `info.rs` fix.
+  - **OATH `VERIFY CODE` (INS `0xB1`) now honours the access code.** It lacked the
+    `validated` gate every other stored-data command has, so a locked applet
+    answered it — a replayable oracle on the primary credential's current OTP
+    across the access-code boundary. Now gated.
+  - **Trusted-display delete-confirmation clips the identity.** The
+    delete-passkey confirmation drew the untrusted rpId/account unclipped with no
+    truncation marker, unlike the approve/add ceremonies; a padded look-alike
+    rpId could overflow the card silently. Now ellipsized + marked to the card.
+  - **OpenPGP private keys are AES-256-GCM-sealed with a fresh nonce.** The DEK
+    seal used one fixed (key, IV) AES-CFB across every key slot, so the block-0
+    keystream repeated and a flash-dump attacker could recover the XOR of two
+    same-format scalars' first bytes; CFB was also unauthenticated. Sealing now
+    uses AES-256-GCM under a synthetic per-record nonce (`HMAC(dek, fid ‖ key)`),
+    adding authentication and eliminating the reuse. Keys in the old CFB format
+    still load (trial-decrypt fallback) and are re-sealed to the new format the
+    first time they are used — no reprovisioning needed.
+  - **The release pipeline no longer ships the `no-touch` firmware.** The release
+    workflow built and published four `no-touch` flavors (user-presence bypass,
+    marked "never ship") as signed, SLSA-provenanced public assets. It now builds
+    and publishes only the four touch-required flavors, with a guard that fails
+    the release if any `no-touch` asset is present.
+
 - **Pre-release cross-review hardening.** An adversarial re-review of the two
   unreleased hardening commits (the trusted-display arc and the pico-keys
   carry-over below) — the ones that had not yet been cross-reviewed before a

@@ -91,12 +91,27 @@ const PIVMAN_MAX: usize = 2 + 3 + 2 + PIVMAN_TS_MAX;
 const PROTECTED_TAG: u8 = 0x88;
 const PROTECTED_MGM_TAG: u8 = 0x89;
 
+/// Which GENERAL AUTHENTICATE handshake issued the pending `challenge`. The two
+/// flows attach opposite confidentiality to that field — mutual auth returns the
+/// witness *encrypted* (proof = decrypt it), single auth returns the challenge in
+/// *plaintext* (proof = encrypt it) — so a challenge issued by one flow must never
+/// be consumed by the other. Without this tag the plaintext single-auth challenge
+/// could be replayed as the mutual-auth witness, authenticating with no key.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ChallengeKind {
+    #[default]
+    None,
+    MutualWitness,
+    SingleChallenge,
+}
+
 /// Volatile per-selection security state.
 #[derive(Default)]
 pub(crate) struct Session {
     pub(crate) has_pin: bool,
     pub(crate) has_mgm: bool,
     pub(crate) has_challenge: bool,
+    pub(crate) chal_kind: ChallengeKind,
     pub(crate) challenge: [u8; 16],
 }
 
@@ -105,6 +120,7 @@ impl Session {
         self.has_pin = false;
         self.has_mgm = false;
         self.has_challenge = false;
+        self.chal_kind = ChallengeKind::None;
         self.challenge.zeroize();
     }
 }
@@ -1966,6 +1982,45 @@ mod tests {
         msg.extend_from_slice(&[0u8; 16]);
         let (sw, _) = run(&mut app, &mut fs, INS_AUTHENTICATE, ALGO_AES192, 0x9B, &msg);
         assert_eq!(sw, Sw::DATA_INVALID);
+        let (sw, _) = run(&mut app, &mut fs, INS_SET_RETRIES, 5, 5, &[]);
+        assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
+    }
+
+    #[test]
+    fn single_auth_challenge_cannot_be_replayed_as_mutual_witness() {
+        // Regression for the management-key bypass: single-auth step 1 returns the
+        // challenge in plaintext; that value must NOT satisfy the mutual-auth step-2
+        // witness check (which would set has_mgm with no knowledge of the key).
+        let rng = RefCell::new(TestRng(7));
+        let pres = RefCell::new(AlwaysConfirm);
+        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
+        let mut fs = new_fs();
+        select(&mut app, &mut fs);
+        // Step 1: obtain the plaintext single-auth challenge C.
+        let (sw, chal) = run(
+            &mut app,
+            &mut fs,
+            INS_AUTHENTICATE,
+            ALGO_AES192,
+            0x9B,
+            &[0x7C, 0x02, 0x81, 0x00],
+        );
+        assert_eq!(sw, Sw::OK);
+        assert_eq!(&chal[..4], &[0x7C, 0x12, 0x81, 0x10]);
+        let c: [u8; 16] = chal[4..20].try_into().unwrap();
+        // Replay C as the mutual-auth step-2 witness (t80) — must be rejected.
+        let mut msg = vec![0x7C, 0x24, 0x80, 0x10];
+        msg.extend_from_slice(&c);
+        msg.push(0x81);
+        msg.push(0x10);
+        msg.extend_from_slice(&[0u8; 16]);
+        let (sw, _) = run(&mut app, &mut fs, INS_AUTHENTICATE, ALGO_AES192, 0x9B, &msg);
+        assert_ne!(
+            sw,
+            Sw::OK,
+            "single-auth challenge accepted as mutual witness"
+        );
+        // has_mgm must still be closed: a mgmt-gated op is refused.
         let (sw, _) = run(&mut app, &mut fs, INS_SET_RETRIES, 5, 5, &[]);
         assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
     }

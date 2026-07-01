@@ -24,7 +24,7 @@ use zeroize::Zeroize;
 use crate::files::*;
 use crate::seal;
 use crate::x509;
-use crate::{RngAdapter, Session, WRONG_DATA, ct_eq, dyn_auth_resp};
+use crate::{ChallengeKind, RngAdapter, Session, WRONG_DATA, ct_eq, dyn_auth_resp};
 
 enum Dir {
     Encrypt,
@@ -164,6 +164,7 @@ pub(crate) fn general_authenticate<S: Storage>(
                     Dir::Encrypt,
                 )?;
                 sess.has_challenge = true;
+                sess.chal_kind = ChallengeKind::MutualWitness;
                 dyn_auth_resp(res, 0x80, &enc[..chal_len])?;
                 return Ok(());
             }
@@ -172,11 +173,14 @@ pub(crate) fn general_authenticate<S: Storage>(
             if key_ref != SLOT_CARDMGM {
                 return Err(Sw::INCORRECT_P1P2);
             }
-            if !sess.has_challenge {
+            // Only a witness this device issued *encrypted* (mutual step 1) may be
+            // verified here — never a plaintext single-auth challenge.
+            if !sess.has_challenge || sess.chal_kind != ChallengeKind::MutualWitness {
                 return Err(Sw::INCORRECT_PARAMS);
             }
             let host_chal = t81.filter(|c| !c.is_empty()).ok_or(Sw::INCORRECT_PARAMS)?;
             sess.has_challenge = false;
+            sess.chal_kind = ChallengeKind::None;
             if w.len() != chal_len || !ct_eq(w, &sess.challenge[..chal_len]) {
                 return Err(Sw::DATA_INVALID);
             }
@@ -201,6 +205,7 @@ pub(crate) fn general_authenticate<S: Storage>(
                 // Single auth step 1: return a plaintext challenge.
                 rng.fill(&mut sess.challenge[..chal_len]);
                 sess.has_challenge = true;
+                sess.chal_kind = ChallengeKind::SingleChallenge;
                 dyn_auth_resp(res, 0x81, &sess.challenge[..chal_len])?;
                 return Ok(());
             }
@@ -283,11 +288,14 @@ pub(crate) fn general_authenticate<S: Storage>(
             if key_ref != SLOT_CARDMGM {
                 return Err(Sw::INCORRECT_P1P2);
             }
-            if !sess.has_challenge {
+            // Only a challenge this device issued in *plaintext* (single step 1) may be
+            // answered here — never a mutual-auth witness.
+            if !sess.has_challenge || sess.chal_kind != ChallengeKind::SingleChallenge {
                 return Err(Sw::INCORRECT_PARAMS);
             }
             check_touch(touch_policy, presence)?;
             sess.has_challenge = false;
+            sess.chal_kind = ChallengeKind::None;
             if r.len() != chal_len {
                 return Err(Sw::DATA_INVALID);
             }

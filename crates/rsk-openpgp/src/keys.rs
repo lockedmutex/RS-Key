@@ -2,16 +2,16 @@
 // Copyright (C) 2026 RS-Key contributors
 
 //! Private-key sealing and the asymmetric operations. Keys live in the internal
-//! EFs `EF_PK_SIG`/`DEC`/`AUT`, AES-256-CFB-sealed under the random DEK (key =
-//! `dek[16..48]`, IV = `dek[0..16]`; the DEK itself is PIN-wrapped, see
-//! [`crate::pin`]). EC blobs are `[curve_id] ‖ scalar`; signatures are raw
+//! EFs `EF_PK_SIG`/`DEC`/`AUT`, AES-256-GCM-sealed under the random DEK (key =
+//! `dek[16..48]`, nonce-PRF key = `dek[0..16]`; the DEK itself is PIN-wrapped,
+//! see [`crate::pin`]). EC blobs are `[curve_id] ‖ scalar`; signatures are raw
 //! `r ‖ s` (fixed field width), NOT DER.
 
 use alloc::boxed::Box;
 use zeroize::Zeroize;
 
-use rsk_crypto::Device;
-use rsk_crypto::aes::{aes_decrypt_cfb_256, aes_encrypt_cfb_256};
+use rsk_crypto::aes::aes_decrypt_cfb_256;
+use rsk_crypto::{Device, aes256gcm_decrypt, aes256gcm_encrypt, hmac_sha256};
 use rsk_fs::{Fs, KeyFid, Sealed, Storage};
 use rsk_sdk::Sw;
 
@@ -45,50 +45,140 @@ pub const MAX_EC_POINT: usize = 133;
 const MAX_EC_KDATA: usize = 1 + 66;
 
 // ---------------------------------------------------------------- DEK seal ---
+//
+// Key blobs are AES-256-GCM-sealed under the PIN-wrapped DEK: the record is
+// `nonce(12) ‖ ct ‖ tag(16)`, GCM key = `dek[16..48]`, AAD = the device serial
+// hash. The 12-byte nonce is SYNTHETIC — `HMAC-SHA256(dek[0..16], fid ‖ plain)`
+// truncated — so two distinct keys (or the same key in two slots) never share a
+// nonce, killing the block-0 keystream reuse the old fixed-IV CFB seal had, and
+// GCM adds the authentication CFB lacked. A synthetic nonce needs no RNG, so the
+// (RNG-less) import path is unaffected. Records written by the older seal (bare
+// fixed-IV CFB ciphertext) still load: `dek_unseal` trial-decrypts under GCM and,
+// on an auth failure, falls back to the legacy CFB decrypt, and the caller then
+// re-seals the key forward the first time it is loaded.
 
-/// Unwrap the DEK with the verified PIN session, then AES-256-CFB decrypt
-/// `data` in place (key = `dek[16..48]`, IV = `dek[0..16]`).
-pub fn dek_decrypt<S: Storage>(
-    dev: &Device,
-    fs: &mut Fs<S>,
-    sess: &Session,
-    data: &mut [u8],
-) -> Result<(), Sw> {
-    let (mut key, mut iv) = load_seal(dev, fs, sess)?;
-    let r = aes_decrypt_cfb_256(&key, &iv, data);
-    key.zeroize();
-    iv.zeroize();
-    r.map_err(|_| Sw::EXEC_ERROR)
+const DEK_NONCE_LEN: usize = 12;
+const DEK_TAG_LEN: usize = 16;
+/// Bytes the GCM seal adds over the plaintext (`nonce ‖ … ‖ tag`).
+pub const DEK_SEAL_OVERHEAD: usize = DEK_NONCE_LEN + DEK_TAG_LEN;
+
+/// Synthetic 12-byte nonce for `fid`'s `plain`: `HMAC(nonce_key, fid)` re-keys a
+/// second HMAC over the plaintext, so distinct key material always yields a
+/// distinct nonce (and identical material re-seals identically — no reuse risk).
+fn synth_nonce(nonce_key: &[u8; IV_SIZE], fid: KeyFid, plain: &[u8]) -> [u8; DEK_NONCE_LEN] {
+    let sub = hmac_sha256(nonce_key, &fid.get().to_be_bytes());
+    let full = hmac_sha256(&sub, plain);
+    let mut nonce = [0u8; DEK_NONCE_LEN];
+    nonce.copy_from_slice(&full[..DEK_NONCE_LEN]);
+    nonce
 }
 
-/// The encrypting counterpart of [`dek_decrypt`].
-pub fn dek_encrypt<S: Storage>(
-    dev: &Device,
-    fs: &mut Fs<S>,
-    sess: &Session,
-    data: &mut [u8],
-) -> Result<(), Sw> {
-    let (mut key, mut iv) = load_seal(dev, fs, sess)?;
-    let r = aes_encrypt_cfb_256(&key, &iv, data);
-    key.zeroize();
-    iv.zeroize();
-    r.map_err(|_| Sw::EXEC_ERROR)
+/// Seal `plain` under the split DEK halves into `out` as `nonce ‖ ct ‖ tag`;
+/// returns the record length. Pure over the key material so it is unit-testable
+/// without a PIN session.
+fn seal_with(
+    key: &[u8; 32],
+    nonce_key: &[u8; IV_SIZE],
+    serial_hash: &[u8],
+    fid: KeyFid,
+    plain: &[u8],
+    out: &mut [u8],
+) -> Result<usize, Sw> {
+    let n = DEK_NONCE_LEN + plain.len() + DEK_TAG_LEN;
+    if out.len() < n {
+        return Err(Sw::WRONG_LENGTH);
+    }
+    let nonce = synth_nonce(nonce_key, fid, plain);
+    out[..DEK_NONCE_LEN].copy_from_slice(&nonce);
+    out[DEK_NONCE_LEN..DEK_NONCE_LEN + plain.len()].copy_from_slice(plain);
+    let tag = aes256gcm_encrypt(
+        key,
+        &nonce,
+        serial_hash,
+        &mut out[DEK_NONCE_LEN..DEK_NONCE_LEN + plain.len()],
+    );
+    out[DEK_NONCE_LEN + plain.len()..n].copy_from_slice(&tag);
+    Ok(n)
 }
 
-/// Load the DEK and split it into the AES-CFB (key, IV) seal halves.
-fn load_seal<S: Storage>(
+/// Unseal a `blob` under the split DEK halves into `out`; returns
+/// `(plaintext_len, was_legacy)`. Tries the GCM format, falling back to the
+/// legacy fixed-IV CFB decrypt on an auth failure. Pure over the key material.
+fn unseal_with(
+    key: &[u8; 32],
+    nonce_key: &[u8; IV_SIZE],
+    serial_hash: &[u8],
+    blob: &[u8],
+    out: &mut [u8],
+) -> Result<(usize, bool), Sw> {
+    if blob.len() >= DEK_NONCE_LEN + DEK_TAG_LEN {
+        let pt_len = blob.len() - DEK_NONCE_LEN - DEK_TAG_LEN;
+        if out.len() >= pt_len {
+            let mut nonce = [0u8; DEK_NONCE_LEN];
+            nonce.copy_from_slice(&blob[..DEK_NONCE_LEN]);
+            let mut tag = [0u8; DEK_TAG_LEN];
+            tag.copy_from_slice(&blob[blob.len() - DEK_TAG_LEN..]);
+            out[..pt_len].copy_from_slice(&blob[DEK_NONCE_LEN..DEK_NONCE_LEN + pt_len]);
+            if aes256gcm_decrypt(key, &nonce, serial_hash, &mut out[..pt_len], &tag).is_ok() {
+                return Ok((pt_len, false));
+            }
+        }
+    }
+    // Legacy fixed-IV CFB record (bare ciphertext, no nonce/tag).
+    if out.len() < blob.len() {
+        return Err(Sw::WRONG_LENGTH);
+    }
+    out[..blob.len()].copy_from_slice(blob);
+    aes_decrypt_cfb_256(key, nonce_key, &mut out[..blob.len()]).map_err(|_| Sw::EXEC_ERROR)?;
+    Ok((blob.len(), true))
+}
+
+/// Load the DEK and split it into the GCM key (`dek[16..48]`) and the nonce-PRF
+/// key (`dek[0..16]`, also the legacy CFB IV) — disjoint bytes of one random DEK.
+fn load_dek_keys<S: Storage>(
     dev: &Device,
     fs: &mut Fs<S>,
     sess: &Session,
-) -> Result<([u8; 32], [u8; 16]), Sw> {
+) -> Result<([u8; 32], [u8; IV_SIZE]), Sw> {
     let mut dek = [0u8; DEK_SIZE];
     load_dek(dev, fs, sess, &mut dek)?;
     let mut key = [0u8; 32];
     key.copy_from_slice(&dek[IV_SIZE..IV_SIZE + 32]);
-    let mut iv = [0u8; 16];
-    iv.copy_from_slice(&dek[..IV_SIZE]);
+    let mut nk = [0u8; IV_SIZE];
+    nk.copy_from_slice(&dek[..IV_SIZE]);
     dek.zeroize();
-    Ok((key, iv))
+    Ok((key, nk))
+}
+
+/// Seal `plain` under the DEK into `out` (`nonce ‖ ct ‖ tag`); returns its length.
+fn dek_seal<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    sess: &Session,
+    fid: KeyFid,
+    plain: &[u8],
+    out: &mut [u8],
+) -> Result<usize, Sw> {
+    let (mut key, mut nk) = load_dek_keys(dev, fs, sess)?;
+    let r = seal_with(&key, &nk, dev.serial_hash, fid, plain, out);
+    key.zeroize();
+    nk.zeroize();
+    r
+}
+
+/// Unseal a DEK `blob` into `out`; returns `(plaintext_len, was_legacy)`.
+fn dek_unseal<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    sess: &Session,
+    blob: &[u8],
+    out: &mut [u8],
+) -> Result<(usize, bool), Sw> {
+    let (mut key, mut nk) = load_dek_keys(dev, fs, sess)?;
+    let r = unseal_with(&key, &nk, dev.serial_hash, blob, out);
+    key.zeroize();
+    nk.zeroize();
+    r
 }
 
 // ------------------------------------------------------------------ curves ---
@@ -486,36 +576,45 @@ pub fn store_ec_key<S: Storage>(
     let mut kdata = [0u8; MAX_EC_KDATA];
     kdata[0] = key.curve().id();
     kdata[1..n].copy_from_slice(scalar);
+    let mut blob = [0u8; MAX_EC_KDATA + DEK_SEAL_OVERHEAD];
     let r = (|| {
-        dek_encrypt(dev, fs, sess, &mut kdata[..n])?;
-        fs.put_key(fid, Sealed::wrap(&kdata[..n]))
+        let bn = dek_seal(dev, fs, sess, fid, &kdata[..n], &mut blob)?;
+        fs.put_key(fid, Sealed::wrap(&blob[..bn]))
             .map_err(|_| Sw::MEMORY_FAILURE)
     })();
     kdata.zeroize();
+    blob.zeroize();
     r
 }
 
-/// Read and unseal the EC key stored at `fid`.
+/// Read and unseal the EC key stored at `fid`. A key still in the legacy CFB
+/// seal is transparently re-sealed to the authenticated fresh-nonce format.
 pub fn load_ec_key<S: Storage>(
     dev: &Device,
     fs: &mut Fs<S>,
     sess: &Session,
     fid: KeyFid,
 ) -> Result<PrivKey, Sw> {
+    let mut blob = [0u8; MAX_EC_KDATA + DEK_SEAL_OVERHEAD];
+    let n = fs.read_key(fid, &mut blob).ok_or(Sw::REFERENCE_NOT_FOUND)?;
+    let n = n.min(blob.len());
     let mut kdata = [0u8; MAX_EC_KDATA];
-    let n = fs
-        .read_key(fid, &mut kdata)
-        .ok_or(Sw::REFERENCE_NOT_FOUND)?;
-    if n < 2 {
-        return Err(WRONG_DATA);
-    }
     let r = (|| {
-        dek_decrypt(dev, fs, sess, &mut kdata[..n])?;
+        let (pt, legacy) = dek_unseal(dev, fs, sess, &blob[..n], &mut kdata)?;
+        if pt < 2 {
+            return Err(WRONG_DATA);
+        }
         let curve = Curve::from_id(kdata[0]).ok_or(WRONG_DATA)?;
-        PrivKey::from_scalar(curve, &kdata[1..n]).ok_or(WRONG_DATA)
+        let key = PrivKey::from_scalar(curve, &kdata[1..pt]).ok_or(WRONG_DATA)?;
+        Ok((key, legacy))
     })();
     kdata.zeroize();
-    r
+    blob.zeroize();
+    let (key, legacy) = r?;
+    if legacy {
+        let _ = store_ec_key(dev, fs, sess, fid, &key);
+    }
+    Ok(key)
 }
 
 /// Wrap a public point as the OpenPGP public-key DO `7F49 { 86 <point> }`, with
@@ -555,13 +654,13 @@ pub fn store_aes_key<S: Storage>(
     sess: &Session,
     key: &[u8; 32],
 ) -> Result<(), Sw> {
-    let mut kdata = *key;
+    let mut blob = [0u8; 32 + DEK_SEAL_OVERHEAD];
     let r = (|| {
-        dek_encrypt(dev, fs, sess, &mut kdata)?;
-        fs.put_key(EF_AES_KEY, Sealed::wrap(&kdata))
+        let bn = dek_seal(dev, fs, sess, EF_AES_KEY, key, &mut blob)?;
+        fs.put_key(EF_AES_KEY, Sealed::wrap(&blob[..bn]))
             .map_err(|_| Sw::MEMORY_FAILURE)
     })();
-    kdata.zeroize();
+    blob.zeroize();
     r
 }
 
@@ -573,14 +672,25 @@ pub fn load_aes_key<S: Storage>(
     fs: &mut Fs<S>,
     sess: &Session,
 ) -> Result<([u8; 32], usize), Sw> {
-    let mut kdata = [0u8; 32];
-    let n = fs
-        .read_key(EF_AES_KEY, &mut kdata)
+    let mut blob = [0u8; 32 + DEK_SEAL_OVERHEAD];
+    let bn = fs
+        .read_key(EF_AES_KEY, &mut blob)
         .filter(|&n| n > 0)
         .ok_or(Sw::REFERENCE_NOT_FOUND)?;
-    if let Err(e) = dek_decrypt(dev, fs, sess, &mut kdata[..n]) {
-        kdata.zeroize();
-        return Err(e);
+    let bn = bn.min(blob.len());
+    let mut kdata = [0u8; 32];
+    let (n, legacy) = match dek_unseal(dev, fs, sess, &blob[..bn], &mut kdata) {
+        Ok(v) => v,
+        Err(e) => {
+            blob.zeroize();
+            kdata.zeroize();
+            return Err(e);
+        }
+    };
+    blob.zeroize();
+    // GENERATE only ever mints a 32-byte AES-256 key; re-seal a legacy one forward.
+    if legacy && n == 32 {
+        let _ = store_aes_key(dev, fs, sess, &kdata);
     }
     Ok((kdata, n))
 }
@@ -892,40 +1002,48 @@ pub fn store_rsa_key<S: Storage>(
     kdata[n - qb.len()..n].copy_from_slice(&qb);
     pb.zeroize();
     qb.zeroize();
+    let mut blob = [0u8; MAX_RSA_KDATA + DEK_SEAL_OVERHEAD];
     let r = (|| {
-        dek_encrypt(dev, fs, sess, &mut kdata[..n])?;
-        fs.put_key(fid, Sealed::wrap(&kdata[..n]))
+        let bn = dek_seal(dev, fs, sess, fid, &kdata[..n], &mut blob)?;
+        fs.put_key(fid, Sealed::wrap(&blob[..bn]))
             .map_err(|_| Sw::MEMORY_FAILURE)
     })();
     kdata.zeroize();
+    blob.zeroize();
     r
 }
 
 /// Read and unseal the RSA key at `fid`, rebuilding it from `P ‖ Q` with
-/// `E = 65537`.
+/// `E = 65537`. A key still in the legacy CFB seal is re-sealed forward.
 pub fn load_rsa_key<S: Storage>(
     dev: &Device,
     fs: &mut Fs<S>,
     sess: &Session,
     fid: KeyFid,
 ) -> Result<RsaPrivateKey, Sw> {
+    let mut blob = [0u8; MAX_RSA_KDATA + DEK_SEAL_OVERHEAD];
+    let bn = fs.read_key(fid, &mut blob).ok_or(Sw::REFERENCE_NOT_FOUND)?;
+    let bn = bn.min(blob.len());
     let mut kdata = [0u8; MAX_RSA_KDATA];
-    let n = fs
-        .read_key(fid, &mut kdata)
-        .ok_or(Sw::REFERENCE_NOT_FOUND)?;
-    if n < 2 || n % 2 != 0 {
-        kdata.zeroize();
-        return Err(WRONG_DATA);
-    }
     let res = (|| {
-        dek_decrypt(dev, fs, sess, &mut kdata[..n])?;
+        let (n, legacy) = dek_unseal(dev, fs, sess, &blob[..bn], &mut kdata)?;
+        if n < 2 || n % 2 != 0 {
+            return Err(WRONG_DATA);
+        }
         let half = n / 2;
         let p = BigUint::from_bytes_be(&kdata[..half]);
         let q = BigUint::from_bytes_be(&kdata[half..n]);
-        RsaPrivateKey::from_p_q(p, q, BigUint::from(65_537u32)).map_err(|_| WRONG_DATA)
+        let key =
+            RsaPrivateKey::from_p_q(p, q, BigUint::from(65_537u32)).map_err(|_| WRONG_DATA)?;
+        Ok((key, legacy))
     })();
     kdata.zeroize();
-    res
+    blob.zeroize();
+    let (key, legacy) = res?;
+    if legacy {
+        let _ = store_rsa_key(dev, fs, sess, fid, &key);
+    }
+    Ok(key)
 }
 
 /// Build the public-key DO `7F49 82 LL { 81 82 <N> · 82 <Elen> <E> }` (modulus
@@ -1477,5 +1595,58 @@ mod x25519_tests {
         let mut out = [0u8; 32];
         assert_eq!(key.ecdh(&[0u8; 31], &mut out), Err(Sw::DATA_INVALID));
         assert_eq!(key.ecdh(&[0u8; 40], &mut out), Err(Sw::DATA_INVALID));
+    }
+
+    // ------------------------------------------------------------ DEK seal ---
+
+    #[test]
+    fn dek_seal_roundtrips_and_uses_fresh_nonces() {
+        let key = [0x11u8; 32];
+        let nk = [0x22u8; IV_SIZE];
+        let sh = [0x33u8; 32];
+        let fid = KeyFid::new(0x10d1);
+        let pt_a = [0xAAu8; 33];
+        let mut blob_a = [0u8; 33 + DEK_SEAL_OVERHEAD];
+        let na = seal_with(&key, &nk, &sh, fid, &pt_a, &mut blob_a).unwrap();
+        assert_eq!(na, 33 + DEK_SEAL_OVERHEAD);
+        // Round-trips as the new (authenticated) format.
+        let mut out = [0u8; 33];
+        let (pn, legacy) = unseal_with(&key, &nk, &sh, &blob_a[..na], &mut out).unwrap();
+        assert_eq!((pn, legacy), (33, false));
+        assert_eq!(&out[..pn], &pt_a);
+        // A DIFFERENT plaintext seals under a DIFFERENT nonce — no keystream reuse
+        // (the whole point of the fix; the old fixed-IV CFB seal reused it).
+        let pt_b = [0xBBu8; 33];
+        let mut blob_b = [0u8; 33 + DEK_SEAL_OVERHEAD];
+        seal_with(&key, &nk, &sh, fid, &pt_b, &mut blob_b).unwrap();
+        assert_ne!(&blob_a[..DEK_NONCE_LEN], &blob_b[..DEK_NONCE_LEN]);
+        // …and a wrong-tag / tampered record does not round-trip to the original.
+        let mut bad = blob_a;
+        bad[na - 1] ^= 1;
+        let mut out2 = [0u8; 33];
+        // Tag mismatch → falls back to CFB → garbage, never the true plaintext.
+        if let Ok((m, _)) = unseal_with(&key, &nk, &sh, &bad[..na], &mut out2) {
+            assert_ne!(&out2[..m.min(33)], &pt_a[..m.min(33)]);
+        }
+    }
+
+    #[test]
+    fn legacy_cfb_blob_still_unseals_and_is_flagged() {
+        use rsk_crypto::aes::aes_encrypt_cfb_256;
+        let key = [0x11u8; 32];
+        let nk = [0x22u8; IV_SIZE];
+        let sh = [0x33u8; 32];
+        let pt = [0xA5u8; 33];
+        // An old-format record: bare fixed-IV CFB ciphertext (IV = the nonce key),
+        // no nonce/tag — exactly what the pre-fix seal wrote.
+        let mut legacy = pt;
+        aes_encrypt_cfb_256(&key, &nk, &mut legacy).unwrap();
+        let mut out = [0u8; 33];
+        let (pn, was_legacy) = unseal_with(&key, &nk, &sh, &legacy, &mut out).unwrap();
+        assert!(
+            was_legacy,
+            "legacy blob must be detected for forward re-sealing"
+        );
+        assert_eq!(&out[..pn], &pt, "legacy CFB record must still decrypt");
     }
 }

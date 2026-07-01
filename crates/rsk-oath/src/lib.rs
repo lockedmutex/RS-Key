@@ -568,6 +568,12 @@ impl<'a> OathApplet<'a> {
     }
 
     fn cmd_verify_code<S: Storage>(&mut self, apdu: &Apdu, fs: &mut Fs<S>) -> Sw {
+        // Same access-code gate as every other stored-data command: a locked applet
+        // must not answer VERIFY CODE, which would be a replayable oracle on the
+        // primary credential's current OTP across the access-code boundary.
+        if !self.validated {
+            return Sw::SECURITY_STATUS_NOT_SATISFIED;
+        }
         let data = &apdu.data[..apdu.nc];
         if find_tag(data, TAG_NAME as u16).is_none() {
             return Sw::INCORRECT_PARAMS;
@@ -1953,6 +1959,7 @@ mod tests {
             INS_CALCULATE,
             INS_CALC_ALL,
             INS_RENAME,
+            INS_VERIFY_CODE,
         ] {
             let (sw, _) = run(&mut app, &mut fs, &apdu(ins, 0, 0, &[]));
             assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED, "ins {ins:#x}");

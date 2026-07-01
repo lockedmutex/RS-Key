@@ -91,8 +91,12 @@ impl<'a, S: Storage> DoWriter<'a, S> {
     }
 
     fn read_flash(&mut self, fid: u16) {
-        if let Some(n) = self.fs.read(fid, &mut self.out[self.pos..]) {
-            self.pos += n;
+        let cap = &mut self.out[self.pos..];
+        if let Some(n) = self.fs.read(fid, cap) {
+            // `fs.read` returns the value's FULL stored length while it copies only
+            // `min(len, cap.len())`; advance by what actually fit, or an over-long
+            // stored DO would push `pos` past `out` and panic on the next slice.
+            self.pos += n.min(cap.len());
         }
     }
 
@@ -429,6 +433,23 @@ mod tests {
         // 5F52 historical bytes follows.
         let hist_tag = 6 + 16;
         assert_eq!(&out[hist_tag..hist_tag + 2], &[0x5F, 0x52]);
+    }
+
+    #[test]
+    fn over_long_flash_do_does_not_overflow_the_output_buffer() {
+        // Regression: an over-long stored DO (cardholder name here) must not push the
+        // write cursor past `out` and panic. PUT DATA is uncapped and `fs.read`
+        // returns the full stored length, so GET DATA 65 used to slice out of range.
+        let mut fs = fs();
+        fs.put(EF_CH_NAME, &[0x41u8; 2000]).unwrap();
+        let aid = full_aid(&[0; 4]);
+        let cap = 1024;
+        let mut out = [0u8; 1024];
+        let mut w = DoWriter::new(&mut out, &mut fs, &aid);
+        w.build(EF_CH_DATA); // 0x65 cardholder template, nests EF_CH_NAME
+        // Reaching here means no OOB slice panicked; the cursor stayed in bounds.
+        assert!(w.len() <= cap);
+        let _ = w.bytes(); // bytes() slices out[..pos] — would panic if pos overran
     }
 
     #[test]
