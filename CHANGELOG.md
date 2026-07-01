@@ -676,6 +676,41 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   settings menu unwinds cleanly afterwards without repainting over the blanked panel.
   Display flavor only.
 
+- **OpenPGP / trusted display: an over-long fingerprint, timestamp or algorithm object can no
+  longer crash the Apps screen.** `read_info` sliced fixed stack buffers by the *full* stored
+  length that `Storage::read` reports, so a fingerprint (`C7`), timestamp (`CE`) or algorithm
+  attribute stored longer than its buffer — PUT DATA caps nothing, so a PW3 host or flash
+  corruption can leave one — indexed out of bounds and panicked (a device brick) every time the
+  OpenPGP screen was opened. The read length is now clamped before slicing, and a host test
+  exercises an over-long record. Found by a pre-release cross-wave review.
+
+- **PIV: imported X25519 keys now match their real public identity (ykman / yubico-piv-tool
+  interop).** An imported X25519 scalar was stored verbatim, but the curve op treats the stored
+  scalar as a big-endian MPI while `ykman` / `yubico-piv-tool` send it little-endian (RFC 8410 /
+  RFC 7748) — so the slot's public key (and every ECDH) disagreed with the key's established
+  public key, and ciphertext or certificates already bound to it could not be decrypted by the
+  slot. The import now flips the byte order for X25519 (Ed25519 seeds are unaffected), and a host
+  test asserts the reported public point equals the one standard tooling derives from the same
+  bytes. On-device *generated* X25519 keys were always self-consistent and are unchanged.
+
+- **Trusted display: a look-alike relying-party id can no longer hide its tail on the Approve
+  screen.** The sign-in / approve screen hard-clipped a too-wide rp id with no marker, and the
+  "was truncated" flag on a sanitized label was never rendered — so a padded look-alike id could
+  be silently cut to a trustworthy-looking prefix on the very screen meant to expose it. The rp
+  id is now ellipsized (`…`) on overflow and always marked when the label was clamped. Display
+  flavor only.
+
+- **Trusted display: a long OpenPGP cardholder name no longer overruns the overview row.** The
+  host-set cardholder name is drawn right-anchored on the "Card holder" overview row; without a
+  clip a long name spilled left across the icon and off the panel edge. The trailing value is now
+  clipped to the row (short values are unaffected), with a regression test that renders a
+  max-length name on-panel. Display flavor only.
+
+- **Hardening: property sweeps now pin the `EF_DISPLAY`, `EF_RPNICK` (passkey nickname) and PIV
+  ADMIN-DATA / PRINTED codecs against regression.** No new defect was found in these, but the
+  load-bearing read-length clamps and the fail-closed protection-flag parse are locked in by
+  deterministic host sweeps over adversarial bytes. bcdDevice 0x07D1 → 0x07D2.
+
 ## [0.2.8] — 2026-06-21
 
 ### Changed

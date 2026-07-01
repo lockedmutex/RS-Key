@@ -2224,6 +2224,42 @@ mod tests {
         assert_eq!(shared, &x25519_dalek::x25519(host_scalar, cardpk)[..]);
     }
 
+    /// Importing a *pre-existing* X25519 private key must make the slot adopt that
+    /// key's real public identity. ykman / yubico-piv-tool send the scalar
+    /// little-endian (RFC 8410); the card's reported public point therefore has to
+    /// equal the one standard tooling derives from the same bytes — otherwise
+    /// ciphertext or certs already bound to the public key can never be decrypted by
+    /// the slot. (The sibling test above is deliberately endianness-agnostic — it
+    /// agrees against the card's own key — so it cannot catch a flipped import; this
+    /// pins the byte order.)
+    #[test]
+    fn x25519_import_public_key_matches_host_derivation() {
+        let rng = RefCell::new(TestRng(7));
+        let pres = RefCell::new(AlwaysConfirm);
+        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
+        let mut fs = new_fs();
+        select(&mut app, &mut fs);
+        auth_mgm(&mut app, &mut fs);
+        verify_pin(&mut app, &mut fs);
+
+        // A non-palindromic scalar so a reversed byte order yields a different key.
+        let mut d = [0u8; 32];
+        for (i, b) in d.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(7).wrapping_add(3);
+        }
+        let host_pub = x25519_dalek::x25519(d, x25519_dalek::X25519_BASEPOINT_BYTES);
+
+        let mut imp = vec![0x08, 32];
+        imp.extend_from_slice(&d);
+        let (sw, _) = run(&mut app, &mut fs, INS_IMPORT_ASYM, ALGO_X25519, 0x9D, &imp);
+        assert_eq!(sw, Sw::OK);
+
+        let (sw, md) = run(&mut app, &mut fs, INS_GET_METADATA, 0, 0x9D, &[]);
+        assert_eq!(sw, Sw::OK);
+        let card_pub = find_tag(find_tag(&md, 0x04).unwrap(), 0x86).unwrap();
+        assert_eq!(card_pub, &host_pub[..]);
+    }
+
     /// An Ed25519 slot attests: the cert chains to F9 (P-384 ECDSA over the TBS)
     /// and carries the RFC 8410 Ed25519 SPKI.
     #[test]
@@ -2873,5 +2909,196 @@ mod tests {
         select(&mut app3, &mut fs);
         let (sw, _) = run(&mut app3, &mut fs, INS_VERIFY, 0, 0x80, &DEFAULT_PIN);
         assert_eq!(sw, Sw::new(0x63, 0xC2));
+    }
+
+    /// Targeted property fuzz for the Pivman ADMIN-DATA (`5FFF00`) parse and the
+    /// PIN-protected PRINTED (`5FC109`) assembly. A management-key-authenticated
+    /// host can PUT *arbitrary* bytes into the ADMIN-DATA object; `mgm_is_protected`
+    /// then parses them, and that parse gates whether the (PIN-readable) wrapped
+    /// management key is disclosed. The contract under any stored bytes:
+    ///   (a) the protected flag is set IFF a well-formed `80{81{..02..}}` says so —
+    ///       a truncated/garbage record fails CLOSED (never spuriously protected);
+    ///   (b) neither the parse nor the PRINTED assembly panics / reads OOB;
+    ///   (c) when protection IS on, GET DATA `5FC109` discloses the key only after a
+    ///       PIN VERIFY, and the wrapped key is exactly the sealed 0x9B mgmt key.
+    /// A deterministic enumeration (LCG-mutated PivmanData payloads, plus a
+    /// hand-picked adversarial corpus) stands in for libfuzzer so this runs in the
+    /// normal host gate. `protect_mgm_key` seeds the sealed 0x9B key once so the
+    /// PRINTED assembly path is reachable.
+    #[test]
+    fn pivman_printed_codec_property_fuzz() {
+        const ADMIN: [u8; 3] = [0x5F, 0xFF, 0x00];
+        const PRINTED: [u8; 3] = [0x5F, 0xC1, 0x09];
+
+        // Oracle for the ADMIN-DATA protection flag, independent of the parser
+        // under test: the record is `80 <l> { ... 81 <m> <flags..> ... }` and is
+        // protected iff the FIRST 81 object inside the 80 body has a non-empty
+        // value whose first byte has bit 0x02 set. Mirrors a strict ykman reader.
+        fn oracle_protected(rec: &[u8]) -> bool {
+            if rec.len() < 2 || rec[0] != PIVMAN_TAG {
+                return false;
+            }
+            let inner_len = (rec[1] as usize).min(rec.len() - 2);
+            let inner = &rec[2..2 + inner_len];
+            let mut p = 0usize;
+            while p < inner.len() {
+                let tag = inner[p];
+                p += 1;
+                if p >= inner.len() {
+                    return false;
+                }
+                let l = inner[p] as usize;
+                p += 1;
+                if l > inner.len() - p {
+                    return false; // overrun → walker ends, tag not found
+                }
+                if tag == PIVMAN_FLAGS_TAG {
+                    return l > 0 && inner[p] & PIVMAN_FLAG_MGM_PROTECTED != 0;
+                }
+                p += l;
+            }
+            false
+        }
+
+        let put_admin = |app: &mut PivApplet, fs: &mut Fs<RamStorage>, body: &[u8]| -> Sw {
+            // PUT DATA: 5C 03 5FFF00  53 <len> <body>
+            let mut data = vec![0x5C, 0x03, ADMIN[0], ADMIN[1], ADMIN[2]];
+            let mut ll = [0u8; 3];
+            let n = format_len(body.len() as u16, &mut ll);
+            data.push(0x53);
+            data.extend_from_slice(&ll[..n]);
+            data.extend_from_slice(body);
+            run(app, fs, INS_PUT_DATA, 0x3F, 0xFF, &data).0
+        };
+
+        // Hand-picked adversarial PivmanData bodies (the value inside the 0x53).
+        let corpus: Vec<Vec<u8>> = vec![
+            vec![],                                                           // empty → delete
+            vec![PIVMAN_TAG],       // bare outer tag, no len
+            vec![PIVMAN_TAG, 0x00], // outer len 0, no inner
+            vec![PIVMAN_TAG, 0xFF], // outer len overruns buffer
+            vec![PIVMAN_TAG, 0x03, PIVMAN_FLAGS_TAG, 0x01, 0x02], // canonical protected
+            vec![PIVMAN_TAG, 0x03, PIVMAN_FLAGS_TAG, 0x01, 0x00], // canonical NOT protected
+            vec![PIVMAN_TAG, 0x02, PIVMAN_FLAGS_TAG, 0x01], // flag tag, len 1, value MISSING (truncated)
+            vec![PIVMAN_TAG, 0x02, PIVMAN_FLAGS_TAG, 0x00], // flag tag, empty value
+            vec![PIVMAN_TAG, 0x05, PIVMAN_FLAGS_TAG, 0x03, 0x02, 0x02, 0x02], // multi-byte flags, bit set
+            vec![PIVMAN_TAG, 0x03, 0x82, 0x01, 0x02], // wrong inner tag (0x82 not 0x81)
+            vec![PIVMAN_TAG, 0xFF, PIVMAN_FLAGS_TAG, 0x01, 0x02], // outer len 255 >> body; clamp must hold
+            vec![PIVMAN_TAG, 0x03, PIVMAN_FLAGS_TAG, 0x01, 0xFF], // all flag bits incl 0x02
+            vec![PIVMAN_TAG, 0x03, PIVMAN_FLAGS_TAG, 0x01, 0xFD], // every bit EXCEPT 0x02 → not protected
+            vec![0x81, 0x01, 0x02],                               // missing outer 0x80 wrapper
+            vec![
+                PIVMAN_TAG,
+                0x06,
+                0x83,
+                0x01,
+                0x00,
+                PIVMAN_FLAGS_TAG,
+                0x01,
+                0x02,
+            ], // flag after another tag
+            // Real ykman shape: flags + 16B salt + 4B timestamp.
+            {
+                let mut v = vec![PIVMAN_FLAGS_TAG, 0x01, 0x02, 0x82, 0x10];
+                v.extend_from_slice(&[0u8; 16]);
+                v.extend_from_slice(&[0x83, 0x04]);
+                v.extend_from_slice(&[0u8; 4]);
+                let mut rec = vec![PIVMAN_TAG, v.len() as u8];
+                rec.extend_from_slice(&v);
+                rec
+            },
+        ];
+
+        // LCG-mutated bodies: random length 0..=80, random bytes, biased to start
+        // with the real tags so the parser's deep branches are exercised.
+        let mut lcg: u64 = 0x1234_5678_9abc_def1;
+        let next = |lcg: &mut u64| -> u8 {
+            *lcg = lcg
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (*lcg >> 33) as u8
+        };
+        let mut inputs = corpus;
+        for _ in 0..4000 {
+            let len = (next(&mut lcg) % 80) as usize;
+            let mut b = Vec::with_capacity(len + 2);
+            if next(&mut lcg) & 0x3 != 0 {
+                b.push(PIVMAN_TAG);
+                b.push(next(&mut lcg));
+            }
+            for _ in 0..len {
+                b.push(next(&mut lcg));
+            }
+            inputs.push(b);
+        }
+
+        let rng = RefCell::new(TestRng(7));
+        let pres = RefCell::new(AlwaysConfirm);
+        let dev = Device {
+            serial_hash: &HASH,
+            serial_id: &SERIAL,
+            otp_key: None,
+        };
+
+        for body in inputs {
+            if body.len() > MAX_OBJECT {
+                continue; // PUT DATA rejects oversize before storage
+            }
+            let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
+            let mut fs = new_fs();
+            select(&mut app, &mut fs);
+            // Hold a management-key session FIRST (default AES-192 key), which is
+            // what PUT DATA requires; then `protect_mgm_key` swaps 0x9B for a fresh
+            // random key without touching the session, so PRINTED is reachable.
+            auth_mgm(&mut app, &mut fs);
+            assert_eq!(protect_mgm_key(&dev, &mut fs, &mut TestRng(42)), Sw::OK);
+
+            let _ = put_admin(&mut app, &mut fs, &body);
+
+            // (a) protection flag matches the independent oracle — no spurious flip.
+            let stored = {
+                let mut o = [0u8; 64];
+                fs.read(EF_PIVMAN_DATA, &mut o)
+                    .map(|n| o[..n.min(o.len())].to_vec())
+            };
+            let oracle = stored.as_deref().map(oracle_protected).unwrap_or(false);
+            let actual = mgm_is_protected(&mut fs);
+            assert_eq!(
+                actual, oracle,
+                "protection flag disagrees with oracle for body {body:02x?}, stored {stored:02x?}",
+            );
+
+            // (b)+(c) GET DATA 5FC109 must not panic and must honour the gate.
+            let get_printed = [0x5C, 0x03, PRINTED[0], PRINTED[1], PRINTED[2]];
+
+            // Without a PIN: never discloses the key.
+            let (sw_nopin, body_nopin) =
+                run(&mut app, &mut fs, INS_GET_DATA, 0x3F, 0xFF, &get_printed);
+            if actual {
+                assert_eq!(sw_nopin, Sw::SECURITY_STATUS_NOT_SATISFIED);
+            } else {
+                assert_eq!(sw_nopin, Sw::FILE_NOT_FOUND);
+            }
+            assert!(body_nopin.is_empty() || sw_nopin != Sw::OK);
+
+            // With a PIN verified: discloses ONLY if protection is on, and the
+            // disclosed key is exactly the sealed 0x9B mgmt key (32B), TLV-wrapped.
+            verify_pin(&mut app, &mut fs);
+            let (sw_pin, out) = run(&mut app, &mut fs, INS_GET_DATA, 0x3F, 0xFF, &get_printed);
+            if actual {
+                assert_eq!(sw_pin, Sw::OK);
+                assert_eq!(
+                    &out[..6],
+                    &[0x53, 0x24, PROTECTED_TAG, 0x22, PROTECTED_MGM_TAG, 0x20]
+                );
+                let mut sealed = [0u8; 32];
+                let klen = seal::seal_read(&dev, &mut fs, key_fid(SLOT_CARDMGM), &mut sealed)
+                    .expect("sealed mgmt key present");
+                assert_eq!(klen, 32);
+                assert_eq!(&out[6..38], &sealed[..]);
+            } else {
+                assert_eq!(sw_pin, Sw::FILE_NOT_FOUND);
+            }
+        }
     }
 }

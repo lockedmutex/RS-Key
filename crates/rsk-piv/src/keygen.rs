@@ -428,7 +428,25 @@ pub(crate) fn import<S: Storage>(
             if scalar.len() > 32 {
                 return WRONG_DATA;
             }
-            let Some(key) = PrivKey::from_scalar(curve, scalar) else {
+            // ykman / yubico-piv-tool import the X25519 private key little-endian
+            // (RFC 8410 / RFC 7748); `PrivKey` keeps the scalar as a big-endian MPI
+            // (keys.rs reverses it for the curve op), so flip the imported bytes —
+            // else the slot's public key disagrees with the key's real identity and
+            // ciphertext bound to it can't be decrypted. Ed25519's tag 0x07 is a
+            // hash seed, not an integer, so it is imported verbatim.
+            let mut flipped = [0u8; 32];
+            let scalar = if algo == ALGO_X25519 {
+                let n = scalar.len();
+                for (i, &b) in scalar.iter().enumerate() {
+                    flipped[n - 1 - i] = b;
+                }
+                &flipped[..n]
+            } else {
+                scalar
+            };
+            let key = PrivKey::from_scalar(curve, scalar);
+            flipped.zeroize();
+            let Some(key) = key else {
                 return WRONG_DATA;
             };
             if let Err(sw) = seal::store_ec_key(dev, fs, rng, key_fid(slot), &key) {

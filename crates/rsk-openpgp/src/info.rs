@@ -95,8 +95,10 @@ fn slot_algo<S: Storage>(fs: &mut Fs<S>, slot: usize, present: bool) -> SlotAlgo
     }
     let mut buf = [0u8; 16];
     let attr = match fs.read(EF_ALGO_PRIV1 + slot as u16, &mut buf) {
-        // A key with no stored attribute is the applet's rsa2k default.
-        Some(n) if n >= 1 => &buf[..n],
+        // `Storage::read` returns the value's FULL stored length, not the copied
+        // count, so a DO longer than `buf` must be clamped before slicing — else a
+        // PW3-written over-long record (PUT DATA caps nothing) panics here = brick.
+        Some(n) if n >= 1 => &buf[..n.min(buf.len())],
         _ => return SlotAlgo::Rsa(2048),
     };
     match attr[0] {
@@ -128,11 +130,13 @@ pub fn read_info<S: Storage>(fs: &mut Fs<S>) -> OpenpgpInfo {
         let present = fs.has_key(PK_FIDS[s]);
         let mut fp = [0u8; 20];
         let fingerprint = match fs.read(EF_FP_SIG + s as u16, &mut fp) {
-            Some(n) if n > 0 && fp[..n].iter().any(|&b| b != 0) => Some(fp),
+            // Clamp the full-length read (see `slot_algo`) before slicing the
+            // fixed buffer — an over-long stored DO must not panic.
+            Some(n) if n > 0 && fp[..n.min(fp.len())].iter().any(|&b| b != 0) => Some(fp),
             _ => None,
         };
         let mut ts = [0u8; 4];
-        let created = matches!(fs.read(EF_TS_SIG + s as u16, &mut ts), Some(n) if ts[..n].iter().any(|&b| b != 0));
+        let created = matches!(fs.read(EF_TS_SIG + s as u16, &mut ts), Some(n) if ts[..n.min(ts.len())].iter().any(|&b| b != 0));
         let mut uif = [0u8; 2];
         let touch =
             matches!(fs.read(EF_UIF_SIG + s as u16, &mut uif), Some(n) if n >= 1 && uif[0] != 0);
@@ -300,6 +304,23 @@ mod tests {
         assert_eq!(info.slots[2].algo.label(), "RSA 2048");
         assert!(info.slots[1].fingerprint.is_none());
         assert_eq!(info.key_count(), 2);
+    }
+
+    #[test]
+    fn over_long_stored_dos_do_not_panic_read_info() {
+        // `Storage::read` reports the value's FULL stored length, and PUT DATA caps
+        // nothing, so a PW3 host (or flash corruption) can leave a fingerprint /
+        // timestamp / algo DO longer than the reader's fixed stack buffer. read_info
+        // must clamp before slicing — an index-OOB panic on device is a brick.
+        let mut fs = fs();
+        fs.put(EF_PK_SIG.get(), &[0xAB; 40]).unwrap();
+        fs.put(EF_FP_SIG, &[0x11; 64]).unwrap(); // > 20-byte fp buffer
+        fs.put(EF_TS_SIG, &[0x65; 16]).unwrap(); // > 4-byte ts buffer
+        fs.put(EF_ALGO_PRIV1, &[0x13; 48]).unwrap(); // > 16-byte algo buffer
+        let s = read_info(&mut fs).slots[0]; // must not panic
+        assert!(s.present);
+        assert!(s.created);
+        assert_eq!(s.fingerprint, Some([0x11; 20]));
     }
 
     #[test]

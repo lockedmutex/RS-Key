@@ -656,4 +656,135 @@ mod tests {
         }
         assert!(!found_cleartext, "nickname must be sealed, not cleartext");
     }
+
+    // ---- Adversarial property sweep over nickname + stored-record bytes ------
+    //
+    // Two attacker surfaces, both deterministic so the gate runs them:
+    //   1. arbitrary `nick` bytes into `set_rp_nickname` (length-bound + isolation),
+    //   2. arbitrary bytes written straight into an EF_RPNICK slot, then decoded by
+    //      `for_each_rp` / `unseal_nick` — modelling a corrupt/forged flash record.
+    use crate::credential::{NICK_BOX_MAX, seal_nick, unseal_nick};
+
+    // A cheap splitmix64 PRNG so the sweep is reproducible without `rand`.
+    struct Prng(u64);
+    impl Prng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^ (z >> 31)
+        }
+        fn bytes(&mut self, out: &mut [u8]) {
+            for chunk in out.chunks_mut(8) {
+                let r = self.next().to_le_bytes();
+                let n = chunk.len();
+                chunk.copy_from_slice(&r[..n]);
+            }
+        }
+    }
+
+    /// `set_rp_nickname` must never truncate-and-store: a nickname one byte over the
+    /// cap is rejected, and the rejection must leave NO record (it must not bleed into
+    /// the slot as a truncated value). At exactly the cap it stores and round-trips.
+    #[test]
+    fn fuzz_nickname_length_bound_is_reject_not_truncate() {
+        let mut prng = Prng(0xDEAD_BEEF);
+        for _ in 0..2_000 {
+            let (mut fs, seed) = provisioned();
+            add(&mut fs, &seed, 1, "github.com", b"u", "n", "N", 0);
+            let gh = sha256(b"github.com");
+
+            // Build an ASCII nickname of an attacker-chosen length around the cap.
+            let len = (prng.next() % (RP_NICK_MAX_LEN as u64 + 4)) as usize;
+            let mut raw = [0u8; RP_NICK_MAX_LEN + 4];
+            prng.bytes(&mut raw[..len]);
+            for b in raw[..len].iter_mut() {
+                *b = b'a' + (*b % 26); // keep it valid UTF-8 / printable
+            }
+            let nick = core::str::from_utf8(&raw[..len]).unwrap();
+
+            let ok = set_rp_nickname(&dev(), &mut fs, &gh, nick);
+            assert_eq!(
+                ok,
+                nick.len() <= RP_NICK_MAX_LEN,
+                "store accepted iff within the cap"
+            );
+
+            let got = nick_of(&mut fs, "github.com");
+            if nick.is_empty() {
+                assert_eq!(got, None, "empty nick clears, leaves no name");
+            } else if nick.len() <= RP_NICK_MAX_LEN {
+                assert_eq!(
+                    got.as_deref(),
+                    Some(nick),
+                    "stored nick round-trips exactly"
+                );
+            } else {
+                // Over-long: rejected. There must be NO truncated remnant in the slot.
+                assert_eq!(got, None, "an over-long nick must store nothing");
+            }
+        }
+    }
+
+    /// Decoding an arbitrary/corrupt EF_RPNICK record must never panic and must never
+    /// surface a name for a slot whose box does not authenticate under its RP. We write
+    /// junk of every length — including > NICK_BOX_MAX, the slice that would OOB-panic
+    /// if `for_each_rp` dropped its `m.min(NICK_BOX_MAX)` clamp — straight into the slot
+    /// behind the real RP, then walk it.
+    #[test]
+    fn fuzz_corrupt_stored_record_never_panics_or_names() {
+        let mut prng = Prng(0x0BAD_F00D);
+        for _ in 0..4_000 {
+            let (mut fs, seed) = provisioned();
+            add(&mut fs, &seed, 7, "github.com", b"u", "n", "N", 0);
+
+            // Junk length spans short (< IV+TAG), exact box sizes, and oversize.
+            let len = (prng.next() % (NICK_BOX_MAX as u64 + 40)) as usize;
+            let mut junk = [0u8; NICK_BOX_MAX + 40];
+            prng.bytes(&mut junk[..len]);
+            // Slot 0 is where github.com's EF_RP lands (first occupied slot).
+            fs.put(EF_RPNICK, &junk[..len]).unwrap();
+
+            // The decode walk must complete and the RP must fall back to its rpId:
+            // forged bytes can't open under github.com's rpIdHash (the AEAD AAD).
+            let got = nick_of(&mut fs, "github.com");
+            assert_eq!(got, None, "a corrupt/forged record must never name an RP");
+        }
+    }
+
+    /// `unseal_nick` directly, over adversarial (tail, rpIdHash, out-buffer) shapes:
+    /// every length and a too-small `out` must yield `None`, never panic; only a
+    /// genuine box under the matching rpIdHash opens, and never as a foreign RP.
+    #[test]
+    fn fuzz_unseal_nick_shapes_never_panic() {
+        let mut prng = Prng(0xC0FF_EE42);
+        let seed = [0x5A; 32];
+        let rp_a = [0x11; 32];
+        let rp_b = [0x22; 32];
+
+        // A real box for rp_a, opened back only under rp_a — never under rp_b.
+        let mut real = [0u8; NICK_BOX_MAX];
+        let rlen = seal_nick(&seed, &rp_a, "Work GitHub", &mut real).unwrap();
+        let mut p = [0u8; RP_NICK_MAX_LEN];
+        assert_eq!(
+            unseal_nick(&seed, &rp_a, &real[..rlen], &mut p),
+            Some("Work GitHub")
+        );
+        let mut p2 = [0u8; RP_NICK_MAX_LEN];
+        assert_eq!(unseal_nick(&seed, &rp_b, &real[..rlen], &mut p2), None);
+
+        for _ in 0..20_000 {
+            let len = (prng.next() % (NICK_BOX_MAX as u64 + 16)) as usize;
+            let mut tail = [0u8; NICK_BOX_MAX + 16];
+            prng.bytes(&mut tail[..len]);
+            // Vary the output buffer size too: a ct longer than `out` must be `None`,
+            // not an OOB copy.
+            let out_cap = (prng.next() % (RP_NICK_MAX_LEN as u64 + 1)) as usize;
+            let mut out = [0u8; RP_NICK_MAX_LEN];
+            // Random junk practically never authenticates → always None, never panic.
+            let r = unseal_nick(&seed, &rp_a, &tail[..len], &mut out[..out_cap]);
+            assert!(r.is_none(), "random bytes must not forge a valid nickname");
+        }
+    }
 }

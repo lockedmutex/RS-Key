@@ -1100,6 +1100,7 @@ where
             Role::Body,
             color,
             Rect::new(14, (y + 8) as u16, PANEL_W - 28, 24),
+            false,
         )?;
         y += 46;
     }
@@ -2206,6 +2207,7 @@ fn audit_body<D: DrawTarget<Color = Rgb565>>(
         Role::Body,
         FG,
         clip,
+        false,
     )
 }
 
@@ -2708,7 +2710,15 @@ fn centered_clipped<D: DrawTarget<Color = Rgb565>>(
     if w <= clip.w as u32 {
         text(t, s, EgPoint::new(cx, y), role, color)
     } else {
-        text_left_ellipsized(t, s, EgPoint::new(clip.x as i32, y), role, color, clip)
+        text_left_ellipsized(
+            t,
+            s,
+            EgPoint::new(clip.x as i32, y),
+            role,
+            color,
+            clip,
+            false,
+        )
     }
 }
 
@@ -2736,31 +2746,37 @@ fn service_head<D: DrawTarget<Color = Rgb565>>(
     )?;
     let tx = chip.x as i32 + chip.w as i32 + 11;
     let clip = Rect::new(tx as u16, y as u16, PANEL_W - 14 - tx as u16, 38);
+    // The relying party is attacker-chosen text: ellipsize (never hard-cut) and force
+    // the marker when the label was already clamped, so a padded look-alike id can't
+    // present a complete-looking prefix on the very screen meant to expose it.
     if account.as_str().is_empty() {
-        text_left_clipped(
+        text_left_ellipsized(
             t,
             rp.as_str(),
             EgPoint::new(tx, y + 19),
             Role::Strong,
             theme::TEXT,
             clip,
+            rp.truncated,
         )
     } else {
-        text_left_clipped(
+        text_left_ellipsized(
             t,
             rp.as_str(),
             EgPoint::new(tx, y + 12),
             Role::Strong,
             theme::TEXT,
             clip,
+            rp.truncated,
         )?;
-        text_left_clipped(
+        text_left_ellipsized(
             t,
             account.as_str(),
             EgPoint::new(tx, y + 28),
             Role::Body,
             theme::GREY,
             clip,
+            account.truncated,
         )
     }
 }
@@ -3428,6 +3444,10 @@ fn text_left_clipped<D: DrawTarget<Color = Rgb565>>(
 /// and on the anti-phishing screens a padded look-alike id is *visibly* truncated. Input is
 /// ASCII-sanitised ([`crate::Label::clamp`]) and the static titles are ASCII, so a byte is a
 /// char; the ellipsis is ASCII because the `_tr` faces carry no `U+2026`.
+///
+/// `force_mark` appends the marker even when `s` fits: a [`crate::Label`] already cut at
+/// `LABEL_MAX` (its `truncated` flag) is a prefix of a longer original, so on a trust screen
+/// it must still read as truncated even if the clamped prefix happens to fit the box.
 fn text_left_ellipsized<D: DrawTarget<Color = Rgb565>>(
     t: &mut D,
     s: &str,
@@ -3435,8 +3455,9 @@ fn text_left_ellipsized<D: DrawTarget<Color = Rgb565>>(
     role: Role,
     color: Rgb565,
     clip: Rect,
+    force_mark: bool,
 ) -> Result<(), D::Error> {
-    if font::width(s, role).unwrap_or(0) <= clip.w as u32 {
+    if !force_mark && font::width(s, role).unwrap_or(0) <= clip.w as u32 {
         return font::left(&mut t.clipped(&eg_rect(clip)), s, at, role, color);
     }
     const ELL: &str = "...";
@@ -3545,7 +3566,15 @@ fn title_bar_to<D: DrawTarget<Color = Rgb565>>(
         right.saturating_sub(tx as u16),
         TITLE_BAR_H,
     );
-    text_left_ellipsized(t, title, EgPoint::new(tx, cy), Role::Heading, color, clip)
+    text_left_ellipsized(
+        t,
+        title,
+        EgPoint::new(tx, cy),
+        Role::Heading,
+        color,
+        clip,
+        false,
+    )
 }
 
 /// The top header strip: a title (accent or muted) at the left, an optional status
@@ -3652,7 +3681,17 @@ fn row_body<D: DrawTarget<Color = Rgb565>>(
     let label_x = rect.x as i32 + 28;
     let label_right = if let Some((txt, col)) = trailing {
         let tx = right_x - 4;
-        text_right(t, txt, EgPoint::new(tx, cy), Role::Body, col)?;
+        // The trailing value can be host-controlled (e.g. the OpenPGP cardholder
+        // name) — clip it to the row so a long string can't overrun left across the
+        // icon and off the panel edge. Short static values are unaffected.
+        let tclip = Rect::new(label_x as u16, rect.y, (tx - label_x).max(0) as u16, rect.h);
+        font::right(
+            &mut t.clipped(&eg_rect(tclip)),
+            txt,
+            EgPoint::new(tx, cy),
+            Role::Body,
+            col,
+        )?;
         tx - font::width(txt, Role::Body).unwrap_or(0) as i32 - ROW_TRAILING_GAP
     } else {
         right_x - ROW_TRAILING_GAP
@@ -3670,6 +3709,7 @@ fn row_body<D: DrawTarget<Color = Rgb565>>(
         Role::Body,
         theme::TEXT,
         clip,
+        false,
     )
 }
 
@@ -4587,6 +4627,50 @@ mod tests {
         // The pencil's region still gets its glyph (the title didn't paint over it... the
         // clip ends before it).
         assert!(d.any_non_bg_in(crate::TITLE_EDIT_RECT));
+    }
+
+    #[test]
+    fn ellipsized_force_mark_marks_a_fitting_label() {
+        // A Label clamped at LABEL_MAX fits the box but is a prefix of a longer
+        // original; on a trust screen (the RP on the Approve pad) it must still read
+        // as truncated. force_mark appends the marker even when the text fits, so a
+        // padded look-alike id cannot present a complete-looking prefix.
+        let clip = Rect::new(0, 0, PANEL_W, 24);
+        let at = EgPoint::new(0, 16);
+        let rightmost = |d: &Rec| {
+            (0..PANEL_W)
+                .rev()
+                .find(|&x| (0..24).any(|y| d.at(x, y) != BG))
+        };
+
+        let mut plain = Rec::new();
+        text_left_ellipsized(
+            &mut plain,
+            "google.com",
+            at,
+            Role::Strong,
+            theme::TEXT,
+            clip,
+            false,
+        )
+        .unwrap();
+        let mut marked = Rec::new();
+        text_left_ellipsized(
+            &mut marked,
+            "google.com",
+            at,
+            Role::Strong,
+            theme::TEXT,
+            clip,
+            true,
+        )
+        .unwrap();
+
+        assert!(plain.drew_anything() && marked.drew_anything());
+        assert!(
+            rightmost(&marked) > rightmost(&plain),
+            "force_mark must append a visible truncation marker even when the text fits"
+        );
     }
 
     #[test]
@@ -5705,6 +5789,15 @@ mod tests {
         let mut d = Rec::new();
         render_openpgp(&mut d, &pgp).unwrap();
         assert!(!d.oob, "openpgp overview spilled");
+
+        // A max-length host-controlled cardholder name on the OVERVIEW row must stay
+        // on-panel: the "Card holder" value is right-anchored, so an unclipped long
+        // name would overrun left off the panel (the row_body trailing-clip guard).
+        let mut wide = pgp;
+        wide.cardholder_name = Label::clamp(&[b'W'; 64]);
+        let mut d = Rec::new();
+        render_openpgp(&mut d, &wide).unwrap();
+        assert!(!d.oob, "openpgp overview cardholder name overran the panel");
 
         let mut d = Rec::new();
         render_openpgp_cardholder(
