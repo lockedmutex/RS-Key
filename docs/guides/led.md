@@ -12,7 +12,7 @@ PicoForge) and must be ≤ `MAX_LEDS`.
 
 | Knob | Default | When to change it |
 |---|---|---|
-| `LED_KIND` | `ws2812` | `ws2812` (addressable RGB, default), `gpio` (plain on/off), `pimoroni` (3-pin PWM RGB), or `none` (no indicator). See [build.md](build.md). |
+| `LED_KIND` | `ws2812` | `ws2812` (addressable RGB, default), `gpio` (plain on/off), `pimoroni` (3-pin PWM RGB), or `none` (no indicator). See [build.md](../build.md). |
 | `LED_PIN` | `16` | A board whose addressable LED is on a different GPIO (`0..=29`). |
 | `LED_ORDER` | `rgb` | A WS2812 board with swapped red/green — set `grb` (the WS2812B standard). The Waveshare RP2350-One is `rgb`; most other parts are `grb`. |
 | `MAX_LEDS` | `1` | A board with **multiple** daisy-chained addressable LEDs — set it to the chain length (max `64`). Default `1` is a single onboard LED. The actual connected count is set at runtime with `rsk hw --led-num`. |
@@ -136,8 +136,8 @@ steady toggle, use `rsk led`.
 
 ## Hardware wiring (`rsk hw`)
 
-See [hw.md](hw.md) for the full reference. The LED wiring — pin, driver, wire
-order — lives in the `phy` record, shared with PicoForge:
+See the [phy record spec](../protocol.md) for the full reference. The LED wiring
+— pin, driver, wire order — lives in the `phy` record, shared with PicoForge:
 
 ```sh
 rsk hw --led-pin 22                     # move the WS2812/gpio data pin to GPIO22
@@ -172,8 +172,8 @@ so your settings survive a power cycle but not an OpenPGP/FIDO factory reset
 that the render task reads live — SET LED updates them immediately, then
 persists the full block to flash.
 
-For the wiring half (`rsk hw`), see [hw.md](hw.md); it writes to `EF_PHY` via
-the rescue applet and applies at next boot.
+For the wiring half (`rsk hw`), see the [phy record spec](../protocol.md); it
+writes to `EF_PHY` via the rescue applet and applies at next boot.
 
 ## Troubleshooting
 
