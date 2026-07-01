@@ -93,17 +93,28 @@ fn chain(h: &[u8; 32], entry: &[u8; ENTRY_LEN]) -> [u8; 32] {
 
 fn load_meta<S: Storage>(dev: &Device, fs: &mut Fs<S>) -> Meta {
     let mut buf = [0u8; META_LEN];
-    match fs.read(EF_AUDIT_META, &mut buf) {
-        Some(META_LEN) if buf[0] == META_VER => Meta {
-            seq_next: u32::from_le_bytes(buf[1..5].try_into().unwrap()),
-            start: u32::from_le_bytes(buf[5..9].try_into().unwrap()),
-            epoch: buf[9..].try_into().unwrap(),
-        },
-        _ => Meta {
-            seq_next: 0,
-            start: 0,
-            epoch: genesis(dev),
-        },
+    if let Some(META_LEN) = fs.read(EF_AUDIT_META, &mut buf)
+        && buf[0] == META_VER
+    {
+        let seq_next = u32::from_le_bytes(buf[1..5].try_into().unwrap());
+        let start = u32::from_le_bytes(buf[5..9].try_into().unwrap());
+        // raw_append keeps the live window [start, seq_next) at most
+        // AUDIT_RING_SLOTS wide; a persisted meta claiming a wider span is
+        // corrupt (only reachable by raw flash write). Fail closed to genesis
+        // rather than let the vendor_read / fold walk overrun its fixed
+        // AUDIT_RING_SLOTS-entry buffer.
+        if seq_next.wrapping_sub(start) <= AUDIT_RING_SLOTS {
+            return Meta {
+                seq_next,
+                start,
+                epoch: buf[9..].try_into().unwrap(),
+            };
+        }
+    }
+    Meta {
+        seq_next: 0,
+        start: 0,
+        epoch: genesis(dev),
     }
 }
 

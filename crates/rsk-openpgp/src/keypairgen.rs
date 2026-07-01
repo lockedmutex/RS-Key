@@ -159,7 +159,12 @@ fn read_public<S: Storage>(fs: &mut Fs<S>, fid: KeyFid, out: &mut [u8]) -> Resul
     if !fs.has_data(fid.get() + 3) {
         return Err(Sw::REFERENCE_NOT_FOUND);
     }
-    fs.read(fid.get() + 3, out).ok_or(Sw::REFERENCE_NOT_FOUND)
+    // Fs::read returns the value's full stored length; the backend copied only
+    // min(len, out.len()). Clamp before returning, like every other reader in the
+    // crate, so the caller's `scratch[..n]` slice can never run past `out`.
+    fs.read(fid.get() + 3, out)
+        .map(|n| n.min(out.len()))
+        .ok_or(Sw::REFERENCE_NOT_FOUND)
 }
 
 // --- CCID keepalive path: split RSA generate so the slow keygen can run async ---

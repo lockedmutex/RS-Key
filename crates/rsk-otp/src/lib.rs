@@ -65,6 +65,11 @@ impl UserPresence for AlwaysConfirm {
 // are reached over CCID via the P2 slot offset and typed by three/four BOOTSEL clicks.
 pub(crate) const EF_OTP_SLOT1: u16 = 0xBB00;
 const EF_OTP_SLOT2: u16 = 0xBB01;
+/// Highest addressable slot FID. Only slots 1..=4 (0xBB00..=0xBB03) are ever read
+/// back (button_ticket, status, migrate_seal, power_up_bump); every command that
+/// derives a FID from a host offset must reject anything past this, or a slot can
+/// be written/relocated to an FID no code ever reaches again.
+const EF_OTP_SLOT_LAST: u16 = EF_OTP_SLOT1 + 3;
 
 /// Slot-config field offsets (packed, 52 bytes).
 pub(crate) const FIXED_SIZE: usize = 16;
@@ -309,6 +314,9 @@ impl<'a> OtpApplet<'a> {
             EF_OTP_SLOT2
         };
         let fid = base + apdu.p2 as u16;
+        if fid > EF_OTP_SLOT_LAST {
+            return Sw::INCORRECT_P1P2;
+        }
         if apdu.nc < CONFIG_SIZE {
             return Sw::WRONG_LENGTH;
         }
@@ -355,6 +363,9 @@ impl<'a> OtpApplet<'a> {
             EF_OTP_SLOT2
         };
         let fid = base + apdu.p2 as u16;
+        if fid > EF_OTP_SLOT_LAST {
+            return Sw::INCORRECT_P1P2;
+        }
         if apdu.nc < CONFIG_SIZE {
             return Sw::WRONG_LENGTH;
         }
@@ -397,21 +408,42 @@ impl<'a> OtpApplet<'a> {
         self.status(fs, res)
     }
 
-    /// P1 = 0x06: swap the two slots; the optional 2-byte body selects other
-    /// slot pairs in the 4-slot layout.
+    /// P1 = 0x06: swap the two slots. Body layouts: empty = slots 1↔2, no code;
+    /// `[a,b]` = slots (1+a)↔(2+b); `[a,b,code0..code5]` = the same pair with a
+    /// 6-byte access code. Swapping moves/deletes stored configs, so — like
+    /// cmd_configure/cmd_update/delete (docs/guides/otp.md) — a programmed slot is
+    /// only touched when the presented code matches its stored access code; an
+    /// unprotected slot's all-zero code is satisfied by the default, so a plain
+    /// `ykman otp swap` of unprotected slots is unchanged. Out-of-range offsets
+    /// are rejected so a swap can never orphan a slot outside the 4-slot range.
     fn cmd_swap<S: Storage>(&mut self, apdu: &Apdu, fs: &mut Fs<S>, res: &mut ResBuf) -> Sw {
         let (mut fid1, mut fid2) = (EF_OTP_SLOT1, EF_OTP_SLOT2);
+        let mut code = [0u8; ACC_CODE_SIZE];
         if apdu.nc > 0 {
-            if apdu.nc != 2 {
+            if apdu.nc != 2 && apdu.nc != 2 + ACC_CODE_SIZE {
                 return Sw::WRONG_LENGTH;
             }
             fid1 += apdu.data[0] as u16;
             fid2 += apdu.data[1] as u16;
+            if apdu.nc == 2 + ACC_CODE_SIZE {
+                code.copy_from_slice(&apdu.data[2..2 + ACC_CODE_SIZE]);
+            }
+        }
+        if fid1 > EF_OTP_SLOT_LAST || fid2 > EF_OTP_SLOT_LAST {
+            return Sw::INCORRECT_P1P2;
         }
         let mut a = [0u8; SLOT_SIZE];
         let mut b = [0u8; SLOT_SIZE];
         let na = self.read_slot_m(fs, fid1, &mut a);
         let nb = self.read_slot_m(fs, fid2, &mut b);
+        // The access code gates a swap's move/delete just as it gates
+        // overwrite/update/delete: a programmed slot may not be relocated or
+        // deleted without its code (an unprotected slot's stored code is zero).
+        let unmatched =
+            |rec: &[u8; SLOT_SIZE]| !ct_eq(&code, &rec[OFF_ACC_CODE..OFF_ACC_CODE + ACC_CODE_SIZE]);
+        if (na.is_some() && unmatched(&a)) || (nb.is_some() && unmatched(&b)) {
+            return Sw::SECURITY_STATUS_NOT_SATISFIED;
+        }
         match nb {
             Some(n) => {
                 if !self.put_slot(fs, fid1, &b[..n]) {
@@ -476,6 +508,9 @@ impl<'a> OtpApplet<'a> {
             EF_OTP_SLOT2
         };
         let fid = base + apdu.p2 as u16;
+        if fid > EF_OTP_SLOT_LAST {
+            return Sw::INCORRECT_P1P2;
+        }
         let mut slot = [0u8; SLOT_SIZE];
         if self.read_slot_m(fs, fid, &mut slot).is_none() {
             // Protocol quirk: an empty slot answers 9000 with no body.
@@ -1145,6 +1180,51 @@ mod tests {
         assert_eq!(body[4], CONFIG1_VALID);
         let (sw, _) = run(&mut app, &mut fs, &otp_apdu(0x06, 0, &[0, 1, 2]));
         assert_eq!(sw, Sw::WRONG_LENGTH);
+    }
+
+    #[test]
+    fn swap_refuses_protected_slot_without_access_code() {
+        // run-5 (HIGH): SLOT_SWAP used to move/delete an access-code-protected slot
+        // with no code — unlike configure/update — so an unauthenticated host could
+        // silently break a protected chal-resp credential (and an out-of-range
+        // offset orphaned it outside the addressable 1..=4 range). It must now
+        // refuse without the matching code, and reject the out-of-range offset.
+        let mut fs = new_fs();
+        let presence = RefCell::new(AlwaysConfirm);
+        let rng = RefCell::new(CountRng(7));
+        let mut app = OtpApplet::new(SERIAL, SERIAL_HASH, None, &rng, &presence);
+        let acc = [1, 2, 3, 4, 5, 6];
+        let cfgd = chalresp_config(&[0x33; 20], &acc, 0);
+        assert_eq!(
+            configure(&mut app, &mut fs, 0x01, 0, &cfgd, &[0; 6]).0,
+            Sw::OK
+        );
+
+        // Plain swap with no code is refused now that slot 1 is protected…
+        let (sw, _) = run(&mut app, &mut fs, &otp_apdu(0x06, 0, &[]));
+        assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
+        // …a wrong code is refused…
+        let (sw, _) = run(
+            &mut app,
+            &mut fs,
+            &otp_apdu(0x06, 0, &[0, 0, 9, 9, 9, 9, 9, 9]),
+        );
+        assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
+        // …and an out-of-range offset can no longer orphan the slot.
+        let (sw, _) = run(&mut app, &mut fs, &otp_apdu(0x06, 0, &[0, 5]));
+        assert_eq!(sw, Sw::INCORRECT_P1P2);
+        // The credential is untouched: slot 1 still challenge-responds.
+        let chal = [0x11; 64];
+        let (sw, resp) = run(&mut app, &mut fs, &otp_apdu(0x30, 0, &chal));
+        assert_eq!(sw, Sw::OK);
+        assert_eq!(resp, hmac_sha1(&[0x33; 20], &chal));
+
+        // With the correct code the swap succeeds (moves slot 1 → slot 2).
+        let mut body = [0u8; 2 + ACC_CODE_SIZE];
+        body[2..].copy_from_slice(&acc);
+        let (sw, st) = run(&mut app, &mut fs, &otp_apdu(0x06, 0, &body));
+        assert_eq!(sw, Sw::OK);
+        assert_eq!(st[4], CONFIG2_VALID);
     }
 
     #[test]

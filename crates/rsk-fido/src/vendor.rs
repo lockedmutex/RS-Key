@@ -449,7 +449,9 @@ fn pin_gate<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req) -> Result<(), Ct
 }
 
 /// `BACKUP_EXPORT`: encrypt the 32-byte seed under the MSE channel and return it.
-/// Refused once the export window is sealed (finalize or a prior backup).
+/// Refused once the export window is sealed by `BACKUP_FINALIZE` (a reset reopens
+/// it). Export itself does not seal the window; each call re-encrypts under a
+/// fresh nonce, so a repeat export before finalize is safe (no keystream reuse).
 fn backup_export<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [u8]) -> CtapResult {
     // The FIPS-style profile seals the seed in entirely (non-exportable key
     // material; the MSE channel is ChaCha20-Poly1305 — not approved transport).

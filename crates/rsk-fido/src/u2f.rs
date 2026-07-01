@@ -114,7 +114,9 @@ fn cmd_register<S: Storage, R: Rng>(
     let clen = if org {
         // The chain's leaf — a U2F response carries exactly one certificate.
         let n = match ctx.fs.read(EF_ATT_CHAIN, &mut cert) {
-            Some(n) if n > 3 => n,
+            // Fs::read returns the full stored length; clamp to the buffer before
+            // slicing cert[..n] below, matching the EF_EE_DEV branch.
+            Some(n) if n > 3 => n.min(cert.len()),
             _ => return (Sw::EXEC_ERROR, 0),
         };
         let Some((off, len)) = crate::cert::att_chain_cert_range(&cert[..n], 0) else {

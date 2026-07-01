@@ -15,6 +15,34 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Security
 
+- **Security-audit run-5 hardening.** Fixed the findings from a fifth agentic
+  audit against `fefa199` (bcdDevice `0x07D9` → `0x07DA`):
+  - **OTP `SLOT_SWAP` access-code bypass (high).** `cmd_swap` was the only
+    slot-mutating OTP command that did not check the per-slot access code that
+    `cmd_configure`/`cmd_update` enforce: it unsealed both target slots (the seal
+    read never compares the access code) and relocated/deleted them unconditionally.
+    An unauthenticated USB host (CCID or the HID keyboard frame, no PIN/code/touch)
+    could `SLOT_SWAP` a programmed, access-code-protected slot to **silently delete
+    or relocate** it — persistently breaking a challenge-response credential used
+    for LUKS / KeePassXC / pam_yubico. An unbounded swap offset could also orphan
+    the slot at an FID outside the addressable 1..=4 range. `cmd_swap` now requires
+    the access code of every non-empty slot it touches (an unprotected slot's code
+    is all-zero, so a plain `ykman otp swap` of unprotected slots is unchanged) and
+    rejects out-of-range offsets; the same offset bound is applied to
+    `cmd_configure`/`cmd_update`/`cmd_calculate`. Integrity/availability only — the
+    config stays GCM-sealed (no secret exfiltration).
+  - **OpenPGP `read_public` unclamped stored length (hardening).** `read_public`
+    returned the value's full `Fs::read` length without `n.min(out.len())` — the
+    6th member of the OpenPGP stored-length family. Latent only (`EF_PB_*` is not
+    host-writable beyond its bound), now clamped like every other reader.
+  - **U2F attestation-chain read (hardening).** The org-attestation branch sliced
+    `cert[..n]` on the full stored length with only a size margin; now clamps
+    `n.min(cert.len())`, matching the sibling `EF_EE_DEV` branch.
+  - **Audit-journal meta window (hardening).** `load_meta` now fails closed to
+    genesis when a persisted `EF_AUDIT_META` claims a window wider than
+    `AUDIT_RING_SLOTS`, so a flash-corrupted meta can't overrun the export buffer.
+  - **`BACKUP_EXPORT` docstring corrected** to match behavior (only
+    `BACKUP_FINALIZE` seals the window; repeat export before finalize is safe).
 - **Security-audit run-4 hardening.** Fixed the findings from a fourth agentic
   audit against `bb95cc1` (bcdDevice `0x07D8` → `0x07D9`):
   - **FIDO `getNextAssertion` user-presence bypass (high).** `getAssertion` armed
