@@ -47,6 +47,23 @@ project — see [README.md](README.md) and
   → "Commits and PRs". History reads as a changelog; one topic per change, with
   refactors kept separate from behaviour changes.
 
+## Working discipline
+
+- **Surface assumptions; don't code through confusion.** If the task has several
+  reasonable readings or an important detail is unclear, say so and ask before
+  writing code. State the assumptions the implementation depends on.
+- **Surgical diffs.** Touch only what the task requires; no refactoring adjacent
+  code "while you're there". Unrelated dead code or design problems: mention
+  them separately, don't fold them into the diff.
+- **Define done as something checkable.** A bug fix starts by reproducing the
+  bug — a failing host test where the logic is host-testable, a `tests/*.py`
+  repro otherwise — then fixes it. A refactor preserves behaviour and proves it
+  with the existing tests and an unchanged wire surface. For multi-step work,
+  each step names its verification.
+- **Never report unverified success.** Don't claim a fix works, a command
+  succeeded, or the gate is green unless you observed it. If something couldn't
+  be verified (e.g. it needs hardware), say exactly what remains unchecked.
+
 ## Code style
 
 Match the file you're editing — naming, error-handling pattern, and comment
@@ -59,11 +76,37 @@ not stamped with a different house style. Then:
   (`// loop over the items`), no commented-out code left behind, no changelog
   prose, no `// this function will …` preambles. Worth words: a constraint, a
   spec reference (`// CTAP 2.1 §6.5.5.7`), power-cut ordering, a why-this-not-that.
-- **Smallest surface that works.** Focused functions; the iterator/idiom the
-  neighbours already use; no trait, generic, or config knob for a future that
-  isn't here yet (YAGNI).
+- **Smallest surface that works (KISS, YAGNI).** Focused functions; the
+  iterator/idiom the neighbours already use; no trait, generic, or config knob
+  for a future that isn't here yet. If the same result takes materially less
+  code, choose the smaller solution. But simple ≠ incomplete: a "simple" change
+  still satisfies the whole current contract — every affected layer, state,
+  test, and doc (see "When you change X, also do Y") — not an MVP slice of it.
 - **Names carry the domain vocabulary** (`rpIdHash`, `KeyFid`, `bcdDevice`), not
   invented synonyms.
+- **No magic values; define once, reuse (DRY).** Anything protocol- or
+  policy-shaped — an INS or tag, a FID, a timeout, a retry budget, a buffer
+  size — is defined once under a domain name and reused (pattern:
+  `crates/rsk-fido/src/consts.rs`); the same goes for duplicated status/label
+  mappings. Self-evident literals in place (`0`, `1`, an obvious length) are fine.
+- **Typed state, not string matching.** Control flow follows enums and typed
+  states, never display text or ad-hoc literal comparison. A flow with more than
+  3–4 states, retries, or cancellation gets an explicit state machine kept
+  separate from transport and rendering, with its invalid transitions tested.
+- **No hidden side effects.** A function named like `get`/`parse`/`validate`/
+  `format` must not write flash, mutate state, or do I/O; if it must, make that
+  visible in its name and at the call site.
+- **Fail explicitly.** Don't swallow errors into vague fallbacks; map a failure
+  to the status word or error variant that preserves the cause. An intentional
+  fallback is named, scoped, and tested.
+- **Don't grow oversized files.** A sizeable new unit (a command handler, a
+  screen, a codec) goes in its own module — or a `crates/rsk-*` crate if it's
+  host-testable — not appended to an already-long file. Split an oversized file
+  along existing applet/command/screen boundaries only when a task touches it,
+  as its own refactor commit; never split just to hit a line count.
+- **UI text is presentation only** (`rsk-ui`, `tools/tui`, `tools/rsk`): map
+  typed state to text at the edge, never branch on a display string, and keep
+  each domain's status→label/colour mapping in one place.
 
 The rest — `no_std`/no-alloc, `-D warnings`, `unsafe`, new dependencies, the
 Python conventions for `tools/rsk` — is in the Golden rules above and
@@ -86,6 +129,28 @@ CONTRIBUTING.md → "Code".
   one — and keep `firmware/` as the thin glue that calls it. Worked example: the
   `EF_LED_CONF` codec lives in `crates/rsk-led` (host-tested + Kani); `led.rs`
   only marshals its atomics through it.
+- **Tests and Kani proofs live in sibling files, not inline.** Don't grow
+  `#[cfg(test)] mod tests { … }` / `#[cfg(kani)] mod proofs { … }` blocks at the
+  bottom of a source file — keep the code file to code and hook the modules in
+  by path:
+
+  ```rust
+  #[cfg(test)]
+  #[path = "foo_tests.rs"]
+  mod tests;
+
+  #[cfg(kani)]
+  #[path = "foo_kani.rs"]
+  mod proofs;
+  ```
+
+  `foo_tests.rs` / `foo_kani.rs` sit next to `foo.rs`; a crate root (`lib.rs`)
+  uses `tests.rs` / `kani.rs` (worked example: `crates/rsk-slip39/src/tests.rs`).
+  Each starts with the SPDX header and `use super::*;`. The `#[path]`
+  child-module form is deliberate: it keeps the tests' access to the parent's
+  private items, which a plain sibling `mod` would lose. cfg-gated code never
+  reaches the firmware image, so moving it is not a behaviour change (no
+  `bcdDevice` bump).
 - **`check.sh` leaves the *no-touch* test image** at
   `target/.../release/firmware`. Anything meant to be flashed must be rebuilt
   with `cargo build --release -p firmware` first — flag this if your change
