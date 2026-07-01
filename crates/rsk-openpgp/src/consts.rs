@@ -110,6 +110,21 @@ pub const EF_AES_KEY: KeyFid = KeyFid::new(0x00d5); // S — symmetric key for D
 pub const EF_UIF_SIG: u16 = 0x00d6; // S — user-interaction flag (touch)
 pub const EF_UIF_DEC: u16 = 0x00d7; // S
 pub const EF_UIF_AUT: u16 = 0x00d8; // S
+
+/// The touch-policy (UIF) DO for the private-key slot actually being used.
+/// MANAGE SECURITY ENVIRONMENT can cross-wire the DEC/AUT slot references, so
+/// the touch check must follow the repointed slot (`sess.pk_dec`/`sess.pk_aut`)
+/// rather than the fixed command — otherwise a DECIPHER on an MSE-repointed AUT
+/// key would enforce only the DEC key's touch policy, and vice-versa.
+pub(crate) fn slot_uif(pk: KeyFid) -> u16 {
+    if pk == EF_PK_SIG {
+        EF_UIF_SIG
+    } else if pk == EF_PK_AUT {
+        EF_UIF_AUT
+    } else {
+        EF_UIF_DEC
+    }
+}
 pub const EF_KEY_INFO: u16 = 0x00de; // S
 pub const EF_KDF: u16 = 0x00f9; // C — KDF parameters
 pub const EF_ALGO_INFO: u16 = 0x00fa; // C — algorithm info

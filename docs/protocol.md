@@ -332,6 +332,15 @@ firmware predates the rescue applet.
 > `1F/01` (BOOTSEL) drops the device into the bootloader for reflashing; also
 > confirm.
 
+> ### User-presence gate (runtime)
+> The runtime-reachable privileged commands require an **on-device user-presence
+> confirmation** — a button touch, or an Approve on the trusted-display build —
+> before the firmware acts, and return `6985` (CONDITIONS_NOT_SATISFIED) if the
+> operator declines or the wait times out. This gates `10/01` (attestation
+> sign), `10/03` (store cert), `1C/01` (WRITE phy record) and `1F/01` (reboot to
+> BOOTSEL) against a hostile USB host. Read-only status (`1E/*`), the pubkey read
+> (`10/02`), SET RTC (`1C/02`) and a warm reboot (`1F/00`) stay ungated.
+
 ### 7.1 The phy record (`EF_PHY`) — **PicoForge-compatible**
 
 The phy record is the device-config TLV blob. **It is the same format PicoForge

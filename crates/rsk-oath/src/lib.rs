@@ -65,6 +65,13 @@ const EF_OTP_PIN: u16 = 0x10A0;
 const MAX_OATH_CRED: u16 = 255;
 const CHALLENGE_LEN: usize = 8;
 const MAX_OTP_COUNTER: u8 = 3;
+/// OTP-PIN record format tag. v1 = `[counter, 0x01, pin_derive_verifier(pin)]`
+/// roots the verifier in the OTP MKEK (identical to the OpenPGP/PIV PINs), so a
+/// flash-dump thief can no longer offline-brute-force it once the device is
+/// provisioned. The legacy layout `[counter, double_hash_pin(pin)]` (33 B, no
+/// tag) is a serial-only fast hash; it is recognised and upgraded to v1 on the
+/// next successful VERIFY / CHANGE. See #35/#42 (pico-keys carryover).
+const OTP_PIN_FMT_V1: u8 = 0x01;
 
 // Data-object tags.
 const TAG_NAME: u8 = 0x71;
@@ -700,6 +707,29 @@ impl<'a> OathApplet<'a> {
         Sw::OK
     }
 
+    /// Constant-time check of a presented OTP-PIN `pw` against a stored record.
+    /// Handles both the v1 OTP-rooted verifier and the legacy serial-only double
+    /// hash (which [`Self::cmd_verify_otp_pin`] / [`Self::cmd_change_otp_pin`]
+    /// upgrade to v1 on success).
+    fn otp_pin_matches(&self, rec: &[u8], pw: &[u8]) -> bool {
+        match rec.len() {
+            34 if rec[1] == OTP_PIN_FMT_V1 => {
+                ct_eq(&self.device().pin_derive_verifier(pw), &rec[2..34])
+            }
+            33 => ct_eq(&self.device().double_hash_pin(pw), &rec[1..33]),
+            _ => false,
+        }
+    }
+
+    /// A fresh v1 record: `[MAX_OTP_COUNTER, 0x01, pin_derive_verifier(pw)]`.
+    fn otp_pin_record_v1(&self, pw: &[u8]) -> [u8; 34] {
+        let mut rec = [0u8; 34];
+        rec[0] = MAX_OTP_COUNTER;
+        rec[1] = OTP_PIN_FMT_V1;
+        rec[2..].copy_from_slice(&self.device().pin_derive_verifier(pw));
+        rec
+    }
+
     fn cmd_set_otp_pin<S: Storage>(&mut self, apdu: &Apdu, fs: &mut Fs<S>) -> Sw {
         if fs.has_data(EF_OTP_PIN) {
             return Sw::CONDITIONS_NOT_SATISFIED;
@@ -707,56 +737,54 @@ impl<'a> OathApplet<'a> {
         let Some(pw) = find_tag(&apdu.data[..apdu.nc], TAG_PASSWORD as u16) else {
             return Sw::INCORRECT_PARAMS;
         };
-        let mut rec = [0u8; 33];
-        rec[0] = MAX_OTP_COUNTER;
-        rec[1..].copy_from_slice(&self.device().double_hash_pin(pw));
-        match fs.put(EF_OTP_PIN, &rec) {
+        match fs.put(EF_OTP_PIN, &self.otp_pin_record_v1(pw)) {
             Ok(()) => Sw::OK,
             Err(_) => Sw::MEMORY_FAILURE,
         }
     }
 
     fn cmd_change_otp_pin<S: Storage>(&mut self, apdu: &Apdu, fs: &mut Fs<S>) -> Sw {
-        let mut rec = [0u8; 33];
-        if fs.read(EF_OTP_PIN, &mut rec) != Some(33) {
-            return Sw::CONDITIONS_NOT_SATISFIED;
-        }
+        let mut rec = [0u8; 34];
+        let size = match fs.read(EF_OTP_PIN, &mut rec) {
+            Some(n) if (33..=34).contains(&n) => n,
+            _ => return Sw::CONDITIONS_NOT_SATISFIED,
+        };
         let data = &apdu.data[..apdu.nc];
         let Some(pw) = find_tag(data, TAG_PASSWORD as u16) else {
             return Sw::INCORRECT_PARAMS;
         };
-        if !ct_eq(&self.device().double_hash_pin(pw), &rec[1..]) {
+        if !self.otp_pin_matches(&rec[..size], pw) {
             return Sw::SECURITY_STATUS_NOT_SATISFIED;
         }
         let Some(new_pw) = find_tag(data, TAG_NEW_PASSWORD as u16) else {
             return Sw::INCORRECT_PARAMS;
         };
-        rec[0] = MAX_OTP_COUNTER;
-        rec[1..].copy_from_slice(&self.device().double_hash_pin(new_pw));
-        match fs.put(EF_OTP_PIN, &rec) {
+        match fs.put(EF_OTP_PIN, &self.otp_pin_record_v1(new_pw)) {
             Ok(()) => Sw::OK,
             Err(_) => Sw::MEMORY_FAILURE,
         }
     }
 
     fn cmd_verify_otp_pin<S: Storage>(&mut self, apdu: &Apdu, fs: &mut Fs<S>) -> Sw {
-        let mut rec = [0u8; 33];
-        if fs.read(EF_OTP_PIN, &mut rec) != Some(33) {
-            return Sw::CONDITIONS_NOT_SATISFIED;
-        }
+        let mut rec = [0u8; 34];
+        let size = match fs.read(EF_OTP_PIN, &mut rec) {
+            Some(n) if (33..=34).contains(&n) => n,
+            _ => return Sw::CONDITIONS_NOT_SATISFIED,
+        };
         let Some(pw) = find_tag(&apdu.data[..apdu.nc], TAG_PASSWORD as u16) else {
             return Sw::INCORRECT_PARAMS;
         };
-        let hash = self.device().double_hash_pin(pw);
         // A counter at 0 fails even with the right PIN (CHANGE PIN still works).
-        if rec[0] == 0 || !ct_eq(&hash, &rec[1..]) {
+        if rec[0] == 0 || !self.otp_pin_matches(&rec[..size], pw) {
             rec[0] = rec[0].saturating_sub(1);
-            let _ = fs.put(EF_OTP_PIN, &rec);
+            // Preserve the stored format on failure; only the counter changes.
+            let _ = fs.put(EF_OTP_PIN, &rec[..size]);
             self.validated = false;
             return Sw::SECURITY_STATUS_NOT_SATISFIED;
         }
-        rec[0] = MAX_OTP_COUNTER;
-        let _ = fs.put(EF_OTP_PIN, &rec);
+        // Success: reset the counter and (lazily) upgrade a legacy record to the
+        // OTP-rooted v1 verifier.
+        let _ = fs.put(EF_OTP_PIN, &self.otp_pin_record_v1(pw));
         // The OTP PIN doubles as an alternative to VALIDATE (nitropy flow).
         self.validated = true;
         Sw::OK
@@ -1903,6 +1931,64 @@ mod tests {
             &apdu(INS_SET_PIN, 0, 0, &tlv(TAG_PASSWORD, b"5678")),
         );
         assert_eq!(sw, Sw::OK);
+    }
+
+    #[test]
+    fn legacy_otp_pin_verifies_and_upgrades_to_otp_rooted() {
+        // A device provisioned before #35 stored [counter, double_hash_pin(pin)]
+        // (serial-only, fast). It must still verify, and the first success
+        // upgrades it to the OTP-rooted v1 verifier so a flash dump can no longer
+        // offline-crack it.
+        let mut fs = new_fs();
+        let rng = RefCell::new(CountRng(7));
+        let touch = RefCell::new(AlwaysConfirm);
+        let mut app = OathApplet::new(SERIAL, [0x22; 32], None, &rng, &touch);
+        let dev = Device {
+            serial_hash: &[0x22; 32],
+            serial_id: &SERIAL,
+            otp_key: None,
+        };
+        // Legacy record straight to flash (what old firmware wrote).
+        let mut legacy = [0u8; 33];
+        legacy[0] = MAX_OTP_COUNTER;
+        legacy[1..].copy_from_slice(&dev.double_hash_pin(b"1234"));
+        fs.put(EF_OTP_PIN, &legacy).unwrap();
+
+        // The legacy PIN still verifies…
+        let (sw, _) = run(
+            &mut app,
+            &mut fs,
+            &apdu(INS_VERIFY_PIN, 0, 0, &tlv(TAG_PASSWORD, b"1234")),
+        );
+        assert_eq!(sw, Sw::OK);
+
+        // …and the record is upgraded to the OTP-rooted v1 verifier.
+        let mut rec = [0u8; 34];
+        assert_eq!(fs.read(EF_OTP_PIN, &mut rec), Some(34));
+        assert_eq!(rec[1], OTP_PIN_FMT_V1);
+        assert_eq!(&rec[2..], &dev.pin_derive_verifier(b"1234")[..]);
+        assert_ne!(
+            &rec[2..],
+            &dev.double_hash_pin(b"1234")[..],
+            "must not store the legacy hash after upgrade"
+        );
+
+        // A wrong legacy PIN fails cleanly: no upgrade, counter decrements.
+        let mut fs2 = new_fs();
+        fs2.put(EF_OTP_PIN, &legacy).unwrap();
+        let (sw, _) = run(
+            &mut app,
+            &mut fs2,
+            &apdu(INS_VERIFY_PIN, 0, 0, &tlv(TAG_PASSWORD, b"nope")),
+        );
+        assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
+        let mut rec2 = [0u8; 34];
+        assert_eq!(
+            fs2.read(EF_OTP_PIN, &mut rec2),
+            Some(33),
+            "failure preserves the legacy format"
+        );
+        assert_eq!(rec2[0], MAX_OTP_COUNTER - 1, "counter decremented");
     }
 
     #[test]

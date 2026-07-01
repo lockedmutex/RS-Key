@@ -59,6 +59,7 @@ impl<'a> CcidApplets<'a> {
         presence: &'a RefCell<dyn rsk_openpgp::UserPresence>,
         otp_presence: &'a RefCell<dyn rsk_otp::UserPresence>,
         oath_presence: &'a RefCell<dyn rsk_oath::UserPresence>,
+        rescue_presence: &'a RefCell<dyn rsk_rescue::UserPresence>,
         platform: &'a RefCell<dyn rsk_rescue::Platform>,
         serial_id: [u8; 8],
         serial_hash: [u8; 32],
@@ -75,7 +76,7 @@ impl<'a> CcidApplets<'a> {
             management: ManagementApplet::new(serial_id),
             // Touch-flagged OATH credentials gate CALCULATE on the same button.
             oath: OathApplet::new(serial_id, serial_hash, otp_key, rng, oath_presence),
-            otp: OtpApplet::new(serial_id, otp_presence),
+            otp: OtpApplet::new(serial_id, serial_hash, otp_key, rng, otp_presence),
             // PIV reuses the OpenPGP user-presence trait, so the same presence
             // source drives its slot/management touch policies.
             piv: PivApplet::new(serial_id, serial_hash, otp_key, rng, presence),
@@ -89,6 +90,7 @@ impl<'a> CcidApplets<'a> {
                 devk,
                 rng,
                 platform,
+                rescue_presence,
                 kv_total,
                 crate::flash_storage::FLASH_SIZE as u32,
             ),

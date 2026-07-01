@@ -644,9 +644,10 @@ fn reseal_user<S: Storage, R: Rng>(
     let mut scratch = [0u8; 1024];
     let cred =
         credential_load(seed, cred_box, &rp_id_hash, &mut scratch).ok_or(CtapError::NotAllowed)?;
-    // The supplied user id must match the credential's (MIN-length compare).
-    let cmp = user_id.len().min(cred.user_id.len());
-    if user_id[..cmp] != cred.user_id[..cmp] {
+    // The supplied user id must match the credential's exactly. CTAP 2.1
+    // §6.8.3 keys updateUserInformation on the full userId; a min-length prefix
+    // compare would let a prefix (or an empty id) match the wrong credential.
+    if user_id != cred.user_id {
         return Err(CtapError::InvalidParameter);
     }
 
@@ -1309,20 +1310,21 @@ mod tests {
         let (id_a, ..) = register(&mut fs, &mut rng, "example.com", &[1, 1], "alice");
         let mut state = armed(PERM_CM);
         let mut out = [0u8; 256];
-        // A different user id than the credential's → InvalidParameter.
-        assert_eq!(
-            run(
-                &mut fs,
-                &mut state,
-                &cm_request(
-                    0x07,
-                    Some(&subpara_update(&id_a, &[9, 9], "x", "y")),
-                    &TOKEN
+        // A wrong user id → InvalidParameter. The credential's id is [1, 1], so
+        // this also pins that a PREFIX ([1]) and the EMPTY id no longer match
+        // (they did under the old min-length compare).
+        for wrong in [&[9, 9][..], &[1][..], &[][..]] {
+            assert_eq!(
+                run(
+                    &mut fs,
+                    &mut state,
+                    &cm_request(0x07, Some(&subpara_update(&id_a, wrong, "x", "y")), &TOKEN),
+                    &mut out
                 ),
-                &mut out
-            ),
-            Err(CtapError::InvalidParameter)
-        );
+                Err(CtapError::InvalidParameter),
+                "user id {wrong:?} must be rejected"
+            );
+        }
     }
 
     #[test]

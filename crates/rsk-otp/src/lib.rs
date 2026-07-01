@@ -9,13 +9,21 @@
 
 use core::cell::RefCell;
 
-use rsk_crypto::{aes128_encrypt_block, ct_eq, hmac_sha1};
-use rsk_fs::{Fs, Storage};
+use rsk_crypto::{Device, aes128_encrypt_block, ct_eq, hmac_sha1};
+use rsk_fs::{Fs, KeyFid, Storage};
 pub use rsk_sdk::Confirm;
 use rsk_sdk::{Apdu, Applet, ResBuf, Sw};
+use zeroize::Zeroize;
 
 pub mod hid;
+pub mod seal;
 pub mod ticket;
+
+/// Randomness source for at-rest seal nonces (the firmware backs it with the
+/// hardware TRNG). Mirrors the sibling applets' `Rng` traits.
+pub trait Rng {
+    fn fill(&mut self, buf: &mut [u8]);
+}
 
 #[cfg(test)]
 mod tests_support;
@@ -111,6 +119,10 @@ const SW_WRONG_DATA: Sw = Sw::WRONG_LENGTH;
 
 pub struct OtpApplet<'a> {
     serial_id: [u8; 8],
+    serial_hash: [u8; 32],
+    /// The OTP MKEK, once provisioned — roots the slot seal in the hardware fuse.
+    otp_key: Option<[u8; 32]>,
+    rng: &'a RefCell<dyn Rng>,
     presence: &'a RefCell<dyn UserPresence>,
     /// Status-record sequence number; bumped on every config write, reset on
     /// SELECT to 1/0 depending on whether any slot is programmed.
@@ -121,13 +133,53 @@ pub struct OtpApplet<'a> {
 }
 
 impl<'a> OtpApplet<'a> {
-    pub fn new(serial_id: [u8; 8], presence: &'a RefCell<dyn UserPresence>) -> Self {
+    pub fn new(
+        serial_id: [u8; 8],
+        serial_hash: [u8; 32],
+        otp_key: Option<[u8; 32]>,
+        rng: &'a RefCell<dyn Rng>,
+        presence: &'a RefCell<dyn UserPresence>,
+    ) -> Self {
         Self {
             serial_id,
+            serial_hash,
+            otp_key,
+            rng,
             presence,
             config_seq: 1,
             session_counter: [0; 4],
         }
+    }
+
+    fn device(&self) -> Device<'_> {
+        Device {
+            serial_hash: &self.serial_hash,
+            serial_id: &self.serial_id,
+            otp_key: self.otp_key.as_ref(),
+        }
+    }
+
+    /// Read+unseal a slot into `buf`; `Some(len)` only when it holds at least a
+    /// full config. A `&self` helper so the `&mut self` command handlers read a
+    /// slot without pinning a device borrow across their own mutations.
+    fn read_slot_m<S: Storage>(
+        &self,
+        fs: &mut Fs<S>,
+        fid: u16,
+        buf: &mut [u8; SLOT_SIZE],
+    ) -> Option<usize> {
+        read_slot(&self.device(), fs, fid, buf)
+    }
+
+    /// Seal+write a slot record. `false` on a storage failure.
+    fn put_slot<S: Storage>(&self, fs: &mut Fs<S>, fid: u16, data: &[u8]) -> bool {
+        seal::seal_put(
+            &self.device(),
+            fs,
+            &mut *self.rng.borrow_mut(),
+            KeyFid::new(fid),
+            data,
+        )
     }
 
     /// Generate the typed ticket for a physical button press on `slot` (1–4: one
@@ -149,7 +201,7 @@ impl<'a> OtpApplet<'a> {
         }
         let fid = EF_OTP_SLOT1 + (slot as u16 - 1);
         let mut buf = [0u8; SLOT_SIZE];
-        let n = read_slot(fs, fid, &mut buf)?;
+        let n = self.read_slot_m(fs, fid, &mut buf)?;
         if n < SLOT_SIZE {
             buf[CONFIG_SIZE..].fill(0);
         }
@@ -165,7 +217,7 @@ impl<'a> OtpApplet<'a> {
         if let Some(tail) = t.new_tail {
             let mut rec = buf;
             rec[CONFIG_SIZE..].copy_from_slice(&tail);
-            let _ = fs.put(fid, &rec);
+            let _ = self.put_slot(fs, fid, &rec);
         }
         Some((t.len, t.encode))
     }
@@ -189,7 +241,7 @@ impl<'a> OtpApplet<'a> {
         let (maj, min, patch) = VERSION;
         let mut opts = 0u8;
         let mut slot = [0u8; SLOT_SIZE];
-        if read_slot(fs, EF_OTP_SLOT1, &mut slot).is_some() {
+        if self.read_slot_m(fs, EF_OTP_SLOT1, &mut slot).is_some() {
             opts |= CONFIG1_VALID;
             if slot[OFF_TKT_FLAGS] & TKT_CHAL_RESP == 0
                 || slot[OFF_CFG_FLAGS] & CFG_CHAL_BTN_TRIG != 0
@@ -197,7 +249,7 @@ impl<'a> OtpApplet<'a> {
                 opts |= CONFIG1_TOUCH;
             }
         }
-        if read_slot(fs, EF_OTP_SLOT2, &mut slot).is_some() {
+        if self.read_slot_m(fs, EF_OTP_SLOT2, &mut slot).is_some() {
             opts |= CONFIG2_VALID;
             if slot[OFF_TKT_FLAGS] & TKT_CHAL_RESP == 0
                 || slot[OFF_CFG_FLAGS] & CFG_CHAL_BTN_TRIG != 0
@@ -262,7 +314,7 @@ impl<'a> OtpApplet<'a> {
         }
         let data = &apdu.data[..apdu.nc];
         let mut stored = [0u8; SLOT_SIZE];
-        if read_slot(fs, fid, &mut stored).is_some() {
+        if self.read_slot_m(fs, fid, &mut stored).is_some() {
             // Existing config: the host must present its access code.
             if data.len() < CONFIG_SIZE + ACC_CODE_SIZE {
                 return Sw::WRONG_LENGTH;
@@ -280,7 +332,7 @@ impl<'a> OtpApplet<'a> {
             }
             let mut rec = [0u8; SLOT_SIZE];
             rec[..CONFIG_SIZE].copy_from_slice(&data[..CONFIG_SIZE]);
-            if fs.put(fid, &rec).is_err() {
+            if !self.put_slot(fs, fid, &rec) {
                 return Sw::MEMORY_FAILURE;
             }
         } else {
@@ -311,7 +363,7 @@ impl<'a> OtpApplet<'a> {
             return SW_WRONG_DATA;
         }
         let mut stored = [0u8; SLOT_SIZE];
-        if read_slot(fs, fid, &mut stored).is_some() {
+        if self.read_slot_m(fs, fid, &mut stored).is_some() {
             if data.len() < CONFIG_SIZE + ACC_CODE_SIZE {
                 return Sw::WRONG_LENGTH;
             }
@@ -337,7 +389,7 @@ impl<'a> OtpApplet<'a> {
             } else {
                 stored[OFF_CFG_FLAGS]
             };
-            if fs.put(fid, &merged).is_err() {
+            if !self.put_slot(fs, fid, &merged) {
                 return Sw::MEMORY_FAILURE;
             }
             self.config_seq = self.config_seq.wrapping_add(1);
@@ -358,11 +410,11 @@ impl<'a> OtpApplet<'a> {
         }
         let mut a = [0u8; SLOT_SIZE];
         let mut b = [0u8; SLOT_SIZE];
-        let na = read_slot(fs, fid1, &mut a);
-        let nb = read_slot(fs, fid2, &mut b);
+        let na = self.read_slot_m(fs, fid1, &mut a);
+        let nb = self.read_slot_m(fs, fid2, &mut b);
         match nb {
             Some(n) => {
-                if fs.put(fid1, &b[..n]).is_err() {
+                if !self.put_slot(fs, fid1, &b[..n]) {
                     return Sw::MEMORY_FAILURE;
                 }
             }
@@ -372,7 +424,7 @@ impl<'a> OtpApplet<'a> {
         }
         match na {
             Some(n) => {
-                if fs.put(fid2, &a[..n]).is_err() {
+                if !self.put_slot(fs, fid2, &a[..n]) {
                     return Sw::MEMORY_FAILURE;
                 }
             }
@@ -388,7 +440,7 @@ impl<'a> OtpApplet<'a> {
     fn cmd_status_ext<S: Storage>(&mut self, fs: &mut Fs<S>, res: &mut ResBuf) -> Sw {
         let mut slot = [0u8; SLOT_SIZE];
         for i in 0..4u16 {
-            if read_slot(fs, EF_OTP_SLOT1 + i, &mut slot).is_none() {
+            if self.read_slot_m(fs, EF_OTP_SLOT1 + i, &mut slot).is_none() {
                 continue;
             }
             let tkt = slot[OFF_TKT_FLAGS];
@@ -425,7 +477,7 @@ impl<'a> OtpApplet<'a> {
         };
         let fid = base + apdu.p2 as u16;
         let mut slot = [0u8; SLOT_SIZE];
-        if read_slot(fs, fid, &mut slot).is_none() {
+        if self.read_slot_m(fs, fid, &mut slot).is_none() {
             // Protocol quirk: an empty slot answers 9000 with no body.
             return Sw::OK;
         }
@@ -524,25 +576,58 @@ impl<S: Storage> Applet<Fs<S>> for OtpApplet<'_> {
     }
 }
 
-/// Read a slot file; `Some(len)` only when it holds at least a full config.
+/// Read+unseal a slot file; `Some(len)` only when it holds at least a full
+/// config. Legacy plaintext (pre-seal) fails GCM authentication and reads as
+/// `None` until [`migrate_seal`] re-seals it at boot.
 pub(crate) fn read_slot<S: Storage>(
+    dev: &Device,
     fs: &mut Fs<S>,
     fid: u16,
     buf: &mut [u8; SLOT_SIZE],
 ) -> Option<usize> {
-    let n = fs.read(fid, buf)?.min(SLOT_SIZE);
+    let n = seal::seal_read(dev, fs, KeyFid::new(fid), buf)?;
     (n >= CONFIG_SIZE).then_some(n)
+}
+
+/// Boot pass: seal any slot config still stored as legacy plaintext. A blob that
+/// already unseals is left alone; one that does not, and is plaintext-sized, is
+/// taken to be a pre-seal slot and re-sealed in place. Idempotent and crash-safe
+/// per slot — GCM authentication tells the sealed and plaintext generations
+/// apart — so it runs unconditionally at every boot (see `firmware/src/main.rs`),
+/// before any host command or [`power_up_bump`] touches a slot. Closes the one
+/// applet that historically stored its secrets in the clear.
+pub fn migrate_seal<S: Storage>(dev: &Device, fs: &mut Fs<S>, rng: &mut dyn Rng) {
+    let mut out = [0u8; SLOT_SIZE];
+    // Sized to hold a full sealed blob so a sealed-but-unauthenticating slot
+    // (e.g. a foreign serial) reads back at its true length and is skipped
+    // rather than truncated and mis-resealed.
+    let mut raw = [0u8; seal::MAX_BLOB];
+    for i in 0..4u16 {
+        let fid = KeyFid::new(EF_OTP_SLOT1 + i);
+        if seal::seal_read(dev, fs, fid, &mut out).is_some() {
+            continue; // already sealed
+        }
+        if let Some(n) = fs.read_key(fid, &mut raw) {
+            // Only re-seal a genuine plaintext config; anything longer is not a
+            // legacy record (the smallest sealed blob is already > SLOT_SIZE).
+            if (CONFIG_SIZE..=SLOT_SIZE).contains(&n) {
+                let _ = seal::seal_put(dev, fs, rng, fid, &raw[..n]);
+            }
+        }
+    }
+    out.zeroize();
+    raw.zeroize();
 }
 
 /// Boot-time use-counter bump: on power-up, advance the 16-bit use counter of
 /// every plain Yubico-OTP slot (skipping HOTP / short / static slots), so a
 /// counter never repeats across reboots — the YubiKey replay defence. Runs once
 /// at startup.
-pub fn power_up_bump<S: Storage>(fs: &mut Fs<S>) {
+pub fn power_up_bump<S: Storage>(dev: &Device, fs: &mut Fs<S>, rng: &mut dyn Rng) {
     let mut slot = [0u8; SLOT_SIZE];
     for i in 0..4u16 {
         let fid = EF_OTP_SLOT1 + i;
-        let Some(n) = read_slot(fs, fid, &mut slot) else {
+        let Some(n) = read_slot(dev, fs, fid, &mut slot) else {
             continue;
         };
         let tkt = slot[OFF_TKT_FLAGS];
@@ -558,7 +643,7 @@ pub fn power_up_bump<S: Storage>(fs: &mut Fs<S>) {
         let counter = u16::from_be_bytes([rec[CONFIG_SIZE], rec[CONFIG_SIZE + 1]]).wrapping_add(1);
         if counter <= 0x7FFF {
             rec[CONFIG_SIZE..CONFIG_SIZE + 2].copy_from_slice(&counter.to_be_bytes());
-            let _ = fs.put(fid, &rec);
+            let _ = seal::seal_put(dev, fs, rng, KeyFid::new(fid), &rec);
         }
     }
 }
@@ -591,8 +676,20 @@ mod tests {
     use rsk_fs::storage::ram::RamStorage;
 
     const SERIAL: [u8; 8] = [0x12, 0x34, 0x56, 0x78, 0x9A, 0, 0, 0];
+    const SERIAL_HASH: [u8; 32] = [0x22; 32];
     /// Typed-ticket flag used to build non-chalresp test slots.
     const TKT_APPEND_CR: u8 = 0x20;
+
+    /// Deterministic counter RNG for the at-rest seal-nonce round-trips.
+    struct CountRng(u8);
+    impl Rng for CountRng {
+        fn fill(&mut self, b: &mut [u8]) {
+            for x in b {
+                *x = self.0;
+                self.0 = self.0.wrapping_add(1);
+            }
+        }
+    }
 
     /// Presence stub the tests can flip to Declined.
     struct TestPresence(Presence);
@@ -707,7 +804,8 @@ mod tests {
         // EF 0xBB02/0xBB03); a fifth slot is rejected.
         let mut fs = new_fs();
         let presence = RefCell::new(AlwaysConfirm);
-        let mut app = OtpApplet::new(SERIAL, &presence);
+        let rng = RefCell::new(CountRng(7));
+        let mut app = OtpApplet::new(SERIAL, SERIAL_HASH, None, &rng, &presence);
         // Plain Yubico-OTP slot (tkt = cfg = 0): types a 44-char modhex + bumps the
         // use counter, so this also covers per-slot counter persistence on slot 3/4.
         let cfg = build_config(&[0, 1, 2, 3, 4, 5], &[1; 6], &[2; 16], &[0; 6], 0, 0, 0);
@@ -737,7 +835,8 @@ mod tests {
     fn select_status_and_config_seq() {
         let mut fs = new_fs();
         let presence = RefCell::new(AlwaysConfirm);
-        let mut app = OtpApplet::new(SERIAL, &presence);
+        let rng = RefCell::new(CountRng(7));
+        let mut app = OtpApplet::new(SERIAL, SERIAL_HASH, None, &rng, &presence);
         let (sw, body) = select(&mut app, &mut fs);
         assert_eq!(sw, Sw::OK);
         // Empty device: version 5.7.4, seq 0, no valid/touch bits.
@@ -764,7 +863,8 @@ mod tests {
     fn configure_validates_crc_and_rfu() {
         let mut fs = new_fs();
         let presence = RefCell::new(AlwaysConfirm);
-        let mut app = OtpApplet::new(SERIAL, &presence);
+        let rng = RefCell::new(CountRng(7));
+        let mut app = OtpApplet::new(SERIAL, SERIAL_HASH, None, &rng, &presence);
         let mut bad = chalresp_config(&[1; 20], &[0; 6], 0);
         bad[10] ^= 0xFF; // breaks the CRC
         let (sw, _) = configure(&mut app, &mut fs, 0x01, 0, &bad, &[0; 6]);
@@ -790,7 +890,8 @@ mod tests {
     fn access_code_protects_reconfig_and_delete() {
         let mut fs = new_fs();
         let presence = RefCell::new(AlwaysConfirm);
-        let mut app = OtpApplet::new(SERIAL, &presence);
+        let rng = RefCell::new(CountRng(7));
+        let mut app = OtpApplet::new(SERIAL, SERIAL_HASH, None, &rng, &presence);
         let acc = [1, 2, 3, 4, 5, 6];
         let cfgd = chalresp_config(&[0xBB; 20], &acc, 0);
         let (sw, _) = configure(&mut app, &mut fs, 0x01, 0, &cfgd, &[0; 6]);
@@ -814,7 +915,8 @@ mod tests {
     fn hmac_chalresp_full_64() {
         let mut fs = new_fs();
         let presence = RefCell::new(AlwaysConfirm);
-        let mut app = OtpApplet::new(SERIAL, &presence);
+        let rng = RefCell::new(CountRng(7));
+        let mut app = OtpApplet::new(SERIAL, SERIAL_HASH, None, &rng, &presence);
         let key20 = [0x0B; 20];
         let cfgd = chalresp_config(&key20, &[0; 6], 0); // no HMAC_LT64: full 64 bytes
         configure(&mut app, &mut fs, 0x01, 0, &cfgd, &[0; 6]);
@@ -831,7 +933,8 @@ mod tests {
     fn hmac_chalresp_lt64_trims_padding() {
         let mut fs = new_fs();
         let presence = RefCell::new(AlwaysConfirm);
-        let mut app = OtpApplet::new(SERIAL, &presence);
+        let rng = RefCell::new(CountRng(7));
+        let mut app = OtpApplet::new(SERIAL, SERIAL_HASH, None, &rng, &presence);
         let key20 = [0x0B; 20];
         let cfgd = chalresp_config(&key20, &[0; 6], CFG_HMAC_LT64);
         configure(&mut app, &mut fs, 0x01, 0, &cfgd, &[0; 6]);
@@ -857,7 +960,8 @@ mod tests {
     fn yubico_chalresp_mixes_serial() {
         let mut fs = new_fs();
         let presence = RefCell::new(AlwaysConfirm);
-        let mut app = OtpApplet::new(SERIAL, &presence);
+        let rng = RefCell::new(CountRng(7));
+        let mut app = OtpApplet::new(SERIAL, SERIAL_HASH, None, &rng, &presence);
         let aes_key = [0x42; 16];
         let cfgd = build_config(
             &[],
@@ -884,7 +988,8 @@ mod tests {
     fn calculate_rejections_and_empty_slot() {
         let mut fs = new_fs();
         let presence = RefCell::new(AlwaysConfirm);
-        let mut app = OtpApplet::new(SERIAL, &presence);
+        let rng = RefCell::new(CountRng(7));
+        let mut app = OtpApplet::new(SERIAL, SERIAL_HASH, None, &rng, &presence);
         // Empty slot: bare OK, no body.
         let (sw, body) = run(&mut app, &mut fs, &otp_apdu(0x30, 0, &[0; 64]));
         assert_eq!((sw, body.len()), (Sw::OK, 0));
@@ -918,7 +1023,8 @@ mod tests {
         let mut fs = new_fs();
         let presence = RefCell::new(TestPresence(Presence::Declined));
         let presence_dyn: &RefCell<dyn UserPresence> = &presence;
-        let mut app = OtpApplet::new(SERIAL, presence_dyn);
+        let rng = RefCell::new(CountRng(7));
+        let mut app = OtpApplet::new(SERIAL, SERIAL_HASH, None, &rng, presence_dyn);
         let cfgd = chalresp_config(&[7; 20], &[0; 6], CFG_CHAL_BTN_TRIG);
         configure(&mut app, &mut fs, 0x01, 0, &cfgd, &[0; 6]);
 
@@ -934,7 +1040,8 @@ mod tests {
     fn update_merges_flag_masks_only() {
         let mut fs = new_fs();
         let presence = RefCell::new(AlwaysConfirm);
-        let mut app = OtpApplet::new(SERIAL, &presence);
+        let rng = RefCell::new(CountRng(7));
+        let mut app = OtpApplet::new(SERIAL, SERIAL_HASH, None, &rng, &presence);
         // A typed Yubico-OTP slot (not chal-resp) with APPEND_CR.
         let orig = build_config(b"public", &[3; 6], &[4; 16], &[0; 6], 0, TKT_APPEND_CR, 0);
         configure(&mut app, &mut fs, 0x01, 0, &orig, &[0; 6]);
@@ -968,7 +1075,8 @@ mod tests {
     fn swap_moves_configs_between_slots() {
         let mut fs = new_fs();
         let presence = RefCell::new(AlwaysConfirm);
-        let mut app = OtpApplet::new(SERIAL, &presence);
+        let rng = RefCell::new(CountRng(7));
+        let mut app = OtpApplet::new(SERIAL, SERIAL_HASH, None, &rng, &presence);
         let key20 = [0x33; 20];
         let cfgd = chalresp_config(&key20, &[0; 6], 0);
         configure(&mut app, &mut fs, 0x01, 0, &cfgd, &[0; 6]);
@@ -995,7 +1103,8 @@ mod tests {
     fn serial_and_config_passthrough() {
         let mut fs = new_fs();
         let presence = RefCell::new(AlwaysConfirm);
-        let mut app = OtpApplet::new(SERIAL, &presence);
+        let rng = RefCell::new(CountRng(7));
+        let mut app = OtpApplet::new(SERIAL, SERIAL_HASH, None, &rng, &presence);
         let (sw, body) = run(&mut app, &mut fs, &otp_apdu(0x10, 0, &[]));
         assert_eq!(sw, Sw::OK);
         // serial4: first 4 chip-id bytes, top 6 bits cleared (0x12 → 0x02).
@@ -1016,7 +1125,8 @@ mod tests {
     fn hid_frame_device_info_read() {
         let mut fs = new_fs();
         let presence = RefCell::new(AlwaysConfirm);
-        let mut app = OtpApplet::new(SERIAL, &presence);
+        let rng = RefCell::new(CountRng(7));
+        let mut app = OtpApplet::new(SERIAL, SERIAL_HASH, None, &rng, &presence);
 
         // read_config(page=0) sends a single zero page byte (already zero).
         let payload = [0u8; hid::PAYLOAD_SIZE];
@@ -1070,7 +1180,8 @@ mod tests {
     fn hid_frame_unknown_command_answers_empty() {
         let mut fs = new_fs();
         let presence = RefCell::new(AlwaysConfirm);
-        let mut app = OtpApplet::new(SERIAL, &presence);
+        let rng = RefCell::new(CountRng(7));
+        let mut app = OtpApplet::new(SERIAL, SERIAL_HASH, None, &rng, &presence);
         for slot in [0x11u8, 0x12, 0x15] {
             let payload = [0u8; hid::PAYLOAD_SIZE];
             let mut out = [0u8; 64];
@@ -1082,5 +1193,80 @@ mod tests {
                 "slot {slot:#x} must not stream a body"
             );
         }
+    }
+
+    #[test]
+    fn configure_seals_secret_at_rest() {
+        // A fresh configure must never leave the 16-byte AES key readable in
+        // flash — it goes through the seal chokepoint, not a raw fs.put.
+        let mut fs = new_fs();
+        let presence = RefCell::new(AlwaysConfirm);
+        let rng = RefCell::new(CountRng(7));
+        let mut app = OtpApplet::new(SERIAL, SERIAL_HASH, None, &rng, &presence);
+        let aes_key = [0x42; 16];
+        let cfgd = build_config(
+            &[],
+            &[0; 6],
+            &aes_key,
+            &[0; 6],
+            0,
+            TKT_CHAL_RESP,
+            CFG_CHAL_YUBICO,
+        );
+        configure(&mut app, &mut fs, 0x01, 0, &cfgd, &[0; 6]);
+
+        let mut raw = [0u8; seal::MAX_BLOB];
+        let n = fs.read_key(KeyFid::new(EF_OTP_SLOT1), &mut raw).unwrap();
+        assert!(
+            !raw[..n].windows(16).any(|w| w == aes_key),
+            "AES slot key stored in plaintext at rest"
+        );
+    }
+
+    #[test]
+    fn legacy_plaintext_slot_migrates_and_stays_usable() {
+        // A pre-seal device stored the 52-byte config in the clear via fs.put.
+        // migrate_seal re-seals it (so a flash dump no longer yields the AES /
+        // HMAC secret) while chalresp keeps working, and is idempotent.
+        let mut fs = new_fs();
+        let key20 = [0x0B; 20];
+        let cfg = chalresp_config(&key20, &[0; 6], 0);
+        let fid = EF_OTP_SLOT1;
+        fs.put(fid, &cfg).unwrap(); // legacy plaintext write
+
+        let dev = Device {
+            serial_hash: &SERIAL_HASH,
+            serial_id: &SERIAL,
+            otp_key: None,
+        };
+        let mut mrng = CountRng(1);
+        migrate_seal(&dev, &mut fs, &mut mrng);
+
+        // The stored bytes are now a sealed blob, not the config.
+        let mut stored = [0u8; seal::MAX_BLOB];
+        let n = fs.read_key(KeyFid::new(fid), &mut stored).unwrap();
+        assert!(
+            n > CONFIG_SIZE,
+            "sealed blob must be longer than the config"
+        );
+        assert_ne!(
+            &stored[..CONFIG_SIZE],
+            &cfg[..],
+            "config must not remain in the clear"
+        );
+
+        // The migrated slot still answers chalresp with the right MAC.
+        let presence = RefCell::new(AlwaysConfirm);
+        let rng = RefCell::new(CountRng(7));
+        let mut app = OtpApplet::new(SERIAL, SERIAL_HASH, None, &rng, &presence);
+        let chal = [0x5A; 64];
+        let (sw, body) = run(&mut app, &mut fs, &otp_apdu(0x30, 0, &chal));
+        assert_eq!(sw, Sw::OK);
+        assert_eq!(body, hmac_sha1(&key20, &chal));
+
+        // Idempotent: a second pass leaves the sealed slot untouched.
+        migrate_seal(&dev, &mut fs, &mut mrng);
+        let (sw2, body2) = run(&mut app, &mut fs, &otp_apdu(0x30, 0, &chal));
+        assert_eq!((sw2, body2), (Sw::OK, body));
     }
 }

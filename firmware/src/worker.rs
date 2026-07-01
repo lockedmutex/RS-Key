@@ -283,6 +283,7 @@ impl<'a> Worker<'a> {
                 presence,
                 presence,
                 presence,
+                presence,
                 platform,
                 serial_id,
                 serial_hash,

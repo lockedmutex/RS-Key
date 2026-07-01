@@ -90,14 +90,10 @@ fn try_pso<S: Storage>(
         _ => return Err(Sw::INCORRECT_P1P2),
     };
 
-    // UIF (touch policy): SIG → 0xD6, DECIPHER → 0xD7. A no-op unless the DO is
-    // set; a missed touch → SECURE_MESSAGE_EXEC_ERROR.
-    let uif_fid = if (p1, p2) == (0x9E, 0x9A) {
-        EF_UIF_SIG
-    } else {
-        EF_UIF_DEC
-    };
-    check_uif(fs, uif_fid, presence)?;
+    // UIF (touch policy) of the slot actually used — follows an MSE repoint so a
+    // DECIPHER on a cross-wired AUT key still enforces the AUT touch policy. A
+    // no-op unless the DO is set; a missed touch → SECURE_MESSAGE_EXEC_ERROR.
+    check_uif(fs, slot_uif(pk_fid), presence)?;
 
     let mut algo_buf = [0u8; 16];
     let algo0 = algo_id(fs, algo_fid, &mut algo_buf);

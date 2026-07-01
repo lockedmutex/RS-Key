@@ -99,6 +99,12 @@ impl rsk_oath::Rng for FidoRng {
     }
 }
 
+impl rsk_otp::Rng for FidoRng {
+    fn fill(&mut self, buf: &mut [u8]) {
+        self.draw(buf);
+    }
+}
+
 impl rsk_rescue::Rng for FidoRng {
     fn fill(&mut self, buf: &mut [u8]) {
         self.draw(buf);

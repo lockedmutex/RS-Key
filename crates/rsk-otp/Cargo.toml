@@ -14,6 +14,8 @@ rsk-sdk = { workspace = true }
 rsk-fs = { workspace = true }
 rsk-crypto = { workspace = true }
 rsk-mgmt = { workspace = true }
+# At-rest sealing of slot secrets: zeroize scrubs the plaintext scratch buffers.
+zeroize = { workspace = true }
 
 [dev-dependencies]
 # RamStorage for the host tests (the same backend the other applets use).

@@ -13,6 +13,42 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+### Security
+
+- **Carry-over hardening from a pico-keys upstream audit.** A review of the upstream
+  pico-keys C firmware surfaced design flaws; each was re-verified against the RS-Key
+  Rust source. The overwhelming majority were already handled by the port (OATH gate,
+  PIV key sealing + admin-auth gates, parser totality, HMAC-DRBG, constant-time
+  compares), and this wave closes the remaining gaps:
+  - **Yubico OTP slot secrets are now sealed at rest.** The 52-byte slot config —
+    which carries the AES-128 key, private UID and the HMAC-SHA1 / OATH-HOTP secret —
+    was the one applet still written to flash in the clear. It now goes through the same
+    `KeyFid` AES-256-GCM chokepoint as FIDO / PIV / OpenPGP / OATH; a boot pass re-seals
+    any pre-existing plaintext slot, so a flash-dump thief no longer recovers the token
+    secrets.
+  - **The OATH OTP-PIN verifier is OTP-rooted, not a fast serial-only hash.** The
+    Nitrokey-style OTP PIN now stores `pin_derive_verifier` (rooted in the OTP MKEK,
+    exactly like the OpenPGP / PIV PINs) instead of the legacy `double_hash_pin`; a
+    legacy record still verifies and is upgraded on the next successful use.
+  - **The device attestation key is AEAD-sealed.** `EF_DEVCERT_KEY` moved from raw
+    AES-256-CBC under a public fixed IV with no MAC to AES-256-GCM (random nonce, auth
+    tag); a bit-flip in the sealed scalar is now detected rather than silently accepted,
+    and legacy CBC records are re-sealed at boot.
+  - **Privileged rescue commands require user presence.** Attestation signing over a
+    host-chosen digest, attestation-cert overwrite, phy/identity write and
+    reboot-to-BOOTSEL now need an on-device confirmation (a touch, or an on-screen
+    Approve on the trusted-display build), so a hostile USB host can no longer drive
+    them silently. Read-only status and a plain restart stay ungated.
+  - **OpenPGP MSE touch policy follows the repointed slot.** The UIF (touch) check for
+    PSO:DECIPHER / INTERNAL AUTHENTICATE now follows an MSE key-reference repoint, so a
+    cross-wired DEC↔AUT key can no longer be used under the wrong slot's touch policy.
+  - **FIDO credMgmt `updateUserInformation` requires an exact userId match** (CTAP 2.1
+    §6.8.3), closing a min-length-prefix compare where a prefix (or empty id) matched.
+  - **`rsk-wipe` erases the whole target flash.** It reads the same `FLASH_SIZE` build
+    knob as the firmware instead of assuming 4 MB, so a 16 MiB board is fully wiped.
+
+  bcdDevice 0x07D2 → 0x07D3. (`rsk-wipe` is a separate binary and carries no bcdDevice.)
+
 ### Added
 
 - **Trusted-display: every PIN screen names which credential it's asking for, and a fresh

@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 RS-Key contributors
 
-//! Makes `memory.x` available to the linker and re-runs when it changes.
+//! Makes `memory.x` available to the linker and resolves the target flash size
+//! so the wiper erases the whole chip (not a fixed 4 MB).
 use std::env;
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
+
+const DEFAULT_FLASH_SIZE: u32 = 4 * 1024 * 1024;
 
 fn main() {
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -16,4 +19,46 @@ fn main() {
     println!("cargo:rustc-link-search={}", out.display());
     println!("cargo:rerun-if-changed=memory.x");
     println!("cargo:rerun-if-changed=build.rs");
+
+    // Erase the whole target flash, not a fixed 4 MB — a larger board (e.g. the
+    // 16 MiB display board) must not keep sealed secrets above the assumed size.
+    // Same `FLASH_SIZE` knob the firmware build reads.
+    println!("cargo:rustc-env=PK_FLASH_SIZE={}", resolve_flash_size());
+    println!("cargo:rerun-if-env-changed=FLASH_SIZE");
+}
+
+/// Resolve `FLASH_SIZE` to a byte count. Accepts a decimal byte count, `0xHEX`,
+/// or a `<n>K`/`<n>KB`/`<n>M`/`<n>MB` suffix; defaults to 4 MB. Must be
+/// sector-aligned and within the supported 16 MB. Mirrors `firmware/build.rs`.
+fn resolve_flash_size() -> u32 {
+    let raw = env::var("FLASH_SIZE").unwrap_or_else(|_| DEFAULT_FLASH_SIZE.to_string());
+    let bytes = parse_size(raw.trim())
+        .unwrap_or_else(|| panic!("FLASH_SIZE={raw:?} — use a byte count, 0xHEX, or <n>K / <n>M"));
+    assert!(
+        bytes.is_multiple_of(4096),
+        "FLASH_SIZE={bytes} must be a multiple of 4096 (the QSPI erase sector)"
+    );
+    assert!(
+        bytes <= 16 * 1024 * 1024,
+        "FLASH_SIZE={bytes} exceeds the supported 16 MiB"
+    );
+    bytes
+}
+
+/// Parse `123`, `0x10000`, `512K`, `4M`, `4MB`, … into a byte count.
+fn parse_size(s: &str) -> Option<u32> {
+    let lower = s.to_ascii_lowercase();
+    let (digits, mult) = if let Some(n) = lower.strip_suffix("mb").or(lower.strip_suffix('m')) {
+        (n, 1024 * 1024)
+    } else if let Some(n) = lower.strip_suffix("kb").or(lower.strip_suffix('k')) {
+        (n, 1024)
+    } else {
+        (lower.as_str(), 1)
+    };
+    let digits = digits.trim();
+    let base = match digits.strip_prefix("0x") {
+        Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+        None => digits.parse::<u32>().ok()?,
+    };
+    base.checked_mul(mult)
 }

@@ -325,9 +325,10 @@ async fn main(spawner: Spawner) {
         otp_key: otp_mkek.as_ref(),
     };
     let _ = rsk_fido::seed::migrate_keydev_boot(&dev, &mut fs);
-    rsk_rescue::keydev::migrate_kbase(&dev, &mut fs);
+    rsk_rescue::keydev::migrate_kbase(&dev, &mut fs, &mut rng);
     rsk_piv::migrate_kbase(&dev, &mut fs, &mut rng);
     rsk_oath::migrate_seal(&dev, &mut fs, &mut rng);
+    rsk_otp::migrate_seal(&dev, &mut fs, &mut rng);
     rsk_fido::credential::migrate_rp_seal(&dev, &mut fs);
     let _ = rsk_fido::seed::ensure_seed(&dev, &mut fs, &mut rng);
     let _ = rsk_openpgp::scan_files(&dev, &mut fs, &mut rng);
@@ -364,7 +365,7 @@ async fn main(spawner: Spawner) {
         }
     }
     vendor::load_led_config(&mut fs);
-    rsk_otp::power_up_bump(&mut fs);
+    rsk_otp::power_up_bump(&dev, &mut fs, &mut rng);
 
     let fs_ref = FS.init(RefCell::new(fs));
     let rng_ref = RNG_CELL.init(RefCell::new(rng));
@@ -379,7 +380,7 @@ async fn main(spawner: Spawner) {
     config.max_power = 100;
     config.max_packet_size_0 = 64;
     // bcdDevice build counter; also surfaced on the trusted-display Firmware screen.
-    let device_release: u16 = 0x07D2;
+    let device_release: u16 = 0x07D3;
     config.device_release = device_release;
 
     let mut builder = Builder::new(
