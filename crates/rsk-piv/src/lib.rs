@@ -113,6 +113,11 @@ pub(crate) struct Session {
     pub(crate) has_challenge: bool,
     pub(crate) chal_kind: ChallengeKind,
     pub(crate) challenge: [u8; 16],
+    /// The 9B algorithm the outstanding challenge/witness was issued under. A
+    /// step-2 presented under a different algorithm is refused, so an AES-192
+    /// witness cannot be answered as 3DES (both are 24-byte keys, so the
+    /// length gate alone does not separate them).
+    pub(crate) chal_algo: u8,
 }
 
 impl Session {
@@ -121,6 +126,7 @@ impl Session {
         self.has_mgm = false;
         self.has_challenge = false;
         self.chal_kind = ChallengeKind::None;
+        self.chal_algo = 0;
         self.challenge.zeroize();
     }
 }
@@ -534,8 +540,12 @@ impl PivApplet<'_> {
             return Sw::FILE_NOT_FOUND;
         };
         let mut obj = [0u8; MAX_OBJECT];
+        // `Storage::read` returns the value's FULL stored length; clamp to the
+        // bytes we actually hold. Host writers cap at MAX_OBJECT (put_data), so
+        // this only bites a flash-corrupted over-length record — returning its
+        // prefix instead of panicking on the slice.
         let n = match fs.read(fid, &mut obj) {
-            Some(n) if n > 0 => n,
+            Some(n) if n > 0 => n.min(obj.len()),
             _ => return Sw::FILE_NOT_FOUND,
         };
         if push_tlv(res, 0x53, &obj[..n]).is_err() {
@@ -837,8 +847,10 @@ impl PivApplet<'_> {
             }
             let mut obj = [0u8; MAX_OBJECT];
             let cert = cert_from.and_then(|f| fs.read(f, &mut obj));
+            // Clamp the full stored length to the buffer (flash-corruption guard,
+            // as in get_data); host-written certs are already <= MAX_OBJECT.
             if let (Some(n), Some(tofid)) = (cert, cert_to) {
-                if fs.put(tofid, &obj[..n]).is_err() {
+                if fs.put(tofid, &obj[..n.min(obj.len())]).is_err() {
                     blob.zeroize();
                     return Sw::MEMORY_FAILURE;
                 }
@@ -2081,6 +2093,71 @@ mod tests {
             Sw::SECURITY_STATUS_NOT_SATISFIED,
             "has_mgm forged without the key"
         );
+    }
+
+    #[test]
+    fn mgm_challenge_bound_to_issuing_algorithm() {
+        // Run-7 H2: a 9B challenge/witness issued under one algorithm must not be
+        // answerable under another. AES-192 and 3DES share a 24-byte key, so the
+        // length gate alone does not separate them — `chal_algo` binding does.
+        let rng = RefCell::new(TestRng(7));
+        let pres = RefCell::new(AlwaysConfirm);
+        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
+        let mut fs = new_fs();
+        select(&mut app, &mut fs);
+        // Single-auth step 1 under AES-192 → plaintext challenge (chal_algo = AES-192).
+        let (sw, chal) = run(
+            &mut app,
+            &mut fs,
+            INS_AUTHENTICATE,
+            ALGO_AES192,
+            0x9B,
+            &[0x7C, 0x02, 0x81, 0x00],
+        );
+        assert_eq!(sw, Sw::OK);
+        assert_eq!(&chal[..4], &[0x7C, 0x12, 0x81, 0x10]);
+        // Answer step 2 (tag 0x82) under 3DES (8-byte block) — refused before any
+        // compare because the issuing algorithm differs.
+        let mut d3 = vec![0x7C, 0x0A, 0x82, 0x08];
+        d3.extend_from_slice(&[0u8; 8]);
+        let (sw, _) = run(&mut app, &mut fs, INS_AUTHENTICATE, ALGO_3DES, 0x9B, &d3);
+        assert_eq!(
+            sw,
+            Sw::INCORRECT_PARAMS,
+            "cross-algo step-2 must be refused"
+        );
+        // has_mgm stays closed.
+        let (sw, _) = run(&mut app, &mut fs, INS_SET_RETRIES, 5, 5, &[]);
+        assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
+    }
+
+    #[test]
+    fn get_data_clamps_oversized_stored_object() {
+        // Run-7 H3 (defense-in-depth): a stored object longer than the MAX_OBJECT
+        // read buffer must be returned clamped, never panic on the slice. Only a raw
+        // flash write can plant such a record (put_data caps at MAX_OBJECT); this
+        // guards the reader regardless.
+        let rng = RefCell::new(TestRng(1));
+        let pres = RefCell::new(AlwaysConfirm);
+        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
+        let mut fs = new_fs();
+        select(&mut app, &mut fs);
+        // Plant a 2000-byte value at the 5FC100 object fid (0xD200), bypassing put_data.
+        let big = [0xABu8; 2000];
+        fs.put(object_fid(0x5F_C1_00).unwrap(), &big).unwrap();
+        let (sw, resp) = run(
+            &mut app,
+            &mut fs,
+            INS_GET_DATA,
+            0x3F,
+            0xFF,
+            &[0x5C, 0x03, 0x5F, 0xC1, 0x00],
+        );
+        assert_eq!(sw, Sw::OK, "oversized object must not panic");
+        // 0x53 wrapper (tag + 3-byte long-form length) around exactly MAX_OBJECT
+        // bytes, not the planted 2000.
+        assert_eq!(resp[0], 0x53);
+        assert_eq!(resp.len(), 4 + MAX_OBJECT, "payload clamped to MAX_OBJECT");
     }
 
     #[cfg(feature = "fips-profile")]

@@ -257,7 +257,10 @@ impl Dispatcher {
     }
 
     /// Drop any held GET RESPONSE remainder, scrubbing it (it can be PSO output).
-    fn clear_pending(&mut self) {
+    /// Public so a transport that short-circuits [`Self::process`] (the firmware's
+    /// dual-core RSA-keygen fast path) can drop a stale chained-response tail the
+    /// way a normal dispatch would.
+    pub fn clear_pending(&mut self) {
         if self.pending_len > 0 {
             self.pending[..self.pending_len].zeroize();
         }

@@ -165,6 +165,7 @@ pub(crate) fn general_authenticate<S: Storage>(
                 )?;
                 sess.has_challenge = true;
                 sess.chal_kind = ChallengeKind::MutualWitness;
+                sess.chal_algo = algo;
                 dyn_auth_resp(res, 0x80, &enc[..chal_len])?;
                 return Ok(());
             }
@@ -175,7 +176,10 @@ pub(crate) fn general_authenticate<S: Storage>(
             }
             // Only a witness this device issued *encrypted* (mutual step 1) may be
             // verified here — never a plaintext single-auth challenge.
-            if !sess.has_challenge || sess.chal_kind != ChallengeKind::MutualWitness {
+            if !sess.has_challenge
+                || sess.chal_kind != ChallengeKind::MutualWitness
+                || sess.chal_algo != algo
+            {
                 return Err(Sw::INCORRECT_PARAMS);
             }
             let host_chal = t81.filter(|c| !c.is_empty()).ok_or(Sw::INCORRECT_PARAMS)?;
@@ -206,6 +210,7 @@ pub(crate) fn general_authenticate<S: Storage>(
                 rng.fill(&mut sess.challenge[..chal_len]);
                 sess.has_challenge = true;
                 sess.chal_kind = ChallengeKind::SingleChallenge;
+                sess.chal_algo = algo;
                 dyn_auth_resp(res, 0x81, &sess.challenge[..chal_len])?;
                 return Ok(());
             }
@@ -282,7 +287,10 @@ pub(crate) fn general_authenticate<S: Storage>(
             }
             // Only a challenge this device issued in *plaintext* (single step 1) may be
             // answered here — never a mutual-auth witness.
-            if !sess.has_challenge || sess.chal_kind != ChallengeKind::SingleChallenge {
+            if !sess.has_challenge
+                || sess.chal_kind != ChallengeKind::SingleChallenge
+                || sess.chal_algo != algo
+            {
                 return Err(Sw::INCORRECT_PARAMS);
             }
             check_touch(touch_policy, presence)?;

@@ -15,6 +15,35 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Security
 
+- **Security-audit run-7 hardening.** A seventh agentic audit against `8506a42`
+  found **no exploitable vulnerabilities** — all run-1…6 fixes were re-verified
+  to hold, and the PIV `GENERAL AUTHENTICATE` state machine and the trusted-
+  display touch/PIN path (this run's focus) held up under empirical tracing. Only
+  three defense-in-depth hardening items were applied (bcdDevice `0x07DB` →
+  `0x07DC`):
+  - **PIV `GENERAL AUTHENTICATE` challenge is now bound to its issuing
+    algorithm.** A 9B mutual/single-auth challenge issued under one algorithm
+    (3DES `chal_len` 8 vs AES `chal_len` 16) could structurally be answered under
+    the other; AES-192 and 3DES share a 24-byte key, so the key-length gate alone
+    did not separate them. This was **not** exploitable (the witness always
+    requires knowledge of the management key, and every replay failed closed with
+    `has_mgm` staying false), but the `Session` now records `chal_algo` at issue
+    and refuses a step-2 whose algorithm differs.
+  - **PIV GET DATA / MOVE KEY clamp the stored object length.** `get_data` and
+    `move_key` sliced a `MAX_OBJECT` (1900-byte) buffer by the full length
+    `Storage::read` returns, which would panic on a stored value longer than the
+    buffer. Every host writer already caps at `MAX_OBJECT` (so this was reachable
+    only by a raw flash write — a stronger attacker than the USB host), but the
+    readers now clamp with `n.min(MAX_OBJECT)`, returning the prefix instead of
+    panicking. Matches the existing `EF_PIVMAN_DATA` clamp pattern.
+  - **CCID RSA-keygen fast path clears the GET RESPONSE remainder.** The dual-core
+    `try_rsa_keygen` / `try_piv_rsa_keygen` fast paths bypass
+    `Dispatcher::process`, which is what normally drops a stale chained-response
+    tail, so a host interleaving `chained-response → GENERATE → GET RESPONSE` was
+    re-served its own prior tail. This crossed no trust boundary (same principal;
+    a SELECT to another applet clears the buffer first), but the fast paths now
+    call `Dispatcher::clear_pending()` to match ordinary dispatch.
+
 - **Security-audit run-6 hardening.** Fixed the findings from a sixth agentic
   audit against `28a6678` (bcdDevice `0x07DA` → `0x07DB`):
   - **PIV management-key authentication bypass via an encryption oracle
