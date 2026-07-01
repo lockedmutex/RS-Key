@@ -15,6 +15,31 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Security
 
+- **Security-audit run-4 hardening.** Fixed the findings from a fourth agentic
+  audit against `bb95cc1` (bcdDevice `0x07D8` → `0x07D9`):
+  - **FIDO `getNextAssertion` user-presence bypass (high).** `getAssertion` armed
+    the multi-credential `getNextAssertion` queue during resident discovery
+    *before* its user-presence gate, and no path tore the queue down when that gate
+    failed; `getNextAssertion` performs no presence check of its own. So on a
+    device holding ≥2 discoverable credentials for one RP, after the user
+    **declined or ignored** the touch, a host could still pull valid `UP=1`
+    assertions for credentials #2..N with no touch — defeating the test of user
+    presence. `get_assertion` now calls `gna.reset()` on any error return (CTAP 2.1
+    §6.3: getNextAssertion only continues a *successful* getAssertion).
+  - **OpenPGP `GENERATE` OOB panic on a short algorithm attribute (medium).** A
+    PW3-written 1–2 byte `C1/C2/C3` DO (`PUT DATA` caps no minimum length) made
+    `GENERATE ASYMMETRIC KEY PAIR` index the RSA modulus-size bytes past the slice
+    → panic/reset on every `GENERATE` for that slot. The run-3 clamp only bounded
+    the *over*-long case; both `generate` and `rsa_generate_params` now reject an
+    attribute shorter than 3 bytes, matching the guarded sibling `info::slot_algo`.
+  - **OATH OTP-PIN counter glitch-hardening (defense-in-depth).** `VERIFY PIN` /
+    `CHANGE PIN` now persist and read back the retry-counter decrement *before* the
+    PIN compare (mirroring the FIDO clientPIN gate), so a fault-injected or failed
+    flash program can't widen the 3-try OTP-PIN limiter.
+  - **FIDO `verify_pin_hash` self-guards the retry decrement (defense-in-depth).**
+    Added an in-function `retry == 0` check before `pin_data[0] -= 1` (matching
+    `verify_pin_at`), so no future caller can underflow the PIN retry budget in a
+    release build without overflow-checks.
 - **Security-audit run-2 + run-3 hardening.** Fixed the outstanding findings from
   two further agentic audits (bcdDevice `0x07D8`; `rsk` 0.3.1; `rsk-tui` 0.2.1):
   - **OpenPGP `GET DATA` unclamped length → OOB brick (high, ×2 sites).** Both the

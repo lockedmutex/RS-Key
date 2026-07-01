@@ -87,6 +87,13 @@ fn generate<S: Storage>(
 
     let n = match algo[0] {
         ALGO_RSA => {
+            // The RSA modulus size lives in bytes 1..3; a host can PUT DATA a
+            // short (0/1/2-byte) C1/C2/C3 that PUT never length-checks, so guard
+            // before indexing — else the slice read panics (device reset). The
+            // sibling reader `info::slot_algo` has the same `attr.len() >= 3` gate.
+            if algo.len() < 3 {
+                return Err(WRONG_DATA);
+            }
             let nbits = ((algo[1] as usize) << 8) | algo[2] as usize;
             let key = generate_rsa(rng, nbits)?;
             store_rsa_key(dev, fs, sess, fid, &key)?;
@@ -200,6 +207,11 @@ pub fn rsa_generate_params<S: Storage>(
     if algo[0] != ALGO_RSA {
         return Ok(None); // EC generate — synchronous path handles it
     }
+    // Guard the modulus-size read against a short host-written attribute (see the
+    // synchronous `generate`); indexing a 1/2-byte slice would panic (device reset).
+    if algo.len() < 3 {
+        return Err(WRONG_DATA);
+    }
     let nbits = ((algo[1] as usize) << 8) | algo[2] as usize;
     Ok(Some((fid, nbits)))
 }
@@ -255,5 +267,24 @@ mod tests {
             rsa_generate_params(&mut fs, &sess, 0x80, 0x00, &[0xB6, 0x00]),
             Ok(Some((EF_PK_SIG, 2048)))
         );
+    }
+
+    #[test]
+    fn short_algo_do_does_not_panic() {
+        // run-4: the sibling under-length case of the above. PUT DATA caps no
+        // minimum length, so a PW3 host can leave a 1- or 2-byte C1 whose first
+        // byte is ALGO_RSA; reading the modulus-size bytes algo[1]/algo[2] must be
+        // guarded, else the slice index panics (device reset), not clamp it away.
+        let mut sess = Session::new();
+        sess.has_pw3 = true;
+        for short in [&[ALGO_RSA][..], &[ALGO_RSA, 0x00][..]] {
+            let mut fs = Fs::new(RamStorage::new(), &[]);
+            fs.scan();
+            fs.put(EF_ALGO_PRIV1, short).unwrap();
+            assert_eq!(
+                rsa_generate_params(&mut fs, &sess, 0x80, 0x00, &[0xB6, 0x00]),
+                Err(WRONG_DATA)
+            );
+        }
     }
 }

@@ -282,6 +282,14 @@ pub fn get_assertion<S: Storage, R: Rng>(
     seed.zeroize();
     if result.is_ok() {
         journal::append(ctx, journal::EV_GET_ASSERT, 0, &rp_id_hash[..8]);
+    } else {
+        // getNextAssertion performs no presence check of its own — it may only
+        // continue a getAssertion whose presence gate SUCCEEDED (CTAP 2.1 §6.3).
+        // The multi-credential queue is armed during resident discovery, before
+        // that gate; if the ceremony then fails (declined / timed-out / cancelled
+        // touch, or any later error) the queue must be torn down, or the next
+        // getNextAssertion would emit a UP=1 assertion the user never approved.
+        ctx.state.gna.reset();
     }
     result
 }
@@ -1711,6 +1719,64 @@ mod tests {
         };
         assert_eq!(
             get_next_assertion(&mut ctx, &mut o3),
+            Err(CtapError::NotAllowed)
+        );
+    }
+
+    #[test]
+    fn declined_get_assertion_disarms_get_next_assertion() {
+        // run-4 (HIGH): getNextAssertion performs no presence check of its own, so a
+        // getAssertion whose touch was declined/ignored must leave nothing armed —
+        // else the next getNextAssertion emits a UP=1 assertion the user never
+        // approved (a user-presence bypass for resident credentials #2..N).
+        let (mut fs, mut rng) = setup();
+        let mut state = crate::FidoState::new();
+        for (uid, t) in [(&[9u8, 8, 7, 6][..], 10u64), (&[1u8, 1, 1, 1][..], 20u64)] {
+            let mut out = [0u8; 1024];
+            let mut presence = crate::AlwaysConfirm;
+            let mut ctx = Ctx {
+                presence: &mut presence,
+                dev: dev(),
+                fs: &mut fs,
+                rng: &mut rng,
+                state: &mut state,
+                now_ms: t,
+            };
+            make_credential(&mut ctx, &mc_request_user(uid), &mut out).unwrap();
+        }
+
+        // getAssertion (no allowList) with the touch DECLINED → OPERATION_DENIED,
+        // and the multi-credential queue must be torn down, not left armed.
+        let mut o1 = [0u8; 1024];
+        {
+            let mut presence = Decline;
+            let mut ctx = Ctx {
+                presence: &mut presence,
+                dev: dev(),
+                fs: &mut fs,
+                rng: &mut rng,
+                state: &mut state,
+                now_ms: 30,
+            };
+            assert_eq!(
+                get_assertion(&mut ctx, &ga_request(None), &mut o1),
+                Err(CtapError::OperationDenied)
+            );
+        }
+
+        // getNextAssertion must refuse — no touchless assertion for the older cred.
+        let mut o2 = [0u8; 1024];
+        let mut presence = Decline;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 31,
+        };
+        assert_eq!(
+            get_next_assertion(&mut ctx, &mut o2),
             Err(CtapError::NotAllowed)
         );
     }

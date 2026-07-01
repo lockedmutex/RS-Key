@@ -772,6 +772,21 @@ impl<'a> OathApplet<'a> {
         }
     }
 
+    /// Persist one retry decrement and confirm it stuck before an OTP-PIN compare,
+    /// so a glitched or failed flash program can't widen the limiter (mirrors the
+    /// FIDO clientPIN verify_pin_hash read-back). `false` = fail closed, no compare.
+    fn spend_otp_retry<S: Storage>(fs: &mut Fs<S>, rec: &mut [u8], size: usize) -> bool {
+        rec[0] = rec[0].saturating_sub(1);
+        if fs.put(EF_OTP_PIN, &rec[..size]).is_err() {
+            return false;
+        }
+        let mut back = [0u8; 34];
+        matches!(
+            fs.read(EF_OTP_PIN, &mut back),
+            Some(n) if n == size && back[0] == rec[0]
+        )
+    }
+
     fn cmd_change_otp_pin<S: Storage>(&mut self, apdu: &Apdu, fs: &mut Fs<S>) -> Sw {
         let mut rec = [0u8; 34];
         let size = match fs.read(EF_OTP_PIN, &mut rec) {
@@ -782,18 +797,19 @@ impl<'a> OathApplet<'a> {
         let Some(pw) = find_tag(data, TAG_PASSWORD as u16) else {
             return Sw::INCORRECT_PARAMS;
         };
-        if !self.otp_pin_matches(&rec[..size], pw) {
-            // Spend a retry on a WRONG old-PIN, matching cmd_verify_otp_pin's
-            // rate limit — otherwise CHANGE PIN is an unlimited guessing oracle.
-            // A correct old-PIN still works at counter 0, so a caller who knows
-            // it can recover from a self-lockout (do NOT gate on rec[0]==0).
-            rec[0] = rec[0].saturating_sub(1);
-            let _ = fs.put(EF_OTP_PIN, &rec[..size]);
-            return Sw::SECURITY_STATUS_NOT_SATISFIED;
-        }
         let Some(new_pw) = find_tag(data, TAG_NEW_PASSWORD as u16) else {
             return Sw::INCORRECT_PARAMS;
         };
+        // Spend a retry BEFORE the compare (persist + read back), matching
+        // cmd_verify_otp_pin's rate limit — otherwise CHANGE PIN is an unlimited
+        // guessing oracle. A correct old-PIN still recovers at counter 0 (the
+        // record is reset below), so do NOT gate on rec[0] == 0.
+        if !Self::spend_otp_retry(fs, &mut rec, size) {
+            return Sw::SECURITY_STATUS_NOT_SATISFIED;
+        }
+        if !self.otp_pin_matches(&rec[..size], pw) {
+            return Sw::SECURITY_STATUS_NOT_SATISFIED;
+        }
         match fs.put(EF_OTP_PIN, &self.otp_pin_record_v1(new_pw)) {
             Ok(()) => Sw::OK,
             Err(_) => Sw::MEMORY_FAILURE,
@@ -809,18 +825,23 @@ impl<'a> OathApplet<'a> {
         let Some(pw) = find_tag(&apdu.data[..apdu.nc], TAG_PASSWORD as u16) else {
             return Sw::INCORRECT_PARAMS;
         };
-        // A counter at 0 fails even with the right PIN (CHANGE PIN still works).
-        if rec[0] == 0 || !self.otp_pin_matches(&rec[..size], pw) {
-            rec[0] = rec[0].saturating_sub(1);
-            // Preserve the stored format on failure; only the counter changes.
-            let _ = fs.put(EF_OTP_PIN, &rec[..size]);
-            self.validated = false;
+        // Any attempt clears a prior unlock; only a correct PIN re-validates below.
+        self.validated = false;
+        // A counter at 0 fails even with the right PIN (CHANGE PIN still recovers).
+        if rec[0] == 0 {
+            return Sw::SECURITY_STATUS_NOT_SATISFIED;
+        }
+        // Spend the retry BEFORE the compare (persist + read back), so a glitched
+        // or failed flash program can't widen the limiter.
+        if !Self::spend_otp_retry(fs, &mut rec, size) {
+            return Sw::SECURITY_STATUS_NOT_SATISFIED;
+        }
+        if !self.otp_pin_matches(&rec[..size], pw) {
             return Sw::SECURITY_STATUS_NOT_SATISFIED;
         }
         // Success: reset the counter and (lazily) upgrade a legacy record to the
-        // OTP-rooted v1 verifier.
+        // OTP-rooted v1 verifier. The OTP PIN doubles as VALIDATE (nitropy flow).
         let _ = fs.put(EF_OTP_PIN, &self.otp_pin_record_v1(pw));
-        // The OTP PIN doubles as an alternative to VALIDATE (nitropy flow).
         self.validated = true;
         Sw::OK
     }

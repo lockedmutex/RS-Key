@@ -538,6 +538,13 @@ fn verify_pin_hash<S: Storage, R: Rng>(
     if n != PIN_FILE_LEN {
         return Err(CtapError::Other);
     }
+    // Self-defend the decrement rather than trusting the external
+    // pin_set_and_unblocked() gate: release builds have no overflow-checks, so a
+    // future caller reaching here at 0 would wrap the retry budget to 255. The
+    // sibling verify_pin_at has the same in-function guard.
+    if pin_data[0] == 0 {
+        return Err(CtapError::PinBlocked);
+    }
     pin_data[0] -= 1;
     ctx.fs
         .put(EF_PIN, &pin_data)
