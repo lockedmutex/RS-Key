@@ -7,6 +7,11 @@ publish = false
 
 # Hardware-agnostic USB transport: CTAPHID and CCID. Generic over any
 # embassy-usb driver, so it builds without a HAL and stays host-testable.
+
+# `cfg(kani)` guards the proof harnesses (set by `cargo kani`, unknown to rustc).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
 [dependencies]
 embassy-usb = { workspace = true }
 # RX-path receive-timeout (incomplete message) + keepalive needs timers + select.

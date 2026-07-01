@@ -1218,6 +1218,36 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     rsk_crypto::ct_eq(a, b)
 }
 
+/// Kani proof harnesses (`cargo kani -p rsk-oath`): exhaustive over every input
+/// up to the stated bound, where the unit tests only sample.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// [`split_period`] on ANY credential name never panics or overflows, always
+    /// returns the bare label as a *suffix* of the input, and any parsed period is
+    /// at most four digits (≤ 9999, so the `u16` fold cannot overflow — the `i < 4`
+    /// cap is exactly what guarantees it).
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn split_period_total_and_bounded() {
+        let name: [u8; 6] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= name.len());
+        let (period, label) = split_period(&name[..len]);
+        match period {
+            // A prefix was consumed → the label is strictly shorter, and the value
+            // came from ≤ 4 ASCII digits, so it fits u16 without wrapping.
+            Some(p) => {
+                assert!(p <= 9999);
+                assert!(label.len() < len);
+            }
+            // No numeric prefix → the whole input is the label.
+            None => assert_eq!(label.len(), len),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1394,6 +1424,61 @@ mod tests {
         assert_eq!(split_period(b"GitHub:alex"), (None, &b"GitHub:alex"[..]));
         assert_eq!(split_period(b"a/b"), (None, &b"a/b"[..]));
         assert_eq!(split_period(b"12345/x"), (None, &b"12345/x"[..]));
+    }
+
+    /// Host stand-in for the `split_period` Kani proof: LCG-mutated names (biased
+    /// toward digits and `/`) must always leave the label a genuine suffix, cap a
+    /// parsed period at 9999, and never overflow — regardless of the input.
+    #[test]
+    fn split_period_property_fuzz() {
+        fn check(name: &[u8]) {
+            let (period, label) = split_period(name);
+            assert!(label.len() <= name.len());
+            // the label is exactly the tail of the input
+            assert_eq!(label, &name[name.len() - label.len()..]);
+            match period {
+                Some(p) => {
+                    assert!(p <= 9999);
+                    assert!(label.len() < name.len());
+                }
+                None => assert_eq!(label.len(), name.len()),
+            }
+        }
+        for n in [
+            &b""[..],
+            b"/",
+            b"3",
+            b"30/",
+            b"9999/",
+            b"12345/x",
+            b"/abc",
+            b"0/x",
+            b"00/y",
+            b"issuer:acct",
+        ] {
+            check(n);
+        }
+        let mut lcg: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = || -> u8 {
+            lcg = lcg
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (lcg >> 33) as u8
+        };
+        for _ in 0..50000 {
+            let len = (next() % 24) as usize;
+            let mut v = Vec::with_capacity(len);
+            for _ in 0..len {
+                let r = next();
+                // Bias toward digits and the '/' separator so the prefix path is hit.
+                v.push(match r & 3 {
+                    0 => b'0' + (r % 10),
+                    1 => b'/',
+                    _ => r,
+                });
+            }
+            check(&v);
+        }
     }
 
     #[test]

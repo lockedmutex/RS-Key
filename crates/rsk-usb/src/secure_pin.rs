@@ -105,6 +105,49 @@ pub fn assemble_verify(template: &[u8], pin: &[u8], out: &mut [u8]) -> Option<us
     Some(5 + body_len)
 }
 
+/// Kani proof harnesses (`cargo kani -p rsk-usb`): exhaustive over every input up
+/// to the stated bound, where the unit tests only sample. The host bytes here are
+/// attacker-controlled (a crafted `PC_to_RDR_Secure`), so totality + OOB-safety
+/// matter: the PIN the user typed is written into `out` beside a host template.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// [`assemble_verify`] never panics and, on success, writes a self-consistent
+    /// APDU wholly inside `out`: the returned length is `5 + Lc`, within `out`, and
+    /// `out[4]` (Lc) equals the body length — for any template / PIN / buffer sizes.
+    #[kani::proof]
+    fn assemble_verify_never_writes_out_of_bounds() {
+        let tbuf: [u8; 5] = kani::any();
+        let tlen: usize = kani::any();
+        kani::assume(tlen <= tbuf.len());
+        let pbuf: [u8; 8] = kani::any();
+        let plen: usize = kani::any();
+        kani::assume(plen <= pbuf.len());
+        let mut obuf = [0u8; 16];
+        let olen: usize = kani::any();
+        kani::assume(olen <= obuf.len());
+
+        if let Some(n) = assemble_verify(&tbuf[..tlen], &pbuf[..plen], &mut obuf[..olen]) {
+            assert!((5..=olen).contains(&n));
+            assert_eq!(n, obuf[4] as usize + 5);
+        }
+    }
+
+    /// [`parse_secure`] never panics on host bytes; a parsed template is a suffix of
+    /// the input at least 4 bytes long (a bare `CLA INS P1 P2`).
+    #[kani::proof]
+    fn parse_secure_is_total() {
+        let buf: [u8; APDU_TEMPLATE_OFFSET + 5] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= buf.len());
+        if let Some(req) = parse_secure(&buf[..len]) {
+            assert!(req.apdu_template.len() >= 4);
+            assert!(req.apdu_template.len() <= len);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,5 +262,50 @@ mod tests {
             &out[5..n],
             &[b'6', b'5', b'4', b'3', b'2', b'1', 0xFF, 0xFF]
         );
+    }
+
+    /// Host stand-in for the secure-PIN Kani proofs: LCG-mutated templates, PINs
+    /// and buffers must never make `assemble_verify` / `parse_secure` write or read
+    /// out of bounds, and a success is always a self-consistent APDU.
+    #[test]
+    fn secure_pin_codec_property_fuzz() {
+        let mut lcg: u64 = 0x1D87_2B41_C6A3_09F5;
+        let mut next = || -> u8 {
+            lcg = lcg
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (lcg >> 33) as u8
+        };
+        let make = |max: usize, bias_verify: bool, n: &mut dyn FnMut() -> u8| -> Vec<u8> {
+            let len = (n() as usize) % (max + 1);
+            let mut v = Vec::with_capacity(len);
+            for i in 0..len {
+                v.push(match (i, bias_verify, n() & 3) {
+                    (1, true, 0) => INS_VERIFY,
+                    (3, true, 0) => PIV_PIN_P2,
+                    _ => n(),
+                });
+            }
+            v
+        };
+        for _ in 0..40000 {
+            let template = make(6, true, &mut next);
+            let pin = make(10, false, &mut next);
+            let olen = (next() as usize) % 20;
+            let mut out = vec![0u8; olen];
+            if let Some(k) = assemble_verify(&template, &pin, &mut out) {
+                assert!((5..=olen).contains(&k));
+                assert_eq!(k, out[4] as usize + 5);
+                let _ = &out[..k]; // fully written, in bounds
+            }
+            let abdata = make(APDU_TEMPLATE_OFFSET + 6, true, &mut next);
+            if let Some(req) = parse_secure(&abdata) {
+                assert!(req.apdu_template.len() >= 4);
+                assert_eq!(
+                    req.apdu_template,
+                    &abdata[abdata.len() - req.apdu_template.len()..]
+                );
+            }
+        }
     }
 }

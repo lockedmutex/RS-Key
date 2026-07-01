@@ -473,6 +473,33 @@ impl<'d, D: Driver<'d>, H: ApduHandler> Ccid<'d, D, H> {
     }
 }
 
+/// Kani proof harnesses (`cargo kani -p rsk-usb`): exhaustive over every input
+/// up to the stated bound, where the unit tests only sample.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// `xfr_apdu` / `secure_apdu` never panic on any host message and always return
+    /// a range *inside* the message — `HEADER <= start <= end <= msg.len()` — so the
+    /// caller can slice `msg[start..end]` (the untrusted APDU payload) without its
+    /// own bounds check. The `dw.min(msg.len() - HEADER)` clamp is what guarantees it.
+    #[kani::proof]
+    fn xfr_and_secure_apdu_ranges_stay_in_bounds() {
+        let buf: [u8; HEADER + 3] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= buf.len());
+        let msg = &buf[..len];
+        if let Some((s, e)) = xfr_apdu(msg) {
+            assert_eq!(s, HEADER);
+            assert!(s <= e && e <= len);
+        }
+        if let Some((s, e)) = secure_apdu(msg) {
+            assert_eq!(s, HEADER);
+            assert!(s <= e && e <= len);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,6 +605,36 @@ mod tests {
         assert_eq!(u32::from_le_bytes([out[1], out[2], out[3], out[4]]), 2);
         assert_eq!(out[6], 5); // seq echoed
         assert_eq!(&out[HEADER..HEADER + 2], &[0x90, 0x00]);
+    }
+
+    /// Host stand-in for the `xfr_apdu` / `secure_apdu` Kani proof: LCG-mutated raw
+    /// messages must never yield a range that would slice out of the message.
+    #[test]
+    fn apdu_ranges_stay_in_bounds_property_fuzz() {
+        let mut lcg: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || -> u8 {
+            lcg = lcg
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (lcg >> 33) as u8
+        };
+        for _ in 0..50000 {
+            let len = (next() % (HEADER as u8 + 6)) as usize;
+            let mut m = Vec::with_capacity(len);
+            // Bias byte 0 toward the real message types so the Some paths are hit.
+            for i in 0..len {
+                m.push(match (i, next() & 1) {
+                    (0, 0) => CCID_XFR_BLOCK,
+                    (0, _) => CCID_SECURE,
+                    _ => next(),
+                });
+            }
+            for (s, e) in [xfr_apdu(&m), secure_apdu(&m)].into_iter().flatten() {
+                assert_eq!(s, HEADER);
+                assert!(s <= e && e <= m.len());
+                let _ = &m[s..e]; // must not panic
+            }
+        }
     }
 
     #[test]
