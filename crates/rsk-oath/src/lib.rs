@@ -787,6 +787,33 @@ impl<'a> OathApplet<'a> {
         )
     }
 
+    /// The single OTP-PIN attempt chokepoint shared by VERIFY and CHANGE. Refuses
+    /// once the retry counter is exhausted (`rec[0] == 0`) so neither path can turn
+    /// the saturating floor into an unlimited guessing oracle (run-3 #2 / run-6);
+    /// legitimate recovery after lock-out is RESET, not more guesses. Spends the
+    /// retry (persist + read-back) before the constant-time compare so a glitched
+    /// or failed flash program can't widen the limiter. Ok(()) only on a real match;
+    /// the caller resets the counter on success. This is the sole caller of
+    /// `spend_otp_retry`, so a future command cannot reintroduce the gap by forgetting the gate.
+    fn spend_and_match_otp_pin<S: Storage>(
+        &self,
+        fs: &mut Fs<S>,
+        rec: &mut [u8],
+        size: usize,
+        pw: &[u8],
+    ) -> Result<(), Sw> {
+        if rec[0] == 0 {
+            return Err(Sw::SECURITY_STATUS_NOT_SATISFIED);
+        }
+        if !Self::spend_otp_retry(fs, rec, size) {
+            return Err(Sw::SECURITY_STATUS_NOT_SATISFIED);
+        }
+        if !self.otp_pin_matches(&rec[..size], pw) {
+            return Err(Sw::SECURITY_STATUS_NOT_SATISFIED);
+        }
+        Ok(())
+    }
+
     fn cmd_change_otp_pin<S: Storage>(&mut self, apdu: &Apdu, fs: &mut Fs<S>) -> Sw {
         let mut rec = [0u8; 34];
         let size = match fs.read(EF_OTP_PIN, &mut rec) {
@@ -800,15 +827,11 @@ impl<'a> OathApplet<'a> {
         let Some(new_pw) = find_tag(data, TAG_NEW_PASSWORD as u16) else {
             return Sw::INCORRECT_PARAMS;
         };
-        // Spend a retry BEFORE the compare (persist + read back), matching
-        // cmd_verify_otp_pin's rate limit — otherwise CHANGE PIN is an unlimited
-        // guessing oracle. A correct old-PIN still recovers at counter 0 (the
-        // record is reset below), so do NOT gate on rec[0] == 0.
-        if !Self::spend_otp_retry(fs, &mut rec, size) {
-            return Sw::SECURITY_STATUS_NOT_SATISFIED;
-        }
-        if !self.otp_pin_matches(&rec[..size], pw) {
-            return Sw::SECURITY_STATUS_NOT_SATISFIED;
+        // Same anti-bruteforce gate as VERIFY: refuse at the counter floor. After a
+        // lock-out even a correct old-PIN cannot CHANGE (that floor "recovery" was
+        // the run-6 unlimited-guessing oracle); recover with RESET instead.
+        if let Err(sw) = self.spend_and_match_otp_pin(fs, &mut rec, size, pw) {
+            return sw;
         }
         match fs.put(EF_OTP_PIN, &self.otp_pin_record_v1(new_pw)) {
             Ok(()) => Sw::OK,
@@ -827,17 +850,10 @@ impl<'a> OathApplet<'a> {
         };
         // Any attempt clears a prior unlock; only a correct PIN re-validates below.
         self.validated = false;
-        // A counter at 0 fails even with the right PIN (CHANGE PIN still recovers).
-        if rec[0] == 0 {
-            return Sw::SECURITY_STATUS_NOT_SATISFIED;
-        }
-        // Spend the retry BEFORE the compare (persist + read back), so a glitched
-        // or failed flash program can't widen the limiter.
-        if !Self::spend_otp_retry(fs, &mut rec, size) {
-            return Sw::SECURITY_STATUS_NOT_SATISFIED;
-        }
-        if !self.otp_pin_matches(&rec[..size], pw) {
-            return Sw::SECURITY_STATUS_NOT_SATISFIED;
+        // Shared anti-bruteforce chokepoint: refuse at the counter floor, spend the
+        // retry (persist + read-back), then constant-time compare.
+        if let Err(sw) = self.spend_and_match_otp_pin(fs, &mut rec, size, pw) {
+            return sw;
         }
         // Success: reset the counter and (lazily) upgrade a legacy record to the
         // OTP-rooted v1 verifier. The OTP PIN doubles as VALIDATE (nitropy flow).
@@ -2219,11 +2235,12 @@ mod tests {
     }
 
     #[test]
-    fn change_pin_wrong_old_spends_a_retry_and_locks_out() {
-        // run-3 #2: CHANGE PIN must decrement the retry counter on a wrong old-PIN,
-        // else it is an unlimited brute-force oracle. After MAX_OTP_COUNTER wrong
-        // CHANGE PINs the counter is 0 and even a correct VERIFY is refused — but a
-        // correct CHANGE PIN still recovers (the intentional self-lockout escape).
+    fn change_pin_locks_out_at_floor_and_recovers_only_via_reset() {
+        // run-3 #2 + run-6: CHANGE PIN decrements the retry counter on a wrong old-PIN,
+        // AND — unlike the earlier design — refuses once the counter floors at 0, for
+        // BOTH a wrong and a correct old-PIN. The floor "recovery" via a correct old
+        // CHANGE was an unlimited online guessing oracle (spend_otp_retry saturates
+        // 0->0, so the compare kept running). Recovery after lock-out is now RESET.
         let mut fs = new_fs();
         let rng = RefCell::new(CountRng(7));
         let touch = RefCell::new(AlwaysConfirm);
@@ -2243,18 +2260,37 @@ mod tests {
             let (sw, _) = run(&mut app, &mut fs, &apdu(INS_CHANGE_PIN, 0, 0, &d));
             assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
         }
-        // Counter exhausted: the correct PIN via VERIFY is now refused.
-        let (sw, _) = run(
-            &mut app,
-            &mut fs,
-            &apdu(INS_VERIFY_PIN, 0, 0, &tlv(TAG_PASSWORD, b"1234")),
+        // Counter exhausted: the correct PIN is now refused via BOTH VERIFY and CHANGE
+        // (the floor no longer runs the compare — no unlimited oracle).
+        assert_eq!(
+            run(
+                &mut app,
+                &mut fs,
+                &apdu(INS_VERIFY_PIN, 0, 0, &tlv(TAG_PASSWORD, b"1234"))
+            )
+            .0,
+            Sw::SECURITY_STATUS_NOT_SATISFIED
         );
-        assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
-        // …but a correct CHANGE PIN still recovers and resets the budget.
         let mut d = tlv(TAG_PASSWORD, b"1234");
         d.extend(tlv(TAG_NEW_PASSWORD, b"5678"));
         assert_eq!(
             run(&mut app, &mut fs, &apdu(INS_CHANGE_PIN, 0, 0, &d)).0,
+            Sw::SECURITY_STATUS_NOT_SATISFIED,
+            "correct old-PIN must NOT recover at the floor (that was the oracle)"
+        );
+        // Recovery is RESET: it wipes the OTP-PIN, after which a fresh PIN can be set.
+        assert_eq!(
+            run(&mut app, &mut fs, &apdu(INS_RESET, 0xDE, 0xAD, &[])).0,
+            Sw::OK
+        );
+        assert!(!fs.has_data(EF_OTP_PIN), "RESET wipes the OTP-PIN");
+        assert_eq!(
+            run(
+                &mut app,
+                &mut fs,
+                &apdu(INS_SET_PIN, 0, 0, &tlv(TAG_PASSWORD, b"5678"))
+            )
+            .0,
             Sw::OK
         );
         assert_eq!(
@@ -2384,8 +2420,8 @@ mod tests {
         let (sw, _) = run(&mut app, &mut fs, &apdu(INS_CHANGE_PIN, 0, 0, &d));
         assert_eq!(sw, Sw::OK);
 
-        // Three failures exhaust the retry counter; then even the right PIN
-        // fails, but CHANGE PIN still works.
+        // Three failures exhaust the retry counter; then the right PIN fails via
+        // BOTH VERIFY and CHANGE (the floor no longer runs the compare — run-6).
         for _ in 0..3 {
             let (sw, _) = run(
                 &mut app,
@@ -2403,8 +2439,18 @@ mod tests {
         let mut d = tlv(TAG_PASSWORD, b"abcd");
         d.extend(tlv(TAG_NEW_PASSWORD, b"1234"));
         let (sw, _) = run(&mut app, &mut fs, &apdu(INS_CHANGE_PIN, 0, 0, &d));
+        assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
+        // Recovery is RESET (wipes the PIN); then a fresh PIN can be set + verified.
+        assert_eq!(
+            run(&mut app, &mut fs, &apdu(INS_RESET, 0xDE, 0xAD, &[])).0,
+            Sw::OK
+        );
+        let (sw, _) = run(
+            &mut app,
+            &mut fs,
+            &apdu(INS_SET_PIN, 0, 0, &tlv(TAG_PASSWORD, b"1234")),
+        );
         assert_eq!(sw, Sw::OK);
-        // The counter was restored by CHANGE PIN, so VERIFY works again.
         let (sw, _) = run(
             &mut app,
             &mut fs,

@@ -15,6 +15,36 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Security
 
+- **Security-audit run-6 hardening.** Fixed the findings from a sixth agentic
+  audit against `28a6678` (bcdDevice `0x07DA` → `0x07DB`):
+  - **PIV management-key authentication bypass via an encryption oracle
+    (critical).** `GENERAL AUTHENTICATE` had a symmetric-algorithm tag-`0x81`
+    ("internal authenticate") branch for slot `9B` that returned
+    `E(mgm_key, caller_bytes)` with no `has_mgm`, no PIN (`9B` is not a key slot,
+    so the PIN gate was skipped) and no touch (default `9B` policy is
+    `TOUCHPOLICY_NEVER`). Because the management-key cipher is deterministic ECB,
+    an unauthenticated USB host could chain it with the applet's own single-auth
+    challenge — request a plaintext challenge `R`, ask the oracle for `E(mgm,R)`,
+    submit that as the response — and the card's `D(mgm,·)==R` check would pass,
+    setting `has_mgm` with **zero knowledge of the management key**. That grants
+    full, persistent PIV takeover (generate/import/overwrite slot keys, `PUT DATA`,
+    rotate the management key, reset PIN/PUK counters). It is a distinct-mechanism
+    sibling of the run-1 mgmt-key bypass; the run-1 `ChallengeKind` binding did not
+    cover it. **Fix:** the symmetric tag-`0x81` branch (which has no legitimate PIV
+    client) is removed, so the only sanctioned `9B` flows are mutual-witness
+    (tag `0x80`) and single-auth (tag `0x81`-empty challenge → tag `0x82` verify).
+    A class-invariant test asserts no `GENERAL AUTHENTICATE` path reachable without
+    prior auth can set `has_mgm`.
+  - **OATH `CHANGE PIN` unlimited OTP-PIN guessing at the retry floor (medium).**
+    `cmd_change_otp_pin` decremented the OTP-PIN retry counter with a saturating
+    subtraction but, unlike `cmd_verify_otp_pin`, did not refuse at the floor —
+    once the counter reached 0 it stayed 0 and the PIN comparison kept running on
+    every request, an unlimited online brute-force of the store-unlocking OTP-PIN
+    (a residual sibling of the run-3 `CHANGE PIN` finding). **Fix:** both `VERIFY`
+    and `CHANGE` now go through a single `spend_and_match_otp_pin` chokepoint that
+    refuses at `rec[0]==0`; legitimate recovery after lock-out is `RESET` (which
+    wipes the store), not more guesses. **Behavior change:** a correct old-PIN no
+    longer recovers a locked-out OTP-PIN via `CHANGE`; use `RESET`.
 - **Security-audit run-5 hardening.** Fixed the findings from a fifth agentic
   audit against `fefa199` (bcdDevice `0x07D9` → `0x07DA`):
   - **OTP `SLOT_SWAP` access-code bypass (high).** `cmd_swap` was the only

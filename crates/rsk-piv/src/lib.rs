@@ -2025,6 +2025,64 @@ mod tests {
         assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
     }
 
+    #[test]
+    fn mgm_encrypt_oracle_is_refused_and_cannot_forge_auth() {
+        // Class invariant (run-6 CRITICAL + run-1 CRITICAL): NO GENERAL AUTHENTICATE
+        // path reachable without prior auth may set has_mgm. The removed symmetric
+        // tag-0x81 "internal authenticate" branch was an encrypt oracle: it returned
+        // E(mgm, R) for the card's own single-auth challenge R, letting an attacker
+        // forge the tag-0x82 response with zero key knowledge. Assert the oracle is
+        // gone and has_mgm stays closed against a secret (unknown) key.
+        let rng = RefCell::new(TestRng(7));
+        let pres = RefCell::new(AlwaysConfirm);
+        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
+        let mut fs = new_fs();
+        select(&mut app, &mut fs);
+        // Operator rotates 9B to a secret AES-256 key the attacker never learns.
+        auth_mgm(&mut app, &mut fs);
+        let secret = [0x5Au8; 32];
+        let mut setk = vec![ALGO_AES256, 0x9B, 32];
+        setk.extend_from_slice(&secret);
+        assert_eq!(
+            run(&mut app, &mut fs, INS_SET_MGMKEY, 0xFF, 0xFF, &setk).0,
+            Sw::OK
+        );
+        // Fresh session: attacker with ZERO knowledge of `secret`.
+        select(&mut app, &mut fs);
+        // (1) single-auth step 1 -> plaintext challenge R.
+        let (sw, chal) = run(
+            &mut app,
+            &mut fs,
+            INS_AUTHENTICATE,
+            ALGO_AES256,
+            0x9B,
+            &[0x7C, 0x02, 0x81, 0x00],
+        );
+        assert_eq!(sw, Sw::OK);
+        let r: [u8; 16] = chal[4..20].try_into().unwrap();
+        // (2) the former encrypt oracle: tag 0x81 non-empty must now be REFUSED
+        // and leak no ciphertext.
+        let mut orc = vec![0x7C, 0x12, 0x81, 0x10];
+        orc.extend_from_slice(&r);
+        let (sw, resp) = run(&mut app, &mut fs, INS_AUTHENTICATE, ALGO_AES256, 0x9B, &orc);
+        assert_eq!(sw, Sw::INCORRECT_P1P2, "encrypt oracle must be refused");
+        assert!(
+            resp.is_empty() || !resp.windows(2).any(|w| w == [0x82, 0x10]),
+            "no E(mgm, .) may be returned"
+        );
+        // (3) any guessed/garbage tag-0x82 response must fail (can't forge without E).
+        let mut msg = vec![0x7C, 0x12, 0x82, 0x10];
+        msg.extend_from_slice(&[0u8; 16]);
+        let (sw, _) = run(&mut app, &mut fs, INS_AUTHENTICATE, ALGO_AES256, 0x9B, &msg);
+        assert_ne!(sw, Sw::OK);
+        // has_mgm must remain closed: a management-gated op is refused.
+        assert_eq!(
+            run(&mut app, &mut fs, INS_SET_RETRIES, 5, 5, &[]).0,
+            Sw::SECURITY_STATUS_NOT_SATISFIED,
+            "has_mgm forged without the key"
+        );
+    }
+
     #[cfg(feature = "fips-profile")]
     #[test]
     fn fips_refuses_3des_mgm_and_rsa1024() {

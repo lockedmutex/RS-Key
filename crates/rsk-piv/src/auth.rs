@@ -259,22 +259,14 @@ pub(crate) fn general_authenticate<S: Storage>(
                     dyn_auth_resp(res, 0x82, &sig[..n])?;
                 }
                 ALGO_3DES | ALGO_AES128 | ALGO_AES192 | ALGO_AES256 => {
-                    if key_ref != SLOT_CARDMGM {
-                        return Err(Sw::INCORRECT_P1P2);
-                    }
-                    check_touch(touch_policy, presence)?;
-                    if c.len() != chal_len {
-                        return Err(Sw::DATA_INVALID);
-                    }
-                    let mut enc = [0u8; 16];
-                    enc[..chal_len].copy_from_slice(c);
-                    mgm_crypt(
-                        algo,
-                        &mgm_key[..mgm_len],
-                        &mut enc[..chal_len],
-                        Dir::Encrypt,
-                    )?;
-                    dyn_auth_resp(res, 0x82, &enc[..chal_len])?;
+                    // "Internal authenticate" — encrypting caller-chosen data under
+                    // the 9B management key — has no legitimate PIV consumer, and
+                    // chained with the single-auth challenge (81-empty -> 81 below)
+                    // it is an oracle that forges `has_mgm` with zero key knowledge:
+                    // E(mgm, R) submitted as the 82 response decrypts back to R.
+                    // The only sanctioned symmetric flows are mutual-witness (t80)
+                    // and single-auth (t81-empty challenge -> t82 verify). Refuse.
+                    return Err(Sw::INCORRECT_P1P2);
                 }
                 _ => return Err(WRONG_DATA),
             }
