@@ -9,6 +9,10 @@ publish = false
 # speaks), reached over CCID. Pure and host-testable like the other applet
 # crates; reuses rsk-openpgp's key machinery (PrivKey, RsaKeygen) with its
 # own kbase-rooted sealing.
+# `cfg(kani)` guards the proof harnesses (set by `cargo kani`, unknown to rustc).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
 [dependencies]
 rsk-sdk = { workspace = true }
 rsk-fs = { workspace = true }

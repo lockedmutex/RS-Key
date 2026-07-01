@@ -34,6 +34,14 @@ run "clippy (tui)"             cargo clippy --manifest-path tools/tui/Cargo.toml
 # (deep-checks CI). Format fuzz/ with this same stable rustfmt — not the .#fuzz
 # nightly one, which lays imports out differently.
 run "fmt (fuzz)"               cargo fmt --manifest-path fuzz/Cargo.toml --check
+# The fuzz targets call into the applet crates, so a crate signature change can
+# leave a target uncompilable — but the full `cargo fuzz build` only runs weekly
+# in .#fuzz, so that drift used to surface days later (it did: a `new()` arity
+# change silently broke three targets). A plain `cargo check` on the HOST target
+# (the fuzz workspace inherits the thumbv8m default, so `--target` is required)
+# typechecks every target's calls now, on stable, in the gate — no nightly, no
+# sanitizer build. The instrumented `cargo fuzz build` + run stays in deep-checks.
+run "check (fuzz)"             cargo check --manifest-path fuzz/Cargo.toml --target "$HOST"
 run "test (host)"              cargo test -p rsk-sdk -p rsk-fs -p rsk-usb -p rsk-crypto -p rsk-fido -p rsk-openpgp -p rsk-rsa-asm -p rsk-mgmt -p rsk-oath -p rsk-otp -p rsk-piv -p rsk-rescue -p rsk-led -p rsk-ui -p rsk-bip39 -p rsk-slip39 --target "$HOST"
 # The PQC-advertisement opt-in changes the getInfo shape — test both forms.
 run "test (advertise-pqc)"     cargo test -p rsk-fido --features advertise-pqc --target "$HOST" getinfo

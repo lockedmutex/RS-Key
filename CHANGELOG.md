@@ -87,6 +87,11 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Added
 
+- **Documentation: a trusted-display guide.** The screen-and-touch build now has its own page
+  ([`docs/guides/display.md`](docs/guides/display.md)) covering the build and flashing, the
+  Approve / Deny anti-phishing prompt, on-screen PIN entry (built-in UV + CCID pinpad), the
+  Passkeys and Apps browsers, Settings, and the security model.
+
 - **Trusted-display: every PIN screen names which credential it's asking for, and a fresh
   device offers to set a PIN.** The on-screen PIN pad now titles each entry with the
   credential it collects — **Device PIN**, **FIDO PIN**, **PIV PIN** / **PIV PUK**, or the
@@ -679,9 +684,9 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   Each glyph is now a hand-authored 1-bit bitmap at the canonical sizes the UI paints
   (14 / 16 / 18 / 20 / 36 / 44 px), blitted 1:1 with a centre-sampled nearest-neighbour
   fallback for the few off-canonical sizes; the round / detailed icons were redrawn cleanly
-  at the small sizes via a distance-field rasteriser, while the large sizes are frozen from
-  the prior renders (no regression). No new glyphs, no behaviour change. bcdDevice
-  0x07D0 → 0x07D1.
+  at the small sizes via a distance-field rasteriser, while the large 36 / 44 px sizes were
+  re-authored from the prior renders to stay visually close. No new glyphs, no behaviour
+  change. bcdDevice 0x07D0 → 0x07D1.
 
 - **Trusted-display: redraw the icon set for crisp, centred rendering at small sizes.** A
   pass over the vector glyphs to fix the rough edges that showed at 14–20px: diagonals
@@ -782,6 +787,15 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   ADMIN-DATA / PRINTED codecs against regression.** No new defect was found in these, but the
   load-bearing read-length clamps and the fail-closed protection-flag parse are locked in by
   deterministic host sweeps over adversarial bytes. bcdDevice 0x07D1 → 0x07D2.
+
+- **Trusted display + PIV: on-panel "Protect mgmt key" now preserves a host's `PivmanData`.**
+  Setting a PIN-protected management key from the panel rebuilt the YubiKey ADMIN-DATA object
+  from scratch, discarding any PIN-change timestamp and unrelated flag bits a host (`ykman`)
+  had written. It now carries those forward and drops only the derived-key salt — which a
+  PIN-protected (device-stored, no longer PIN-*derived*) key makes obsolete, exactly as
+  ykman's `--protect` does. The rebuild moved into a pure codec pinned by a Kani proof and a
+  host property sweep: for any prior bytes it always emits a well-formed protected object that
+  carries no salt. bcdDevice 0x07D4 → 0x07D5.
 
 ## [0.2.8] — 2026-06-21
 

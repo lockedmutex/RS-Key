@@ -71,11 +71,22 @@ const INS_SET_MGMKEY: u8 = 0xFF;
 /// enabled). The key itself is synthesized from the sealed 0x9B auth slot, never
 /// stored a second time.
 const PRINTED_ID: u32 = 0x5FC109;
-/// PivmanData (ADMIN DATA) TLV: outer `0x80 { 0x81 = flags }`; flag bit `0x02`
-/// means the management key is PIN-protected (a host reads it back from PRINTED).
+/// PivmanData (ADMIN DATA) TLV: outer `0x80 { 0x81 = flags, 0x82 = derived-key
+/// salt, 0x83 = PIN-change timestamp }`; flag bit `0x02` means the management key
+/// is PIN-protected (a host reads it back from PRINTED). ykman writes the salt
+/// only for the deprecated PIN-*derived* management key; the timestamp is the
+/// last-PIN-change record it displays.
 const PIVMAN_TAG: u8 = 0x80;
 const PIVMAN_FLAGS_TAG: u8 = 0x81;
+// Salt (0x82) is only ever *read* to be dropped, never re-emitted, so it needs no
+// named constant in the encoder; tests spell the raw tag with a `// salt` note.
+const PIVMAN_TS_TAG: u8 = 0x83;
 const PIVMAN_FLAG_MGM_PROTECTED: u8 = 0x02;
+/// Upper bound for a PivmanData record we re-emit: outer tag+len, the 3-byte
+/// flags TLV, and a preserved timestamp TLV whose value we cap at 16 bytes (a
+/// real one is 4). The salt is never re-emitted, so it is not budgeted.
+const PIVMAN_TS_MAX: usize = 16;
+const PIVMAN_MAX: usize = 2 + 3 + 2 + PIVMAN_TS_MAX;
 /// PivmanProtectedData TLV: outer `0x88 { 0x89 = raw management key }`.
 const PROTECTED_TAG: u8 = 0x88;
 const PROTECTED_MGM_TAG: u8 = 0x89;
@@ -1067,7 +1078,21 @@ fn mgm_is_protected<S: Storage>(fs: &mut Fs<S>) -> bool {
 /// write leaves the flag clear → PRINTED reads absent (fail-closed, no half-key
 /// disclosure). Re-running this (or a PIV factory reset) recovers — it depends on
 /// no prior state, just overwriting the slot.
+///
+/// The ADMIN-DATA record is rebuilt from any prior host-written one
+/// ([`pivman_set_protected`]): the PIN-change timestamp and unrelated flag bits
+/// survive, so on-panel protect no longer discards a host's PivmanData.
 pub fn protect_mgm_key<S: Storage>(dev: &Device, fs: &mut Fs<S>, rng: &mut dyn Rng) -> Sw {
+    // Read any existing PivmanData up front (before the writes below), so the new
+    // record can carry its timestamp / flags forward.
+    let mut prior_buf = [0u8; 64];
+    let prior = match fs.read(EF_PIVMAN_DATA, &mut prior_buf) {
+        Some(n) => &prior_buf[..n.min(prior_buf.len())],
+        None => &[][..],
+    };
+    let mut admin = [0u8; PIVMAN_MAX];
+    let admin_len = pivman_set_protected(prior, &mut admin);
+
     let mut key = [0u8; 32];
     rng.fill(&mut key);
     let sealed = seal::seal_put(dev, fs, rng, key_fid(SLOT_CARDMGM), &key);
@@ -1086,18 +1111,56 @@ pub fn protect_mgm_key<S: Storage>(dev: &Device, fs: &mut Fs<S>, rng: &mut dyn R
     {
         return Sw::MEMORY_FAILURE;
     }
-    // ADMIN DATA = PivmanData { flags: MGM_PROTECTED } = 80 03 81 01 02.
-    let admin = [
-        PIVMAN_TAG,
-        0x03,
-        PIVMAN_FLAGS_TAG,
-        0x01,
-        PIVMAN_FLAG_MGM_PROTECTED,
-    ];
-    if fs.put(EF_PIVMAN_DATA, &admin).is_err() {
+    if fs.put(EF_PIVMAN_DATA, &admin[..admin_len]).is_err() {
         return Sw::MEMORY_FAILURE;
     }
     Sw::OK
+}
+
+/// Rebuild the PivmanData (ADMIN DATA) record for the PIN-protected-mgmt state
+/// from an arbitrary `prior` record, writing the encoded object into `out` and
+/// returning its length. The MGM_PROTECTED flag is forced on; any other flag bits
+/// and the PIN-change timestamp (`0x83`) in `prior` are carried forward; the
+/// derived-key salt (`0x82`) is deliberately dropped.
+///
+/// Dropping the salt mirrors ykman's `--protect`: once the management key is a
+/// fresh random device-sealed key it is no longer derived from PIN+salt, so a
+/// left-over salt would only mislead a host into the derivation path. A malformed
+/// `prior` contributes nothing (flags default to 0, no timestamp) and never
+/// panics — the record is always a well-formed `80 { 81 .. }`, protected.
+pub(crate) fn pivman_set_protected(prior: &[u8], out: &mut [u8; PIVMAN_MAX]) -> usize {
+    // Parse the prior record's inner TLV run, if it is a `80 <len> { .. }`.
+    let inner = if prior.len() >= 2 && prior[0] == PIVMAN_TAG {
+        let l = (prior[1] as usize).min(prior.len() - 2);
+        &prior[2..2 + l]
+    } else {
+        &[][..]
+    };
+    let flags = find_tag(inner, PIVMAN_FLAGS_TAG as u16)
+        .and_then(|f| f.first().copied())
+        .unwrap_or(0)
+        | PIVMAN_FLAG_MGM_PROTECTED;
+    let ts = find_tag(inner, PIVMAN_TS_TAG as u16)
+        .map(|t| &t[..t.len().min(PIVMAN_TS_MAX)])
+        .unwrap_or(&[]);
+
+    // Body = 81 01 <flags> [83 <len> <ts>]; outer = 80 <body_len> <body>.
+    let mut body = [0u8; 3 + 2 + PIVMAN_TS_MAX];
+    let mut n = 0;
+    body[n] = PIVMAN_FLAGS_TAG;
+    body[n + 1] = 0x01;
+    body[n + 2] = flags;
+    n += 3;
+    if !ts.is_empty() {
+        body[n] = PIVMAN_TS_TAG;
+        body[n + 1] = ts.len() as u8;
+        body[n + 2..n + 2 + ts.len()].copy_from_slice(ts);
+        n += 2 + ts.len();
+    }
+    out[0] = PIVMAN_TAG;
+    out[1] = n as u8;
+    out[2..2 + n].copy_from_slice(&body[..n]);
+    2 + n
 }
 
 /// Constant-time slice equality (length public).
@@ -1166,6 +1229,47 @@ impl rsa::rand_core::RngCore for RngAdapter<'_> {
     }
 }
 impl rsa::rand_core::CryptoRng for RngAdapter<'_> {}
+
+/// Kani proof harnesses (`cargo kani -p rsk-piv`): exhaustive over every input up
+/// to the stated bound, where the unit tests only sample.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// [`pivman_set_protected`] on ANY prior record (up to a bound past every
+    /// tag/length form) never panics and always emits a well-formed, protected
+    /// PivmanData carrying no salt: the output is `80 <n> { 81 01 <flags> [83 ..] }`
+    /// with the `0x02` flag set, and the second sub-TLV (if any) is the timestamp,
+    /// never the `0x82` salt.
+    #[kani::proof]
+    #[kani::unwind(20)]
+    fn set_protected_total_and_invariant() {
+        let len: usize = kani::any();
+        kani::assume(len <= 18);
+        let mut prior = [0u8; 18];
+        for b in prior[..len].iter_mut() {
+            *b = kani::any();
+        }
+        let mut out = [0u8; PIVMAN_MAX];
+        let n = pivman_set_protected(&prior[..len], &mut out);
+
+        // A well-formed outer object whose declared length matches what we wrote.
+        assert!((5..=PIVMAN_MAX).contains(&n));
+        assert_eq!(out[0], PIVMAN_TAG);
+        assert_eq!(out[1] as usize, n - 2);
+        let body = &out[2..n];
+
+        // Flags TLV first, protected bit forced on.
+        assert_eq!(body[0], PIVMAN_FLAGS_TAG);
+        assert_eq!(body[1], 0x01);
+        assert!(body[2] & PIVMAN_FLAG_MGM_PROTECTED != 0);
+        // The only other sub-TLV the encoder ever emits is the timestamp — so a
+        // body past the 3-byte flags TLV starts with `0x83`, never the salt `0x82`.
+        if body.len() > 3 {
+            assert_eq!(body[3], PIVMAN_TS_TAG);
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1650,6 +1754,130 @@ mod tests {
         assert!(admin.len() > 16);
         fs.put(EF_PIVMAN_DATA, &admin).unwrap();
         assert!(mgm_is_protected(&mut fs));
+    }
+
+    #[test]
+    fn protect_mgm_preserves_timestamp_and_flags_drops_salt() {
+        // Host-written PivmanData: an unrelated flag bit (0x01), a derived-key
+        // salt, and a PIN-change timestamp. On-panel protect must keep the
+        // timestamp and that flag bit, force MGM_PROTECTED, and drop the now
+        // obsolete salt — ykman's `--protect` clears the salt identically.
+        let dev = Device {
+            serial_hash: &HASH,
+            serial_id: &SERIAL,
+            otp_key: None,
+        };
+        let mut fs = new_fs();
+        let mut inner = vec![PIVMAN_FLAGS_TAG, 0x01, 0x01];
+        inner.extend_from_slice(&[0x82, 0x10]); // salt
+        inner.extend_from_slice(&[0xAB; 16]);
+        inner.extend_from_slice(&[PIVMAN_TS_TAG, 0x04, 0xDE, 0xAD, 0xBE, 0xEF]);
+        let mut admin = vec![PIVMAN_TAG, inner.len() as u8];
+        admin.extend_from_slice(&inner);
+        fs.put(EF_PIVMAN_DATA, &admin).unwrap();
+
+        assert_eq!(protect_mgm_key(&dev, &mut fs, &mut TestRng(42)), Sw::OK);
+        assert!(mgm_is_protected(&mut fs));
+
+        let mut out = [0u8; 64];
+        let n = fs.read(EF_PIVMAN_DATA, &mut out).unwrap();
+        let body = &out[..n];
+        assert_eq!(body[0], PIVMAN_TAG);
+        let inner = &body[2..2 + body[1] as usize];
+        assert_eq!(
+            find_tag(inner, PIVMAN_FLAGS_TAG as u16).unwrap(),
+            &[0x01 | PIVMAN_FLAG_MGM_PROTECTED]
+        );
+        assert_eq!(
+            find_tag(inner, PIVMAN_TS_TAG as u16).unwrap(),
+            &[0xDE, 0xAD, 0xBE, 0xEF]
+        );
+        assert!(find_tag(inner, 0x82).is_none()); // salt dropped
+
+        // With no prior record at all, protect still emits a minimal protected
+        // object (flags only, no stray timestamp).
+        let mut fs2 = new_fs();
+        assert_eq!(protect_mgm_key(&dev, &mut fs2, &mut TestRng(9)), Sw::OK);
+        let n2 = fs2.read(EF_PIVMAN_DATA, &mut out).unwrap();
+        let inner2 = &out[2..2 + out[1] as usize];
+        assert_eq!(n2, 5);
+        assert_eq!(
+            find_tag(inner2, PIVMAN_FLAGS_TAG as u16).unwrap(),
+            &[PIVMAN_FLAG_MGM_PROTECTED]
+        );
+        assert!(find_tag(inner2, PIVMAN_TS_TAG as u16).is_none());
+    }
+
+    /// Host stand-in for the `pivman_set_protected` Kani proof: an LCG-mutated
+    /// corpus of prior records (biased to start with the real tags) must always
+    /// yield a well-formed, protected, salt-free object — and a well-formed
+    /// timestamp must survive verbatim.
+    #[test]
+    fn pivman_set_protected_property_fuzz() {
+        fn check(prior: &[u8]) {
+            let mut out = [0u8; PIVMAN_MAX];
+            let n = pivman_set_protected(prior, &mut out);
+            assert!((5..=PIVMAN_MAX).contains(&n));
+            assert_eq!(out[0], PIVMAN_TAG);
+            assert_eq!(out[1] as usize, n - 2);
+            let inner = &out[2..n];
+            let flags = find_tag(inner, PIVMAN_FLAGS_TAG as u16).unwrap();
+            assert_eq!(flags.len(), 1);
+            assert!(flags[0] & PIVMAN_FLAG_MGM_PROTECTED != 0);
+            assert!(find_tag(inner, 0x82).is_none()); // salt
+            if inner.len() > 3 {
+                assert_eq!(inner[3], PIVMAN_TS_TAG);
+            }
+        }
+
+        for body in [
+            &[][..],
+            &[PIVMAN_TAG][..],
+            &[PIVMAN_TAG, 0x00][..],
+            &[PIVMAN_TAG, 0xFF][..],
+            &[PIVMAN_TAG, 0x03, PIVMAN_FLAGS_TAG, 0x01, 0x00][..],
+            &[0x81, 0x01, 0x02][..], // missing outer wrapper → nothing carried
+        ] {
+            check(body);
+        }
+
+        // A well-formed prior with flags + salt + timestamp: salt dropped, ts kept.
+        let prior = {
+            let mut inner = vec![PIVMAN_FLAGS_TAG, 0x01, 0x01, 0x82, 0x10]; // 0x82 = salt
+            inner.extend_from_slice(&[0u8; 16]);
+            inner.extend_from_slice(&[PIVMAN_TS_TAG, 0x04, 1, 2, 3, 4]);
+            let mut rec = vec![PIVMAN_TAG, inner.len() as u8];
+            rec.extend_from_slice(&inner);
+            rec
+        };
+        let mut out = [0u8; PIVMAN_MAX];
+        let n = pivman_set_protected(&prior, &mut out);
+        let inner = &out[2..n];
+        assert_eq!(
+            find_tag(inner, PIVMAN_TS_TAG as u16).unwrap(),
+            &[1, 2, 3, 4]
+        );
+        assert!(find_tag(inner, 0x82).is_none()); // salt dropped
+
+        let mut lcg: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || -> u8 {
+            lcg = lcg
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (lcg >> 33) as u8
+        };
+        for _ in 0..20000 {
+            let len = (next() % 40) as usize;
+            let mut b = Vec::with_capacity(len + 2);
+            if next() & 1 != 0 {
+                b.push(PIVMAN_TAG);
+                b.push(next());
+            }
+            for _ in 0..len {
+                b.push(next());
+            }
+            check(&b);
+        }
     }
 
     #[test]
