@@ -265,6 +265,12 @@ fn set_min_pin_length<S: Storage, R: Rng>(
     if new_min < current {
         return Err(CtapError::PinPolicyViolation);
     }
+    // …and is bounded by the maximum PIN length. Without this the `as u8` store
+    // below truncates a host-supplied u64 (e.g. 256 -> 0), passing the monotonic
+    // guard yet silently lowering the floor to 0.
+    if new_min > crate::clientpin::MAX_PIN_LENGTH as u64 {
+        return Err(CtapError::PinPolicyViolation);
+    }
     let pin_set = ctx.fs.has_data(EF_PIN);
     if force_change && !pin_set {
         return Err(CtapError::PinNotSet);
@@ -430,6 +436,34 @@ mod tests {
         let mut buf = [0u8; 2];
         assert_eq!(fs.read(EF_MINPINLEN, &mut buf), Some(2));
         assert_eq!(buf, [6, 0]); // minPINLength 6, no forced change
+    }
+
+    #[test]
+    fn set_min_pin_length_rejects_truncating_value() {
+        // run-3 #3: a newMinPINLength above the max PIN length must be rejected
+        // before the `as u8` store, which would truncate (256 -> 0) and pass the
+        // `256 < current` monotonic guard while silently lowering the floor.
+        let mut fs = Fs::new(RamStorage::new(), &[]);
+        let mut state = armed(PERM_ACFG);
+        assert_eq!(
+            run_fs(
+                &mut fs,
+                &mut state,
+                &config_request(0x03, &subpara_min_pin(8), &TOKEN)
+            ),
+            Ok(0)
+        );
+        assert_eq!(
+            run_fs(
+                &mut fs,
+                &mut state,
+                &config_request(0x03, &subpara_min_pin(256), &TOKEN)
+            ),
+            Err(CtapError::PinPolicyViolation)
+        );
+        let mut buf = [0u8; 2];
+        assert_eq!(fs.read(EF_MINPINLEN, &mut buf), Some(2));
+        assert_eq!(buf[0], 8, "floor not lowered by the truncating value");
     }
 
     #[test]

@@ -15,6 +15,31 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Security
 
+- **Security-audit run-2 + run-3 hardening.** Fixed the outstanding findings from
+  two further agentic audits (bcdDevice `0x07D8`; `rsk` 0.3.1; `rsk-tui` 0.2.1):
+  - **OpenPGP `GET DATA` unclamped length → OOB brick (high, ×2 sites).** Both the
+    generic top-level Flash DO (`login`/`url`/private DOs) and the `C1/C2/C3`
+    algorithm-attribute path returned the value's full stored length, so an
+    over-long PW3-written object panicked the device on every read (persistent
+    DoS reached by `gpg --card-status`). `get_data` now clamps `data_len` to the
+    scratch buffer at the single chokepoint, plus a defensive clamp at the extend.
+  - **OATH access-code / OTP-PIN bypasses (high, ×2).** `SET PIN` now requires a
+    validated session (an unauthenticated host could mint the unlock secret on a
+    locked applet); `CHANGE PIN` now spends a retry on a wrong old-PIN (it was an
+    unlimited brute-force oracle that recovered the OTP-PIN and unlocked the store).
+  - **FIDO `setMinPINLength` truncation (medium).** A `newMinPINLength` above the
+    max PIN length is now rejected before the `as u8` store, which otherwise
+    truncated (e.g. 256 → 0) and silently defeated the monotonic enterprise floor.
+  - **`rsk offboard` receipt binding (medium).** The signed wipe receipt is now
+    bound to the journal window it presents (recompute + compare the head, hard-fail
+    a missing RESET), matching `rsk audit`; the verify ceremonies also validate
+    device-supplied checkpoint fields instead of raising a traceback.
+  - **Defense-in-depth (low).** Clamped five remaining `Fs::read` readers
+    (`phy`/`largeblobs`/vendor `unlock`/`makeCredential` att-chain/OpenPGP DEK) to
+    their buffers; fixed the OpenPGP `GET DATA 0x7A` stale-scratch over-read;
+    rejected the 2-byte TLV tag form in OATH `PUT`; hardened the `rsk-tui` audit
+    view and `rsk led` against malformed device responses.
+
 - **Security-audit hardening (six-phase agentic audit).** A fresh full-tree audit
   found and fixed:
   - **PIV management-key authentication bypass (critical).** `GENERAL

@@ -78,6 +78,14 @@ pub fn get_data<S: Storage>(
         let mut w = DoWriter::new(out, fs, full_aid);
         w.build(fid)
     };
+    // `build` reports a DO's full stored length, which can exceed `out` when an
+    // over-long object was stored (Fs::read returns the value's full length, the
+    // Func(AlgoInfo) C1/C2/C3 arm returns fs.size() directly). Clamp before any
+    // slice so an oversized object truncates instead of panicking here
+    // (`&out[..data_len]`) or upstream (`res.extend(&scratch[..n])`).
+    if data_len > out.len() {
+        data_len = out.len();
+    }
     // GET DATA returns a PRIMITIVE DO's bare value (gpg/opensc want the value,
     // not its tag+length), but a CONSTRUCTED template DO keeps its outer
     // tag+length. The BER constructed bit (0x20 on the first tag byte) is the
@@ -289,5 +297,23 @@ mod tests {
         assert_eq!(sw, Sw::OK);
         assert_eq!(&out[..n], &[0xCA, 0xFE]);
         assert_eq!(cur, Some(EF_PRIV_DO_2));
+    }
+
+    #[test]
+    fn oversized_algo_attr_truncates_without_panic() {
+        // run-3 #1 / run-2 F3 regression: Fs::read reports the value's FULL stored
+        // length; an over-long DO (here a 1500-byte C1 algorithm attribute) must
+        // clamp to the output buffer, never slice past it (which would panic-reset).
+        let mut fs = fs();
+        fs.put(EF_ALGO_PRIV1, &[0x01u8; 1500]).unwrap();
+        let a = aid();
+        let mut out = [0u8; 1024];
+        let mut cur = None;
+        let (n, sw) = get_data(EF_ALGO_SIG, false, false, &mut fs, &a, &mut cur, &mut out);
+        assert_eq!(sw, Sw::OK);
+        assert!(
+            n <= out.len(),
+            "returned length clamped to the output buffer"
+        );
     }
 }

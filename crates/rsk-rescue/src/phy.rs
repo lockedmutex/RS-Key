@@ -251,7 +251,9 @@ impl Writer<'_> {
 /// Load the phy record; `None` when none was ever written.
 pub fn load<S: Storage>(fs: &mut Fs<S>) -> Option<PhyData> {
     let mut buf = [0u8; PHY_MAX_SIZE];
-    let n = fs.read(EF_PHY, &mut buf)?;
+    // Fs::read returns the value's full stored length; clamp before slicing so an
+    // over-long EF_PHY record can never push the slice past the fixed buffer.
+    let n = fs.read(EF_PHY, &mut buf)?.min(buf.len());
     Some(PhyData::parse(&buf[..n]))
 }
 

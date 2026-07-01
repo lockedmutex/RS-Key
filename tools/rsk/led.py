@@ -67,7 +67,9 @@ def register(sub):
 
 def _get_block(conn):
     d, s1, s2 = ccid.transmit(conn, [0x00, 0x11, 0x00, 0x00, 0x00])
-    if (s1, s2) != (0x90, 0x00) or len(d) < 9:
+    # The readers index up to d[15] (steady + 4 statuses x 4 bytes); require the
+    # full block so a short/hostile response fails cleanly instead of IndexError.
+    if (s1, s2) != (0x90, 0x00) or len(d) < 16:
         raise SystemExit(f"GET LED failed: {s1:02X}{s2:02X} (len {len(d)})")
     return d
 

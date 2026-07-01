@@ -287,7 +287,7 @@ fn unlock<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req) -> CtapResult {
     }
     let mut blob = [0u8; LOCK_BLOB_LEN];
     let n = ctx.fs.read_key(EF_KEY_DEV_ENC, &mut blob);
-    let seed = n.and_then(|n| open_seed_locked(&lock_key, &blob[..n]));
+    let seed = n.and_then(|n| open_seed_locked(&lock_key, &blob[..n.min(blob.len())]));
     lock_key.zeroize();
     match seed {
         Some(seed) => {

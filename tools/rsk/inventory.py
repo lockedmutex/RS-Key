@@ -202,16 +202,21 @@ def cmd_verify(args):
         die("denied — no touch within 30 s; press the button when the LED blinks")
     if st != 0:
         die(f"challenge signing failed: {st:#x}")
+    if not all(k in m for k in (1, 2, 3, 4)):
+        die("malformed checkpoint response — do not trust this device")
     head, seq, sig, pubkey = m[1], m[2], m[3], m[4]
 
     from cryptography.exceptions import InvalidSignature
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import ec
 
-    vk = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), pubkey)
     try:
-        vk.verify(sig, CKPT_TAG + head + seq.to_bytes(4, "little") + challenge,
-                  ec.ECDSA(hashes.SHA256()))
+        vk = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), pubkey)
+        msg = CKPT_TAG + head + int(seq).to_bytes(4, "little") + challenge
+    except (ValueError, TypeError, OverflowError):
+        die("malformed checkpoint fields — do not trust this device")
+    try:
+        vk.verify(sig, msg, ec.ECDSA(hashes.SHA256()))
     except InvalidSignature:
         die("SIGNATURE INVALID — this device cannot prove its identity")
 

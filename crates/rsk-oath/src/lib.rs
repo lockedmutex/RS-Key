@@ -190,6 +190,12 @@ impl<'a> OathApplet<'a> {
         let data = &apdu.data[..apdu.nc];
         let (mut name, mut key, mut imf, mut prop) = (None, None, None, None);
         for (t, v) in PutIter::new(data) {
+            // The stored-blob walkers (find_tag_range/PutIter) decode 1-byte tags;
+            // reject the 2-byte tag form (tag&0x1f==0x1f) so a credential is never
+            // re-read differently by the SDK Tlv walker. No OATH tag uses that form.
+            if t & 0x1f == 0x1f {
+                return Sw::INCORRECT_PARAMS;
+            }
             match t {
                 TAG_NAME if name.is_none() => name = Some(v),
                 TAG_KEY if key.is_none() => key = Some(v),
@@ -747,6 +753,13 @@ impl<'a> OathApplet<'a> {
     }
 
     fn cmd_set_otp_pin<S: Storage>(&mut self, apdu: &Apdu, fs: &mut Fs<S>) -> Sw {
+        // Setting the OTP-PIN mints an unlock secret; a locked (access-code)
+        // applet must be validated first, else an unauthenticated host could
+        // create the very PIN that unlocks the store. On a no-access-code applet
+        // select() leaves validated=true so the nitropy first-set flow still works.
+        if !self.validated {
+            return Sw::SECURITY_STATUS_NOT_SATISFIED;
+        }
         if fs.has_data(EF_OTP_PIN) {
             return Sw::CONDITIONS_NOT_SATISFIED;
         }
@@ -770,6 +783,12 @@ impl<'a> OathApplet<'a> {
             return Sw::INCORRECT_PARAMS;
         };
         if !self.otp_pin_matches(&rec[..size], pw) {
+            // Spend a retry on a WRONG old-PIN, matching cmd_verify_otp_pin's
+            // rate limit — otherwise CHANGE PIN is an unlimited guessing oracle.
+            // A correct old-PIN still works at counter 0, so a caller who knows
+            // it can recover from a self-lockout (do NOT gate on rec[0]==0).
+            rec[0] = rec[0].saturating_sub(1);
+            let _ = fs.put(EF_OTP_PIN, &rec[..size]);
             return Sw::SECURITY_STATUS_NOT_SATISFIED;
         }
         let Some(new_pw) = find_tag(data, TAG_NEW_PASSWORD as u16) else {
@@ -2144,6 +2163,101 @@ mod tests {
             &apdu(INS_VERIFY_PIN, 0, 0, &tlv(TAG_PASSWORD, b"nope")),
         );
         assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
+    }
+
+    /// Lock the applet behind an access code, so a fresh SELECT starts unvalidated.
+    fn lock_with_code(app: &mut OathApplet, fs: &mut Fs<RamStorage>) {
+        let mut code_key = vec![ALG_HMAC_SHA1];
+        code_key.extend_from_slice(&[0xAB; 16]);
+        let chal = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let proof = hmac_sha1(&[0xAB; 16], &chal);
+        let mut d = tlv(TAG_KEY, &code_key);
+        d.extend(tlv(TAG_CHALLENGE, &chal));
+        d.extend(tlv(TAG_RESPONSE, &proof));
+        assert_eq!(run(app, fs, &apdu(INS_SET_CODE, 0, 0, &d)).0, Sw::OK);
+        select(app, fs);
+    }
+
+    #[test]
+    fn set_pin_rejected_while_access_code_locked() {
+        // run-2 F4: minting the OTP-PIN on an access-code-locked applet must require
+        // validation, else an unauthenticated host creates the secret that unlocks
+        // the store. (A no-code applet starts validated=true, so first-set still works.)
+        let mut fs = new_fs();
+        let rng = RefCell::new(CountRng(7));
+        let touch = RefCell::new(AlwaysConfirm);
+        let mut app = OathApplet::new(SERIAL, [0x22; 32], None, &rng, &touch);
+        lock_with_code(&mut app, &mut fs);
+        let (sw, _) = run(
+            &mut app,
+            &mut fs,
+            &apdu(INS_SET_PIN, 0, 0, &tlv(TAG_PASSWORD, b"1234")),
+        );
+        assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
+        assert!(!fs.has_data(EF_OTP_PIN), "no OTP-PIN minted while locked");
+    }
+
+    #[test]
+    fn change_pin_wrong_old_spends_a_retry_and_locks_out() {
+        // run-3 #2: CHANGE PIN must decrement the retry counter on a wrong old-PIN,
+        // else it is an unlimited brute-force oracle. After MAX_OTP_COUNTER wrong
+        // CHANGE PINs the counter is 0 and even a correct VERIFY is refused — but a
+        // correct CHANGE PIN still recovers (the intentional self-lockout escape).
+        let mut fs = new_fs();
+        let rng = RefCell::new(CountRng(7));
+        let touch = RefCell::new(AlwaysConfirm);
+        let mut app = OathApplet::new(SERIAL, [0x22; 32], None, &rng, &touch);
+        assert_eq!(
+            run(
+                &mut app,
+                &mut fs,
+                &apdu(INS_SET_PIN, 0, 0, &tlv(TAG_PASSWORD, b"1234"))
+            )
+            .0,
+            Sw::OK
+        );
+        for _ in 0..MAX_OTP_COUNTER {
+            let mut d = tlv(TAG_PASSWORD, b"9999");
+            d.extend(tlv(TAG_NEW_PASSWORD, b"0000"));
+            let (sw, _) = run(&mut app, &mut fs, &apdu(INS_CHANGE_PIN, 0, 0, &d));
+            assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
+        }
+        // Counter exhausted: the correct PIN via VERIFY is now refused.
+        let (sw, _) = run(
+            &mut app,
+            &mut fs,
+            &apdu(INS_VERIFY_PIN, 0, 0, &tlv(TAG_PASSWORD, b"1234")),
+        );
+        assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
+        // …but a correct CHANGE PIN still recovers and resets the budget.
+        let mut d = tlv(TAG_PASSWORD, b"1234");
+        d.extend(tlv(TAG_NEW_PASSWORD, b"5678"));
+        assert_eq!(
+            run(&mut app, &mut fs, &apdu(INS_CHANGE_PIN, 0, 0, &d)).0,
+            Sw::OK
+        );
+        assert_eq!(
+            run(
+                &mut app,
+                &mut fs,
+                &apdu(INS_VERIFY_PIN, 0, 0, &tlv(TAG_PASSWORD, b"5678"))
+            )
+            .0,
+            Sw::OK
+        );
+    }
+
+    #[test]
+    fn put_rejects_two_byte_tag_form() {
+        // run-3 #6: a stored credential must not carry a (tag&0x1f)==0x1f byte, which
+        // the 1-byte PutIter and the 2-byte SDK Tlv walker would read differently.
+        let mut fs = new_fs();
+        let rng = RefCell::new(CountRng(7));
+        let touch = RefCell::new(AlwaysConfirm);
+        let mut app = OathApplet::new(SERIAL, [0x22; 32], None, &rng, &touch);
+        let mut d = put_data(b"c", 0x21, 6, SECRET_SHA1, false, None);
+        d.extend(tlv(0x7F, &[0xAA])); // low 5 bits == 0x1f
+        assert_eq!(put(&mut app, &mut fs, &d), Sw::INCORRECT_PARAMS);
     }
 
     #[test]

@@ -124,14 +124,19 @@ def cmd_verify(args):
         die("denied — no touch within 30 s; press the button when the LED blinks")
     if st != 0:
         die(f"checkpoint failed: {st:#x}")
+    if not all(k in m for k in (1, 2, 3, 4)):
+        die("malformed checkpoint response — do not trust this journal")
     head_signed, seq_signed, sig, pubkey = m[1], m[2], m[3], m[4]
 
     from cryptography.exceptions import InvalidSignature
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import ec
 
-    vk = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), pubkey)
-    msg = CKPT_TAG + head_signed + seq_signed.to_bytes(4, "little") + challenge
+    try:
+        vk = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), pubkey)
+        msg = CKPT_TAG + head_signed + int(seq_signed).to_bytes(4, "little") + challenge
+    except (ValueError, TypeError, OverflowError):
+        die("malformed checkpoint fields — do not trust this journal")
     try:
         vk.verify(sig, msg, ec.ECDSA(hashes.SHA256()))
     except InvalidSignature:

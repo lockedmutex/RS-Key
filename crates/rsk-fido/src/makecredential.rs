@@ -530,6 +530,7 @@ fn make_credential_inner<S: Storage, R: Rng>(
             let cl = ctx
                 .fs
                 .read(EF_ATT_CHAIN, &mut chain)
+                .map(|n| n.min(chain.len()))
                 .filter(|&n| cert::att_chain_count(&chain[..n]) > 0)
                 .ok_or(CtapError::Other)?;
             let count = cert::att_chain_count(&chain[..cl]);

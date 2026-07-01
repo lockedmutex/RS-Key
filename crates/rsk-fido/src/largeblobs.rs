@@ -100,7 +100,11 @@ fn read_fragment<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [
         return Err(CtapError::InvalidParameter);
     }
     let mut blob = [0u8; MAX_LARGE_BLOB_SIZE];
-    let size = ctx.fs.read(EF_LARGEBLOB, &mut blob).unwrap_or(0);
+    let size = ctx
+        .fs
+        .read(EF_LARGEBLOB, &mut blob)
+        .unwrap_or(0)
+        .min(blob.len());
     let offset = req.offset as usize;
     if offset > size {
         return Err(CtapError::InvalidParameter);

@@ -217,7 +217,7 @@ fn migrate_pin_kbase<S: Storage>(
         _ => return Err(Sw::EXEC_ERROR),
     };
     let mut blob = [0u8; DEK_FILE_SIZE];
-    if let Some(n) = fs.read_key(dek_fid, &mut blob) {
+    if let Some(n) = fs.read_key(dek_fid, &mut blob).map(|n| n.min(blob.len())) {
         if n < 1 || blob[0] != 0x03 {
             return Err(Sw::EXEC_ERROR);
         }
@@ -267,7 +267,10 @@ pub fn load_dek<S: Storage>(
         return Err(Sw::CONDITIONS_NOT_SATISFIED); // no PIN verified
     };
     let mut blob = [0u8; DEK_FILE_SIZE];
-    let n = fs.read_key(fid, &mut blob).ok_or(Sw::REFERENCE_NOT_FOUND)?;
+    let n = fs
+        .read_key(fid, &mut blob)
+        .ok_or(Sw::REFERENCE_NOT_FOUND)?
+        .min(blob.len());
     if n < 1 || blob[0] != 0x03 {
         return Err(Sw::EXEC_ERROR);
     }

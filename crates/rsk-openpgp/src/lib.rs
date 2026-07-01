@@ -234,6 +234,7 @@ impl<S: Storage> Applet<Fs<S>> for OpenpgpApplet<'_> {
                     &mut self.scratch,
                 );
                 if sw.is_ok() {
+                    let n = n.min(self.scratch.len());
                     res.extend(&self.scratch[..n]);
                 }
                 sw

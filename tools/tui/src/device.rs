@@ -777,6 +777,12 @@ pub fn audit_read(pin: Option<&str>) -> Result<(String, String), String> {
         Some(Value::Bytes(b)) => b.clone(),
         _ => return Err("no entries".into()),
     };
+    // Treat the device as untrusted: a length that is not a whole number of
+    // entries would make the fixed-stride display slice run past the end and
+    // panic (matches the Python client's rejection at audit.py).
+    if entries.len() % AUDIT_ENTRY_LEN != 0 {
+        return Err("malformed audit journal (length not a multiple of entry size)".into());
+    }
 
     let head = fold(&epoch, &entries);
     let count = entries.len() / AUDIT_ENTRY_LEN;

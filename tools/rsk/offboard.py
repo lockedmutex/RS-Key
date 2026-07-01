@@ -21,7 +21,7 @@ import sys
 from datetime import datetime
 
 from . import ccid, ctaphid, openpgp
-from .audit import AUDIT_CHECKPOINT, CKPT_TAG, EVENTS, ENTRY_LEN, read_journal
+from .audit import AUDIT_CHECKPOINT, CKPT_TAG, EVENTS, ENTRY_LEN, _fold, read_journal
 from .backup import _gated, _vendor, mse_handshake
 from .common import confirm, connect_fido, die
 from .fido import ATT_CLEAR, ATT_STATE
@@ -170,26 +170,37 @@ def run(args):
     elif st != 0:
         print(f"warning: checkpoint failed ({st:#x}) — receipt is UNSIGNED", file=sys.stderr)
     else:
-        head, seq, sig, pubkey = m[1], m[2], m[3], m[4]
         import hashlib
 
         from cryptography.exceptions import InvalidSignature
         from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives.asymmetric import ec
 
-        vk = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), pubkey)
+        # The device is untrusted: validate every field before use so a
+        # malformed checkpoint fails closed instead of raising a traceback.
+        if not all(k in m for k in (1, 2, 3, 4)):
+            die("malformed checkpoint response — do not trust this device")
+        head, seq, sig, pubkey = m[1], m[2], m[3], m[4]
         try:
-            vk.verify(sig, CKPT_TAG + head + seq.to_bytes(4, "little") + challenge,
-                      ec.ECDSA(hashes.SHA256()))
+            vk = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), pubkey)
+            msg = CKPT_TAG + head + int(seq).to_bytes(4, "little") + challenge
+        except (ValueError, TypeError, OverflowError):
+            die("malformed checkpoint fields — do not trust this device")
+        try:
+            vk.verify(sig, msg, ec.ECDSA(hashes.SHA256()))
         except InvalidSignature:
             die("receipt SIGNATURE INVALID — do not trust this device")
+        # Bind the signature to the window the receipt shows: recompute the head
+        # locally and require it match the signed head (as `rsk audit` does),
+        # then require the RESET event actually be present in that bound window.
+        if head != _fold(epoch, entries):
+            die("signed head differs from the exported window — TAMPER")
+        if not any(e["event"] == "RESET" for e in window):
+            die("signed window does not contain the RESET event — refusing to certify")
         report.update({"signed": True, "challenge": challenge.hex(),
                        "signed_head": head.hex(), "seq": seq, "signature": sig.hex(),
                        "attestation_pubkey": pubkey.hex(),
                        "fingerprint": hashlib.sha256(pubkey).hexdigest()[:16]})
-
-    if not any(e["event"] == "RESET" for e in window):
-        report["warning"] = "signed window does not contain the RESET event"
 
     path = args.report or f"offboard-{serial}-{datetime.now():%Y%m%d-%H%M%S}.json"
     with open(path, "w") as f:

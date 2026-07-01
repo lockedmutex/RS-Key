@@ -216,6 +216,7 @@ impl<'a, S: Storage> DoWriter<'a, S> {
     }
 
     fn parse_sec_tpl(&mut self) -> usize {
+        let start = self.pos;
         self.push((EF_SEC_TPL & 0xff) as u8);
         self.push(5);
         if self.fs.has_data(EF_SIG_COUNT) {
@@ -223,7 +224,10 @@ impl<'a, S: Storage> DoWriter<'a, S> {
             self.push(3);
             self.read_flash(EF_SIG_COUNT);
         }
-        5 + 2
+        // Return what was actually written: when EF_SIG_COUNT is absent (or short)
+        // only the 2-byte header lands, so a constant `5 + 2` would over-read the
+        // scratch tail (stale bytes from a prior command).
+        self.pos - start
     }
 
     /// `num` consecutive fids, each `size` bytes; absent ones zero-filled.
