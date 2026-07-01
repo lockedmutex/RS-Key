@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 RS-Key contributors
 
+use super::ceremony::centered_clipped;
+use super::home::HOME_CARD_TOP;
 use super::*;
 use crate::{HomeView, PANEL_H, SuccessKind};
 use embedded_graphics::{Pixel, geometry::OriginDimensions};
