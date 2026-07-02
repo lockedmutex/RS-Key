@@ -18,18 +18,16 @@ verify: challenge-response proof that the key in hand is the enrolled device:
         set. The checkpoint is itself journaled, so every verify leaves a
         trace in the audit log.
 """
-import hashlib
 import json
 import os
 import sys
 
 from . import ccid, ctaphid
-from .audit import AUDIT_CHECKPOINT, CKPT_TAG
-from .backup import _gated, _vendor
+from .audit import AUDIT_CHECKPOINT, _fingerprint, verify_checkpoint
+from .backup import ERR_NOT_ALLOWED, _die_pin_required, _die_touch_denied, _gated, _vendor
 from .common import add_pin_arg, connect_fido, device_has_pin, die, resolve_pin
-from .status import RESCUE_AID, VENDOR_STATE, _fw
-
-ATT_STATE = 11  # vendor: org-attestation state (ungated)
+from .fido import ATT_STATE  # vendor: org-attestation state (ungated)
+from .status import RESCUE_AID, VENDOR_STATE, _fw, rescue_read, rescue_serial
 
 
 def register(sub):
@@ -66,16 +64,17 @@ def _ccid_records():
             conn = r.createConnection()
             conn.connect()
             d, s1, s2 = ccid.select(conn, RESCUE_AID)
-            if (s1, s2) != (0x90, 0x00) or len(d) < 12:
+            serial = rescue_serial(d, s1, s2)
+            if serial is None:
                 continue  # not an RS-Key
-            rec["serial"] = d[4:12].hex()
+            rec["serial"] = serial
             rec["sdk"] = f"{d[2]}.{d[3]}"
-            d, s1, s2 = ccid.transmit(conn, [0x80, 0x1E, 0x03, 0x00, 0x00])
-            if (s1, s2) == (0x90, 0x00) and len(d) >= 3:
+            d, s1, s2 = rescue_read(conn, 0x03)
+            if (s1, s2) == ccid.SW_OK and len(d) >= 3:
                 rec["secure_boot"] = {"enabled": bool(d[0]), "locked": bool(d[1]),
                                       "bootkey": d[2]}
-            d, s1, s2 = ccid.transmit(conn, [0x80, 0x1E, 0x02, 0x00, 0x00])
-            if (s1, s2) == (0x90, 0x00) and len(d) >= 20:
+            d, s1, s2 = rescue_read(conn, 0x02)
+            if (s1, s2) == ccid.SW_OK and len(d) >= 20:
                 rec["flash"] = {"free": int.from_bytes(d[0:4], "big"),
                                 "used": int.from_bytes(d[4:8], "big"),
                                 "kv_total": int.from_bytes(d[8:12], "big"),
@@ -94,7 +93,7 @@ def _hid_records():
     """One record per FIDO HID device (usage page 0xF1D0)."""
     out = []
     for info in ctaphid.hid.enumerate():
-        if info.get("usage_page") != 0xF1D0:
+        if info.get("usage_page") != ctaphid.FIDO_USAGE_PAGE:
             continue
         rec = {"product": info.get("product_string"),
                "bcd_device": f"0x{info.get('release_number', 0):04x}"}
@@ -102,7 +101,7 @@ def _hid_records():
         try:
             dev.open_path(info["path"])
             cid = ctaphid.ctaphid_init(dev)
-            r = ctaphid.send_cbor(dev, cid, bytes([0x04]))  # getInfo
+            r = ctaphid.send_cbor(dev, cid, bytes([ctaphid.CTAP_GET_INFO]))
             if r[0] == 0:
                 gi = ctaphid.decode(r[1:])
                 rec["fw"] = _fw(gi.get(14))
@@ -194,33 +193,17 @@ def cmd_verify(args):
     print("touch the device (BOOTSEL) to sign the challenge…", file=sys.stderr)
     st, m = _vendor(dev, cid,
                     _gated(AUDIT_CHECKPOINT, {1: challenge}, dev, cid, pin))
-    if st == 0x36:
-        die("device requires a PIN — pass --pin or enter it when prompted")
-    if st == 0x30:
+    _die_pin_required(st)
+    if st == ERR_NOT_ALLOWED:
         die("refused — no OTP DEVK provisioned (see docs/production.md)")
-    if st == 0x27:
-        die("denied — no touch within 30 s; press the button when the LED blinks")
+    _die_touch_denied(st)
     if st != 0:
         die(f"challenge signing failed: {st:#x}")
-    if not all(k in m for k in (1, 2, 3, 4)):
-        die("malformed checkpoint response — do not trust this device")
-    head, seq, sig, pubkey = m[1], m[2], m[3], m[4]
+    _, _, _, pubkey = verify_checkpoint(
+        m, challenge, "do not trust this device",
+        "SIGNATURE INVALID — this device cannot prove its identity")
 
-    from cryptography.exceptions import InvalidSignature
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.asymmetric import ec
-
-    try:
-        vk = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), pubkey)
-        msg = CKPT_TAG + head + int(seq).to_bytes(4, "little") + challenge
-    except (ValueError, TypeError, OverflowError):
-        die("malformed checkpoint fields — do not trust this device")
-    try:
-        vk.verify(sig, msg, ec.ECDSA(hashes.SHA256()))
-    except InvalidSignature:
-        die("SIGNATURE INVALID — this device cannot prove its identity")
-
-    fp = hashlib.sha256(pubkey).hexdigest()[:16]
+    fp = _fingerprint(pubkey)
     serials = [r["serial"] for r in _ccid_records() if r.get("serial")]
     if len(serials) == 1:
         print(f"serial      : {serials[0]}")

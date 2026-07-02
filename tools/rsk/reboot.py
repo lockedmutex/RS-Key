@@ -24,7 +24,7 @@ def run(args):
             file=sys.stderr,
         )
     sw = ccid.reboot(bootsel=bootsel)
-    if sw == (0x69, 0x85):
+    if sw == ccid.SW_COND_NOT_SATISFIED:
         raise SystemExit(
             "reboot-to-BOOTSEL declined on the device (no confirmation). Approve on "
             "the device, or enter BOOTSEL manually (hold BOOTSEL and replug)."

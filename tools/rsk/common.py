@@ -35,7 +35,7 @@ def device_has_pin(dev, cid):
     GetInfo, touch-free). True / False, or None when getInfo can't be read."""
     from . import ctaphid
 
-    r = ctaphid.send_cbor(dev, cid, bytes([0x04]))  # authenticatorGetInfo
+    r = ctaphid.send_cbor(dev, cid, bytes([ctaphid.CTAP_GET_INFO]))
     if not r or r[0] != 0:
         return None
     opts = ctaphid.decode(r[1:]).get(4) or {}

@@ -11,6 +11,10 @@ except ImportError:
 
 VENDOR_AID = [0xF0, 0x00, 0x00, 0x00, 0x01]
 
+# ISO 7816-4 status words, as the (sw1, sw2) tuple transmit() returns.
+SW_OK = (0x90, 0x00)
+SW_COND_NOT_SATISFIED = (0x69, 0x85)
+
 
 def _require():
     if readers is None:
@@ -62,7 +66,7 @@ def reboot(conn=None, bootsel=True):
     resets after flushing SW_OK; on a decline it returns 6985 and stays put."""
     if conn is None:
         conn = connect()
-    transmit(conn, [0x00, 0xA4, 0x04, 0x00, len(VENDOR_AID)] + VENDOR_AID + [0x00])
+    select(conn, VENDOR_AID)
     try:
         _, s1, s2 = transmit(conn, [0x00, 0x1F, 0x01 if bootsel else 0x00, 0x00, 0x00])
         return (s1, s2)

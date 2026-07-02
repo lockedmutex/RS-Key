@@ -22,7 +22,7 @@ persists in a different record — see `rsk led`.)
 import sys
 
 from . import ccid
-from .status import RESCUE_AID
+from .status import RESCUE_AID, rescue_read
 
 # phy TLV tags — must match crates/rsk-rescue/src/phy.rs.
 TAG_LED_GPIO = 0x04
@@ -112,8 +112,8 @@ def _upsert(tlvs, tag, value):
 
 
 def _read_phy(conn):
-    d, s1, s2 = ccid.transmit(conn, [0x80, 0x1E, 0x01, 0x00, 0x00])
-    if (s1, s2) != (0x90, 0x00):
+    d, s1, s2 = rescue_read(conn, 0x01)
+    if (s1, s2) != ccid.SW_OK:
         raise SystemExit(f"READ phy failed: {s1:02X}{s2:02X} (firmware too old?)")
     return _parse_tlv(d)
 
@@ -140,7 +140,7 @@ def _show(tlvs):
 def run(args):
     conn = ccid.connect()
     _, s1, s2 = ccid.select(conn, RESCUE_AID)
-    if (s1, s2) != (0x90, 0x00):
+    if (s1, s2) != ccid.SW_OK:
         raise SystemExit(
             f"SELECT rescue AID failed: {s1:02X}{s2:02X} (firmware too old?)"
         )
@@ -184,12 +184,12 @@ def run(args):
     _, s1, s2 = ccid.transmit(
         conn, [0x80, 0x1C, 0x01, 0x00, len(blob)] + list(blob) + [0x00]
     )
-    if (s1, s2) == (0x69, 0x85):
+    if (s1, s2) == ccid.SW_COND_NOT_SATISFIED:
         raise SystemExit(
             "phy write declined on the device (no confirmation). Approve on the "
             "device when prompted, then retry."
         )
-    if (s1, s2) != (0x90, 0x00):
+    if (s1, s2) != ccid.SW_OK:
         raise SystemExit(f"WRITE phy failed: {s1:02X}{s2:02X}")
     print("phy LED config written ✓")
     _show(tlvs)

@@ -69,7 +69,7 @@ def _get_block(conn):
     d, s1, s2 = ccid.transmit(conn, [0x00, 0x11, 0x00, 0x00, 0x00])
     # The readers index up to d[15] (steady + 4 statuses x 4 bytes); require the
     # full block so a short/hostile response fails cleanly instead of IndexError.
-    if (s1, s2) != (0x90, 0x00) or len(d) < 16:
+    if (s1, s2) != ccid.SW_OK or len(d) < 16:
         raise SystemExit(f"GET LED failed: {s1:02X}{s2:02X} (len {len(d)})")
     return d
 
@@ -122,7 +122,7 @@ def run(args):
             if args.speed is not None:
                 data.append(args.speed & 0xFF)
         _, s1, s2 = ccid.transmit(conn, [0x00, 0x10, brightness & 0xFF, p2] + data)
-        if (s1, s2) != (0x90, 0x00):
+        if (s1, s2) != ccid.SW_OK:
             raise SystemExit(f"SET LED failed: {s1:02X}{s2:02X}")
         parts = [
             f"set {args.status}: color={COLOR_NAMES.get(color, color)}",

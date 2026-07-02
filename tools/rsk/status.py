@@ -10,9 +10,21 @@ fatal.
 import json
 
 from . import ccid, ctaphid
+from .backup import CTAP_VENDOR, STATE as VENDOR_STATE
 
 RESCUE_AID = [0xA0, 0x58, 0x3F, 0xC1, 0x9B, 0x7E, 0x4F, 0x21]
-CTAP_VENDOR, VENDOR_STATE = 0x41, 5
+INS_RESCUE_READ = 0x1E
+
+
+def rescue_read(conn, p1):
+    return ccid.transmit(conn, [0x80, INS_RESCUE_READ, p1, 0x00, 0x00])
+
+
+def rescue_serial(d, s1, s2):
+    """8-byte chip serial (hex) from a rescue SELECT response, or None (protocol.md §7)."""
+    if (s1, s2) != ccid.SW_OK or len(d) < 12:
+        return None
+    return d[4:12].hex()
 
 
 def _fw(v):
@@ -29,7 +41,7 @@ def _fido():
     dev.open_path(info["path"])
     try:
         cid = ctaphid.ctaphid_init(dev)
-        r = ctaphid.send_cbor(dev, cid, bytes([0x04]))
+        r = ctaphid.send_cbor(dev, cid, bytes([ctaphid.CTAP_GET_INFO]))
         if r[0] == 0:
             gi = ctaphid.decode(r[1:])
             out["versions"] = gi.get(1)
@@ -59,14 +71,14 @@ def _secure_boot():
         return None
     try:
         _, s1, s2 = ccid.select(conn, RESCUE_AID)
-        if (s1, s2) != (0x90, 0x00):
+        if (s1, s2) != ccid.SW_OK:
             return {"available": False}
-        d, s1, s2 = ccid.transmit(conn, [0x80, 0x1E, 0x03, 0x00, 0x00])
-        if (s1, s2) != (0x90, 0x00) or len(d) < 3:
+        d, s1, s2 = rescue_read(conn, 0x03)
+        if (s1, s2) != ccid.SW_OK or len(d) < 3:
             return {"available": False}
         out = {"available": True, "enabled": bool(d[0]), "locked": bool(d[1]), "bootkey": d[2]}
-        d, s1, s2 = ccid.transmit(conn, [0x80, 0x1E, 0x06, 0x00, 0x00])
-        if (s1, s2) == (0x90, 0x00) and len(d) >= 3:  # bcdDevice >= 0x074A
+        d, s1, s2 = rescue_read(conn, 0x06)
+        if (s1, s2) == ccid.SW_OK and len(d) >= 3:  # bcdDevice >= 0x074A
             out["rollback"] = {"required": bool(d[0]), "version": d[1], "capacity": d[2]}
         return out
     except Exception as e:
