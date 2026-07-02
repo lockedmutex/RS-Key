@@ -15,78 +15,116 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Added
 
-- **`rsk-tui` can export the seed as SLIP-39 shares** (tools/tui 0.2.3 → 0.2.4).
-  The Backup section gains "Export seed (SLIP-39)" next to the BIP-39 export: it
-  reveals the seed as a 2-of-3 Shamir share set (the host CLI's default) on
-  screen, generated via the in-tree `rsk-slip39` crate so the shares recombine
-  with `rsk backup restore --scheme slip39`. Recombining shares to restore stays
-  in the CLI. (Pulls `rsk-crypto` transitively into the host tool.)
+- **Trusted-display build (experimental, opt-in).** A screen-and-touch RS-Key
+  variant for the Waveshare RP2350-Touch-LCD-2.8, behind the `display` cargo
+  feature (`firmware-display` nix flavor). The screen turns the key into a
+  *trusted display* — the operations that matter happen on the device's own glass,
+  not on the host:
+  - **Approve / Deny** paints the *real* relying party for every touch-gated
+    operation, so a signature can't be produced without a physical tap on a screen
+    showing the true `rpId` (refuse → `OPERATION_DENIED`); a registration shows a
+    *Save new passkey?* card. A look-alike id too long for the box is clipped with
+    a truncation marker so its prefix can't masquerade.
+  - **On-screen PIN entry** — built-in user verification (getInfo `options.uv`; a
+    `pinUvAuthToken` minted from the on-screen pad against the same `EF_PIN`), and
+    a CCID **pinpad** (`bPINSupport` / `PC_to_RDR_Secure`) so GnuPG and OpenSC
+    collect the OpenPGP / PIV PIN on the panel — the PIN never crosses USB. Every
+    PIN screen names which credential it collects, an eye toggle reveals the
+    digits, and "N tries remaining" is shown up front.
+  - A dedicated **device PIN** (separate from the FIDO clientPIN) gating the
+    on-device UI, with **lock / unlock**, display **sleep** (image-retention
+    guard + wake button), and set / change PIN on the panel.
+  - **Passkeys** — browse resident credentials, **rename** (a device-local
+    nickname that never re-seals the box) and **delete** on-device.
+  - **Apps** — a read-only browser of OpenPGP / PIV / OATH state (no PIN, no
+    secret, no OATH code — the device has no clock), plus on-device **PIV key
+    generation** (EC P-256/P-384, Ed25519, X25519, RSA 2048/3072/4096) into empty
+    retired slots.
+  - **Settings** — device & FIDO PINs; a PIV PIN / PUK / unblock / **protect
+    management key** (ykman `--protect`) sub-menu; on-screen **BIP-39 / SLIP-39
+    recovery** export (derived on-device, never over USB) and backup-window status;
+    an **audit log**; **factory reset**; a **Firmware** screen that reboots to
+    BOOTSEL for an over-USB update; and live brightness / display-sleep /
+    touch-timeout that persist across reboots.
+  - A standard **screenless key compiles none of it** — the whole UI stack
+    (`rsk-ui`, `embedded-graphics`, `u8g2-fonts`) is `dep:`-gated and the build
+    asserts it absent from the default image, so an ordinary build is
+    byte-for-byte unaffected. The UI model, geometry and glyphs live in the
+    host-tested + Kani-proved `rsk-ui` crate. See
+    [`docs/guides/display.md`](docs/guides/display.md). Built up across bcdDevice
+    `0x0784`–`0x07D5`.
 
-### Fixed
+- **PIV: RSA-3072 and RSA-4096 keys.** Generate, import, sign / decrypt,
+  attestation and metadata gained RSA-3072/4096 (the applet buffers were lifted
+  off their RSA-2048 ceiling); on a display build the on-device **Generate key**
+  chooser offers RSA via a 2048 / 3072 / 4096 sub-picker. RSA-1024 stays disabled.
+  bcdDevice `0x07C4` → `0x07C6`.
 
-- **The credential-box ceiling was too small for a maximal request.** Unifying
-  the create/assert/reseal ceiling to a literal 640 (an earlier `[Unreleased]`
-  fix) omitted the credBlob (≤127) and the extensions from its accounting, and
-  raising the resident rpId to 253 (also `[Unreleased]`) widened the box
-  further — so a makeCredential with a 253-byte rpId, 64-byte user.id, 64-byte
-  names and a 127-byte credBlob (all within the device's advertised limits)
-  overflowed the box and was rejected `CTAP2_ERR_OTHER`, and an
-  updateUserInformation adding names to a large-credBlob credential failed
-  `NOT_ALLOWED`. `CRED_BOX_MAX` is now **derived** from the field maxima (748),
-  so it can never again drift below what the device accepts; makeCredential
-  rejects an over-maximum rpId/user.id explicitly with `CTAP1_ERR_INVALID_LENGTH`
-  rather than as a box overflow; getInfo's `maxCredentialIdLength` follows (748),
-  and the published metadata statements (`rs-key.metadata.json` and the
-  `-conformance` variant) are synced to it (were a stale 1024).
-  bcdDevice `0x07EB` → `0x07EC`.
+- **PIV: Ed25519 and X25519 keys** (algorithm ids `0xE0` / `0xE1`, Yubico 5.7
+  PIV). Generate (Ed25519 with an RFC 8410 self-signed cert; X25519 is
+  key-agreement-only), import (raw seed / scalar, yubikit tags `0x07` / `0x08`),
+  sign / key-agree, metadata and attestation — interoperating with `ykman` /
+  `yubico-piv-tool` (an imported X25519 scalar is byte-flipped to the little-endian
+  form standard tooling sends, so the slot's public key matches). bcdDevice
+  `0x07C3` → `0x07C4`.
+
+- **Configurable multi-LED effects engine.** Boards with a chain of addressable
+  WS2812 LEDs light the whole strip with per-status animated effects (`vapor`,
+  `bounce`, `flow`, `sparkle`, `legacy`) via `rsk led --effect/--speed`; the
+  connected count is a runtime phy setting (`rsk hw --led-num`, TLV tag `0x0E`)
+  bounded by the `MAX_LEDS` build ceiling (a value over it saturates, never
+  panics). `EF_LED_CONF` grows to 17 bytes; older blocks still load. Thanks to
+  @Curious-r. bcdDevice `0x0780` → `0x0783`.
+
+- **Configurable GPIO presence button (`PRESENCE_PIN`).** The user-presence input
+  can move from BOOTSEL to a dedicated GPIO at compile time (`PRESENCE_PIN=<0..=29>`,
+  active-low with a pull-up by default, or `PRESENCE_ACTIVE_HIGH=1` for a touch
+  sensor / button-to-VCC); the pin is guarded against colliding with the LED and is
+  rejected on a `display` build. One new documented `unsafe`. Thanks to @lpiob
+  ([#17](https://github.com/TheMaxMur/RS-Key/pull/17)). bcdDevice `0x0791` → `0x0793`.
+
+- **`rsk-tui` can export the seed as SLIP-39 shares** (tools/tui 0.2.4). The Backup
+  section gains "Export seed (SLIP-39)" beside the BIP-39 export, revealing the seed
+  as a 2-of-3 Shamir share set (via the in-tree `rsk-slip39` crate) that recombines
+  with `rsk backup restore --scheme slip39`.
 
 ### Changed
 
-- **`rsk-tui` gets a curated colour theme** (tools/tui 0.2.2 → 0.2.3). On
-  truecolor and 256-colour terminals the cockpit now uses a fixed brand palette
-  (teal accent, sage/amber/rust health) with rounded panel borders, accented
-  titles and an explicit selection bar; a bare 16-colour terminal keeps the
-  adaptive named-ANSI colours and the `REVERSED` highlight. Override with
-  `RSK_TUI_TRUECOLOR=1|0`. No change to `--once` / `--json` output.
-- **`rsk-tui` status labels are single-sourced** (tools/tui 0.2.1 → 0.2.2).
-  The `--once` printer had drifted from the cockpit's canonical wording; both
-  now share the model's label mappings, which changes three `--once` labels:
-  seed lock `LOCKED — FIDO ops disabled` → `… disabled until unlock`,
-  secure boot `ENABLED` → `ENABLED (not locked)`, and un-probed applets
-  `—` → `not probed`.
+- **Touch timeout is configurable; phy tag `0x08` now follows pico-fido.** Tag
+  `0x08` (previously an unused presence-button GPIO) now means `PresenceTimeout` —
+  the touch-wait in seconds — matching pico-fido / PicoForge, so a PicoForge config
+  or `rsk hw --touch-timeout <secs>` sets it (absent / `0` keeps the 30 s default).
+  bcdDevice `0x0783` → `0x0784`.
+
+- **`rsk-tui` gets a curated colour theme** (tools/tui 0.2.3). On truecolor / 256-
+  colour terminals the cockpit uses a fixed brand palette with rounded borders and
+  an explicit selection bar; a 16-colour terminal keeps the adaptive named-ANSI
+  colours. Override with `RSK_TUI_TRUECOLOR=1|0`. No `--once` / `--json` change.
+
+- **`rsk-tui` status labels are single-sourced** (tools/tui 0.2.2). The `--once`
+  printer and the cockpit now share the model's label mappings, which changes three
+  `--once` labels (seed lock "… disabled until unlock", secure boot "ENABLED (not
+  locked)", un-probed applets "not probed").
 
 ### Fixed
 
-- **Resident credentials capped the rpId at ~195 bytes.** The EF_RP
-  bookkeeping record (`count ‖ rpIdHash ‖ boxed rpId`) had to fit a 256-byte
-  ceiling, so a resident makeCredential for an rpId longer than ~195 bytes
-  failed with `CTAP2_ERR_KEY_STORE_FULL` while the same rpId registered fine
-  non-resident. `RP_REC_MAX` is now derived from the 253-byte DNS name
-  maximum (314); already-provisioned (smaller) EF_RP records load unchanged.
-  bcdDevice `0x07E9` → `0x07EA`.
-- **Maximal credential-management updates were rejected.** The raw
-  `subCommandParams` cap (`MAX_RAW_SUBPARA`, 256) was smaller than a legal
-  updateUserInformation payload — a 42-byte resident credentialId plus a
-  64-byte user.id, name and displayName encodes to 286 bytes — so such
-  updates failed with `CTAP2_ERR_REQUEST_TOO_LARGE`. The cap is now 384
-  (the 286-byte normative maximum plus a full descriptor `transports` echo).
-  bcdDevice `0x07E8` → `0x07E9`.
-- **Large credentials could never assert.** makeCredential sealed credential
-  boxes up to 640 bytes, but getAssertion's candidate filter and credMgmt's
-  updateUserInformation reseal buffer stopped at 512 — a long-rpId
-  registration succeeded and then every assertion silently skipped it
-  (`CTAP2_ERR_NO_CREDENTIALS`), and user updates failed. One shared ceiling
-  (`credential::CRED_BOX_MAX`, 640) now sizes the create, assert and reseal
-  paths; overlong `user.name`/`user.displayName` are truncated to 64 bytes at
-  create and update (CTAP 2.1 §6.1.2) instead of overflowing the box; and
-  getInfo's `maxCredentialIdLength` reports the real ceiling (640, was 1024).
-  bcdDevice `0x07E7` → `0x07E8`.
+- **Maximal credential requests now fit the credential box.** A registration
+  within every advertised limit (a 253-byte `rpId`, a 64-byte user.id, 64-byte
+  name / displayName and a 127-byte credBlob) could overflow the sealed credential
+  box or its resident bookkeeping and be rejected (`CTAP2_ERR_OTHER` /
+  `KEY_STORE_FULL` / `REQUEST_TOO_LARGE`), and a large credential that did register
+  could then never assert. The three ceilings are now **derived** from the field
+  maxima so they can't drift below what the device advertises: `CRED_BOX_MAX` (748)
+  sizes create / assert / reseal, `RP_REC_MAX` (314) the resident `EF_RP` record,
+  and `MAX_RAW_SUBPARA` (384) a maximal `updateUserInformation`; getInfo's
+  `maxCredentialIdLength` and the published metadata report the real 748, and
+  over-maximum inputs are rejected explicitly with `INVALID_LENGTH`. Older records
+  load unchanged. bcdDevice `0x07E7` → `0x07EC`.
 
 ### Security
 
-- **Security-audit run-8 hardening notes.** Four defense-in-depth items from the
-  run-8 audit, none independently exploitable, applied on top of the two run-8
-  fixes (bcdDevice `0x07DD` → `0x07DE`):
+- **Additional defense-in-depth hardening** (four items, none independently
+  exploitable; bcdDevice `0x07DD` → `0x07DE`):
   - **credProtect is now range-checked.** makeCredential rejected nothing for a
     credProtect value outside `{1,2,3}` and stored it verbatim; `getAssertion`
     enforces protection by exact match, so an out-of-range value silently meant
@@ -104,11 +142,9 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
     fast path already dropped a stale GET RESPONSE tail (`clear_pending`); it now
     also resets a half-accumulated CLA-`0x10` command chain (`clear_chaining`,
     scrubbing it) so an interrupted chain cannot prepend onto a later command.
-- **Security-audit run-8 fixes.** An eighth agentic audit against `db1391a`
-  re-weighted onto the least-audited ground (the FIDO CTAP2 internals and the
-  never-before-audited Yubico-management and rescue applets). All run-1…7 fixes
-  were re-verified to hold; two missing-authorization defects were found and
-  fixed in the two utility applets (bcdDevice `0x07DC` → `0x07DD`):
+- **Missing-authorization fixes in the Yubico-management and rescue applets**
+  (two defects in never-before-audited utility applets; bcdDevice `0x07DC` →
+  `0x07DD`):
   - **Rescue OTP-fuse writes now require an on-device user-presence confirmation.**
     The two irreversible fuse burns — page-58 access lock (`INS 0x1B` `P1=0x58`,
     `"LOCK58"`) and `ROLLBACK_REQUIRED` (`P1=0x48`, `"ROLLBK"`) — were the only
@@ -123,12 +159,8 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
     enforced, so a USB host could persistently spoof the reported DeviceInfo. The
     write now prompts for on-device confirmation (`6985` if declined), matching
     every sibling applet's write path. (`crates/rsk-mgmt/src/lib.rs`.)
-- **Security-audit run-7 hardening.** A seventh agentic audit against `8506a42`
-  found **no exploitable vulnerabilities** — all run-1…6 fixes were re-verified
-  to hold, and the PIV `GENERAL AUTHENTICATE` state machine and the trusted-
-  display touch/PIN path (this run's focus) held up under empirical tracing. Only
-  three defense-in-depth hardening items were applied (bcdDevice `0x07DB` →
-  `0x07DC`):
+- **PIV and CCID defense-in-depth hardening** (no exploitable vulnerability
+  found; three items; bcdDevice `0x07DB` → `0x07DC`):
   - **PIV `GENERAL AUTHENTICATE` challenge is now bound to its issuing
     algorithm.** A 9B mutual/single-auth challenge issued under one algorithm
     (3DES `chal_len` 8 vs AES `chal_len` 16) could structurally be answered under
@@ -152,8 +184,7 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
     a SELECT to another applet clears the buffer first), but the fast paths now
     call `Dispatcher::clear_pending()` to match ordinary dispatch.
 
-- **Security-audit run-6 hardening.** Fixed the findings from a sixth agentic
-  audit against `28a6678` (bcdDevice `0x07DA` → `0x07DB`):
+- **PIV and OATH authentication fixes** (bcdDevice `0x07DA` → `0x07DB`):
   - **PIV management-key authentication bypass via an encryption oracle
     (critical).** `GENERAL AUTHENTICATE` had a symmetric-algorithm tag-`0x81`
     ("internal authenticate") branch for slot `9B` that returned
@@ -166,7 +197,7 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
     setting `has_mgm` with **zero knowledge of the management key**. That grants
     full, persistent PIV takeover (generate/import/overwrite slot keys, `PUT DATA`,
     rotate the management key, reset PIN/PUK counters). It is a distinct-mechanism
-    sibling of the run-1 mgmt-key bypass; the run-1 `ChallengeKind` binding did not
+    sibling of the earlier mgmt-key bypass, whose `ChallengeKind` binding did not
     cover it. **Fix:** the symmetric tag-`0x81` branch (which has no legitimate PIV
     client) is removed, so the only sanctioned `9B` flows are mutual-witness
     (tag `0x80`) and single-auth (tag `0x81`-empty challenge → tag `0x82` verify).
@@ -177,13 +208,13 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
     subtraction but, unlike `cmd_verify_otp_pin`, did not refuse at the floor —
     once the counter reached 0 it stayed 0 and the PIN comparison kept running on
     every request, an unlimited online brute-force of the store-unlocking OTP-PIN
-    (a residual sibling of the run-3 `CHANGE PIN` finding). **Fix:** both `VERIFY`
+    (a residual sibling of the earlier `CHANGE PIN` finding). **Fix:** both `VERIFY`
     and `CHANGE` now go through a single `spend_and_match_otp_pin` chokepoint that
     refuses at `rec[0]==0`; legitimate recovery after lock-out is `RESET` (which
     wipes the store), not more guesses. **Behavior change:** a correct old-PIN no
     longer recovers a locked-out OTP-PIN via `CHANGE`; use `RESET`.
-- **Security-audit run-5 hardening.** Fixed the findings from a fifth agentic
-  audit against `fefa199` (bcdDevice `0x07D9` → `0x07DA`):
+- **OTP, OpenPGP, U2F and audit-journal hardening** (bcdDevice `0x07D9` →
+  `0x07DA`):
   - **OTP `SLOT_SWAP` access-code bypass (high).** `cmd_swap` was the only
     slot-mutating OTP command that did not check the per-slot access code that
     `cmd_configure`/`cmd_update` enforce: it unsealed both target slots (the seal
@@ -210,8 +241,7 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
     `AUDIT_RING_SLOTS`, so a flash-corrupted meta can't overrun the export buffer.
   - **`BACKUP_EXPORT` docstring corrected** to match behavior (only
     `BACKUP_FINALIZE` seals the window; repeat export before finalize is safe).
-- **Security-audit run-4 hardening.** Fixed the findings from a fourth agentic
-  audit against `bb95cc1` (bcdDevice `0x07D8` → `0x07D9`):
+- **FIDO, OpenPGP and OATH fixes** (bcdDevice `0x07D8` → `0x07D9`):
   - **FIDO `getNextAssertion` user-presence bypass (high).** `getAssertion` armed
     the multi-credential `getNextAssertion` queue during resident discovery
     *before* its user-presence gate, and no path tore the queue down when that gate
@@ -224,7 +254,7 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   - **OpenPGP `GENERATE` OOB panic on a short algorithm attribute (medium).** A
     PW3-written 1–2 byte `C1/C2/C3` DO (`PUT DATA` caps no minimum length) made
     `GENERATE ASYMMETRIC KEY PAIR` index the RSA modulus-size bytes past the slice
-    → panic/reset on every `GENERATE` for that slot. The run-3 clamp only bounded
+    → panic/reset on every `GENERATE` for that slot. The earlier clamp only bounded
     the *over*-long case; both `generate` and `rsa_generate_params` now reject an
     attribute shorter than 3 bytes, matching the guarded sibling `info::slot_algo`.
   - **OATH OTP-PIN counter glitch-hardening (defense-in-depth).** `VERIFY PIN` /
@@ -235,8 +265,8 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
     Added an in-function `retry == 0` check before `pin_data[0] -= 1` (matching
     `verify_pin_at`), so no future caller can underflow the PIN retry budget in a
     release build without overflow-checks.
-- **Security-audit run-2 + run-3 hardening.** Fixed the outstanding findings from
-  two further agentic audits (bcdDevice `0x07D8`; `rsk` 0.3.1; `rsk-tui` 0.2.1):
+- **OpenPGP, OATH and FIDO fixes; `rsk` receipt binding** (bcdDevice `0x07D8`;
+  `rsk` 0.3.1; `rsk-tui` 0.2.1):
   - **OpenPGP `GET DATA` unclamped length → OOB brick (high, ×2 sites).** Both the
     generic top-level Flash DO (`login`/`url`/private DOs) and the `C1/C2/C3`
     algorithm-attribute path returned the value's full stored length, so an
@@ -260,8 +290,7 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
     rejected the 2-byte TLV tag form in OATH `PUT`; hardened the `rsk-tui` audit
     view and `rsk led` against malformed device responses.
 
-- **Security-audit hardening (six-phase agentic audit).** A fresh full-tree audit
-  found and fixed:
+- **Full-tree audit fixes.** Found and fixed:
   - **PIV management-key authentication bypass (critical).** `GENERAL
     AUTHENTICATE` shared one session challenge field between the single-auth
     (plaintext challenge) and mutual-auth (encrypted witness) handshakes, so a
@@ -380,718 +409,6 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
     knob as the firmware instead of assuming 4 MB, so a 16 MiB board is fully wiped.
 
   bcdDevice 0x07D2 → 0x07D3. (`rsk-wipe` is a separate binary and carries no bcdDevice.)
-
-### Added
-
-- **Documentation: a trusted-display guide.** The screen-and-touch build now has its own page
-  ([`docs/guides/display.md`](docs/guides/display.md)) covering the build and flashing, the
-  Approve / Deny anti-phishing prompt, on-screen PIN entry (built-in UV + CCID pinpad), the
-  Passkeys and Apps browsers, Settings, and the security model.
-
-- **Trusted-display: every PIN screen names which credential it's asking for, and a fresh
-  device offers to set a PIN.** The on-screen PIN pad now titles each entry with the
-  credential it collects — **Device PIN**, **FIDO PIN**, **PIV PIN** / **PIV PUK**, or the
-  OpenPGP PINs — so the four independent PINs can no longer be confused (the New / Confirm /
-  current step moves to the caption line beneath, keeping the scope label fixed at the top).
-  And on a fresh, PIN-less device the panel shows a one-time **Set a PIN?** prompt at first run
-  (*Set a PIN* / *Continue without PIN*); choosing to continue without one is remembered (a
-  flag in the `EF_DISPLAY` record, forward-compatibly extended), so the offer isn't repeated
-  until a factory reset. bcdDevice 0x07CB → 0x07CC.
-
-- **Trusted-display + PIV: set a PIN-protected random management key on the panel (ykman
-  `--protect`).** Settings → Security → PIV PIN gains a **Protect mgmt key** action: the device
-  generates a fresh random AES-256 management key, seals it, and marks it PIN-protected, so a
-  host (`ykman piv …`) can then use it with just the PIV PIN — you never have to carry the
-  24-byte key. The applet now serves the YubiKey ADMIN-DATA (`5FFF00`) and PRINTED (`5FC109`)
-  objects: the management key is read back from PRINTED only after a PIN VERIFY **and** only once
-  protected (a default/plain key is never PIN-readable), and it is synthesized from the sealed
-  auth slot — there is no second copy at rest. `ykman piv access change-management-key --generate
-  --protect` now works over USB too. **Security:** once protected, the PIV PIN alone grants PIV
-  admin (it unlocks the random key) — the panel states this plainly and gates the action behind
-  the device PIN and a deliberate hold. bcdDevice 0x07CA → 0x07CB.
-
-- **Trusted-display: change the PIV PIN and PUK, and unblock a blocked PIN, on the panel.**
-  Settings → Security gains a **PIV PIN** entry that opens a sub-menu — *Change PIN*,
-  *Change PUK*, and *Unblock PIN* (reset a PIN blocked by too many wrong tries, using the PUK),
-  so PIV PIN management no longer needs a host. Each op is gated by the current PIN/PUK exactly
-  like the host CHANGE REFERENCE DATA / RESET RETRY APDUs (no management key); the PIV applet's
-  own retry counter is shown and enforced, and a blocked PIN/PUK shows the lockout notice. The
-  PIN/PUK are stored padded to the 8-byte `0xFF` PIV wire form, so a host VERIFY (ykman /
-  yubico-piv-tool, which always pad) accepts a panel-set value — a host-tested round-trip locks
-  this in. The change / unblock logic moved into host-tested `rsk-piv` functions shared with the
-  APDU handlers. The PIV *management key* stays host-only for now (a 24-byte AES key can't be
-  typed on a numeric pad). bcdDevice 0x07C9 → 0x07CA.
-
-- **Trusted-display: the brightness, display-sleep and touch-timeout settings persist across
-  reboots.** Edits made in Settings → Display used to reset to their defaults on the next power
-  cycle; they now survive it. Brightness and the display-sleep timeout are stored in a new
-  `EF_DISPLAY` flash record (a 3-byte block — `[brightness, sleep_secs]` — with a pure,
-  host-tested + Kani-proved codec in `rsk-ui`, read at boot so the panel comes up at the saved
-  brightness with no full-bright flash). The touch timeout is written back to `EF_PHY`'s
-  existing `PresenceTimeout` tag — the same field `rsk hw --touch-timeout` and the boot path
-  already read and write — so there is one source of truth (last writer wins; an on-panel edit
-  snaps to the menu's choices). The record is rewritten once when you leave Settings (not per −/+
-  tap, and only when a value actually changed), and an older/newer record loads
-  forward-compatibly. bcdDevice 0x07C8 → 0x07C9.
-
-- **Trusted-display: the on-device keygen spinner animates during the RSA prime search.** The
-  *Generating…* screen's indicator arc now spins while an on-device RSA key is generated, so it
-  reads as actively working rather than hung — important for RSA-4096, whose search can take a
-  minute-plus. The search is a blocking dual-core busy-loop that owns the core, so the panel
-  can't repaint from a loop; instead a new `run_rsa_search_progress` hook (invoked once per prime
-  candidate, off the keygen state) drives the arc, throttled to ~100 ms so the SPI repaints don't
-  slow the search. bcdDevice 0x07C6 → 0x07C7.
-
-- **PIV: RSA-3072 and RSA-4096 keys, including on-device generation (display builds).** PIV gained
-  RSA-3072/4096 across generate, import, sign/decrypt, attestation and metadata — the applet's
-  buffers were lifted off their long-standing RSA-2048 ceiling (the at-rest seal, the on-card
-  X.509 builder, the GENERAL AUTHENTICATE and metadata paths). On the trusted display, the
-  on-device **Generate key** chooser (PIV → Retired & F9) now offers RSA via a size sub-picker
-  (**2048 / 3072 / 4096**) alongside the four curves. RSA runs the firmware's **dual-core** prime
-  search (the same one the USB GENERATE uses) behind a *Generating…* screen — the panel freezes
-  while it runs (a few seconds for 2048, up to a minute-plus for 4096) with USB / CCID keepalives
-  still flowing on interrupts. Same authorisation and fence as the curve path: device PIN (when
-  set) + a deliberate hold, empty retired slots only (add a key, never overwrite), self-signed
-  cert + sealed key written exactly as a host GENERATE. RSA-1024 (weak / FIPS-disabled) is still
-  not offered on-device. bcdDevice 0x07C4 → 0x07C6.
-
-- **PIV: Ed25519 and X25519 keys (algorithm ids `0xE0` / `0xE1`, Yubico 5.7 PIV).** The PIV
-  applet now generates, imports and uses Curve25519 keys alongside RSA and the NIST curves.
-  **GENERATE** mints an Ed25519 key with an RFC 8410 self-signed certificate (id-Ed25519 SPKI,
-  PureEdDSA over the TBS); X25519 is key-agreement-only and cannot self-sign, so it is stored
-  with no auto-certificate (a host/CA provisions one later via PUT DATA). **GENERAL
-  AUTHENTICATE** signs with Ed25519 (the raw message, bare 64-byte signature) and performs
-  X25519 key agreement (`ykman piv calculate-secret`); **IMPORT** accepts the raw 32-byte
-  seed / scalar (yubikit tags `0x07` / `0x08`); **GET METADATA** and attestation cover both.
-  Interoperates with `ykman`. The same curves are offered by the on-device **Generate key**
-  chooser on display builds (four rows now: P-256 / P-384 / Ed25519 / X25519). EdDSA is FIPS
-  186-5-approved and X25519 is widely deployed, so the `fips-profile` does not restrict either.
-  No proprietary wire change (standard NIST SP 800-73 / Yubico PIV). bcdDevice 0x07C3 → 0x07C4.
-
-- **Trusted-display applet detail screens — OATH / OpenPGP / PIV, plus on-device PIV key
-  generation (display builds).** The applet hub gained the detail screens that the overviews
-  only hinted at. **OATH:** each credential row now drills into a detail showing its type
-  (TOTP / HOTP), HMAC algorithm, digit count, TOTP step (the `<period>/` name prefix, default
-  30 s) and touch gate — still no code (the device has no clock). **OpenPGP:** the overview
-  gained a **Card holder** row opening a detail card with the public cardholder name, login,
-  URL and language (all plaintext, no PIN). **PIV:** the overview gained a **Retired & F9** row
-  opening a paged list of the populated retired key-management slots (82–95) and the F9
-  attestation slot, each drilling into the shared slot-detail. From that screen a **Generate
-  key** action creates an EC key (P-256 / P-384) on-device into the next free retired slot —
-  gated on the device PIN (when set) and a deliberate hold, EC only (RSA's prime search would
-  block the panel), and restricted to *empty* retired slots so it can only add a key, never
-  overwrite one (the four primary slots and F9 stay USB-managed; there is no management-key auth
-  — physical presence at the panel is the authorisation). The read paths are plaintext / device
-  metadata; no PIN, DEK or host session. No protocol or wire-format change. bcdDevice 0x07C1 →
-  0x07C3 (the **Card holder** row carries a new person `User` glyph; the generate-confirm screen
-  is a chrome-less modal so its cancel chevron no longer overlaps the status bar).
-
-- **Trusted-display Settings regrouped by domain (display builds).** The Settings root was a
-  flat list of five unrelated rows; it is now three domains — **Display** (Brightness, Display
-  sleep, Touch timeout), **Security** (the existing PIN / Audit / Backup / Factory-reset
-  sub-page), and **Firmware** last (a rarely-touched maintenance action). The three panel knobs
-  moved under a new Display sub-page, each still drilling into its −/+ adjust page (which now
-  backs out to Display, not the root). No protocol or wire-format change. bcdDevice 0x07C0 →
-  0x07C1.
-
-- **Trusted-display polish wave 2 — grouped cards, Settings nav, service icons, motion
-  (display builds).** Every list now reads as one grouped surface with hairline dividers — the
-  Home status card (USB / device PIN / passkey count), the Passkeys and service-detail lists,
-  the Apps / OpenPGP / PIV / OATH lists, the audit log, and the Backup fact rows — instead of a
-  stack of separate pills (the design's grouped-card look). **Settings** is now a full peer of
-  the other tabs: its root screen carries the four-tab bottom nav (Settings active) so you can
-  switch tabs from it, rather than only backing out to Home. Service rows gain the design's icon
-  chip behind each glyph, and an SSH relying party shows a new terminal (`>_`) glyph instead of
-  the generic globe; the boot splash gains a shield brand mark. The screens the design animates
-  now move: the **"Working…"** spinner arc rotates, the locked **"Touch to unlock"** hint
-  breathes, and the rename caret blinks (each a small in-place repaint on the display loop, so
-  the idle hot path and its flicker-free guarantees are untouched). No protocol or wire-format
-  change. bcdDevice 0x07BF → 0x07C0.
-
-- **Trusted-display UI polish (display builds).** A fit-and-finish pass over the on-device
-  screens. Over-long labels and titles now end in an ellipsis ("Authenticat…") instead of being
-  cut mid-glyph — fixing a text-measurement bug where a label that "fit" by a pixel had its last
-  glyph's right edge clipped (a `d` rendered as a `c`): proportional width is now measured to the
-  rightmost ink (left bearing + ink width), not the ink width alone, so a clip is correct across
-  every screen. The applet item counts read grammatically ("1 slot", not "1 slots"). The busy
-  **"Working…"** status screen is a blue ring-and-arc spinner on a dim track instead of a flat
-  filled disc. The brightness / touch-timeout / display-sleep adjust pages back out via the
-  standard title-bar chevron like every other screen, dropping the odd full-width grey "Back"
-  slab. No protocol or wire-format change. bcdDevice 0x07BE → 0x07BF.
-
-- **On-device OpenPGP / PIV / OATH screens behind a unified "Apps" hub (display builds).**
-  The bottom navigation gains a fourth tab — **Apps** (a 2×2 grid glyph) — between Passkeys and
-  Settings, and every tab now carries a caption under its icon (the four tabs are tighter at
-  60px each). The Apps tab opens an **applet chooser** (OpenPGP / PIV / OATH, each with a live
-  item count) that drills into a read-only screen per applet. **OpenPGP** lists the three key
-  slots (Signature / Encryption / Authentication) with each one's algorithm (Ed25519, Cv25519,
-  NIST P-256, RSA 2048, …), the signature counter, and the remaining PW1/PW3 attempts; a present
-  slot drills into a detail card showing the algorithm, touch policy, whether a generation time
-  is recorded, and the full 40-hex SHA-1 fingerprint. **PIV** lists the four primary slots
-  (9A/9C/9D/9E) with each one's algorithm (or "cert" when only a certificate is stored) and the
-  remaining PIN/PUK attempts; a populated slot drills into a detail card with the PIN policy,
-  touch policy, key origin (Generated / Imported), and certificate presence. **OATH** lists the
-  stored credentials (label, TOTP/HOTP, and a padlock when touch-gated); no code is shown — the
-  device has no clock for time-correct TOTP, so codes are still read in the host app. Every fact
-  is read **plaintext / device-sealed without a PIN** (new host-tested `read_info` readers in
-  `rsk-openpgp` / `rsk-piv` and a `for_each_cred` enumerator in `rsk-oath`); no key material,
-  PIN, or public point is ever surfaced (the OpenPGP public key isn't reconstructable without a
-  PIN, by design). All screens are read-only — no on-device mutation, so no PIN gate. **Every
-  OpenPGP / PIV slot row is tappable** and drills into its own detail, even when empty — an
-  unprovisioned slot's screen names the slot's role (e.g. "Signs data and commits",
-  "Authentication / login") and how to set it up over USB, rather than being an inert row. No
-  protocol or wire-format change. bcdDevice 0x07BC → 0x07BE.
-
-- **Design-fidelity polish of the trusted-display UI (display builds).** A visual pass that
-  brings the on-screen widgets closer to the handoff and reads more finished. The
-  hold-to-confirm buttons are now a **solid fill** (primary blue / danger red) with a lighter
-  progress wash growing over them, instead of a dark outline that filled in. Every list /
-  settings row is a **bordered card** (1px hairline + 11px corners) rather than a borderless
-  tile, and a destructive row is red-tinted. The idle **Home** screen shows a calm white
-  "Ready" beside the status check and a **three-row status card** backed by live data — USB,
-  whether a **device PIN** is set, and the **resident-passkey count** (read from a cache
-  refreshed only at modal boundaries — boot, wake, a closed tab — never per idle frame, so it
-  never triggers a per-paint flash scan). The **Factory reset** confirm is a proper destructive
-  ceremony — a red warning disc, a danger-red triangle (not amber), an "Erase RS-Key?" headline,
-  and a red-dot list of what gets wiped. The muted/caption text tiers are tightened (audit
-  timestamps and row glyphs sit one shade dimmer, matching the design hierarchy). No protocol or
-  flag change. bcdDevice 0x07BA → 0x07BB.
-
-- **Redrawn icon set for the trusted-display UI (display builds).** The vector glyphs are cleaner
-  and instantly readable at the small list-row (14px) and nav (20px) sizes they are used at, not
-  just the large headline sizes. The previous "mirror the buffer" symmetry pass was the root of
-  the breakage — its union fill turned a ring (clock, gear) into a solid blob and erased centred
-  axis strokes on an even box (the USB cable, the globe meridian, the sun's rays). It is replaced
-  by symmetry **by construction** plus two guarantees in the renderer: a non-destructive symmetry
-  pass (mirror the canonical half, restore the centre band) that makes a claimed axis exact
-  without filling, and an **auto-centre** step that shifts each glyph's ink to equal margins on
-  every side. Several glyphs were redrawn so they read at a glance — USB (plug + cable), globe
-  (disc + equator + meridian), gear (open bore vs the sun's solid core), eye, lifebuoy, shield,
-  house, clock. No protocol or flag change. bcdDevice 0x07BB → 0x07BC.
-
-- **On-device PIN entry for OpenPGP & PIV over CCID (secure pinpad, experimental; display builds).**
-  The trusted-display build now advertises itself as a **CCID pinpad reader** (`bPINSupport` =
-  VERIFY) and handles `PC_to_RDR_Secure` (`0x69`): when the host driver asks for a secure PIN
-  verify, the **PIN is typed on the device's own touchscreen** and the device assembles and runs
-  the VERIFY APDU itself, so the secret is never placed in a USB transfer. Works with **GnuPG**
-  scdaemon (OpenPGP PW1/PW2/PW3) and **OpenSC** (PIV application PIN). The pad shows which PIN it
-  is collecting; a wrong PIN returns the card's real status word (`63 Cx` tries left / `69 83`
-  blocked), and a cancel/timeout on the pad maps to the CCID `bError` the host surfaces as
-  cancelled/timed-out. The CCID transport streams time-extensions for the whole on-screen entry,
-  so the host transaction doesn't time out. Honest scope: this keeps the PIN off the wire **when
-  the host uses pinpad mode** — it does not, on its own, prevent a host that chooses to send a
-  plaintext VERIFY; an opt-in device-enforced mode is a planned follow-up. Host-tested
-  structure-parse + APDU-assembly logic lives in the new `rsk-usb` `secure_pin` module; the
-  firmware is the glue that collects the PIN and dispatches. The PIN pad's title now names
-  which PIN it is collecting ("OpenPGP Sign PIN" / "PIV PIN" …); a title too wide for the
-  header band **scrolls as a marquee** so it never collides with the back chevron (composited
-  into a 1-bit off-screen mask and blitted in one transaction, so the scroll is flicker-free).
-  The Settings list also drops its row below the title-bar back chevron (a clear gap so a reach
-  for back can't hit the first item) and removes the redundant **Lock now** row (the UI
-  auto-locks on sleep). bcdDevice 0x07B6 → 0x07BA.
-- **On-device Firmware screen with reboot-to-update over USB (experimental).** The trusted
-  display's Settings list now opens a **Firmware** screen (replacing the read-only device-info
-  page): the installed `bcdDevice` build shown inline on the row and as a headline, the chip
-  serial, and an honest update story. This authenticator can't discover firmware updates on its
-  own, so the screen does not fabricate a "newer version available" — it states the real
-  mechanism: the RS-Key host app delivers an image **over USB**, and — **when secure boot is
-  fused** — the RP2350 boot ROM **verifies its signature before it runs**. The screen reads the
-  device's real OTP secure-boot state and only claims that check when it is on, otherwise
-  warning that updates are unverified (the trusted display never vouches for a check the
-  silicon isn't doing). A deliberate (blue) **Hold to update** queues a
-  secure reboot into the BOOTSEL bootloader so the host can flash; the reboot routes through the
-  worker (not a raw ROM call from the display task) so the live RAM secrets — the FIDO auth
-  state and the DRBG — are scrubbed before the device drops to BOOTSEL, and the worker services
-  the request on its idle button-poll tick so it lands without waiting on a host command. New
-  `Glyph::Cpu`, `render_firmware`/`render_rebooting`, and a `run_firmware` hold sub-flow.
-  bcdDevice 0x07B5 → 0x07B6.
-- **On-device SLIP-39 Shamir share display — split the seed on the screen (experimental).**
-  The trusted-display recovery reveal now offers a **format chooser**: a single BIP-39 phrase
-  (as before), or **`T`-of-`N` SLIP-39 Shamir shares** rendered **on the device** so no share
-  ever crosses USB. After the one device-PIN re-auth, **Shamir shares** opens a `T`/`N` picker
-  (default **2-of-3**, configurable on-panel), then a deliberate hold over the warning, then
-  each 33-word share page-by-page with a "Share i/N" title and a global pager. The shares are
-  split from the device DRBG and are **bit-for-bit recombinable by `rsk backup restore
-  --scheme slip39`** (single group, non-extendable, iteration exponent 1, empty passphrase —
-  matching the host `shamir_mnemonic`), so any `T` of the `N` written-down shares reconstruct
-  the FIDO seed. The seed is wiped the instant the shares are derived; the share words on exit.
-  The SLIP-39 encode lives in a new host-tested `rsk-slip39` crate whose 1024-word wordlist is
-  checksum-pinned and whose output is verified against the host library bit-for-bit (golden
-  vectors), with a Kani proof bounding the word indices. Display flavor only; disabled on a
-  `fips-profile` device (non-exportable seed). bcdDevice 0x07B4 → 0x07B5.
-- **On-device recovery-phrase display — the seed never crosses USB (experimental).** The
-  trusted display can now show the device's **24-word BIP-39 recovery phrase on its own
-  screen**, derived **on the device** from the master seed, so the seed is never exported to
-  a host to be backed up. From Settings → Security → Backup (while the backup window is open
-  and **a device PIN is set** — the master secret is never surrendered on a bare gesture),
-  **Show recovery phrase** re-enters the device PIN, takes a deliberate hold over a "no one
-  watching?" warning, then paints the 24 words (two numbered pages). The seed is
-  zeroized the instant the words are derived; the word indices are zeroized on exit and the
-  screen auto-clears on idle (walked-away guard). A **Seal backup** action closes the one-time
-  window on-device (hold-gated) so the phrase can no longer be shown or exported until a
-  factory reset — mirroring the host `BACKUP_FINALIZE`. The existing USB seed-export path is
-  unchanged (it coexists). The on-device BIP-39 encode lives in a new host-tested `rsk-bip39`
-  crate whose embedded English wordlist is checksum-pinned to the canonical BIP-39 list and
-  whose output is verified against the host `mnemonic` library bit-for-bit (so on-device
-  encode == host `rsk backup restore`); a Kani proof bounds the word indices. Display flavor
-  only; disabled on a `fips-profile` device (non-exportable seed). bcdDevice 0x07B3 → 0x07B4.
-- **Seed-backup status screen on the trusted display (experimental).** Settings → Security
-  now has a read-only **Backup** page showing the seed-backup state the device genuinely
-  tracks: whether a recovery seed is present and whether the one-time export window has been
-  **sealed**. A colour-coded status plate reads **Review needed** (export window still open),
-  **Export sealed** (window closed), **No recovery seed**, or **Restore-only** (a
-  `fips-profile` device, where the seed is non-exportable), over two fact rows and a hint that
-  the host app drives the backup over USB. It is honest about the real backend — there is
-  **no** fictional "N of M recovery shares" state, and the screen states only the export
-  **window** state, never claiming a recovery copy exists (the device cannot verify an export
-  happened): backup is a one-time seed export over the host MSE channel, then sealed.
-  Read-only (no on-device action, shows no secret). The Security row reflects the window state
-  as "Sealed" / "Review". Display flavor only. bcdDevice 0x07B2 → 0x07B3.
-- **Dedicated device PIN, separate from the FIDO clientPIN (experimental, display flavor).**
-  The trusted display now has its own **device PIN** (`EF_DEVICE_PIN`, device-sealed, its
-  own retry counter) that gates **local control** — unlocking the on-device UI, deleting a
-  passkey on-device, and factory reset — independent of the FIDO clientPIN. Settings →
-  Security now offers **two** set/change flows: **device PIN** and **FIDO PIN** (each
-  verifies its own current PIN first). The built-in-UV WebAuthn pad stays the FIDO clientPIN
-  (CTAP requires it). The device boot-locks when a device PIN is set. A forgotten device PIN
-  is recoverable by a host `authenticatorReset` (touch-only), which now also clears
-  `EF_DEVICE_PIN` — mirroring how the FIDO PIN is recovered, since the lock gates on-device
-  Settings. The FIDO clientPIN storage/verify path is byte-unchanged (the verify/store cores
-  were parameterized by record FID; the standard screenless key is unaffected). bcdDevice
-  0x07B0 → 0x07B2 (0x07B2 fixes a RefCell double-borrow panic when opening the Settings
-  page — the two PIN-set flags are now read under one borrow).
-- **PIN-entry reveal (eye) toggle on the trusted-display pad (experimental).** The
-  on-screen PIN pad now carries an **eye toggle** beside the masked entry: tapping it shows
-  the digits you have typed (and tapping again re-hides them), so you can check the PIN
-  before committing — on **every** PIN screen, since the pad is shared by built-in UV, the
-  unlock / delete / factory-reset gates, and set/change PIN. A revealed PIN **auto re-masks
-  after a short idle** so a device left mid-entry doesn't keep the digits lit, and a PIN
-  longer than the field shows a "+" overflow marker. The digits are only ever held in the
-  firmware's buffer and painted transiently while revealed — never stored in the UI crate,
-  never sent to the host. Display flavor only. bcdDevice 0x07AD → 0x07B0.
-- **Add-passkey registration screen on the trusted display (experimental).** A WebAuthn
-  **registration** (`makeCredential`) now shows the design's **"Save new passkey?"** card
-  — a placeholder tile, the relying party + account being enrolled, and **Cancel** / **Save**
-  (a tap; the deliberate hold stays reserved for sign-in) — instead of a bare Approve/Deny.
-  The untrusted rp / account are clipped to the panel (centred when they fit, else
-  left-clipped) so a long rp id can never overrun the trusted display. The **approve**
-  screen (FIDO sign-in plus the generic OpenPGP/PIV/OATH/OTP touch prompts) is re-skinned to
-  the status/title chrome — shield + operation title + relying-party header + amber caution —
-  and the hold button is widened so "Hold to approve" sits fully inside it. Routed by a typed
-  `ConfirmKind` (`Generic` / `Register`) on the shared `Confirm` context — a screenless key
-  ignores it and is byte-unaffected. The small **back / cancel** affordances (title bar,
-  the chrome-less modals, the PIN pad) are now drawn as **outlined buttons** with a larger
-  chevron, so the tappable bounds are visible rather than a lone glyph (the PIN pad's title
-  is re-centred between that button and the lock so a wide "Confirm PIN" can't slide under
-  either). Display flavor only. bcdDevice 0x07A9 → 0x07AD.
-- **PIN-entry indicator + "tries remaining" on the trusted display (experimental).** The
-  on-device PIN pad now matches the design's `enterpin` / `createpin` / `confirmpin`
-  screens: the entry row shows a row of **dim placeholder dots for the minimum length**
-  that fill with the accent colour as digits are typed (a longer PIN grows past them),
-  instead of a bare growing run. The on-device PIN gates — unlock, and the delete /
-  factory-reset / change-current-PIN prompts — open with a muted **"N tries remaining"**
-  line so the remaining attempts before lockout are visible up front (read from the same
-  `EF_PIN` counter without spending a try); a wrong entry still swaps it for the
-  danger-coloured "Wrong PIN, N left". The on-device **Set / Change PIN** steps gain
-  matching muted hints — **"Choose a PIN"** then **"Re-enter to confirm"**. Pure on-panel
-  feedback — no auth logic changed. Display flavor only. bcdDevice 0x07A8 → 0x07A9.
-- **Rename a passkey on the trusted display (experimental).** A relying party's detail
-  screen gains a pencil affordance (top-right of the title bar) that opens a character-wheel
-  editor to set a short **device-local nickname**, shown in place of the rpId on both the
-  detail screen and the Passkeys list. The nickname is a display-only label, **sealed at
-  rest** (ChaCha20-Poly1305 under the device seed, rpIdHash as AAD) in a new EF_RPNICK
-  region parallel to EF_RP; it is wiped by `authenticatorReset` and on-device factory reset,
-  and dropped automatically when its RP loses its last credential. Crucially it **never
-  touches the credential box**, so — unlike CTAP `updateUserInformation`, which reseals the
-  box and rotates the signing key — renaming a passkey here leaves it fully working. Because
-  it is device-local, the nickname is **not** reflected in host credential managers. Display
-  flavor only. bcdDevice 0x07A7 → 0x07A8.
-- **List paging on the trusted display (experimental).** The Passkeys list, a relying
-  party's accounts, and the audit log now **page** through long sets instead of silently
-  showing only the first few rows: a `‹` Prev / `›` Next bar with a "page / pages"
-  indicator appears whenever a list spans more than one page (the end arrow dims when
-  there is no further page). One reusable pager drives all three screens; the single-page
-  case is unchanged (the item-count footer). Display flavor only. bcdDevice 0x07A6 →
-  0x07A7.
-- **On-device audit log (trusted display, experimental).** A new **Settings → Security →
-  Audit log** screen shows the most recent device journal events — sign-ins, passkeys
-  added, PIN changes, lockouts, lock changes, config changes, backups, factory resets and
-  power cycles — newest first, each with a colour-coded status dot and, for events in the
-  current power cycle, a compact "time ago" (the device has no wall clock, so entries from
-  earlier boots show no time). Read-only: the full tamper-evident journal, with
-  attestation, is still exported and verified host-side over `authenticatorVendor`. The
-  reader is a lean visitor over the journal ring (no alloc, no CBOR), mirroring the
-  passkeys browser. Display flavor only. bcdDevice 0x07A5 → 0x07A6.
-- **On-device success screens (trusted display, experimental).** The three device-driven
-  ceremonies that previously snapped straight back to the prior screen now end on a
-  brief confirmation, matching the design's "pop" moments: a granted **Approve** shows
-  a green-check **"Approved"** for ~0.4 s before the host ceremony resumes (auto-dismissing,
-  so it barely delays the host); an on-device **passkey delete** shows **"Passkey deleted"**
-  with a **Done** button; and a completed **factory reset** shows a grey rotate
-  **"RS-Key erased / Restarting…"** before the device reboots into its fresh state. The
-  success circle animates the design's scale-up "pop". Pure on-panel feedback — no auth
-  logic changed. Display flavor only. bcdDevice 0x07A4 → 0x07A5.
-- **On-device Set / Change PIN (trusted display, experimental).** The device PIN can now
-  be set and changed entirely on the panel — no host. A new **Settings → Security**
-  sub-page offers **Set PIN** (when none is set) or **Change PIN** (which first verifies
-  the current PIN on the on-screen pad), then prompts for the new PIN twice; the two
-  entries must match before it is stored. The PIN never leaves the device, and it is
-  written as the **same `EF_PIN` verifier** (device-sealed, fresh retry budget) the host
-  clientPIN setPIN/changePIN path stores — so afterwards the host sees a clientPIN exactly
-  as if it had been set over USB, and a satisfied `minPINLength` policy (the pad enforces
-  the floor and shows it) clears any pending forced-change marker. To make room without
-  shrinking the touch targets, the destructive **Factory reset** moved from the Settings
-  root into this Security sub-page (one tap deeper), matching the design's settings →
-  security flow. A wrong entry on any on-device PIN pad (unlock, delete, factory reset,
-  and the set/change current-PIN step) now shows a "Wrong PIN, N left" caption with the
-  remaining attempts before lockout instead of a silent re-prompt, and a New ≠ Confirm
-  mismatch shows "PINs don't match". When the retry budget is spent, a dedicated "PIN
-  blocked" screen explains the lockout and that recovery is a host-side reset (every
-  on-device action shares the one blocked `EF_PIN` counter). Display flavor only.
-  bcdDevice 0x07A1 → 0x07A4.
-- **Trusted-display lock / unlock (on-device UI lock, experimental).** The panel can
-  now be **locked** so the on-device UI — the passkeys browser and Settings — needs the
-  device PIN to reopen, showing a "Locked / Touch to unlock" screen; a tap opens the
-  on-screen PIN pad and a correct PIN (verified against the same `EF_PIN` retry ladder
-  as every other on-device gate) unlocks it. It locks **at boot**, on a new **Settings →
-  Lock now** action, and automatically when the display sleeps on inactivity — all when a
-  PIN is set, so a security key comes up requiring the PIN to reach its on-device UI. This
-  gates **only** the on-device UI: host CTAP / WebAuthn ceremonies are unaffected (they
-  paint their own trusted Approve / built-in-UV prompts and have their own verification),
-  so a locked key still works as a security key. Display flavor only; no-op when no device
-  PIN is set (nothing to unlock with). bcdDevice 0x079E → 0x07A1.
-- **Trusted-display sleep (image-retention guard, experimental).** The panel now
-  blanks itself — backlight off and the glass cleared — after an inactivity timeout,
-  so a static screen can't burn a ghost into the IPS panel. A touch anywhere or the
-  **sleep/wake button** restores it (the first touch/press only wakes; it isn't read
-  as a tap), and an incoming host ceremony wakes it so the trusted prompt is always
-  visible. The button is a power-button-style toggle — pressing it while the screen is
-  on blanks it immediately, and it works from **any** on-device screen (Home, Passkeys,
-  Settings, the per-RP detail, and the Locked screen), not just Home. The timeout is set
-  on-device under **Settings → Display
-  sleep** (15 s … 5 min, or Off; runtime, reseeds to 1 min on reboot). The button is
-  the board's **BAT_PWR** button (GPIO25) by default and is build-configurable —
-  `WAKE_PIN=<gpio>` picks another, `WAKE_PIN=none` makes it touch-only, and
-  `WAKE_ACTIVE_HIGH=1` flips the polarity; a `WAKE_PIN` that collides with an
-  LCD/touch GPIO is rejected at compile time. Display flavor only. bcdDevice 0x079A →
-  0x079C.
-- **Configurable multi-LED effects engine.** Boards with a chain of addressable
-  WS2812 LEDs now light the whole strip with per-status animated effects —
-  `vapor` (breathing), `bounce`, `flow`, `sparkle`, or `legacy` (the classic
-  on/off blink) — each with its own color, brightness, and speed via `rsk led
-  --effect/--speed`. The number of connected LEDs is a **runtime** setting in the
-  phy record (`rsk hw --led-num <n>`, new PicoForge-compatible TLV tag `0x0E`),
-  bounded by a compile-time `MAX_LEDS` buffer ceiling (`MAX_LEDS` build flag,
-  default 1 — a single onboard LED; a chain sets `MAX_LEDS=N`). A phy count above
-  that ceiling is **saturated, not asserted**, so a
-  stray value can never panic the boot path (the phy record survives factory
-  resets, so a boot panic there would be an unrecoverable loop). `EF_LED_CONF`
-  grows to 17 bytes — `steady, (effect, color, brightness, speed) × 4` — and
-  older 13/9/2-byte blocks still load forward-compatibly. Single-LED boards are
-  unaffected (effects reduce to a static color or the legacy blink). Thanks to
-  @Curious-r for the contribution. bcdDevice 0x0780 → 0x0783.
-- **Trusted-display variant — panel bringup (experimental, opt-in).** A screen +
-  touch variant for the Waveshare RP2350-Touch-LCD-2.8, behind the `display` cargo
-  feature / `firmware-display` nix flavor. The panel is now driven: on the display
-  build the ST7789 (over SPI1) shows a boot splash and then mirrors the device
-  status the onboard LED would otherwise show (idle / working / touch), and the
-  CST328 touch controller (over I2C1) is read and each raw touch is marked on
-  screen — the hardware bringup. The *what to draw* and the *touch-report parse*
-  live in `rsk-ui`, a pure host-tested crate (the on-screen UI model + renderer,
-  the untrusted relying-party-string sanitizer, the Allow/Deny button geometry,
-  with Kani proofs and a recording-target render test). Still to come in later
-  phases: the trusted on-screen Approve/Deny showing the relying party, on-device
-  PIN entry, lock, and settings. A standard key **without** a screen compiles
-  **none** of this — the whole stack (`rsk-ui`, `mipidsi`, `embedded-graphics`) is
-  `dep:`-gated and the gate asserts it is absent from the default firmware
-  dependency tree, so there is no size cost; only the shared `bcdDevice` build
-  counter advances. bcdDevice 0x0784 → 0x0785.
-- **Trusted-display variant — on-screen Approve/Deny (experimental, opt-in).** On
-  the `display` build the panel now gates user presence: when an applet asks for a
-  touch, the screen shows a trusted Approve/Deny prompt that names the operation
-  ("Sign in?", "Register key?", …) and, for FIDO make/getAssertion, the **real**
-  relying-party id and account. A tap on **Allow** confirms; a tap on **Deny** is a
-  genuine refusal (`CTAP2_ERR_OPERATION_DENIED`). This is the anti-phishing payoff:
-  even driven over WebUSB, a signature can't be produced without a physical tap on
-  a screen showing the true rp ("what you see is what you sign"). The Allow/Deny
-  buttons are rounded floating targets with muted (not vivid) colors, inset from
-  the edges with a centre gap — a tap in a margin or the gap approves nothing.
-  Relying-party text is sanitized to bounded printable ASCII before it can reach
-  the framebuffer (terminal-escape / homoglyph / overlong tricks can't survive).
-  The confirmation context is threaded through every applet's `UserPresence` via a
-  new dependency-free `rsk_sdk::Confirm`; the standard (button) key ignores it and
-  is byte-for-byte unchanged. CTAPHID_CANCEL and the configurable touch timeout are
-  honored during the wait, and USB keepalives keep flowing (the on-screen wait is a
-  busy-wait on the thread executor, preempted by USB on the interrupt executor).
-  bcdDevice 0x0785 → 0x0786.
-- **Trusted-display variant — on-device PIN / built-in user verification
-  (experimental, opt-in).** On the `display` build the device can now verify the
-  user with a PIN typed on its **own** screen, so the PIN never crosses the host —
-  defeating a host-side keylogger, the user-verification counterpart to Phase 2's
-  "what you see is what you sign". getInfo advertises `options.uv`, and clientPIN
-  gains the standard built-in-UV subcommands `getPinUvAuthTokenUsingUvWithPermissions`
-  (0x06) and `getUVRetries` (0x07): the platform asks the device to verify, the
-  on-screen numeric pad collects the PIN (masked — only dot-per-digit is drawn,
-  each key debounced to release, OK gated at `minPINLength`), it is checked against
-  the same `EF_PIN` clientPIN already uses, and a `pinUvAuthToken` is minted — so
-  makeCredential / getAssertion are unchanged (a token is a token however it was
-  earned, and the Phase 2 Approve/Deny still names the relying party afterwards).
-  Built-in UV shares the clientPIN retry budget, so a wrong on-screen PIN is
-  `UV_INVALID` and spends one retry; an exhausted budget is `UV_BLOCKED`; tapping
-  Cancel declines without spending one. A standard key **without** a screen compiles
-  none of this and is byte-for-byte unchanged — the new `UserPresence` methods
-  default to "no built-in UV", so getInfo omits `uv` and 0x06/0x07 answer
-  `UnsupportedOption`. The pad geometry + hit-test live in `rsk-ui` (host-tested +
-  Kani-proved disjoint). NB the display build's getInfo therefore advertises `uv`,
-  a deliberate divergence from the shared metadata statement, which describes the
-  standard (screenless) key. The pad repaints only its masked-entry row per
-  keystroke — a tiny partial update, not a full-frame redraw — so typing a digit
-  does not flash the whole screen; and the ambient status screen is held back
-  briefly between the pad and the Approve/Deny prompt so it does not blip the
-  idle/working screen in the hand-off. bcdDevice 0x0786 → 0x0789.
-- **Trusted-display variant — on-device settings menu (experimental, opt-in).** On
-  the `display` build the idle screen is now interactive: a **MENU** button (shown
-  only while idle) opens an on-device settings menu — no host involved. It offers
-  **Brightness** (five live backlight levels; GPIO16 is now driven as PWM instead of
-  a plain on/off output), **Touch timeout** (step the presence-wait between
-  10/20/30/60/120 s live), and a read-only **Device info** page (firmware
-  `bcdDevice` + chip serial). The menu is a synchronous on-panel interaction that
-  shares the confirm/PIN modals' executor, so while it is open the worker is parked
-  (a host command waits behind it); it auto-closes after 15 s without a tap so a
-  walked-away user can't wedge the host. These settings are **runtime-only** for now
-  — a reboot re-seeds the touch timeout from the phy record and brightness returns to
-  full; persisting them across boots is a later, deliberate flash-format change. The
-  menu geometry, hit-tests and value steppers live in `rsk-ui` (host-tested +
-  Kani-proved disjoint); a standard key **without** a screen compiles none of it and
-  is byte-for-byte unchanged. bcdDevice 0x0789 → 0x078A.
-- **Trusted-display variant — redesigned UI + hold-to-approve (experimental,
-  opt-in).** The `display` build moves to a consistent on-device design language: a
-  bottom **navigation bar** (Home / Passkeys / Settings) replaces the single corner
-  menu button, a shared list-row / header / card system, vector icon glyphs drawn
-  from primitives (no bitmap assets — and, since the device only knows a relying
-  party's id string, a generic globe + the rpId rather than a brand logo), and a
-  true-black palette with a cyan accent. The Home tab shows the device status; the
-  Approve prompt is restyled with a shield, the relying-party card and a plain
-  "approve only if you started this" caution. Most importantly, **approve is now a
-  deliberate hold, not a tap**: the approve button fills as you hold it (~0.8 s) and
-  an accidental brush — or sliding off — resets it, so a signature needs a sustained,
-  intentional press on the trusted screen. Deny stays a single tap. The Passkeys tab
-  is a stub (the resident-credential list lands in a later wave). The UI model,
-  geometry, hit-tests and glyphs all live in `rsk-ui` (host-tested + Kani-proved
-  disjoint); a standard key without a screen compiles none of it. bcdDevice 0x078A →
-  0x078B.
-- **Trusted-display variant — PIN pad in the new design language (experimental,
-  opt-in).** The on-screen PIN pad — the one screen the redesign hadn't yet reached
-  — now matches the rest of the `display` UI: a lock-marked header, a cyan-accent
-  masked entry, and a 3×4 grid of dark neutral key cards with a subtle edge (the
-  affirmative OK a solid green check glyph, Del a backspace glyph, and the decline a
-  low-emphasis outlined Cancel, mirroring the Approve prompt's Deny). This is a
-  re-skin only — the
-  pad geometry, the masked-dots-only display and the per-keystroke partial repaint
-  are unchanged. The now-unused idle "menu button" hit-test (`MENU_BTN_RECT` /
-  `hit_menu`), superseded by the bottom navigation bar, is removed from `rsk-ui`.
-  bcdDevice 0x078B → 0x078D.
-- **Trusted-display variant — hold-to-approve button: no flicker, no fill artifact
-  (experimental, opt-in).** The Approve screen's hold button now paints a static base
-  once and grows the fill **in place** as you hold, instead of repainting the whole
-  button from a dark base every poll — so the build-up no longer flickers. The
-  progress fill is the button's own rounded shape revealed left-to-right through a
-  clip, so its corners exactly match the card — no square corner pokes past it — and
-  the advancing edge is flat. bcdDevice
-  0x078D → 0x078F.
-- **Trusted-display variant — on-device Passkeys browser (read-only, experimental,
-  opt-in).** The Passkeys tab is no longer a stub: it lists the resident (discoverable)
-  credentials stored on the device — one row per relying party (generic globe + the
-  real rpId + account count), drilling into a per-RP detail that lists each account
-  (user name / display name, with a "UV" tag for credProtect-gated credentials). It is
-  strictly **read-only** — no rename or delete yet (a later wave) — and the data is
-  decrypted on the device, never on the host: a small additive `rsk-fido::passkeys`
-  walk loads the device seed from `EF_KEY_DEV`, unboxes the `EF_RP` / `EF_CRED` records
-  the worker already seals at rest, and zeroizes the seed before returning, so the
-  display task never holds it. No CTAP / wire change — the FIDO-conformance
-  `authenticatorCredentialManagement` path is untouched. The brand of a relying party
-  can't be shown (the device only has the rpId string, not a logo or trademark), and
-  there is no "last used" time (no per-credential timestamps are stored). Navigation
-  switches tab→tab **directly** — tapping Settings (or Home) from inside the Passkeys
-  tab now goes straight there instead of dropping back to Home first — and each tab
-  repaints the moment it is tapped rather than after the finger lifts, so switching
-  feels immediate. bcdDevice 0x078F → 0x0791.
-- **Trusted-display variant — on-device factory reset (experimental, opt-in).** A
-  new danger row in the Settings menu erases the device from the trusted panel: tap
-  **Factory reset**, enter the device PIN if one is set (verified locally, like the
-  delete flow), then **hold** the confirm button. The back chevron, a slid-off
-  finger, or the inactivity timeout all abandon it without erasing anything. A
-  completed hold wipes **every applet's data** — FIDO passkeys and PIN, PIV,
-  OpenPGP, and OATH — physically scrubbing the flash (no superseded secret survives
-  a raw dump), then reboots; the next boot re-provisions a fresh seed, so the device
-  returns blank. Only the org-provisioned batch attestation (device identity, not
-  user data) and the fused OTP / secure-boot state survive — matching what the host
-  `authenticatorReset` keeps. Unlike that host command, this clears all applets, not
-  just FIDO. Implemented as a generic `Fs::factory_wipe` (host-tested) plus a reboot,
-  so the display task needs no rng or session state. bcdDevice 0x0797 → 0x0798.
-- **Trusted-display variant — on-device passkey deletion (experimental, opt-in).**
-  The Passkeys tab moves from read-only to its first **write** action: tapping an
-  account on a relying party's detail opens a trusted Confirm-Delete screen naming
-  exactly what will be removed, and — if a clientPIN is set — asks for it on the
-  on-screen pad (the same built-in-UV input, verified **locally** against the same
-  `EF_PIN` and retry counter the host PIN path uses, so it never crosses the host and
-  shares the anti-bruteforce budget), then requires a deliberate **hold** on the
-  delete button before the credential is removed. A brush, a slid-off finger, the back
-  chevron, or the inactivity timeout all abandon it without a write. The delete mirrors
-  CTAP `deleteCredential` (0x06) on flash — the `EF_CRED` record is removed and its
-  `EF_RP` count decremented (the RP row disappears with its last credential) — keyed by
-  slot rather than the host's resident id, with `decrement_rp` now shared between the
-  two paths. No CTAP / wire change. bcdDevice 0x0793 → 0x0794.
-- **Trusted-display variant — on-device tabs no longer time out mid-browse.** The
-  Passkeys / Settings tabs (and the Confirm-Delete screen) used a short 15 s inactivity
-  auto-close that dropped you back to the Home screen even when you were just reading.
-  That timeout existed only so a walked-away open tab couldn't park the worker and make
-  a host command wait behind it — so the guard is now **precise**: the browse loops poll
-  whether a host request is actually queued and yield to the worker the instant one
-  arrives. With host-starvation handled exactly, the blind timeout is relaxed to 60 s —
-  comfortable for reading a passkey list — while still returning to the idle "Ready"
-  screen when the device is genuinely left unattended (so the credential list isn't left
-  on screen indefinitely). Closing a tab is also snappier: returning to Home (e.g.
-  Settings → Close, or the Home nav button from Passkeys) used to wait out a ~400 ms
-  ambient-repaint hold — a window meant only for the PIN-pad → confirm hand-off — before
-  the Home screen came back; the dispatcher now repaints Home the moment the tab returns,
-  so the transition is immediate. The panel SPI clock is also raised from 40 MHz to the
-  ST7789's 62.5 MHz maximum, cutting each full-frame repaint by ~35%. bcdDevice 0x0794 →
-  0x0797.
-- **Configurable GPIO presence button (`PRESENCE_PIN`).** The user-presence input can
-  be remapped from BOOTSEL to a dedicated GPIO at compile time: `PRESENCE_PIN=<0..=29>`
-  selects an active-low button with an internal pull-up (e.g. a touch sensor to ground),
-  while the default (`bootsel`) keeps the BOOTSEL path byte-for-byte. The chosen pin is
-  guarded — it must not collide with the active LED pin (boot panic) and is rejected on
-  a `display` build (where the touchscreen is the presence source). The button's
-  polarity is configurable: active-low by default (button to ground, internal pull-up),
-  or active-high with `PRESENCE_ACTIVE_HIGH=1` (internal pull-down) for a capacitive
-  touch sensor or a button to VCC. One new `unsafe` (`AnyPin::steal` for the
-  runtime-selected pin) documented in `docs/unsafe.md`. Thanks to @lpiob for the
-  original contribution ([#17](https://github.com/TheMaxMur/RS-Key/pull/17)).
-  bcdDevice 0x0791 → 0x0793.
-
-### Changed
-
-- **Trusted-display: per-size icon bitmaps for crisp small-size rendering.** The glyph
-  renderer no longer scales one 16×16 vector contour to every size — the root cause of the
-  rounding artefacts that detailed icons (key, globe, gear, lifebuoy, microchip, sun, clock)
-  still showed at 14–20px, where features fell off-axis and the icon collapsed into a blob.
-  Each glyph is now a hand-authored 1-bit bitmap at the canonical sizes the UI paints
-  (14 / 16 / 18 / 20 / 36 / 44 px), blitted 1:1 with a centre-sampled nearest-neighbour
-  fallback for the few off-canonical sizes; the round / detailed icons were redrawn cleanly
-  at the small sizes via a distance-field rasteriser, while the large 36 / 44 px sizes were
-  re-authored from the prior renders to stay visually close. No new glyphs, no behaviour
-  change. bcdDevice 0x07D0 → 0x07D1.
-
-- **Trusted-display: redraw the icon set for crisp, centred rendering at small sizes.** A
-  pass over the vector glyphs to fix the rough edges that showed at 14–20px: diagonals
-  (chevron / back / the check marks / the terminal caret) now step at a clean 45°, on-axis
-  features that sat a pixel off-centre (the sun and gear central rays, the clock hands, the
-  lock shackle and home roof peaks, the apps tile gap) are re-centred, the warning sign's
-  exclamation no longer merges into the triangle edge, the eye is re-proportioned with a
-  small pupil, the shield tapers to a clean point, and the USB indicator is redrawn as the
-  familiar trident instead of an unclear plug box. No new glyphs, no behaviour change.
-  bcdDevice 0x07CF → 0x07D0.
-
-- **Trusted-display: design-token fidelity polish pass.** A pass over the on-device
-  screens to close residual drift from the high-fidelity handoff: the PIN keypad keys
-  tighten to the design's 7px grid gap (re-centred so the pad stays balanced) and 9px
-  key radius, the backspace key takes its darker `#101317` shade, outline buttons
-  (Deny / Cancel) gain the design's faint tinted fill behind a 1px border (was a bare
-  2px stroke), buttons settle to the 11px card radius, the Home "Ready" check icon to
-  38px, list rows align to the 13px content gutter, and three screen labels match the
-  spec wording (*Verify & install*, *Hold to wipe*, *RECOVERY SHARES*). No behaviour or
-  wire change. bcdDevice 0x07CE → 0x07CF.
-
-- **Trusted-display visual redesign — typography and palette (experimental).** The
-  on-device screens move to the high-fidelity design language: proportional 1-bit
-  text (Helvetica-style `helvR`/`helvB` and `profont` for mono labels, via the new
-  `u8g2-fonts` dependency) in place of the monospace built-in fonts, and a blue
-  accent over a near-black blue-grey background with calm danger / warning / success
-  tiers. This is the design-system foundation; individual screen layouts are
-  re-skinned onto it wave by wave. Display-flavor only — the new dependency never
-  reaches a standard (screenless) key (the build still asserts `rsk-ui` absent from
-  the default image). The proportional faces also harden two layout spots against
-  the wider, variable text: the PIN screen's cancel is a back chevron (not a "Cancel"
-  word that overran its box into the title), and list-row labels are clipped clear of
-  their trailing value (a long rp name no longer touches its account count).
-  bcdDevice 0x0798 → 0x079A.
-- **Trusted-display redesign — status/title-bar chrome (experimental).** The tab
-  screens (Home, Passkeys, Settings, and per-RP detail) now wear the design's two-tier
-  chrome: a persistent top **status bar** (a mono "RS-Key" wordmark at the left and the
-  USB power indicator at the right — this is a bus-powered device, so always USB, never
-  a battery) and, below it, a **title bar** carrying the screen title and, on a pushed
-  screen, a back chevron. Content shifts down to clear both strips. The geometry is the
-  single source of truth shared by paint and hit-test (a new `hit_title_back`, proven
-  disjoint from the rows and nav under Kani). Display-flavor only. bcdDevice 0x079D →
-  0x079E.
-- **Touch timeout is configurable; phy tag `0x08` now follows pico-fido.** RS-Key
-  read tag `0x08` as a user-presence button GPIO, but the button is always BOOTSEL
-  so the field was never used. It now means `PresenceTimeout` — the touch-wait
-  timeout in **seconds** — matching pico-fido / PicoForge, so a PicoForge config
-  (or `rsk hw --touch-timeout <secs>`) sets how long the device waits for a touch.
-  Absent / `0` keeps the built-in 30 s default; existing phy records never carried
-  a meaningful `0x08`, so the realignment is safe. bcdDevice 0x0783 → 0x0784.
-
-### Fixed
-
-- **Trusted display: the "Protect mgmt key" row label is no longer clipped to nothing on
-  the PIV PIN menu.** Its long right-aligned hint ("random, PIN-unlocked", 159 px) crowded
-  the 128 px label down to 1 px, so the row showed only the hint and not its name. The hint
-  is dropped (the random / PIN-unlocked consequence is stated in full on the confirm screen),
-  so the label shows like the other rows; a regression test now asserts every menu label fits
-  beside its caption. Display flavor only.
-
-- **Trusted display: the device now locks from the audit-log screen.** The power/wake
-  button now sleeps and locks the on-device UI from inside the audit log too — previously
-  it was ignored there, so a PIN-set device could not be locked from that screen — and the
-  settings menu unwinds cleanly afterwards without repainting over the blanked panel.
-  Display flavor only.
-
-- **OpenPGP / trusted display: an over-long fingerprint, timestamp or algorithm object can no
-  longer crash the Apps screen.** `read_info` sliced fixed stack buffers by the *full* stored
-  length that `Storage::read` reports, so a fingerprint (`C7`), timestamp (`CE`) or algorithm
-  attribute stored longer than its buffer — PUT DATA caps nothing, so a PW3 host or flash
-  corruption can leave one — indexed out of bounds and panicked (a device brick) every time the
-  OpenPGP screen was opened. The read length is now clamped before slicing, and a host test
-  exercises an over-long record. Found by a pre-release cross-wave review.
-
-- **PIV: imported X25519 keys now match their real public identity (ykman / yubico-piv-tool
-  interop).** An imported X25519 scalar was stored verbatim, but the curve op treats the stored
-  scalar as a big-endian MPI while `ykman` / `yubico-piv-tool` send it little-endian (RFC 8410 /
-  RFC 7748) — so the slot's public key (and every ECDH) disagreed with the key's established
-  public key, and ciphertext or certificates already bound to it could not be decrypted by the
-  slot. The import now flips the byte order for X25519 (Ed25519 seeds are unaffected), and a host
-  test asserts the reported public point equals the one standard tooling derives from the same
-  bytes. On-device *generated* X25519 keys were always self-consistent and are unchanged.
-
-- **Trusted display: a look-alike relying-party id can no longer hide its tail on the Approve
-  screen.** The sign-in / approve screen hard-clipped a too-wide rp id with no marker, and the
-  "was truncated" flag on a sanitized label was never rendered — so a padded look-alike id could
-  be silently cut to a trustworthy-looking prefix on the very screen meant to expose it. The rp
-  id is now ellipsized (`…`) on overflow and always marked when the label was clamped. Display
-  flavor only.
-
-- **Trusted display: a long OpenPGP cardholder name no longer overruns the overview row.** The
-  host-set cardholder name is drawn right-anchored on the "Card holder" overview row; without a
-  clip a long name spilled left across the icon and off the panel edge. The trailing value is now
-  clipped to the row (short values are unaffected), with a regression test that renders a
-  max-length name on-panel. Display flavor only.
-
-- **Hardening: property sweeps now pin the `EF_DISPLAY`, `EF_RPNICK` (passkey nickname) and PIV
-  ADMIN-DATA / PRINTED codecs against regression.** No new defect was found in these, but the
-  load-bearing read-length clamps and the fail-closed protection-flag parse are locked in by
-  deterministic host sweeps over adversarial bytes. bcdDevice 0x07D1 → 0x07D2.
-
-- **Trusted display + PIV: on-panel "Protect mgmt key" now preserves a host's `PivmanData`.**
-  Setting a PIN-protected management key from the panel rebuilt the YubiKey ADMIN-DATA object
-  from scratch, discarding any PIN-change timestamp and unrelated flag bits a host (`ykman`)
-  had written. It now carries those forward and drops only the derived-key salt — which a
-  PIN-protected (device-stored, no longer PIN-*derived*) key makes obsolete, exactly as
-  ykman's `--protect` does. The rebuild moved into a pure codec pinned by a Kani proof and a
-  host property sweep: for any prior bytes it always emits a well-formed protected object that
-  carries no salt. bcdDevice 0x07D4 → 0x07D5.
 
 ## [0.2.8] — 2026-06-21
 
