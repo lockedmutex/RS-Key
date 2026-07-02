@@ -31,7 +31,7 @@ use crate::hmacsecret::{self, HmacSecretReq, SALT_AUTH_MAX, SALT_ENC_MAX};
 use crate::journal;
 use crate::keyderiv::{KEY_HANDLE_LEN, fido_load_key, verify_key};
 use crate::seed::{bump_sign_counter, get_sign_counter};
-use crate::state::{MAX_ASSERTION_CREDS, PERM_GA};
+use crate::state::{AssertionState, MAX_ASSERTION_CREDS, PERM_GA};
 use crate::{Ctx, Rng};
 use rsk_crypto::pinproto::PinProto;
 
@@ -95,65 +95,77 @@ fn parse(data: &[u8]) -> Result<Request<'_>, CtapError> {
         match key {
             1 => req.rp_id = cbor(d.str())?,
             2 => req.client_data_hash = cbor(d.bytes())?,
-            3 => {
-                let a = def_arr(&mut d)?;
-                for _ in 0..a {
-                    let m = def_map(&mut d)?;
-                    let mut id: &[u8] = &[];
-                    let (mut id_present, mut type_present) = (false, false);
-                    for _ in 0..m {
-                        match cbor(d.str())? {
-                            "id" => {
-                                id = cbor(d.bytes())?;
-                                id_present = true;
-                            }
-                            // Read "type" as text so a byte-string yields CborUnexpectedType.
-                            "type" => {
-                                let _: &str = cbor(d.str())?;
-                                type_present = true;
-                            }
-                            _ => cbor(d.skip())?,
-                        }
-                    }
-                    // A credential descriptor needs both "type" and "id".
-                    if !type_present || !id_present {
-                        return Err(CtapError::MissingParameter);
-                    }
-                    if req.allow_len < MAX_ALLOW {
-                        req.allow[req.allow_len] = id;
-                        req.allow_len += 1;
-                    }
-                }
-            }
-            5 => {
-                let m = def_map(&mut d)?;
-                for _ in 0..m {
-                    match cbor(d.str())? {
-                        "rk" => req.rk_option = cbor(d.bool())?,
-                        "uv" => req.uv = cbor(d.bool())?,
-                        "up" => req.up = cbor(d.bool())?,
-                        _ => cbor(d.skip())?,
-                    }
-                }
-            }
-            4 => {
-                let m = def_map(&mut d)?;
-                for _ in 0..m {
-                    match cbor(d.str())? {
-                        "credBlob" => req.ext_cred_blob = cbor(d.bool())?,
-                        "thirdPartyPayment" => req.ext_third_party_payment = cbor(d.bool())?,
-                        "largeBlobKey" => req.ext_large_blob_key = Some(cbor(d.bool())?),
-                        "hmac-secret" => req.hmac_secret = hmacsecret::parse(&mut d)?,
-                        _ => cbor(d.skip())?,
-                    }
-                }
-            }
+            3 => parse_allow_list(&mut d, &mut req)?,
+            5 => parse_options(&mut d, &mut req)?,
+            4 => parse_extensions(&mut d, &mut req)?,
             6 => req.pin_uv_auth_param = Some(cbor(d.bytes())?),
             7 => req.pin_uv_auth_protocol = cbor(d.u32())? as u64,
             _ => cbor(d.skip())?,
         }
     }
     Ok(req)
+}
+
+/// Parse the `allowList` (request key 3) into `req.allow` (capped at MAX_ALLOW).
+fn parse_allow_list<'a>(d: &mut Decoder<'a>, req: &mut Request<'a>) -> Result<(), CtapError> {
+    let a = def_arr(d)?;
+    for _ in 0..a {
+        let m = def_map(d)?;
+        let mut id: &[u8] = &[];
+        let (mut id_present, mut type_present) = (false, false);
+        for _ in 0..m {
+            match cbor(d.str())? {
+                "id" => {
+                    id = cbor(d.bytes())?;
+                    id_present = true;
+                }
+                // Read "type" as text so a byte-string yields CborUnexpectedType.
+                "type" => {
+                    let _: &str = cbor(d.str())?;
+                    type_present = true;
+                }
+                _ => cbor(d.skip())?,
+            }
+        }
+        // A credential descriptor needs both "type" and "id".
+        if !type_present || !id_present {
+            return Err(CtapError::MissingParameter);
+        }
+        if req.allow_len < MAX_ALLOW {
+            req.allow[req.allow_len] = id;
+            req.allow_len += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Parse the getAssertion `extensions` map (request key 4) into `req`.
+fn parse_extensions<'a>(d: &mut Decoder<'a>, req: &mut Request<'a>) -> Result<(), CtapError> {
+    let m = def_map(d)?;
+    for _ in 0..m {
+        match cbor(d.str())? {
+            "credBlob" => req.ext_cred_blob = cbor(d.bool())?,
+            "thirdPartyPayment" => req.ext_third_party_payment = cbor(d.bool())?,
+            "largeBlobKey" => req.ext_large_blob_key = Some(cbor(d.bool())?),
+            "hmac-secret" => req.hmac_secret = hmacsecret::parse(d)?,
+            _ => cbor(d.skip())?,
+        }
+    }
+    Ok(())
+}
+
+/// Parse the `options` map (request key 5: rk / uv / up) into `req`.
+fn parse_options(d: &mut Decoder<'_>, req: &mut Request<'_>) -> Result<(), CtapError> {
+    let m = def_map(d)?;
+    for _ in 0..m {
+        match cbor(d.str())? {
+            "rk" => req.rk_option = cbor(d.bool())?,
+            "uv" => req.uv = cbor(d.bool())?,
+            "up" => req.up = cbor(d.bool())?,
+            _ => cbor(d.skip())?,
+        }
+    }
+    Ok(())
 }
 
 /// Max user name / displayName length echoed in an assertion — the create-side
@@ -339,6 +351,181 @@ fn enforce_pin<S: Storage, R: Rng>(
     }
 }
 
+/// Populate `best` with the newest visible credential for this rp — from the
+/// allowList (resident-id lookup or a non-resident box) or, if it is empty, by
+/// scanning resident credentials. On a multi-credential resident discovery, arm
+/// getNextAssertion (newest first) so it can return the rest one at a time.
+#[allow(clippy::too_many_arguments)]
+fn resolve_credential<S: Storage, R: Rng>(
+    ctx: &mut Ctx<S, R>,
+    req: &Request,
+    rp_id_hash: &[u8; 32],
+    seed: &[u8; 32],
+    uv: bool,
+    want_up: bool,
+    best: &mut Best,
+) {
+    if req.allow_len > 0 {
+        resolve_from_allowlist(ctx, req, rp_id_hash, seed, uv, best);
+    } else {
+        resolve_by_discovery(ctx, req, rp_id_hash, seed, uv, want_up, best);
+    }
+}
+
+/// allowList resolution: for each descriptor, look up a resident-id box (by its
+/// 42-byte id across the live EF_CRED slots) or decrypt a non-resident box, and
+/// fold the newest visible match into `best`.
+fn resolve_from_allowlist<S: Storage, R: Rng>(
+    ctx: &mut Ctx<S, R>,
+    req: &Request,
+    rp_id_hash: &[u8; 32],
+    seed: &[u8; 32],
+    uv: bool,
+    best: &mut Best,
+) {
+    let mut scratch = [0u8; CRED_REC_MAX];
+    let mut rec = [0u8; CRED_REC_MAX];
+    let mut occupied = [false; MAX_RESIDENT_CREDENTIALS as usize];
+    slot_map(ctx.fs, EF_CRED, &mut occupied);
+    for &id in &req.allow[..req.allow_len] {
+        if is_resident(id) {
+            // Look up the full box by its 42-byte resident id.
+            for i in 0..MAX_RESIDENT_CREDENTIALS {
+                if !occupied[i as usize] {
+                    continue;
+                }
+                let Some(n) = ctx.fs.read(EF_CRED + i, &mut rec) else {
+                    continue;
+                };
+                let n = n.min(rec.len());
+                if n >= RECORD_PREFIX
+                    && rec[..32] == *rp_id_hash
+                    && id.len() == CRED_RESIDENT_LEN
+                    && rec[32..RECORD_PREFIX] == *id
+                {
+                    best.consider(
+                        seed,
+                        rp_id_hash,
+                        &rec[RECORD_PREFIX..n],
+                        Some(&rec[32..RECORD_PREFIX]),
+                        uv,
+                        true,
+                        &mut scratch,
+                    );
+                    break;
+                }
+            }
+        } else {
+            best.consider(seed, rp_id_hash, id, None, uv, true, &mut scratch);
+        }
+    }
+}
+
+/// Resident discovery (empty allowList): fold every stored credential for this rp
+/// into `best`, and — when more than one matches — arm getNextAssertion with the
+/// sorted EF_CRED slots so the rest can be walked one at a time.
+fn resolve_by_discovery<S: Storage, R: Rng>(
+    ctx: &mut Ctx<S, R>,
+    req: &Request,
+    rp_id_hash: &[u8; 32],
+    seed: &[u8; 32],
+    uv: bool,
+    want_up: bool,
+    best: &mut Best,
+) {
+    let mut scratch = [0u8; CRED_REC_MAX];
+    let mut rec = [0u8; CRED_REC_MAX];
+    let mut occupied = [false; MAX_RESIDENT_CREDENTIALS as usize];
+    slot_map(ctx.fs, EF_CRED, &mut occupied);
+    // Collect the matching EF_CRED slots so getNextAssertion can walk them.
+    let mut cands: [(u16, u64); MAX_ASSERTION_CREDS] = [(0, 0); MAX_ASSERTION_CREDS];
+    let mut ncand = 0usize;
+    for i in 0..MAX_RESIDENT_CREDENTIALS {
+        if !occupied[i as usize] {
+            continue;
+        }
+        let Some(n) = ctx.fs.read(EF_CRED + i, &mut rec) else {
+            continue;
+        };
+        let n = n.min(rec.len());
+        if n >= RECORD_PREFIX
+            && rec[..32] == *rp_id_hash
+            && let Some(created) = best.consider(
+                seed,
+                rp_id_hash,
+                &rec[RECORD_PREFIX..n],
+                Some(&rec[32..RECORD_PREFIX]),
+                uv,
+                false,
+                &mut scratch,
+            )
+            && ncand < MAX_ASSERTION_CREDS
+        {
+            cands[ncand] = (i, created);
+            ncand += 1;
+        }
+    }
+    // Arm getNextAssertion when more than one credential matched (newest first).
+    if ncand > 1 {
+        arm_get_next_assertion(
+            &mut ctx.state.gna,
+            &mut cands[..ncand],
+            req,
+            rp_id_hash,
+            uv,
+            want_up,
+            ctx.now_ms,
+        );
+    }
+}
+
+/// Arm getNextAssertion for a multi-credential resident discovery: sort the
+/// matching EF_CRED slots newest-first and stash them (with the request's uv/up
+/// and extension inputs) so [`get_next_assertion`] can return the rest one at a
+/// time. `cands` is the `(slot, created)` list; only its length matters after.
+fn arm_get_next_assertion(
+    gna: &mut AssertionState,
+    cands: &mut [(u16, u64)],
+    req: &Request,
+    rp_id_hash: &[u8; 32],
+    uv: bool,
+    want_up: bool,
+    now_ms: u64,
+) {
+    cands.sort_unstable_by_key(|c| core::cmp::Reverse(c.1));
+    gna.active = true;
+    gna.rp_id_hash = *rp_id_hash;
+    gna.client_data_hash.copy_from_slice(req.client_data_hash);
+    gna.uv = uv;
+    gna.up = want_up;
+    gna.total = cands.len() as u8;
+    gna.counter = 1;
+    gna.started_ms = now_ms;
+    for (k, &(slot, _)) in cands.iter().enumerate() {
+        gna.slots[k] = slot;
+    }
+    // Carry the request's extension inputs so getNextAssertion re-evaluates them
+    // (hmac-secret included) per credential.
+    gna.hmac_present = req.hmac_secret.present;
+    if req.hmac_secret.present {
+        gna.hmac_proto = req.hmac_secret.proto;
+        gna.hmac_peer_x = req.hmac_secret.peer_x;
+        gna.hmac_peer_y = req.hmac_secret.peer_y;
+        let se = req.hmac_secret.salt_enc.len().min(gna.hmac_salt_enc.len());
+        gna.hmac_salt_enc[..se].copy_from_slice(&req.hmac_secret.salt_enc[..se]);
+        gna.hmac_salt_enc_len = se as u8;
+        let sa = req
+            .hmac_secret
+            .salt_auth
+            .len()
+            .min(gna.hmac_salt_auth.len());
+        gna.hmac_salt_auth[..sa].copy_from_slice(&req.hmac_secret.salt_auth[..sa]);
+        gna.hmac_salt_auth_len = sa as u8;
+    }
+    gna.ext_cred_blob = req.ext_cred_blob;
+    gna.ext_third_party_payment = req.ext_third_party_payment;
+}
+
 fn get_assertion_inner<S: Storage, R: Rng>(
     ctx: &mut Ctx<S, R>,
     req: &Request,
@@ -352,113 +539,7 @@ fn get_assertion_inner<S: Storage, R: Rng>(
     // assertion. getNextAssertion reuses it via `gna.up`.
     let want_up = cfg!(feature = "strict-up") || req.up;
     let mut best = Best::new();
-    let mut scratch = [0u8; CRED_REC_MAX];
-    let mut rec = [0u8; CRED_REC_MAX];
-
-    // One storage pass for the EF_CRED occupancy; both arms only `read` live slots.
-    let mut occupied = [false; MAX_RESIDENT_CREDENTIALS as usize];
-    slot_map(ctx.fs, EF_CRED, &mut occupied);
-
-    if req.allow_len > 0 {
-        for &id in &req.allow[..req.allow_len] {
-            if is_resident(id) {
-                // Look up the full box by its 42-byte resident id.
-                for i in 0..MAX_RESIDENT_CREDENTIALS {
-                    if !occupied[i as usize] {
-                        continue;
-                    }
-                    let Some(n) = ctx.fs.read(EF_CRED + i, &mut rec) else {
-                        continue;
-                    };
-                    let n = n.min(rec.len());
-                    if n >= RECORD_PREFIX
-                        && rec[..32] == *rp_id_hash
-                        && id.len() == CRED_RESIDENT_LEN
-                        && rec[32..RECORD_PREFIX] == *id
-                    {
-                        best.consider(
-                            seed,
-                            rp_id_hash,
-                            &rec[RECORD_PREFIX..n],
-                            Some(&rec[32..RECORD_PREFIX]),
-                            uv,
-                            true,
-                            &mut scratch,
-                        );
-                        break;
-                    }
-                }
-            } else {
-                best.consider(seed, rp_id_hash, id, None, uv, true, &mut scratch);
-            }
-        }
-    } else {
-        // Resident discovery: every stored credential for this rp. Collect the
-        // matching EF_CRED slots so getNextAssertion can walk them.
-        let mut cands: [(u16, u64); MAX_ASSERTION_CREDS] = [(0, 0); MAX_ASSERTION_CREDS];
-        let mut ncand = 0usize;
-        for i in 0..MAX_RESIDENT_CREDENTIALS {
-            if !occupied[i as usize] {
-                continue;
-            }
-            let Some(n) = ctx.fs.read(EF_CRED + i, &mut rec) else {
-                continue;
-            };
-            let n = n.min(rec.len());
-            if n >= RECORD_PREFIX
-                && rec[..32] == *rp_id_hash
-                && let Some(created) = best.consider(
-                    seed,
-                    rp_id_hash,
-                    &rec[RECORD_PREFIX..n],
-                    Some(&rec[32..RECORD_PREFIX]),
-                    uv,
-                    false,
-                    &mut scratch,
-                )
-                && ncand < MAX_ASSERTION_CREDS
-            {
-                cands[ncand] = (i, created);
-                ncand += 1;
-            }
-        }
-        // Arm getNextAssertion when more than one credential matched (newest first).
-        if ncand > 1 {
-            cands[..ncand].sort_unstable_by_key(|c| core::cmp::Reverse(c.1));
-            let gna = &mut ctx.state.gna;
-            gna.active = true;
-            gna.rp_id_hash = *rp_id_hash;
-            gna.client_data_hash.copy_from_slice(req.client_data_hash);
-            gna.uv = uv;
-            gna.up = want_up;
-            gna.total = ncand as u8;
-            gna.counter = 1;
-            gna.started_ms = ctx.now_ms;
-            for (k, &(slot, _)) in cands[..ncand].iter().enumerate() {
-                gna.slots[k] = slot;
-            }
-            // Carry the request's extension inputs so getNextAssertion
-            // re-evaluates them (hmac-secret included) per credential.
-            gna.hmac_present = req.hmac_secret.present;
-            if req.hmac_secret.present {
-                gna.hmac_proto = req.hmac_secret.proto;
-                gna.hmac_peer_x = req.hmac_secret.peer_x;
-                gna.hmac_peer_y = req.hmac_secret.peer_y;
-                let se = req.hmac_secret.salt_enc.len().min(gna.hmac_salt_enc.len());
-                gna.hmac_salt_enc[..se].copy_from_slice(&req.hmac_secret.salt_enc[..se]);
-                gna.hmac_salt_enc_len = se as u8;
-                let sa = req
-                    .hmac_secret
-                    .salt_auth
-                    .len()
-                    .min(gna.hmac_salt_auth.len());
-                gna.hmac_salt_auth[..sa].copy_from_slice(&req.hmac_secret.salt_auth[..sa]);
-                gna.hmac_salt_auth_len = sa as u8;
-            }
-            gna.ext_cred_blob = req.ext_cred_blob;
-            gna.ext_third_party_payment = req.ext_third_party_payment;
-        }
-    }
+    resolve_credential(ctx, req, rp_id_hash, seed, uv, want_up, &mut best);
 
     if !best.any {
         return Err(CtapError::NoCredentials);
