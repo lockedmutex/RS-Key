@@ -57,6 +57,20 @@ Three details make that work:
 Outside keygen, core1 parks in WFE, and embassy-rp pauses it around every flash
 erase/program, so its XIP fetches never collide with flash writes.
 
+## Boot sequence
+
+Getting to that runtime state has a strict order. The bootrom verifies the
+signed image, then the firmware provisions and recovers **all** persistent state
+— OTP keys, the KV store, the phy record, the TRNG, the seal migrations and the
+one-shot at-rest scrub — *before* it asserts the USB pull-up. That ordering is
+load-bearing: `builder.build()` starts host enumeration, and the task that
+answers control transfers must be spawned with no blocking work in between, or
+the host enumerates a mute device and times out — the "blink red / not
+recognised until several replugs" report that motivated attaching to the bus
+only after everything else is ready.
+
+![Boot sequence — bootrom secure-boot verify, then a provision-and-recover phase (OTP keys, KV mount, phy record, TRNG seed, seal migrations, at-rest scrub) that completes before the USB pull-up, then attach-and-serve (build, spawn usb_task, transports live, worker dispatches applets)](images/boot-flow.svg)
+
 ## Crates
 
 | Crate | Contents |

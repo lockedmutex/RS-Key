@@ -24,3 +24,4 @@ the mdBook site.
 | `ctaphid-frame.svg` | CTAPHID 64-byte init + continuation frame layout | original — from `protocol.md` §1.2 / `tools/rsk/ctaphid.py` |
 | `phy-record.svg` | EF_PHY TLV record + a worked three-record example | original — from `crates/rsk-rescue/src/phy.rs` |
 | `cred-box.svg` | FIDO credential box + 42-byte resident id byte layout | original — from `crates/rsk-fido/src/credential.rs` |
+| `boot-flow.svg` | Boot sequence: bootrom → provision (pre-attach) → serve | original — from `firmware/src/main.rs` |
