@@ -29,9 +29,9 @@ use crate::consts::{
     MAX_CREDENTIAL_COUNT_IN_LIST, MAX_MIN_PIN_RPIDS, MAX_RESIDENT_CREDENTIALS, PREFER_PQC,
 };
 use crate::credential::{
-    CRED_REC_MAX, CRED_RESIDENT_LEN, CredExt, CredInput, Credential, RECORD_PREFIX,
-    credential_create, credential_load, credential_store, derive_large_blob_key, derive_resident,
-    is_resident, slot_map,
+    CRED_BOX_MAX, CRED_REC_MAX, CRED_RESIDENT_LEN, CredExt, CredInput, Credential, RECORD_PREFIX,
+    USER_NAME_MAX, credential_create, credential_load, credential_store, derive_large_blob_key,
+    derive_resident, is_resident, slot_map, truncate_utf8,
 };
 use crate::ec::{CredKey, MAX_SIG_LEN, P256Key};
 use crate::error::{CtapError, CtapResult};
@@ -271,11 +271,15 @@ pub fn make_credential<S: Storage, R: Rng>(
     data: &[u8],
     out: &mut [u8],
 ) -> CtapResult {
-    let req = parse(data)?;
+    let mut req = parse(data)?;
 
     if req.client_data_hash.len() != 32 || req.rp_id.is_empty() || req.user_id.is_empty() {
         return Err(CtapError::MissingParameter);
     }
+    // CTAP 2.1 §6.1.2: overlong user.name / user.displayName are truncated,
+    // not an error — and the cap bounds the sealed box under CRED_BOX_MAX.
+    req.user_name = truncate_utf8(req.user_name, USER_NAME_MAX);
+    req.user_display_name = truncate_utf8(req.user_display_name, USER_NAME_MAX);
     if !req.has_pubkey_param {
         return Err(CtapError::MissingParameter);
     }
@@ -426,7 +430,7 @@ fn make_credential_inner<S: Storage, R: Rng>(
             third_party_payment: req.ext_third_party_payment,
         },
     };
-    let mut cred_box = [0u8; 640];
+    let mut cred_box = [0u8; CRED_BOX_MAX];
     let box_len = credential_create(seed, &ctx.dev, &input, rp_id_hash, &iv, &mut cred_box)
         .map_err(|_| CtapError::Other)?;
 
@@ -472,9 +476,9 @@ fn make_credential_inner<S: Storage, R: Rng>(
     ))?;
 
     // authData = rpIdHash | flags | counter | aaguid | credIdLen | credId | COSEpubkey | ext
-    // Sized for the ML-DSA-44 worst case: 55 header + a non-resident box (≤640)
-    // + the 1342-byte AKP COSE key + extensions (≤192) + the appended 32-byte
-    // clientDataHash.
+    // Sized for the ML-DSA-44 worst case: 55 header + a non-resident box
+    // (≤CRED_BOX_MAX = 640) + the 1342-byte AKP COSE key + extensions (≤192)
+    // + the appended 32-byte clientDataHash.
     let ctr = get_sign_counter(ctx.fs);
     let mut ad = [0u8; 2304];
     let mut p = 0;

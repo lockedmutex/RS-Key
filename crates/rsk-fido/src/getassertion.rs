@@ -22,8 +22,8 @@ use crate::consts::{
     EF_PIN, FLAG_ED, FLAG_UP, FLAG_UV, MAX_CREDENTIAL_COUNT_IN_LIST, MAX_RESIDENT_CREDENTIALS,
 };
 use crate::credential::{
-    CRED_REC_MAX, CRED_RESIDENT_LEN, Credential, RECORD_PREFIX, credential_load,
-    derive_large_blob_key, is_resident, slot_map,
+    CRED_BOX_MAX, CRED_REC_MAX, CRED_RESIDENT_LEN, Credential, RECORD_PREFIX, USER_NAME_MAX,
+    credential_load, derive_large_blob_key, is_resident, slot_map,
 };
 use crate::ec::{CredKey, MAX_SIG_LEN};
 use crate::error::{CtapError, CtapResult};
@@ -36,7 +36,10 @@ use crate::{Ctx, Rng};
 use rsk_crypto::pinproto::PinProto;
 
 const MAX_ALLOW: usize = MAX_CREDENTIAL_COUNT_IN_LIST as usize;
-const MAX_CRED_ID: usize = 512;
+/// Sized by the create-side ceiling so no creatable box is ever skipped
+/// (`Best::consider` drops longer candidates). The +128 B over the old 512
+/// sits on the getAssertion frame — the ML-DSA keypair already lives off-stack.
+const MAX_CRED_ID: usize = CRED_BOX_MAX;
 const MAX_USER_ID: usize = 64;
 
 struct Request<'a> {
@@ -152,8 +155,9 @@ fn parse(data: &[u8]) -> Result<Request<'_>, CtapError> {
     Ok(req)
 }
 
-/// Max user name / displayName length echoed in an assertion (truncated to 64).
-const MAX_USER_NAME: usize = 64;
+/// Max user name / displayName length echoed in an assertion — the create-side
+/// truncation cap, so a stored name always fits verbatim.
+const MAX_USER_NAME: usize = USER_NAME_MAX;
 
 /// The newest matching credential found so far.
 struct Best {

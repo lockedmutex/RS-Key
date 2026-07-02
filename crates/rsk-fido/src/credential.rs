@@ -47,6 +47,27 @@ const HEAD_LEN: usize = PROTO_LEN + IV_LEN; // 16
 /// Bytes around the ciphertext for proto 0x02: head + poly tag + silent tag.
 const WRAP_LEN_22: usize = HEAD_LEN + TAG_LEN + SILENT_TAG_LEN; // 48
 
+/// The one credential-box ceiling: create (makeCredential), assert
+/// (getAssertion's `Best::id`) and reseal (credMgmt update) all size from it —
+/// a divergent assert cap strands fresh credentials (create OK, assert skips).
+pub(crate) const CRED_BOX_MAX: usize = 640;
+
+/// CTAP 2.1 §6.1.2 sanctions truncating user.name/displayName; 64 bytes keeps
+/// a worst-case box (253-byte rpId, 64-byte user id) inside [`CRED_BOX_MAX`].
+pub(crate) const USER_NAME_MAX: usize = 64;
+
+/// Truncate `s` to at most `max` bytes on a UTF-8 character boundary.
+pub(crate) fn truncate_utf8(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Largest EF_RPNICK record: `iv(12) ‖ ciphertext ‖ tag(16)` for a max-length nickname.
 pub(crate) const NICK_BOX_MAX: usize = IV_LEN + RP_NICK_MAX_LEN + TAG_LEN;
 
@@ -416,6 +437,9 @@ pub const RECORD_PREFIX: usize = 32 + CRED_RESIDENT_LEN;
 
 /// Largest EF_CRED record — up to ~1 KiB with a large credBlob.
 pub(crate) const CRED_REC_MAX: usize = 1024;
+
+// A ceiling-sized resident box must still fit its EF_CRED record.
+const _: () = assert!(RECORD_PREFIX + CRED_BOX_MAX <= CRED_REC_MAX);
 
 /// EF_RP head before the (boxed) rpId tail: `count(1) ‖ rpIdHash(32)`.
 pub(crate) const RP_PREFIX: usize = 1 + 32;

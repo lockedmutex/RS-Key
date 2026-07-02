@@ -13,6 +13,19 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+### Fixed
+
+- **Large credentials could never assert.** makeCredential sealed credential
+  boxes up to 640 bytes, but getAssertion's candidate filter and credMgmt's
+  updateUserInformation reseal buffer stopped at 512 — a long-rpId
+  registration succeeded and then every assertion silently skipped it
+  (`CTAP2_ERR_NO_CREDENTIALS`), and user updates failed. One shared ceiling
+  (`credential::CRED_BOX_MAX`, 640) now sizes the create, assert and reseal
+  paths; overlong `user.name`/`user.displayName` are truncated to 64 bytes at
+  create and update (CTAP 2.1 §6.1.2) instead of overflowing the box; and
+  getInfo's `maxCredentialIdLength` reports the real ceiling (640, was 1024).
+  bcdDevice `0x07E7` → `0x07E8`.
+
 ### Security
 
 - **Security-audit run-8 hardening notes.** Four defense-in-depth items from the

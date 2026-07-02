@@ -150,7 +150,9 @@ pub const FIRMWARE_VERSION: u32 = rsk_sdk::FIRMWARE_VERSION_U32;
 /// worker exchange, applet response) holds this. `MAX_FRAGMENT_LENGTH` tracks
 /// it per the spec's `maxMsgSize - 64`.
 pub const MAX_MSG_SIZE: u64 = 7609;
-pub const MAX_CRED_ID_LENGTH: u64 = 1024;
+/// Mirrors `credential::CRED_BOX_MAX`: the largest credentialId this device
+/// mints (a non-resident box) — and therefore the largest it will assert.
+pub const MAX_CRED_ID_LENGTH: u64 = crate::credential::CRED_BOX_MAX as u64;
 pub const MAX_CREDENTIAL_COUNT_IN_LIST: u64 = 16;
 
 // pinUvAuthParam MAC covers subCommand ‖ subCommandParams; cap on the raw bytes

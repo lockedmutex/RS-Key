@@ -925,3 +925,91 @@ fn legacy_plaintext_rp_migrates_and_stays_usable() {
         "migration not idempotent"
     );
 }
+
+// updateUserInformation must reseal a ceiling-sized box. The registered box
+// (a 195-byte rpId — the largest whose sealed EF_RP record still fits
+// RP_REC_MAX — 64-byte uid, max credBlob) plus 64-byte updated names crosses
+// the OLD 512-byte reseal buffer — updates on such credentials used to fail
+// NotAllowed while smaller ones worked.
+#[test]
+fn update_user_reseals_near_ceiling_box() {
+    let (mut fs, mut rng) = setup();
+    let rp = "a".repeat(191) + ".com";
+    let uid = [0x42u8; 64];
+
+    // Resident makeCredential with a credBlob (register() has no ext support).
+    let mut buf = [0u8; 1024];
+    let n = {
+        let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+        e.map(6).unwrap();
+        e.u8(1).unwrap().bytes(&CDH).unwrap();
+        e.u8(2).unwrap().map(1).unwrap();
+        e.str("id").unwrap().str(&rp).unwrap();
+        e.u8(3).unwrap().map(2).unwrap();
+        e.str("id").unwrap().bytes(&uid).unwrap();
+        e.str("name").unwrap().str("a").unwrap();
+        e.u8(4).unwrap().array(1).unwrap().map(2).unwrap();
+        e.str("alg").unwrap().i64(ALG_ES256).unwrap();
+        e.str("type").unwrap().str("public-key").unwrap();
+        e.u8(6).unwrap().map(1).unwrap();
+        e.str("credBlob").unwrap().bytes(&[0x5A; 127]).unwrap();
+        e.u8(7).unwrap().map(1).unwrap();
+        e.str("rk").unwrap().bool(true).unwrap();
+        e.writer().position()
+    };
+    let mut out = [0u8; 2048];
+    let mut state = FidoState::new();
+    let id_a = {
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 10,
+        };
+        let n = make_credential(&mut ctx, &buf[..n], &mut out).unwrap();
+        parse_mc(&out[..n]).0
+    };
+
+    // Update to 40-byte name/displayName (the largest that also fits the raw
+    // subCommandParams echo buffer, MAX_RAW_SUBPARA): the resealed box exceeds 512.
+    let new_name = "u".repeat(40);
+    let mut sp = [0u8; 512];
+    let n = {
+        let mut e = Encoder::new(Cursor::new(&mut sp[..]));
+        e.map(2).unwrap();
+        e.u8(2).unwrap().map(2).unwrap();
+        e.str("id").unwrap().bytes(&id_a).unwrap();
+        e.str("type").unwrap().str("public-key").unwrap();
+        e.u8(3).unwrap().map(3).unwrap();
+        e.str("id").unwrap().bytes(&uid).unwrap();
+        e.str("name").unwrap().str(&new_name).unwrap();
+        e.str("displayName").unwrap().str(&new_name).unwrap();
+        e.writer().position()
+    };
+    let subpara = sp[..n].to_vec();
+
+    let mut state = armed(PERM_CM);
+    let mut out = [0u8; 1024];
+    let n = run(
+        &mut fs,
+        &mut state,
+        &cm_request(0x07, Some(&subpara), &TOKEN),
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(n, 0);
+
+    // Re-enumerate: the credential carries the updated name.
+    let rp_hash = sha256(rp.as_bytes());
+    let n = run(
+        &mut fs,
+        &mut state,
+        &cm_request(0x04, Some(&subpara_rpidhash(&rp_hash)), &TOKEN),
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(cred_user_name(&out[..n]), new_name);
+}

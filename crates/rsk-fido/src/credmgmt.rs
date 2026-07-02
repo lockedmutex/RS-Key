@@ -24,8 +24,9 @@ use crate::consts::{
     CRED_PROT_UV_OPTIONAL, EF_CRED, EF_RP, MAX_RAW_SUBPARA, MAX_RESIDENT_CREDENTIALS,
 };
 use crate::credential::{
-    CRED_REC_MAX, CRED_RESIDENT_LEN, CredInput, RECORD_PREFIX, RP_PREFIX, RP_REC_MAX,
-    credential_create, credential_load, derive_large_blob_key, slot_map, unseal_rp_id,
+    CRED_BOX_MAX, CRED_REC_MAX, CRED_RESIDENT_LEN, CredInput, RECORD_PREFIX, RP_PREFIX, RP_REC_MAX,
+    USER_NAME_MAX, credential_create, credential_load, derive_large_blob_key, slot_map,
+    truncate_utf8, unseal_rp_id,
 };
 use crate::ec::CredKey;
 use crate::error::{CtapError, CtapResult};
@@ -655,8 +656,10 @@ fn reseal_user<S: Storage, R: Rng>(
     let input = CredInput {
         rp_id: cred.rp_id,
         user_id: cred.user_id,
-        user_name,
-        user_display_name,
+        // Same CTAP 2.1 §6.1.2 truncation as makeCredential, so an update
+        // cannot grow the box past CRED_BOX_MAX when the original sealed fine.
+        user_name: truncate_utf8(user_name, USER_NAME_MAX),
+        user_display_name: truncate_utf8(user_display_name, USER_NAME_MAX),
         use_sign_count: cred.use_sign_count,
         rk: cred.rk,
         created_ms: ctx.now_ms,
@@ -664,7 +667,7 @@ fn reseal_user<S: Storage, R: Rng>(
         curve: cred.curve,
         ext: cred.ext,
     };
-    let mut new_box = [0u8; 512];
+    let mut new_box = [0u8; CRED_BOX_MAX];
     let len = credential_create(seed, &ctx.dev, &input, &rp_id_hash, &iv, &mut new_box)
         .map_err(|_| CtapError::NotAllowed)?;
 

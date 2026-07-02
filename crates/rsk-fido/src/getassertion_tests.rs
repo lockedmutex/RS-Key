@@ -1858,3 +1858,89 @@ fn classic_to_pqc_upgrade() {
     vk.verify(&signed, &Signature::from_der(&sig).unwrap())
         .expect("pre-upgrade ES256 credential still asserts");
 }
+
+// A ceiling-sized credential must round-trip. A 253-byte rpId (the DNS
+// ceiling) plus overlong user strings (truncated to 64, CTAP 2.1 §6.1.2) and a
+// credBlob pushes the box past the OLD 512-byte assert cap — the create/assert
+// divergence stranded exactly these: create succeeded, then Best::consider
+// silently skipped the id and every assertion ended NO_CREDENTIALS.
+#[test]
+fn near_ceiling_credential_roundtrips() {
+    let (mut fs, mut rng) = setup();
+    let rp = "a".repeat(249) + ".com";
+    let uid = [0x42u8; 64];
+    let long_name = "n".repeat(100);
+
+    let mut buf = [0u8; 1024];
+    let n = {
+        let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+        e.map(5).unwrap();
+        e.u8(1).unwrap().bytes(&CDH).unwrap();
+        e.u8(2).unwrap().map(1).unwrap();
+        e.str("id").unwrap().str(&rp).unwrap();
+        e.u8(3).unwrap().map(3).unwrap();
+        e.str("id").unwrap().bytes(&uid).unwrap();
+        e.str("name").unwrap().str(&long_name).unwrap();
+        e.str("displayName").unwrap().str(&long_name).unwrap();
+        e.u8(4).unwrap().array(1).unwrap().map(2).unwrap();
+        e.str("alg").unwrap().i64(ALG_ES256).unwrap();
+        e.str("type").unwrap().str("public-key").unwrap();
+        e.u8(6).unwrap().map(1).unwrap();
+        e.str("credBlob").unwrap().bytes(&[0x5A; 32]).unwrap();
+        e.writer().position()
+    };
+    let mc_req = buf[..n].to_vec();
+
+    let mut out = [0u8; 2048];
+    let mc = {
+        let mut state = crate::FidoState::new();
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 10,
+        };
+        let n = make_credential(&mut ctx, &mc_req, &mut out).unwrap();
+        out[..n].to_vec()
+    };
+    let (cred_id, x, y) = parse_mc(&mc);
+    assert!(
+        cred_id.len() > 512,
+        "box must cross the old assert cap (len {})",
+        cred_id.len()
+    );
+    assert!(cred_id.len() <= crate::credential::CRED_BOX_MAX);
+
+    let mut gbuf = [0u8; 1024];
+    let n = {
+        let mut e = Encoder::new(Cursor::new(&mut gbuf[..]));
+        e.map(3).unwrap();
+        e.u8(1).unwrap().str(&rp).unwrap();
+        e.u8(2).unwrap().bytes(&CDH).unwrap();
+        e.u8(3).unwrap().array(1).unwrap().map(2).unwrap();
+        e.str("type").unwrap().str("public-key").unwrap();
+        e.str("id").unwrap().bytes(&cred_id).unwrap();
+        e.writer().position()
+    };
+    let ga_req = gbuf[..n].to_vec();
+
+    let mut out2 = [0u8; 2048];
+    let ga = {
+        let mut state = crate::FidoState::new();
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 20,
+        };
+        let n = get_assertion(&mut ctx, &ga_req, &mut out2).unwrap();
+        out2[..n].to_vec()
+    };
+    verify_assertion(&ga, &x, &y);
+}
