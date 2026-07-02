@@ -82,6 +82,8 @@ suite on the host ([testing.md](testing.md)).
 
 ## Flash layout
 
+![RP2350-One flash map — a signed code region above two KV partitions (main store + counters) that survive a reflash](images/flash-map.svg)
+
 Two KV partitions at fixed offsets (`firmware/memory.x`): the main store, and
 a small separate partition for the per-operation counters so their churn
 never forces compaction of long-lived records. Files are 16-bit ids; each
@@ -99,6 +101,20 @@ without losing data. Until that burn the root derives from on-chip state
 alone, which an attacker with full flash and chip access could reconstruct —
 [threat-model.md](threat-model.md) covers what at-rest sealing does and does
 not buy before provisioning.
+
+## Capacity — why the flash is mostly empty
+
+The KV store is a fixed 1.5 MB whatever the `FLASH_SIZE` ([build.md](build.md));
+a larger flash only grows the code region, most of which no firmware writes. That
+is deliberate. A security key's maximum *logical* state is small and hard-capped:
+`MAX_RESIDENT_CREDENTIALS` (256 passkeys), `MAX_DYNAMIC_FILES` (256 files across
+all applets), `MAX_OATH_CRED` (255), plus a handful of OpenPGP/PIV slots — so a
+fully provisioned device fills only a few hundred KB, well under the 1408 KB main
+partition. Growing the store to "fill" a 16 MB board would buy nothing usable: it
+lengthens the `sequential-storage` scan behind every cold boot and absent-key
+probe (the present cache exists to dodge exactly that full-partition ~0.2 s cost),
+and forces the logical caps — and the RAM/stack buffers sized to them — up for
+capacity no one reaches. Empty flash here is headroom, not waste.
 
 ## Device identity
 

@@ -72,6 +72,15 @@ The `firmware-*` glob matches one build dir per feature combination you have
 built, so a stale entry can show an old value. Read the freshest one (or
 `cargo clean -p firmware` first) if the output looks doubled.
 
+## Flash size and the memory map
+
+`FLASH_SIZE` regenerates `memory.x`: the 1.5 MB KV store stays pinned to the top
+of flash and only the code region grows. A 16 MB board just gets more (unused)
+code headroom — the credential capacity is unchanged (why the flash is mostly
+empty by design: [architecture.md](architecture.md)).
+
+![4 MB vs 16 MB flash layout — the KV store is identical on both; only the code region and the KV origin move with FLASH_SIZE](images/flash-map-sizes.svg)
+
 ## Examples
 
 ```sh
