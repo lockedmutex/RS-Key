@@ -68,47 +68,68 @@ fn parse(data: &[u8]) -> Result<Req<'_>, CtapError> {
         expected = key + 1;
         match key {
             1 => req.subcommand = cbor(d.u32())? as u64,
-            2 => {
-                // Capture the raw subCommandParams bytes (covered by the MAC) while
-                // extracting the fields setMinPINLength needs.
-                let start = d.position();
-                let m = def_map(&mut d)?;
-                for _ in 0..m {
-                    let sk = cbor(d.u32())? as u64;
-                    if req.subcommand == CONFIG_SET_MIN_PIN {
-                        match sk {
-                            1 => req.new_min_pin = cbor(d.u32())? as u64,
-                            2 => {
-                                let a = def_arr(&mut d)?;
-                                for _ in 0..a {
-                                    let id = cbor(d.str())?;
-                                    if req.rp_ids_len < MAX_MIN_PIN_RPIDS {
-                                        req.rp_ids[req.rp_ids_len] = id;
-                                        req.rp_ids_len += 1;
-                                    }
-                                }
-                            }
-                            3 => req.force_change = cbor(d.bool())?,
-                            _ => cbor(d.skip())?,
-                        }
-                    } else if req.subcommand == CONFIG_VENDOR {
-                        match sk {
-                            1 => req.vendor_id = cbor(d.u64())?,
-                            2 => req.vendor_param = cbor(d.bytes())?,
-                            _ => cbor(d.skip())?,
-                        }
-                    } else {
-                        cbor(d.skip())?;
-                    }
-                }
-                req.raw_subpara = &data[start..d.position()];
-            }
+            2 => parse_subparams(&mut d, &mut req, data)?,
             3 => req.proto = cbor(d.u32())? as u64,
             4 => req.pin_uv_auth_param = Some(cbor(d.bytes())?),
             _ => cbor(d.skip())?,
         }
     }
     Ok(req)
+}
+
+/// Parse the `subCommandParams` map (request key 2), keeping the raw bytes (they
+/// are covered by the pinUvAuth MAC) and dispatching each sub-key to the
+/// setMinPINLength / vendor extractor for the active subcommand.
+fn parse_subparams<'a>(
+    d: &mut Decoder<'a>,
+    req: &mut Req<'a>,
+    data: &'a [u8],
+) -> Result<(), CtapError> {
+    let start = d.position();
+    let m = def_map(d)?;
+    for _ in 0..m {
+        let sk = cbor(d.u32())? as u64;
+        if req.subcommand == CONFIG_SET_MIN_PIN {
+            parse_min_pin_sub(d, req, sk)?;
+        } else if req.subcommand == CONFIG_VENDOR {
+            parse_vendor_sub(d, req, sk)?;
+        } else {
+            cbor(d.skip())?;
+        }
+    }
+    req.raw_subpara = &data[start..d.position()];
+    Ok(())
+}
+
+/// One setMinPINLength subCommandParam: new length (1), rpId list (2), or
+/// forceChangePin (3).
+fn parse_min_pin_sub<'a>(d: &mut Decoder<'a>, req: &mut Req<'a>, sk: u64) -> Result<(), CtapError> {
+    match sk {
+        1 => req.new_min_pin = cbor(d.u32())? as u64,
+        2 => {
+            let a = def_arr(d)?;
+            for _ in 0..a {
+                let id = cbor(d.str())?;
+                if req.rp_ids_len < MAX_MIN_PIN_RPIDS {
+                    req.rp_ids[req.rp_ids_len] = id;
+                    req.rp_ids_len += 1;
+                }
+            }
+        }
+        3 => req.force_change = cbor(d.bool())?,
+        _ => cbor(d.skip())?,
+    }
+    Ok(())
+}
+
+/// One vendor (0xFF) subCommandParam: vendorCommandId (1) or its byte param (2).
+fn parse_vendor_sub<'a>(d: &mut Decoder<'a>, req: &mut Req<'a>, sk: u64) -> Result<(), CtapError> {
+    match sk {
+        1 => req.vendor_id = cbor(d.u64())?,
+        2 => req.vendor_param = cbor(d.bytes())?,
+        _ => cbor(d.skip())?,
+    }
+    Ok(())
 }
 
 /// `authenticatorConfig`: verify the pinUvAuthParam, then run the subcommand.
