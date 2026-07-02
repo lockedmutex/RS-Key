@@ -32,3 +32,7 @@ the mdBook site.
 | `rollback-timeline.svg` | 48-bit rollback thermometer + boot decision | original — from `anti-rollback.md` |
 | `led-status.svg` | Status-LED cheat sheet (state → colour/effect), SMIL-animated | original — from `guides/led.md` |
 | `tui-cockpit.svg` | rsk-tui cockpit terminal mockup (Overview section) | original — modeled on the running cockpit (`tools/tui`), serial redacted |
+| `threat-tiers.svg` | Defense tiers vs out-of-scope (what RS-Key defends) | original — from `threat-model.md` |
+| `soft-lock-states.svg` | Soft-lock state machine (Sealed / Locked / Unlocked) | original — from `guides/soft-lock.md` |
+| `seed-backup-window.svg` | Seed-export one-time window (No seed / Open / Finalized) | original — from `guides/seed-backup.md` |
+| `backup-key-redundancy.svg` | Primary + backup key enrolled at each account | original — from `guides/backup-key.md` |

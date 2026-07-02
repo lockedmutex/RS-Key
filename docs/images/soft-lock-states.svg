@@ -1,0 +1,68 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 RS-Key contributors -->
+<svg viewBox="0 0 780 322" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="ttl dsc" font-family="'Segoe UI', system-ui, -apple-system, sans-serif">
+  <title id="ttl">Soft-lock state machine</title>
+  <desc id="dsc">The seed's at-rest soft-lock has three states. From power-on the device is Sealed (the seed is device-root-sealed). rsk lock enable (PIN + touch) moves it to Locked, where every FIDO operation is refused and the seed carries an extra ChaCha20-Poly1305 wrap. rsk lock unlock with the 256-bit key moves it to Unlocked, serving with the key held in RAM. A power cycle returns Unlocked to Locked and zeroizes the RAM key; rsk lock disable (PIN + touch) returns it to Sealed.</desc>
+  <defs>
+    <style>
+      .h1{font-size:23px;font-weight:700;fill:#2B2723}
+      .sub{font-size:12.5px;fill:#948A7F}
+      .lg{font-size:11px;fill:#6B645C}
+      .sname{font-size:15px;font-weight:700;fill:#fff}
+      .sdesc{font-size:10.5px;fill:#F3ECE4}
+      .tk{font-size:11px;font-weight:700;fill:#A9764F;font-family:'SF Mono','Roboto Mono',ui-monospace,monospace}
+      .tc{font-size:10.5px;fill:#6B645C}
+      .rk{font-size:11px;font-weight:700;fill:#6B645C;font-family:'SF Mono','Roboto Mono',ui-monospace,monospace}
+      .foot{font-size:10.5px;fill:#ADA398}
+    </style>
+    <marker id="af" viewBox="0 0 8 8" refX="6.5" refY="4" markerWidth="6.5" markerHeight="6.5" orient="auto"><path d="M0 0 L8 4 L0 8 z" fill="#A9764F"/></marker>
+    <marker id="ag" viewBox="0 0 8 8" refX="6.5" refY="4" markerWidth="6.5" markerHeight="6.5" orient="auto"><path d="M0 0 L8 4 L0 8 z" fill="#948A7F"/></marker>
+  </defs>
+  <rect x="6" y="6" width="768" height="310" rx="16" fill="#FBFAF8" stroke="#E4DED5" stroke-width="1.5"/>
+
+  <text class="h1" x="34" y="46">Soft-lock state machine</text>
+  <text class="sub" x="34" y="68">the seed's at-rest lock · a stolen device refuses FIDO until the key is presented</text>
+
+  <!-- legend -->
+  <rect x="470" y="34" width="13" height="13" rx="3" fill="#2F7E75"/>
+  <text class="lg" x="490" y="45">protected</text>
+  <rect x="566" y="34" width="13" height="13" rx="3" fill="#3E3A36"/>
+  <text class="lg" x="586" y="45">locked out</text>
+  <rect x="666" y="34" width="13" height="13" rx="3" fill="#C0562B"/>
+  <text class="lg" x="686" y="45">key in RAM</text>
+
+  <!-- initial marker + entry arrow -->
+  <circle cx="34" cy="143" r="5.5" fill="#3E3A36"/>
+  <line x1="40" y1="143" x2="56" y2="143" stroke="#948A7F" stroke-width="2" marker-end="url(#ag)"/>
+
+  <!-- state boxes (center y 143) -->
+  <rect x="58"  y="112" width="152" height="62" rx="11" fill="#2F7E75"/>
+  <text class="sname" x="134" y="140" text-anchor="middle">Sealed</text>
+  <text class="sdesc" x="134" y="158" text-anchor="middle">device-root-sealed seed</text>
+
+  <rect x="314" y="112" width="152" height="62" rx="11" fill="#3E3A36"/>
+  <text class="sname" x="390" y="140" text-anchor="middle">Locked</text>
+  <text class="sdesc" x="390" y="158" text-anchor="middle">FIDO refused · ChaCha20 wrap</text>
+
+  <rect x="570" y="112" width="152" height="62" rx="11" fill="#C0562B"/>
+  <text class="sname" x="646" y="140" text-anchor="middle">Unlocked</text>
+  <text class="sdesc" x="646" y="158" text-anchor="middle">256-bit key held in RAM</text>
+
+  <!-- forward transitions (top) -->
+  <line x1="210" y1="143" x2="314" y2="143" stroke="#A9764F" stroke-width="2" marker-end="url(#af)"/>
+  <text class="tk" x="262" y="104" text-anchor="middle">rsk lock enable</text>
+  <text class="tc" x="262" y="190" text-anchor="middle">PIN + touch</text>
+
+  <line x1="466" y1="143" x2="570" y2="143" stroke="#A9764F" stroke-width="2" marker-end="url(#af)"/>
+  <text class="tk" x="518" y="104" text-anchor="middle">rsk lock unlock</text>
+  <text class="tc" x="518" y="190" text-anchor="middle">256-bit key</text>
+
+  <!-- return transitions (bottom curves) -->
+  <path d="M620 174 C 620 214, 390 214, 390 174" fill="none" stroke="#948A7F" stroke-width="2" marker-end="url(#ag)"/>
+  <text class="rk" x="505" y="209" text-anchor="middle">power cycle · RAM zeroized</text>
+
+  <path d="M672 174 C 672 268, 134 268, 134 174" fill="none" stroke="#948A7F" stroke-width="2" marker-end="url(#ag)"/>
+  <text class="rk" x="403" y="252" text-anchor="middle">rsk lock disable · PIN + touch</text>
+
+  <text class="foot" x="34" y="300">Reference: guides/soft-lock.md · the two-factor seed lock (device + your 256-bit BIP-39/SLIP-39 key)</text>
+</svg>

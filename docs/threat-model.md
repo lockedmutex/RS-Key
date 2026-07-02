@@ -4,21 +4,7 @@ What RS-Key defends against, what it deliberately does not, and the honest
 residuals in between. The defenses compose in tiers — each one assumes the
 ones before it.
 
-```mermaid
-flowchart TB
-    attacker["Attacker-controlled USB bytes"]
-    oos["Out of scope:<br/>physical / lab attacks · a compromised, unlocked host<br/>(the RP2350 is not a secure element)"]
-    subgraph rp["RP2350"]
-      parse["Memory-safe parsers<br/>(safe Rust + fuzzing)"]
-      gates["Protocol gates<br/>PIN/UV · touch · mgmt-key"]
-      keys["Key material"]
-      seal["At-rest seal<br/>(meaningful only after the OTP master-key burn)"]
-      parse --> gates --> keys
-      seal --> keys
-    end
-    attacker --> parse
-    oos -. not defended .-> rp
-```
+![What RS-Key defends and what is out of scope — attacker-controlled USB bytes enter the RP2350 and pass through three composing tiers: memory-safe parsers (safe Rust plus fuzzing), then protocol gates (PIN/UV, touch, management key), then the key material, which is additionally protected by an at-rest seal meaningful after the OTP master-key burn; physical and lab attacks and a compromised, unlocked host are explicitly out of scope and reach the device undefended, since the RP2350 is not a secure element](images/threat-tiers.svg)
 
 ## Assets
 
