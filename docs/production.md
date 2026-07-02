@@ -163,7 +163,8 @@ picotool seal --sign --hash firmware.uf2 firmware-signed.uf2 \
     ~/.rs-key-secrets/secure_boot_key.pem ~/.rs-key-secrets/otp_secureboot.json \
     --major 1 --minor 0 --rollback 1
 picotool info firmware-signed.uf2        # must say "signature: verified"
-# flash firmware-signed.uf2 over BOOTSEL and confirm the device works
+# BOOTSEL, then flash + confirm the device works:
+picotool load -v firmware-signed.uf2 && picotool reboot   # or drag it onto the RP2350 drive
 ```
 
 The arguments:
@@ -223,7 +224,8 @@ picotool uf2 convert target/thumbv8m.main-none-eabihf/release/firmware -t elf fi
 picotool seal --sign --hash firmware.uf2 firmware-signed.uf2 \
     ~/.rs-key-secrets/secure_boot_key.pem ~/.rs-key-secrets/otp_secureboot.json \
     --major 1 --minor 0 --rollback 1
-# flash firmware-signed.uf2 (BOOTSEL, or: rsk reboot bootsel && cp)
+# BOOTSEL (hands-free: rsk reboot bootsel), then:
+picotool load -v firmware-signed.uf2 && picotool reboot   # or drag it onto the RP2350 drive
 ```
 
 The `--rollback` value is your board's current floor (see

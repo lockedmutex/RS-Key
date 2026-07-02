@@ -58,8 +58,9 @@ nix develop -c cargo build --release -p rsk-wipe
 nix develop -c picotool uf2 convert \
   target/thumbv8m.main-none-eabihf/release/rsk-wipe -t elf rsk-wipe.uf2
 
-# Enter BOOTSEL (hold BOOT, tap RESET) then copy it across:
-cp rsk-wipe.uf2 /Volumes/RP2350/
+# Enter BOOTSEL (hold BOOT, tap RESET) then flash it across:
+cp rsk-wipe.uf2 /Volumes/RP2350/                    # or, more robust (verifies):
+picotool load -v rsk-wipe.uf2 && picotool reboot
 ```
 
 On a **secure-boot board** the plain UF2 is refused — seal the wipe image

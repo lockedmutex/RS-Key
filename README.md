@@ -104,8 +104,9 @@ nix develop                       # toolchain, picotool, host tools — everythi
 cargo build --release -p firmware
 picotool uf2 convert target/thumbv8m.main-none-eabihf/release/firmware -t elf firmware.uf2
 
-# hold BOOTSEL, plug the board in, then copy the image to the RP2350 drive:
-cp firmware.uf2 /Volumes/RP2350/  # macOS; on Linux, the mounted RP2350 mass-storage volume
+# hold BOOTSEL, plug the board in, then flash — either way:
+cp firmware.uf2 /Volumes/RP2350/                    # macOS drag-and-drop; Linux: the mounted RP2350 volume
+picotool load -v firmware.uf2 && picotool reboot    # more robust; verifies the write (use if cp flakes)
 ```
 
 Re-plug the board and it enumerates as a composite USB authenticator. The default

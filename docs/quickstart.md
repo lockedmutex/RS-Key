@@ -10,7 +10,7 @@ From zero to a working security key in about ten minutes.
 flowchart TD
     a["nix develop · cargo build"] --> b["firmware.uf2"]
     b --> c["hold BOOT, plug in"]
-    c --> d["copy .uf2 to the RP2350 drive"]
+    c --> d["flash: drag-and-drop or picotool load"]
     d --> e["board reboots, enumerates over USB"]
     e --> f["set PIN, enroll a passkey / ssh key"]
 ```
@@ -42,8 +42,19 @@ suites, or if your board is hard to reach) add `--features no-touch`. All build 
 
 1. Hold the **BOOT** button while plugging the board in (or hold BOOT, tap
    RESET). A mass-storage drive named `RP2350` appears.
-2. Copy the image: `cp firmware.uf2 /Volumes/RP2350/` (macOS) or to the
-   mounted drive on Linux.
+2. Flash it, either way:
+   - **Drag-and-drop:** `cp firmware.uf2 /Volumes/RP2350/` (macOS) or copy it to
+     the mounted drive on Linux.
+   - **picotool (more robust — it verifies, and skips the mass-storage layer):**
+     `picotool load -v firmware.uf2 && picotool reboot`.
+
+   The `RP2350` drive is a *fake* FAT volume the bootrom emulates — it only
+   understands the UF2 blocks written to it, not a real filesystem. On some
+   machines the OS's mass-storage layer breaks that (macOS resource-fork sidecar
+   files and Spotlight, buffered or reordered writes, the board rebooting the
+   instant the last block lands), so the copy errors or silently does nothing.
+   `picotool load` speaks the bootrom's PICOBOOT protocol directly, so reach for
+   it whenever the drive never appears or the copy fails.
 3. The board reboots itself and enumerates as `RS-Key Security Key`. (The
    default build uses the project's own USB identity, VID:PID
    `0x1209:0x0001` from pid.codes; the PC/SC reader name contains "RS-Key".
