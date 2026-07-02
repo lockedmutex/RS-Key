@@ -4,10 +4,16 @@
 [![deep-checks](https://github.com/TheMaxMur/RS-Key/actions/workflows/deep-checks.yml/badge.svg)](https://github.com/TheMaxMur/RS-Key/actions/workflows/deep-checks.yml)
 [![docs](https://github.com/TheMaxMur/RS-Key/actions/workflows/pages.yml/badge.svg)](https://themaxmur.github.io/RS-Key/)
 
-<p align="center">
-  <img src="assets/hero-boards.jpg" width="440"
-       alt="Three RS-Key boards on a blueprint background: a bare RP2350 USB stick on the left, the trusted-display variant in the centre showing its Home &quot;Ready&quot; screen (USB connected, Device PIN set, 2 passkeys), and a Waveshare RP2350-One on the right">
-</p>
+<table align="center">
+  <tr>
+    <td align="center" valign="top"><img src="assets/hero-boards.jpg" height="440" alt="Three RS-Key boards on a blueprint background: a bare RP2350 USB stick, the trusted-display variant showing its Home &quot;Ready&quot; screen (USB connected, Device PIN set, 2 passkeys), and a Waveshare RP2350-One"></td>
+    <td align="center" valign="top"><img src="assets/webauthn-demo.gif" height="440" alt="Registering a passkey on webauthn.io with the trusted-display build: the device screen shows a Device PIN pad, then an Approve / Save-passkey prompt, and the browser confirms you are logged in — the PIN and the approval both happen on the device's own screen"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>Three boards, one firmware — stick · trusted display · RP2350-One</sub></td>
+    <td align="center"><sub>Registering a passkey — the PIN &amp; Approve/Deny happen on the device's own screen</sub></td>
+  </tr>
+</table>
 
 RS-Key (RSK, *Raspberry Security Key* — also a nod to its being written in Rust)
 is open-source security-key firmware for the Raspberry Pi **RP2350**. It makes an
@@ -22,13 +28,6 @@ replacement for an audited commercial key.
 > guard credentials you can't afford to lose or have stolen. Read the
 > [threat model](docs/threat-model.md) and [limitations](docs/limitations.md)
 > before trusting it with anything real.
-
-<p align="center">
-  <img src="assets/webauthn-demo.gif" width="260"
-       alt="Registering a passkey on webauthn.io with the trusted-display build: the device screen shows a Device PIN pad, then an Approve / Save-passkey prompt, and the browser confirms you are logged in — the PIN and the approval both happen on the device's own screen">
-  <br>
-  <sub>Registering a passkey on the trusted-display build — the PIN and the Approve / Deny happen on the device's own screen.</sub>
-</p>
 
 ## Documentation
 
