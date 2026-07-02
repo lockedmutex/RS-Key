@@ -71,6 +71,213 @@ fn mgm_crypt(algo: u8, key: &[u8], data: &mut [u8], dir: Dir) -> Result<(), Sw> 
     }
 }
 
+/// Shared context for one GENERAL AUTHENTICATE call: the session, device, flash,
+/// RNG and presence, plus the resolved per-request parameters. The four tag
+/// operations are methods so each takes only its own tag data (and the response
+/// buffer), keeping [`general_authenticate`] a thin dispatcher.
+struct GenAuth<'c, S: Storage> {
+    sess: &'c mut Session,
+    dev: &'c Device<'c>,
+    fs: &'c mut Fs<S>,
+    rng: &'c mut dyn Rng,
+    presence: &'c mut dyn UserPresence,
+    algo: u8,
+    key_ref: u8,
+    touch_policy: u8,
+    chal_len: usize,
+}
+
+impl<S: Storage> GenAuth<'_, S> {
+    /// t80 mutual auth: step 1 (empty witness) returns an encrypted witness under
+    /// the management key; step 2 verifies the returned witness and answers the
+    /// host challenge. Only a `MutualWitness` this device issued may be verified.
+    fn mutual_auth(
+        &mut self,
+        mgm: &[u8],
+        w: &[u8],
+        host_chal: Option<&[u8]>,
+        res: &mut ResBuf,
+    ) -> Result<(), Sw> {
+        if w.is_empty() {
+            // Mutual auth step 1: return the encrypted witness. The touch is
+            // requested here (the start of the handshake) so step 2 needs no
+            // second one.
+            if self.key_ref != SLOT_CARDMGM {
+                return Err(Sw::INCORRECT_P1P2);
+            }
+            check_touch(self.touch_policy, self.presence)?;
+            self.rng.fill(&mut self.sess.challenge[..self.chal_len]);
+            let mut enc = [0u8; 16];
+            enc[..self.chal_len].copy_from_slice(&self.sess.challenge[..self.chal_len]);
+            mgm_crypt(self.algo, mgm, &mut enc[..self.chal_len], Dir::Encrypt)?;
+            self.sess.has_challenge = true;
+            self.sess.chal_kind = ChallengeKind::MutualWitness;
+            self.sess.chal_algo = self.algo;
+            dyn_auth_resp(res, TAG_AUTH_WITNESS, &enc[..self.chal_len])?;
+            return Ok(());
+        }
+        // Mutual auth step 2: host returns the decrypted witness + its own
+        // challenge; verify, then answer with the encrypted host challenge.
+        if self.key_ref != SLOT_CARDMGM {
+            return Err(Sw::INCORRECT_P1P2);
+        }
+        // Only a witness this device issued *encrypted* (mutual step 1) may be
+        // verified here — never a plaintext single-auth challenge.
+        if !self.sess.has_challenge
+            || self.sess.chal_kind != ChallengeKind::MutualWitness
+            || self.sess.chal_algo != self.algo
+        {
+            return Err(Sw::INCORRECT_PARAMS);
+        }
+        let host_chal = host_chal
+            .filter(|c| !c.is_empty())
+            .ok_or(Sw::INCORRECT_PARAMS)?;
+        self.sess.has_challenge = false;
+        self.sess.chal_kind = ChallengeKind::None;
+        if w.len() != self.chal_len || !ct_eq(w, &self.sess.challenge[..self.chal_len]) {
+            return Err(Sw::DATA_INVALID);
+        }
+        self.sess.has_mgm = true;
+        if host_chal.len() != self.chal_len {
+            return Err(Sw::DATA_INVALID);
+        }
+        let mut enc = [0u8; 16];
+        enc[..self.chal_len].copy_from_slice(host_chal);
+        mgm_crypt(self.algo, mgm, &mut enc[..self.chal_len], Dir::Encrypt)?;
+        dyn_auth_resp(res, TAG_AUTH_RESPONSE, &enc[..self.chal_len])?;
+        Ok(())
+    }
+
+    /// t81 single auth step 1: issue a plaintext challenge for the host to
+    /// encrypt and return (verified in [`single_auth_verify`]).
+    fn single_challenge(&mut self, res: &mut ResBuf) -> Result<(), Sw> {
+        self.rng.fill(&mut self.sess.challenge[..self.chal_len]);
+        self.sess.has_challenge = true;
+        self.sess.chal_kind = ChallengeKind::SingleChallenge;
+        self.sess.chal_algo = self.algo;
+        dyn_auth_resp(
+            res,
+            TAG_AUTH_CHALLENGE,
+            &self.sess.challenge[..self.chal_len],
+        )?;
+        Ok(())
+    }
+
+    /// t81 slot private-key operation over the host-supplied challenge `c`: raw
+    /// RSA (blinded, CRT-fault-checked), ECDSA over the digest, or PureEdDSA over
+    /// the message. Symmetric algos are refused — see the arm's oracle note.
+    fn slot_key_op(&mut self, c: &[u8], res: &mut ResBuf) -> Result<(), Sw> {
+        match self.algo {
+            ALGO_RSA1024 | ALGO_RSA2048 | ALGO_RSA3072 | ALGO_RSA4096 => {
+                check_touch(self.touch_policy, self.presence)?;
+                let mut key = seal::load_rsa_key(self.dev, self.fs, key_fid(self.key_ref))?;
+                let _ = key.precompute();
+                if c.len() != key.size() {
+                    return Err(Sw::INCORRECT_PARAMS);
+                }
+                let m = BigUint::from_bytes_be(c);
+                let mut ad = RngAdapter(self.rng);
+                let pt = rsa::hazmat::rsa_decrypt_and_check(&key, Some(&mut ad), &m)
+                    .map_err(|_| Sw::EXEC_ERROR)?;
+                let mut out = [0u8; 512];
+                let bytes = pt.to_bytes_be();
+                let off = key.size() - bytes.len();
+                out[..off].fill(0);
+                out[off..key.size()].copy_from_slice(&bytes);
+                dyn_auth_resp(res, TAG_AUTH_RESPONSE, &out[..key.size()])?;
+                out.zeroize();
+            }
+            ALGO_ECCP256 | ALGO_ECCP384 => {
+                check_touch(self.touch_policy, self.presence)?;
+                let key = seal::load_ec_key(self.dev, self.fs, key_fid(self.key_ref))?;
+                let want = keygen::curve_for_algo(self.algo).ok_or(Sw::INCORRECT_P1P2)?;
+                if key.curve() != want {
+                    return Err(Sw::INCORRECT_P1P2);
+                }
+                let mut raw = [0u8; 96];
+                let rn = key.sign(c, self.rng, &mut raw)?;
+                let mut der = [0u8; 112];
+                let dn = x509::ecdsa_sig_der(&raw[..rn], &mut der)?;
+                dyn_auth_resp(res, TAG_AUTH_RESPONSE, &der[..dn])?;
+            }
+            ALGO_ED25519 => {
+                check_touch(self.touch_policy, self.presence)?;
+                let key = seal::load_ec_key(self.dev, self.fs, key_fid(self.key_ref))?;
+                if key.curve() != Curve::Ed25519 {
+                    return Err(Sw::INCORRECT_P1P2);
+                }
+                // PureEdDSA signs the raw message `c`; the 64-byte signature is
+                // returned bare (no ASN.1 wrapping).
+                let mut sig = [0u8; 64];
+                let n = key.sign(c, self.rng, &mut sig)?;
+                dyn_auth_resp(res, TAG_AUTH_RESPONSE, &sig[..n])?;
+            }
+            ALGO_3DES | ALGO_AES128 | ALGO_AES192 | ALGO_AES256 => {
+                // "Internal authenticate" — encrypting caller-chosen data under
+                // the 9B management key — has no legitimate PIV consumer, and
+                // chained with the single-auth challenge (81-empty -> 81 below)
+                // it is an oracle that forges `has_mgm` with zero key knowledge:
+                // E(mgm, R) submitted as the 82 response decrypts back to R.
+                // The only sanctioned symmetric flows are mutual-witness (t80)
+                // and single-auth (t81-empty challenge -> t82 verify). Refuse.
+                return Err(Sw::INCORRECT_P1P2);
+            }
+            _ => return Err(WRONG_DATA),
+        }
+        Ok(())
+    }
+
+    /// t82 single auth step 2: verify the host-encrypted challenge. Only a
+    /// `SingleChallenge` this device issued in plaintext may be answered here.
+    fn single_auth_verify(&mut self, mgm: &[u8], r: &[u8]) -> Result<(), Sw> {
+        if self.key_ref != SLOT_CARDMGM {
+            return Err(Sw::INCORRECT_P1P2);
+        }
+        if !self.sess.has_challenge
+            || self.sess.chal_kind != ChallengeKind::SingleChallenge
+            || self.sess.chal_algo != self.algo
+        {
+            return Err(Sw::INCORRECT_PARAMS);
+        }
+        check_touch(self.touch_policy, self.presence)?;
+        self.sess.has_challenge = false;
+        self.sess.chal_kind = ChallengeKind::None;
+        if r.len() != self.chal_len {
+            return Err(Sw::DATA_INVALID);
+        }
+        let mut dec = [0u8; 16];
+        dec[..self.chal_len].copy_from_slice(r);
+        mgm_crypt(self.algo, mgm, &mut dec[..self.chal_len], Dir::Decrypt)?;
+        if !ct_eq(&dec[..self.chal_len], &self.sess.challenge[..self.chal_len]) {
+            return Err(Sw::DATA_INVALID);
+        }
+        self.sess.has_mgm = true;
+        Ok(())
+    }
+
+    /// t85 ECDH ("exponentiation") for the key-management slots — NIST ECDH or
+    /// X25519 (`ykman calculate_secret`). Enforces the key's touch policy first.
+    fn ecdh_op(&mut self, pp: &[u8], res: &mut ResBuf) -> Result<(), Sw> {
+        if !is_key(self.key_ref) {
+            return Err(Sw::INCORRECT_P1P2);
+        }
+        if !matches!(self.algo, ALGO_ECCP256 | ALGO_ECCP384 | ALGO_X25519) {
+            return Err(Sw::INCORRECT_P1P2);
+        }
+        check_touch(self.touch_policy, self.presence)?;
+        let key = seal::load_ec_key(self.dev, self.fs, key_fid(self.key_ref))?;
+        let want = keygen::curve_for_algo(self.algo).ok_or(Sw::INCORRECT_P1P2)?;
+        if key.curve() != want {
+            return Err(Sw::INCORRECT_P1P2);
+        }
+        let mut shared = [0u8; 48];
+        let n = key.ecdh(pp, &mut shared)?;
+        dyn_auth_resp(res, TAG_AUTH_RESPONSE, &shared[..n])?;
+        shared.zeroize();
+        Ok(())
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn general_authenticate<S: Storage>(
     sess: &mut Session,
@@ -140,196 +347,34 @@ pub(crate) fn general_authenticate<S: Storage>(
     let t82 = find_tag(dyn_auth, TAG_AUTH_RESPONSE as u16);
     let t85 = find_tag(dyn_auth, TAG_AUTH_EXPONENTIATION as u16);
 
-    let sw = (|| -> Result<(), Sw> {
+    let sw = {
+        let mut ga = GenAuth {
+            sess: &mut *sess,
+            dev,
+            fs: &mut *fs,
+            rng: &mut *rng,
+            presence: &mut *presence,
+            algo,
+            key_ref,
+            touch_policy,
+            chal_len,
+        };
         if let Some(w) = t80 {
-            if w.is_empty() {
-                // Mutual auth step 1: return the encrypted witness. The touch is
-                // requested here (the start of the handshake) so step 2 needs no
-                // second one.
-                if key_ref != SLOT_CARDMGM {
-                    return Err(Sw::INCORRECT_P1P2);
-                }
-                check_touch(touch_policy, presence)?;
-                rng.fill(&mut sess.challenge[..chal_len]);
-                let mut enc = [0u8; 16];
-                enc[..chal_len].copy_from_slice(&sess.challenge[..chal_len]);
-                mgm_crypt(
-                    algo,
-                    &mgm_key[..mgm_len],
-                    &mut enc[..chal_len],
-                    Dir::Encrypt,
-                )?;
-                sess.has_challenge = true;
-                sess.chal_kind = ChallengeKind::MutualWitness;
-                sess.chal_algo = algo;
-                dyn_auth_resp(res, TAG_AUTH_WITNESS, &enc[..chal_len])?;
-                return Ok(());
-            }
-            // Mutual auth step 2: host returns the decrypted witness + its own
-            // challenge; verify, then answer with the encrypted host challenge.
-            if key_ref != SLOT_CARDMGM {
-                return Err(Sw::INCORRECT_P1P2);
-            }
-            // Only a witness this device issued *encrypted* (mutual step 1) may be
-            // verified here — never a plaintext single-auth challenge.
-            if !sess.has_challenge
-                || sess.chal_kind != ChallengeKind::MutualWitness
-                || sess.chal_algo != algo
-            {
-                return Err(Sw::INCORRECT_PARAMS);
-            }
-            let host_chal = t81.filter(|c| !c.is_empty()).ok_or(Sw::INCORRECT_PARAMS)?;
-            sess.has_challenge = false;
-            sess.chal_kind = ChallengeKind::None;
-            if w.len() != chal_len || !ct_eq(w, &sess.challenge[..chal_len]) {
-                return Err(Sw::DATA_INVALID);
-            }
-            sess.has_mgm = true;
-            if host_chal.len() != chal_len {
-                return Err(Sw::DATA_INVALID);
-            }
-            let mut enc = [0u8; 16];
-            enc[..chal_len].copy_from_slice(host_chal);
-            mgm_crypt(
-                algo,
-                &mgm_key[..mgm_len],
-                &mut enc[..chal_len],
-                Dir::Encrypt,
-            )?;
-            dyn_auth_resp(res, TAG_AUTH_RESPONSE, &enc[..chal_len])?;
-            return Ok(());
-        }
-
-        if let Some(c) = t81 {
+            ga.mutual_auth(&mgm_key[..mgm_len], w, t81, res)
+        } else if let Some(c) = t81 {
             if c.is_empty() {
-                // Single auth step 1: return a plaintext challenge.
-                rng.fill(&mut sess.challenge[..chal_len]);
-                sess.has_challenge = true;
-                sess.chal_kind = ChallengeKind::SingleChallenge;
-                sess.chal_algo = algo;
-                dyn_auth_resp(res, TAG_AUTH_CHALLENGE, &sess.challenge[..chal_len])?;
-                return Ok(());
+                ga.single_challenge(res)
+            } else {
+                ga.slot_key_op(c, res)
             }
-            match algo {
-                ALGO_RSA1024 | ALGO_RSA2048 | ALGO_RSA3072 | ALGO_RSA4096 => {
-                    check_touch(touch_policy, presence)?;
-                    let mut key = seal::load_rsa_key(dev, fs, key_fid(key_ref))?;
-                    let _ = key.precompute();
-                    if c.len() != key.size() {
-                        return Err(Sw::INCORRECT_PARAMS);
-                    }
-                    let m = BigUint::from_bytes_be(c);
-                    let mut ad = RngAdapter(rng);
-                    let pt = rsa::hazmat::rsa_decrypt_and_check(&key, Some(&mut ad), &m)
-                        .map_err(|_| Sw::EXEC_ERROR)?;
-                    let mut out = [0u8; 512];
-                    let bytes = pt.to_bytes_be();
-                    let off = key.size() - bytes.len();
-                    out[..off].fill(0);
-                    out[off..key.size()].copy_from_slice(&bytes);
-                    dyn_auth_resp(res, TAG_AUTH_RESPONSE, &out[..key.size()])?;
-                    out.zeroize();
-                }
-                ALGO_ECCP256 | ALGO_ECCP384 => {
-                    check_touch(touch_policy, presence)?;
-                    let key = seal::load_ec_key(dev, fs, key_fid(key_ref))?;
-                    let want = keygen::curve_for_algo(algo).ok_or(Sw::INCORRECT_P1P2)?;
-                    if key.curve() != want {
-                        return Err(Sw::INCORRECT_P1P2);
-                    }
-                    let mut raw = [0u8; 96];
-                    let rn = key.sign(c, rng, &mut raw)?;
-                    let mut der = [0u8; 112];
-                    let dn = x509::ecdsa_sig_der(&raw[..rn], &mut der)?;
-                    dyn_auth_resp(res, TAG_AUTH_RESPONSE, &der[..dn])?;
-                }
-                ALGO_ED25519 => {
-                    check_touch(touch_policy, presence)?;
-                    let key = seal::load_ec_key(dev, fs, key_fid(key_ref))?;
-                    if key.curve() != Curve::Ed25519 {
-                        return Err(Sw::INCORRECT_P1P2);
-                    }
-                    // PureEdDSA signs the raw message `c`; the 64-byte signature is
-                    // returned bare (no ASN.1 wrapping).
-                    let mut sig = [0u8; 64];
-                    let n = key.sign(c, rng, &mut sig)?;
-                    dyn_auth_resp(res, TAG_AUTH_RESPONSE, &sig[..n])?;
-                }
-                ALGO_3DES | ALGO_AES128 | ALGO_AES192 | ALGO_AES256 => {
-                    // "Internal authenticate" — encrypting caller-chosen data under
-                    // the 9B management key — has no legitimate PIV consumer, and
-                    // chained with the single-auth challenge (81-empty -> 81 below)
-                    // it is an oracle that forges `has_mgm` with zero key knowledge:
-                    // E(mgm, R) submitted as the 82 response decrypts back to R.
-                    // The only sanctioned symmetric flows are mutual-witness (t80)
-                    // and single-auth (t81-empty challenge -> t82 verify). Refuse.
-                    return Err(Sw::INCORRECT_P1P2);
-                }
-                _ => return Err(WRONG_DATA),
-            }
-            return Ok(());
+        } else if let Some(r) = t82.filter(|r| !r.is_empty()) {
+            ga.single_auth_verify(&mgm_key[..mgm_len], r)
+        } else if let Some(pp) = t85.filter(|p| !p.is_empty()) {
+            ga.ecdh_op(pp, res)
+        } else {
+            Ok(())
         }
-
-        if let Some(r) = t82
-            && !r.is_empty()
-        {
-            // Single auth step 2: verify the host-encrypted challenge.
-            if key_ref != SLOT_CARDMGM {
-                return Err(Sw::INCORRECT_P1P2);
-            }
-            // Only a challenge this device issued in *plaintext* (single step 1) may be
-            // answered here — never a mutual-auth witness.
-            if !sess.has_challenge
-                || sess.chal_kind != ChallengeKind::SingleChallenge
-                || sess.chal_algo != algo
-            {
-                return Err(Sw::INCORRECT_PARAMS);
-            }
-            check_touch(touch_policy, presence)?;
-            sess.has_challenge = false;
-            sess.chal_kind = ChallengeKind::None;
-            if r.len() != chal_len {
-                return Err(Sw::DATA_INVALID);
-            }
-            let mut dec = [0u8; 16];
-            dec[..chal_len].copy_from_slice(r);
-            mgm_crypt(
-                algo,
-                &mgm_key[..mgm_len],
-                &mut dec[..chal_len],
-                Dir::Decrypt,
-            )?;
-            if !ct_eq(&dec[..chal_len], &sess.challenge[..chal_len]) {
-                return Err(Sw::DATA_INVALID);
-            }
-            sess.has_mgm = true;
-            return Ok(());
-        }
-
-        if let Some(pp) = t85.filter(|p| !p.is_empty()) {
-            // ECDH (tag 0x85, "exponentiation") for the key-management slots —
-            // NIST ECDH or X25519 (`ykman calculate_secret`).
-            if !is_key(key_ref) {
-                return Err(Sw::INCORRECT_P1P2);
-            }
-            if !matches!(algo, ALGO_ECCP256 | ALGO_ECCP384 | ALGO_X25519) {
-                return Err(Sw::INCORRECT_P1P2);
-            }
-            check_touch(touch_policy, presence)?;
-            let key = seal::load_ec_key(dev, fs, key_fid(key_ref))?;
-            let want = keygen::curve_for_algo(algo).ok_or(Sw::INCORRECT_P1P2)?;
-            if key.curve() != want {
-                return Err(Sw::INCORRECT_P1P2);
-            }
-            let mut shared = [0u8; 48];
-            let n = key.ecdh(pp, &mut shared)?;
-            dyn_auth_resp(res, TAG_AUTH_RESPONSE, &shared[..n])?;
-            shared.zeroize();
-            return Ok(());
-        }
-
-        Ok(())
-    })();
+    };
     mgm_key.zeroize();
 
     match sw {
