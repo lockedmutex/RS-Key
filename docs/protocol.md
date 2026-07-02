@@ -58,6 +58,8 @@ continuation frames: `CID(4) | SEQ(1) | data[:59]`. `CTAPHID_INIT = 0x86`,
 `CTAPHID_CBOR = 0x90`, `CTAPHID_KEEPALIVE = 0xBB`. A CTAP2 message is
 `command_byte | CBOR_payload`. Reference: `tools/rsk/ctaphid.py`.
 
+![CTAPHID framing — a 64-byte init frame (CID, CMD, BCNT-hi/lo header then 57 payload bytes) and a continuation frame (CID, SEQ header then 59 payload bytes)](images/ctaphid-frame.svg)
+
 ### 1.3 CCID secure PIN entry (pinpad) — **display builds only**
 
 A trusted-display build advertises `bPINSupport = 0x01` (VERIFY) in its CCID class
@@ -363,6 +365,8 @@ Wire format: a flat sequence of `TAG(1) LEN(1) VALUE(LEN)` records, any order, a
 optional. An unknown tag is skipped; a record whose length runs past the buffer
 ends the parse. The firmware applies the record at **boot** (USB identity + LED
 hardware).
+
+![EF_PHY record — a TAG(1) LEN(1) VALUE(LEN) triple, then a worked three-record blob concatenating VIDPID (1209:0001), LED_DRIVER (ws2812) and OPTS (LED_STEADY)](images/phy-record.svg)
 
 | Tag | Name | Len | Value |
 |---|---|---|---|

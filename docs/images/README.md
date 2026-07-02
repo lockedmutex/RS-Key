@@ -21,3 +21,6 @@ the mdBook site.
 |---|---|---|
 | `flash-map.svg` | RP2350-One 4 MB flash address map | original — from `firmware/memory.x` / `flash_storage.rs` |
 | `flash-map-sizes.svg` | 4 MB vs 16 MB layout (how `FLASH_SIZE` scales it) | original — from `firmware/build.rs` |
+| `ctaphid-frame.svg` | CTAPHID 64-byte init + continuation frame layout | original — from `protocol.md` §1.2 / `tools/rsk/ctaphid.py` |
+| `phy-record.svg` | EF_PHY TLV record + a worked three-record example | original — from `crates/rsk-rescue/src/phy.rs` |
+| `cred-box.svg` | FIDO credential box + 42-byte resident id byte layout | original — from `crates/rsk-fido/src/credential.rs` |

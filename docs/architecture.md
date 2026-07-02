@@ -102,6 +102,12 @@ alone, which an attacker with full flash and chip access could reconstruct —
 [threat-model.md](threat-model.md) covers what at-rest sealing does and does
 not buy before provisioning.
 
+One sealed object worth spelling out is the FIDO credential box — it doubles as
+the opaque credential ID a relying party stores, so its size caps the reported
+`maxCredentialIdLength` (748):
+
+![FIDO credential box — proto(4) iv(12) then a variable CBOR body, poly1305 tag(16) and silent tag(16); the four framing pieces are 48 bytes and the whole box is at most 748. Below it, the 42-byte resident id returned to the relying party](images/cred-box.svg)
+
 ## Capacity — why the flash is mostly empty
 
 The KV store is a fixed 1.5 MB whatever the `FLASH_SIZE` ([build.md](build.md));

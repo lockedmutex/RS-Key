@@ -1,0 +1,108 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 RS-Key contributors -->
+<svg viewBox="0 0 780 494" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="ttl dsc" font-family="'Segoe UI', system-ui, -apple-system, sans-serif">
+  <title id="ttl">FIDO credential box (credential ID)</title>
+  <desc id="dsc">The credential ID is a self-contained ChaCha20-Poly1305 box: proto(4) iv(12) then a variable CBOR ciphertext, poly1305 tag(16) and silent tag(16). The four framing pieces total 48 bytes; with a maximal CBOR body the box is at most 748 bytes. Resident credentials also derive a 42-byte resident id returned to the relying party. Envelope pieces are rust, the sealed CBOR is teal.</desc>
+  <defs>
+    <style>
+      .h1{font-size:23px;font-weight:700;fill:#2B2723}
+      .sub{font-size:12.5px;fill:#948A7F}
+      .lg{font-size:11.5px;fill:#6B645C}
+      .seclab{font-size:12.5px;font-weight:700;fill:#2B2723}
+      .cell{font-size:11.5px;font-weight:700;fill:#fff}
+      .cellsm{font-size:10px;font-weight:700;fill:#fff}
+      .blab{font-size:10.5px;fill:#948A7F;font-family:'SF Mono','Roboto Mono',ui-monospace,monospace}
+      .summ{font-size:11px;fill:#5A534B}
+      .mono{font-family:'SF Mono','Roboto Mono',ui-monospace,monospace;fill:#A9764F;font-weight:700}
+      .panelt{font-size:11.5px;font-weight:700;fill:#2F7E75}
+      .frow{font-size:10.5px;fill:#3E3A36}
+      .fkey{font-family:'SF Mono','Roboto Mono',ui-monospace,monospace;font-weight:700;fill:#2F7E75}
+      .co{font-size:11px;fill:#5A534B}
+      .foot{font-size:10.5px;fill:#ADA398}
+    </style>
+  </defs>
+  <rect x="6" y="6" width="768" height="482" rx="16" fill="#FBFAF8" stroke="#E4DED5" stroke-width="1.5"/>
+
+  <text class="h1" x="34" y="46">FIDO credential box <tspan font-size="14" font-weight="400" fill="#948A7F">(the credential ID)</tspan></text>
+  <text class="sub" x="34" y="68">ChaCha20-Poly1305 · key from the device seed · rpIdHash as AAD · proto 0x02</text>
+
+  <!-- legend -->
+  <rect x="470" y="34" width="13" height="13" rx="3" fill="#C0562B"/>
+  <text class="lg" x="490" y="45">envelope</text>
+  <rect x="592" y="34" width="13" height="13" rx="3" fill="#2F7E75"/>
+  <text class="lg" x="612" y="45">sealed CBOR</text>
+
+  <!-- box strip -->
+  <g>
+    <rect x="40"  y="96" width="60"  height="46" fill="#C0562B"/>
+    <rect x="100" y="96" width="108" height="46" fill="#C0562B"/>
+    <rect x="208" y="96" width="336" height="46" fill="#2F7E75"/>
+    <rect x="544" y="96" width="96"  height="46" fill="#C0562B"/>
+    <rect x="640" y="96" width="96"  height="46" fill="#C0562B"/>
+    <g stroke="#FBFAF8" stroke-width="1.5">
+      <line x1="100" y1="96" x2="100" y2="142"/>
+      <line x1="208" y1="96" x2="208" y2="142"/>
+      <line x1="544" y1="96" x2="544" y2="142"/>
+      <line x1="640" y1="96" x2="640" y2="142"/>
+    </g>
+    <!-- variable-length break in the ciphertext -->
+    <path d="M 372 96 l 9 46 M 385 96 l 9 46" stroke="#FBFAF8" stroke-width="2" fill="none"/>
+    <text class="cellsm" x="70"  y="123" text-anchor="middle">proto</text>
+    <text class="cell"   x="154" y="123" text-anchor="middle">iv</text>
+    <text class="cell"   x="290" y="123" text-anchor="middle">ciphertext · CBOR body</text>
+    <text class="cellsm" x="592" y="123" text-anchor="middle">poly1305</text>
+    <text class="cellsm" x="688" y="123" text-anchor="middle">silent_tag</text>
+  </g>
+  <g text-anchor="middle">
+    <text class="blab" x="70"  y="159">4</text>
+    <text class="blab" x="154" y="159">12</text>
+    <text class="blab" x="290" y="159">variable</text>
+    <text class="blab" x="592" y="159">16</text>
+    <text class="blab" x="688" y="159">16</text>
+  </g>
+
+  <text class="summ" x="40" y="180"><tspan class="mono">proto = f1d00202</tspan>  ·  envelope 48 B (WRAP_LEN_22 = proto+iv+poly+silent)  ·  body variable  →  box ≤ <tspan class="mono">748</tspan> B (CRED_BOX_MAX = getInfo maxCredentialIdLength)</text>
+
+  <!-- sealed CBOR sub-panel -->
+  <rect x="40" y="192" width="696" height="140" rx="10" fill="#EAF2F0" stroke="#CFE0DC"/>
+  <text class="panelt" x="56" y="212">Sealed CBOR body — key · type ≤ cap</text>
+  <g class="frow">
+    <text x="56" y="234"><tspan class="fkey">1</tspan> · rpId — str ≤ 253</text>
+    <text x="56" y="254"><tspan class="fkey">3</tspan> · userId — bstr ≤ 64</text>
+    <text x="56" y="274"><tspan class="fkey">4</tspan> · name — str ≤ 64 (truncated)</text>
+    <text x="56" y="294"><tspan class="fkey">5</tspan> · displayName — str ≤ 64 (truncated)</text>
+    <text x="404" y="234"><tspan class="fkey">6</tspan> · createdMs — u64</text>
+    <text x="404" y="254"><tspan class="fkey">8</tspan> · useSignCount — bool</text>
+    <text x="404" y="274"><tspan class="fkey">9/10</tspan> · alg / curve — non-P-256 only</text>
+    <text x="404" y="294"><tspan class="fkey">11</tspan> · rk — bool</text>
+    <text x="56" y="320"><tspan class="fkey">7</tspan> · ext — credBlob ≤ 127 · credProtect · hmac-secret · largeBlobKey · thirdPartyPayment</text>
+  </g>
+
+  <!-- resident id -->
+  <text class="seclab" x="40" y="362">Resident id <tspan font-weight="400" fill="#948A7F">— what the RP receives for a discoverable credential (42 B)</tspan></text>
+  <g>
+    <rect x="40"  y="372" width="116" height="42" fill="#C0562B"/>
+    <rect x="156" y="372" width="116" height="42" fill="#C0562B"/>
+    <rect x="272" y="372" width="68"  height="42" fill="#C0562B"/>
+    <rect x="340" y="372" width="396" height="42" fill="#2F7E75"/>
+    <g stroke="#FBFAF8" stroke-width="1.5">
+      <line x1="156" y1="372" x2="156" y2="414"/>
+      <line x1="272" y1="372" x2="272" y2="414"/>
+      <line x1="340" y1="372" x2="340" y2="414"/>
+    </g>
+    <text class="cellsm" x="98"  y="398" text-anchor="middle">serial-derived</text>
+    <text class="cellsm" x="214" y="398" text-anchor="middle">proto f1d00203</text>
+    <text class="cellsm" x="306" y="398" text-anchor="middle">00 00</text>
+    <text class="cell"   x="538" y="398" text-anchor="middle">HMAC-SHA256 chain over the box</text>
+  </g>
+  <g text-anchor="middle">
+    <text class="blab" x="98"  y="430">4</text>
+    <text class="blab" x="214" y="430">4</text>
+    <text class="blab" x="306" y="430">2</text>
+    <text class="blab" x="538" y="430">32</text>
+  </g>
+
+  <!-- notes -->
+  <text class="co" x="40" y="454"><tspan class="fkey" fill="#C0562B">silent_tag</tspan> binds the box to this device + rp <tspan font-weight="700">without decrypting it</tspan>; the ChaCha key derives from the seed, so boxes verify by decrypting.</text>
+  <text class="co" x="40" y="472">The full box stays in flash — <tspan class="mono">EF_CRED = rpIdHash(32) ‖ resident_id(42) ‖ box</tspan>. Source: crates/rsk-fido/src/credential.rs.</text>
+</svg>

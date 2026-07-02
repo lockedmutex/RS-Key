@@ -1,0 +1,107 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 RS-Key contributors -->
+<svg viewBox="0 0 780 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="ttl dsc" font-family="'Segoe UI', system-ui, -apple-system, sans-serif">
+  <title id="ttl">EF_PHY device-config record</title>
+  <desc id="dsc">The phy record is a flat sequence of TAG(1) LEN(1) VALUE(LEN) records in any order. A worked example concatenates three records: VIDPID 00 04 12 09 00 01, LED_DRIVER 0C 01 03, and OPTS 06 02 00 08. TAG bytes are rust, LEN pale, VALUE teal.</desc>
+  <defs>
+    <style>
+      .h1{font-size:23px;font-weight:700;fill:#2B2723}
+      .sub{font-size:12.5px;fill:#948A7F}
+      .lg{font-size:11.5px;fill:#6B645C}
+      .seclab{font-size:12.5px;font-weight:700;fill:#2B2723}
+      .cell{font-size:12px;font-weight:700;fill:#fff}
+      .cellr{font-size:12px;font-weight:700;fill:#A9764F}
+      .blab{font-size:10.5px;fill:#948A7F}
+      .hex{font-family:'SF Mono','Roboto Mono',ui-monospace,monospace;font-size:12.5px;font-weight:700}
+      .grp{font-size:11px;font-weight:700;fill:#2B2723}
+      .dec{font-size:11px;fill:#5A534B}
+      .co{font-size:11.5px;fill:#5A534B}
+      .mono{font-family:'SF Mono','Roboto Mono',ui-monospace,monospace;fill:#A9764F;font-weight:700}
+      .foot{font-size:10.5px;fill:#ADA398}
+    </style>
+  </defs>
+  <rect x="6" y="6" width="768" height="408" rx="16" fill="#FBFAF8" stroke="#E4DED5" stroke-width="1.5"/>
+
+  <text class="h1" x="34" y="46">EF_PHY device-config record</text>
+  <text class="sub" x="34" y="68">flat TLV · any order · unknown tags skipped · PicoForge-compatible · §7.1</text>
+
+  <!-- legend -->
+  <rect x="470" y="34" width="13" height="13" rx="3" fill="#C0562B"/>
+  <text class="lg" x="490" y="45">TAG</text>
+  <rect x="540" y="34" width="13" height="13" rx="3" fill="#EFE0D6" stroke="#E0C7B6"/>
+  <text class="lg" x="560" y="45">LEN</text>
+  <rect x="612" y="34" width="13" height="13" rx="3" fill="#2F7E75"/>
+  <text class="lg" x="632" y="45">VALUE</text>
+
+  <!-- generic anatomy -->
+  <text class="seclab" x="40" y="100">One record</text>
+  <g>
+    <rect x="40"  y="110" width="96"  height="44" fill="#C0562B"/>
+    <rect x="136" y="110" width="96"  height="44" fill="#EFE0D6"/>
+    <rect x="232" y="110" width="300" height="44" fill="#2F7E75"/>
+    <text class="cell"  x="88"  y="137" text-anchor="middle">TAG</text>
+    <text class="cellr" x="184" y="137" text-anchor="middle">LEN</text>
+    <text class="cell"  x="382" y="137" text-anchor="middle">VALUE</text>
+  </g>
+  <g text-anchor="middle">
+    <text class="blab" x="88"  y="170">1 B</text>
+    <text class="blab" x="184" y="170">1 B  (= VALUE length)</text>
+    <text class="blab" x="382" y="170">0..255 B</text>
+  </g>
+
+  <!-- worked example -->
+  <text class="seclab" x="40" y="212">A three-record blob</text>
+
+  <!-- group labels -->
+  <text class="grp" x="166" y="232" text-anchor="middle">VIDPID · tag 00</text>
+  <text class="grp" x="355" y="232" text-anchor="middle">LED_DRIVER · 0C</text>
+  <text class="grp" x="502" y="232" text-anchor="middle">OPTS · 06</text>
+
+  <!-- byte cells: stride 42, width 40, y 240 h 36 -->
+  <g>
+    <!-- rec1 VIDPID: 00 04 | 12 09 00 01 -->
+    <rect x="40"  y="240" width="40" height="36" fill="#C0562B"/>
+    <rect x="82"  y="240" width="40" height="36" fill="#EFE0D6"/>
+    <rect x="124" y="240" width="40" height="36" fill="#2F7E75"/>
+    <rect x="166" y="240" width="40" height="36" fill="#2F7E75"/>
+    <rect x="208" y="240" width="40" height="36" fill="#2F7E75"/>
+    <rect x="250" y="240" width="40" height="36" fill="#2F7E75"/>
+    <!-- rec2 LED_DRIVER: 0C 01 | 03 -->
+    <rect x="292" y="240" width="40" height="36" fill="#C0562B"/>
+    <rect x="334" y="240" width="40" height="36" fill="#EFE0D6"/>
+    <rect x="376" y="240" width="40" height="36" fill="#2F7E75"/>
+    <!-- rec3 OPTS: 06 02 | 00 08 -->
+    <rect x="418" y="240" width="40" height="36" fill="#C0562B"/>
+    <rect x="460" y="240" width="40" height="36" fill="#EFE0D6"/>
+    <rect x="502" y="240" width="40" height="36" fill="#2F7E75"/>
+    <rect x="544" y="240" width="40" height="36" fill="#2F7E75"/>
+  </g>
+  <g text-anchor="middle" class="hex">
+    <text x="60"  y="264" fill="#fff">00</text>
+    <text x="102" y="264" fill="#A9764F">04</text>
+    <text x="144" y="264" fill="#fff">12</text>
+    <text x="186" y="264" fill="#fff">09</text>
+    <text x="228" y="264" fill="#fff">00</text>
+    <text x="270" y="264" fill="#fff">01</text>
+    <text x="312" y="264" fill="#fff">0C</text>
+    <text x="354" y="264" fill="#A9764F">01</text>
+    <text x="396" y="264" fill="#fff">03</text>
+    <text x="438" y="264" fill="#fff">06</text>
+    <text x="480" y="264" fill="#A9764F">02</text>
+    <text x="522" y="264" fill="#fff">00</text>
+    <text x="564" y="264" fill="#fff">08</text>
+  </g>
+
+  <!-- decoded -->
+  <g text-anchor="middle" class="dec">
+    <text x="166" y="296">→ VID:PID 1209:0001</text>
+    <text x="355" y="296">→ ws2812 (3)</text>
+    <text x="502" y="296">→ LED_STEADY</text>
+  </g>
+
+  <!-- notes -->
+  <text class="co" x="40" y="336">A virgin device reads back as the single record <tspan class="mono">06 02 00 00</tspan> (zero OPTS).</text>
+  <text class="co" x="40" y="356">Read-modify-write: change only your tags, preserve the rest. A length running past the buffer ends the parse; applied at boot.</text>
+
+  <text class="foot" x="34" y="392">Source: crates/rsk-rescue/src/phy.rs · reference client tools/rsk/hw.py (rsk hw)</text>
+</svg>
