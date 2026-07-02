@@ -6,11 +6,26 @@
 //! event panel drops away on small screens.
 
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
+};
 
 use crate::app::{App, AppMode, Modal, Search};
 use crate::model::*;
-use crate::theme::{ACCENT, Theme, bold, danger, dim, selection, warn};
+use crate::theme::{Theme, bold, dim};
+
+/// A rounded, muted-border panel — the shared frame for every box.
+fn frame(theme: Theme) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.border_style())
+}
+
+/// A framed panel with an accented title (surrounding spaces added).
+fn titled(theme: Theme, title: &str) -> Block<'static> {
+    frame(theme).title(Span::styled(format!(" {title} "), theme.title_style()))
+}
 
 pub fn render(f: &mut Frame, app: &App) {
     let area = f.area();
@@ -52,13 +67,7 @@ fn header(f: &mut Frame, app: &App, theme: Theme, area: Rect) {
     let snap = &app.snapshot;
     let health = snap.overall_health();
     let mut spans = vec![
-        Span::styled(
-            " rs-key ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(ACCENT)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(" rs-key ", theme.chip_style()),
         Span::raw(" cockpit  "),
         Span::styled(theme.dot(health), theme.health_style(health)),
         Span::raw(" "),
@@ -78,10 +87,7 @@ fn header(f: &mut Frame, app: &App, theme: Theme, area: Rect) {
         format!("   refreshed {}s ago", app.refreshed.elapsed().as_secs()),
         dim(),
     ));
-    f.render_widget(
-        Paragraph::new(Line::from(spans)).block(Block::default().borders(Borders::ALL)),
-        area,
-    );
+    f.render_widget(Paragraph::new(Line::from(spans)).block(frame(theme)), area);
 }
 
 fn body(f: &mut Frame, app: &App, theme: Theme, area: Rect) {
@@ -106,8 +112,8 @@ fn sidebar(f: &mut Frame, app: &App, theme: Theme, area: Rect) {
     st.select(Section::ALL.iter().position(|s| *s == app.section));
     f.render_stateful_widget(
         List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(" sections "))
-            .highlight_style(selection())
+            .block(titled(theme, "sections"))
+            .highlight_style(theme.selection())
             .highlight_symbol(theme.arrow()),
         area,
         &mut st,
@@ -115,9 +121,7 @@ fn sidebar(f: &mut Frame, app: &App, theme: Theme, area: Rect) {
 }
 
 fn panel(f: &mut Frame, app: &App, theme: Theme, area: Rect) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" {} ", app.section.title()));
+    let block = titled(theme, app.section.title());
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -162,8 +166,8 @@ fn panel(f: &mut Frame, app: &App, theme: Theme, area: Rect) {
     }
     f.render_stateful_widget(
         List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(" actions "))
-            .highlight_style(selection())
+            .block(titled(theme, "actions"))
+            .highlight_style(theme.selection())
             .highlight_symbol(theme.arrow()),
         split[1],
         &mut st,
@@ -174,8 +178,8 @@ fn panel(f: &mut Frame, app: &App, theme: Theme, area: Rect) {
 
 fn row(theme: Theme, h: Health, key: &str, value: impl Into<String>) -> Line<'static> {
     let vstyle = match h {
-        Health::Warn => warn(),
-        Health::Error => danger(),
+        Health::Warn => theme.warn(),
+        Health::Error => theme.danger(),
         _ => Style::default(),
     };
     Line::from(vec![
@@ -489,7 +493,7 @@ fn section_health(section: Section, s: &DeviceSnapshot) -> Health {
 // ---- event log + status bar ----
 
 fn event_log(f: &mut Frame, app: &App, theme: Theme, area: Rect) {
-    let block = Block::default().borders(Borders::ALL).title(" events ");
+    let block = titled(theme, "events");
     let inner = block.inner(area);
     f.render_widget(block, area);
     if app.log.is_empty() {
@@ -591,11 +595,7 @@ fn modal(f: &mut Frame, theme: Theme, m: &Modal) {
                     Line::from(""),
                     Line::from(format!("  {shown}_")),
                 ])
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(format!(" {title} ")),
-                )
+                .block(titled(theme, title))
                 .wrap(Wrap { trim: false }),
                 r,
             );
@@ -611,19 +611,14 @@ fn modal(f: &mut Frame, theme: Theme, m: &Modal) {
             f.render_widget(Clear, r);
             f.render_widget(
                 Paragraph::new(vec![
-                    Line::from(Span::styled(body.clone(), warn())),
+                    Line::from(Span::styled(body.clone(), theme.warn())),
                     Line::from(""),
                     Line::from(vec![
                         Span::styled(format!("  type {want} : "), bold()),
                         Span::raw(format!("{buf}_")),
                     ]),
                 ])
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(warn())
-                        .title(format!(" {title} ")),
-                )
+                .block(titled(theme, title).border_style(theme.warn()))
                 .wrap(Wrap { trim: true }),
                 r,
             );
@@ -637,11 +632,7 @@ fn modal(f: &mut Frame, theme: Theme, m: &Modal) {
                     Line::from(""),
                     Line::from(Span::styled("  [y] yes    [n] no", bold())),
                 ])
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(format!(" {title} ")),
-                )
+                .block(titled(theme, title))
                 .wrap(Wrap { trim: true }),
                 r,
             );
@@ -653,7 +644,7 @@ fn modal(f: &mut Frame, theme: Theme, m: &Modal) {
                 Paragraph::new(vec![
                     Line::from(Span::styled(
                         "  WRITE THIS DOWN — the only backup of your FIDO seed.",
-                        warn(),
+                        theme.warn(),
                     )),
                     Line::from(Span::styled(
                         "  Not logged. Cleared from the screen on the next key.",
@@ -662,14 +653,10 @@ fn modal(f: &mut Frame, theme: Theme, m: &Modal) {
                     Line::from(""),
                     Line::from(Span::styled(
                         format!("  {}", body.as_str()),
-                        Style::default().fg(Color::Green),
+                        theme.health_style(Health::Ok),
                     )),
                 ])
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(format!(" {title} ")),
-                )
+                .block(titled(theme, title))
                 .wrap(Wrap { trim: true }),
                 r,
             );
@@ -689,11 +676,7 @@ fn modal(f: &mut Frame, theme: Theme, m: &Modal) {
                         .map(|l| Line::from(Span::styled(format!(" {l}"), style)))
                         .collect::<Vec<_>>(),
                 )
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(format!(" {title} ")),
-                )
+                .block(titled(theme, title))
                 .wrap(Wrap { trim: false }),
                 r,
             );
@@ -709,9 +692,7 @@ fn search_overlay(f: &mut Frame, theme: Theme, s: &Search) {
         .max(3);
     let r = centered(area, 70, h);
     f.render_widget(Clear, r);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" search actions ");
+    let block = titled(theme, "search actions");
     let inner = block.inner(r);
     f.render_widget(block, r);
     let rows = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(inner);
@@ -732,7 +713,7 @@ fn search_overlay(f: &mut Frame, theme: Theme, s: &Search) {
     }
     f.render_stateful_widget(
         List::new(items)
-            .highlight_style(selection())
+            .highlight_style(theme.selection())
             .highlight_symbol(theme.arrow()),
         rows[1],
         &mut st,

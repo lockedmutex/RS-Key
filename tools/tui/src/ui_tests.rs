@@ -14,7 +14,13 @@ fn buffer_text(app: &App, w: u16, h: u16) -> String {
 }
 
 fn demo_app() -> App {
-    App::new(Box::new(MockProvider::new()), Theme { ascii: true })
+    App::new(
+        Box::new(MockProvider::new()),
+        Theme {
+            ascii: true,
+            depth: crate::theme::Depth::Basic,
+        },
+    )
 }
 
 #[test]

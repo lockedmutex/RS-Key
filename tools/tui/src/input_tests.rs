@@ -7,7 +7,13 @@ use crate::model::Action;
 use crate::theme::Theme;
 
 fn app() -> App {
-    App::new(Box::new(MockProvider::new()), Theme { ascii: true })
+    App::new(
+        Box::new(MockProvider::new()),
+        Theme {
+            ascii: true,
+            depth: crate::theme::Depth::Basic,
+        },
+    )
 }
 fn press(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)

@@ -33,6 +33,12 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Changed
 
+- **`rsk-tui` gets a curated colour theme** (tools/tui 0.2.2 → 0.2.3). On
+  truecolor and 256-colour terminals the cockpit now uses a fixed brand palette
+  (teal accent, sage/amber/rust health) with rounded panel borders, accented
+  titles and an explicit selection bar; a bare 16-colour terminal keeps the
+  adaptive named-ANSI colours and the `REVERSED` highlight. Override with
+  `RSK_TUI_TRUECOLOR=1|0`. No change to `--once` / `--json` output.
 - **`rsk-tui` status labels are single-sourced** (tools/tui 0.2.1 → 0.2.2).
   The `--once` printer had drifted from the cockpit's canonical wording; both
   now share the model's label mappings, which changes three `--once` labels:

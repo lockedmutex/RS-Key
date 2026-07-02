@@ -5,7 +5,13 @@ use super::*;
 use crate::device::MockProvider;
 
 fn app() -> App {
-    App::new(Box::new(MockProvider::new()), Theme { ascii: true })
+    App::new(
+        Box::new(MockProvider::new()),
+        Theme {
+            ascii: true,
+            depth: crate::theme::Depth::Basic,
+        },
+    )
 }
 
 #[test]
