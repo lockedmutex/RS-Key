@@ -30,8 +30,8 @@ use crate::consts::{
 };
 use crate::credential::{
     CRED_BOX_MAX, CRED_REC_MAX, CRED_RESIDENT_LEN, CredExt, CredInput, Credential, RECORD_PREFIX,
-    USER_NAME_MAX, credential_create, credential_load, credential_store, derive_large_blob_key,
-    derive_resident, is_resident, slot_map, truncate_utf8,
+    RP_ID_MAX, USER_ID_MAX, USER_NAME_MAX, credential_create, credential_load, credential_store,
+    derive_large_blob_key, derive_resident, is_resident, slot_map, truncate_utf8,
 };
 use crate::ec::{CredKey, MAX_SIG_LEN, P256Key};
 use crate::error::{CtapError, CtapResult};
@@ -276,8 +276,15 @@ pub fn make_credential<S: Storage, R: Rng>(
     if req.client_data_hash.len() != 32 || req.rp_id.is_empty() || req.user_id.is_empty() {
         return Err(CtapError::MissingParameter);
     }
+    // rpId (a domain) and user.id have hard maxima; reject an over-long one
+    // explicitly rather than let the sealed box overflow into a vague
+    // `CtapError::Other`. Together with the name truncation below this makes
+    // `CRED_BOX_MAX` a true ceiling for every accepted request.
+    if req.rp_id.len() > RP_ID_MAX || req.user_id.len() > USER_ID_MAX {
+        return Err(CtapError::InvalidLength);
+    }
     // CTAP 2.1 §6.1.2: overlong user.name / user.displayName are truncated,
-    // not an error — and the cap bounds the sealed box under CRED_BOX_MAX.
+    // not an error.
     req.user_name = truncate_utf8(req.user_name, USER_NAME_MAX);
     req.user_display_name = truncate_utf8(req.user_display_name, USER_NAME_MAX);
     if !req.has_pubkey_param {

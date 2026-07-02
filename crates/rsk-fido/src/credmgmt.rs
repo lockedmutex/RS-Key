@@ -656,8 +656,9 @@ fn reseal_user<S: Storage, R: Rng>(
     let input = CredInput {
         rp_id: cred.rp_id,
         user_id: cred.user_id,
-        // Same CTAP 2.1 §6.1.2 truncation as makeCredential, so an update
-        // cannot grow the box past CRED_BOX_MAX when the original sealed fine.
+        // Same CTAP 2.1 §6.1.2 truncation as makeCredential. Both names cap at
+        // USER_NAME_MAX and the reused rpId/user_id/credBlob were themselves
+        // capped at create, so the resealed box stays within CRED_BOX_MAX.
         user_name: truncate_utf8(user_name, USER_NAME_MAX),
         user_display_name: truncate_utf8(user_display_name, USER_NAME_MAX),
         use_sign_count: cred.use_sign_count,

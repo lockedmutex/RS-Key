@@ -1944,3 +1944,129 @@ fn near_ceiling_credential_roundtrips() {
     };
     verify_assertion(&ga, &x, &y);
 }
+
+// The TRUE maximal box — 253-byte rpId + 64-byte user.id + 64-byte names + a
+// 127-byte credBlob + hmac-secret — must create and assert. This box is
+// ~670-748 bytes, well over the old 640 ceiling that CRED_BOX_MAX=640 (a
+// literal that omitted credBlob + extensions) silently rejected as Other.
+#[test]
+fn maximal_box_creates_and_asserts() {
+    let (mut fs, mut rng) = setup();
+    let rp = "a".repeat(249) + ".com"; // 253 bytes, DNS max
+    let uid = [0x42u8; 64];
+    let long = "n".repeat(100); // truncated to 64 at seal
+
+    let mut buf = [0u8; 2048];
+    let n = {
+        let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+        e.map(5).unwrap();
+        e.u8(1).unwrap().bytes(&CDH).unwrap();
+        e.u8(2).unwrap().map(1).unwrap();
+        e.str("id").unwrap().str(&rp).unwrap();
+        e.u8(3).unwrap().map(3).unwrap();
+        e.str("id").unwrap().bytes(&uid).unwrap();
+        e.str("name").unwrap().str(&long).unwrap();
+        e.str("displayName").unwrap().str(&long).unwrap();
+        e.u8(4).unwrap().array(1).unwrap().map(2).unwrap();
+        e.str("alg").unwrap().i64(ALG_ES256).unwrap();
+        e.str("type").unwrap().str("public-key").unwrap();
+        e.u8(6).unwrap().map(2).unwrap();
+        e.str("credBlob").unwrap().bytes(&[0x5A; 127]).unwrap();
+        e.str("hmac-secret").unwrap().bool(true).unwrap();
+        e.writer().position()
+    };
+    let mc_req = buf[..n].to_vec();
+
+    let mut out = [0u8; 2048];
+    let mc = {
+        let mut state = crate::FidoState::new();
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: u64::MAX, // largest createdMs → widest box
+        };
+        let n = make_credential(&mut ctx, &mc_req, &mut out).unwrap();
+        out[..n].to_vec()
+    };
+    let (cred_id, x, y) = parse_mc(&mc);
+    assert!(
+        cred_id.len() > 640,
+        "box must cross the old 640 cap (len {})",
+        cred_id.len()
+    );
+    assert!(cred_id.len() <= crate::credential::CRED_BOX_MAX);
+
+    let mut gbuf = [0u8; 1024];
+    let n = {
+        let mut e = Encoder::new(Cursor::new(&mut gbuf[..]));
+        e.map(3).unwrap();
+        e.u8(1).unwrap().str(&rp).unwrap();
+        e.u8(2).unwrap().bytes(&CDH).unwrap();
+        e.u8(3).unwrap().array(1).unwrap().map(2).unwrap();
+        e.str("type").unwrap().str("public-key").unwrap();
+        e.str("id").unwrap().bytes(&cred_id).unwrap();
+        e.writer().position()
+    };
+    let mut out2 = [0u8; 2048];
+    let ga = {
+        let mut state = crate::FidoState::new();
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 20,
+        };
+        let n = get_assertion(&mut ctx, &gbuf[..n], &mut out2).unwrap();
+        out2[..n].to_vec()
+    };
+    verify_assertion(&ga, &x, &y);
+}
+
+// An rpId or user.id past its ceiling is rejected explicitly (InvalidLength),
+// not by a downstream box overflow that would surface as a vague Other.
+#[test]
+fn overlong_rpid_or_userid_rejected() {
+    let (mut fs, mut rng) = setup();
+    let over_rp = "a".repeat(251) + ".com"; // 255 > RP_ID_MAX(253)
+    let mk = |rp: &str, uid: &[u8]| {
+        let mut buf = [0u8; 512];
+        let n = {
+            let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+            e.map(4).unwrap();
+            e.u8(1).unwrap().bytes(&CDH).unwrap();
+            e.u8(2).unwrap().map(1).unwrap();
+            e.str("id").unwrap().str(rp).unwrap();
+            e.u8(3).unwrap().map(1).unwrap();
+            e.str("id").unwrap().bytes(uid).unwrap();
+            e.u8(4).unwrap().array(1).unwrap().map(2).unwrap();
+            e.str("alg").unwrap().i64(ALG_ES256).unwrap();
+            e.str("type").unwrap().str("public-key").unwrap();
+            e.writer().position()
+        };
+        buf[..n].to_vec()
+    };
+    for req in [mk(&over_rp, &[1, 2, 3, 4]), mk("ok.com", &[0u8; 65])] {
+        let mut out = [0u8; 512];
+        let mut state = crate::FidoState::new();
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 10,
+        };
+        assert_eq!(
+            make_credential(&mut ctx, &req, &mut out),
+            Err(CtapError::InvalidLength)
+        );
+    }
+}

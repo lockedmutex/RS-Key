@@ -13,6 +13,22 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+### Fixed
+
+- **The credential-box ceiling was too small for a maximal request.** Unifying
+  the create/assert/reseal ceiling to a literal 640 (an earlier `[Unreleased]`
+  fix) omitted the credBlob (≤127) and the extensions from its accounting, and
+  raising the resident rpId to 253 (also `[Unreleased]`) widened the box
+  further — so a makeCredential with a 253-byte rpId, 64-byte user.id, 64-byte
+  names and a 127-byte credBlob (all within the device's advertised limits)
+  overflowed the box and was rejected `CTAP2_ERR_OTHER`, and an
+  updateUserInformation adding names to a large-credBlob credential failed
+  `NOT_ALLOWED`. `CRED_BOX_MAX` is now **derived** from the field maxima (748),
+  so it can never again drift below what the device accepts; makeCredential
+  rejects an over-maximum rpId/user.id explicitly with `CTAP1_ERR_INVALID_LENGTH`
+  rather than as a box overflow; getInfo's `maxCredentialIdLength` follows (748).
+  bcdDevice `0x07EB` → `0x07EC`.
+
 ### Changed
 
 - **`rsk-tui` status labels are single-sourced** (tools/tui 0.2.1 → 0.2.2).

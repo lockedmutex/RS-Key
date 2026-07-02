@@ -28,6 +28,9 @@ use crate::consts::{
     ALG_ES256, CURVE_P256, EF_CRED, EF_RP, MAX_CREDBLOB_LENGTH, MAX_RESIDENT_CREDENTIALS,
     RP_NICK_MAX_LEN,
 };
+
+// `MAX_CREDBLOB_LENGTH` (128) over-bounds the sealable credBlob (`< 128`), a
+// harmless 1-byte slack in `CRED_BOX_MAX`.
 use crate::keyderiv::{KEY_HANDLE_LEN, verify_key};
 
 const CRED_PROTO: &[u8; 4] = b"\xf1\xd0\x02\x02";
@@ -47,14 +50,51 @@ const HEAD_LEN: usize = PROTO_LEN + IV_LEN; // 16
 /// Bytes around the ciphertext for proto 0x02: head + poly tag + silent tag.
 const WRAP_LEN_22: usize = HEAD_LEN + TAG_LEN + SILENT_TAG_LEN; // 48
 
+// --- Sealed-field maxima. makeCredential enforces the first three (over-max
+// input → InvalidLength) and truncates the names, so the box ceiling below is a
+// TRUE bound for every accepted request. ---
+
+/// rpId ceiling — the DNS name maximum, shared by the non-resident box and the
+/// resident EF_RP record ([`RP_REC_MAX`]).
+pub(crate) const RP_ID_MAX: usize = 253;
+/// user.id ceiling (WebAuthn: 1..=64 bytes). getAssertion already echoes at most
+/// this many, so the box never stores more.
+pub(crate) const USER_ID_MAX: usize = 64;
+/// user.name / user.displayName ceiling — CTAP 2.1 §6.1.2 sanctions truncating
+/// to it rather than erroring.
+pub(crate) const USER_NAME_MAX: usize = 64;
+
 /// The one credential-box ceiling: create (makeCredential), assert
 /// (getAssertion's `Best::id`) and reseal (credMgmt update) all size from it —
 /// a divergent assert cap strands fresh credentials (create OK, assert skips).
-pub(crate) const CRED_BOX_MAX: usize = 640;
-
-/// CTAP 2.1 §6.1.2 sanctions truncating user.name/displayName; 64 bytes keeps
-/// a worst-case box (253-byte rpId, 64-byte user id) inside [`CRED_BOX_MAX`].
-pub(crate) const USER_NAME_MAX: usize = 64;
+///
+/// DERIVED from the field maxima so it can never again drift below what the
+/// device accepts (the 640 literal it replaced omitted credBlob + extensions
+/// and under-sized the box once `RP_ID_MAX` rose to 253). Every optional field
+/// present, every string at its cap; `9` is the u64/i64 CBOR worst case, string
+/// headers are 2 bytes at 24..=255.
+const CBOR_KEY: usize = 1;
+const CBOR_STR_HDR: usize = 2;
+const CBOR_U64: usize = 9;
+const MAX_EXT_BODY: usize = CBOR_KEY
+    + 1 // sub-map header
+    + (1 + 8) + CBOR_STR_HDR + MAX_CREDBLOB_LENGTH // "credBlob" + bytes
+    + (1 + 11) + CBOR_U64 // "credProtect" + u64
+    + (1 + 11) + 1 // "hmac-secret" + bool
+    + (1 + 12) + 1 // "largeBlobKey" + bool
+    + (1 + 17) + 1; // "thirdPartyPayment" + bool
+const MAX_BODY: usize = 1 // outer map header (<24 fields)
+    + CBOR_KEY + CBOR_STR_HDR + RP_ID_MAX // 1: rpId
+    + CBOR_KEY + CBOR_STR_HDR + USER_ID_MAX // 3: userId
+    + CBOR_KEY + CBOR_STR_HDR + USER_NAME_MAX // 4: name
+    + CBOR_KEY + CBOR_STR_HDR + USER_NAME_MAX // 5: displayName
+    + CBOR_KEY + CBOR_U64 // 6: createdMs
+    + MAX_EXT_BODY // 7: extensions
+    + CBOR_KEY + 1 // 8: useSignCount
+    + CBOR_KEY + CBOR_U64 // 9: alg
+    + CBOR_KEY + CBOR_U64 // 10: curve
+    + CBOR_KEY + 1; // 11: rk
+pub(crate) const CRED_BOX_MAX: usize = WRAP_LEN_22 + MAX_BODY;
 
 /// Truncate `s` to at most `max` bytes on a UTF-8 character boundary.
 pub(crate) fn truncate_utf8(s: &str, max: usize) -> &str {
@@ -443,10 +483,6 @@ const _: () = assert!(RECORD_PREFIX + CRED_BOX_MAX <= CRED_REC_MAX);
 
 /// EF_RP head before the (boxed) rpId tail: `count(1) ‖ rpIdHash(32)`.
 pub(crate) const RP_PREFIX: usize = 1 + 32;
-
-/// rpId ceiling — the DNS name maximum, so resident bookkeeping accepts every
-/// relying-party id the non-resident box budget does.
-pub(crate) const RP_ID_MAX: usize = 253;
 
 /// Largest EF_RP record: `count ‖ rpIdHash ‖ box(iv ‖ rpId ‖ tag)` at
 /// [`RP_ID_MAX`]. Older (smaller) records load unchanged — reads are

@@ -1046,3 +1046,85 @@ fn resident_rp_id_at_dns_max_registers() {
     assert_eq!(hash, sha256(rp.as_bytes()));
     assert_eq!(total, Some(1));
 }
+
+// updateUserInformation on the MAXIMAL box: a resident cred at DNS-max rpId
+// with a 127-byte credBlob and EMPTY names creates small, then a 64+64-byte
+// name update reseals it to ~670-748 bytes. This is the case the old 640
+// reseal buffer rejected (NotAllowed) even though create succeeded.
+#[test]
+fn update_user_reseals_maximal_box() {
+    let (mut fs, mut rng) = setup();
+    let rp = "a".repeat(249) + ".com"; // 253, DNS max
+    let uid = [0x42u8; 64];
+
+    let mut buf = [0u8; 1024];
+    let n = {
+        let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+        e.map(6).unwrap();
+        e.u8(1).unwrap().bytes(&CDH).unwrap();
+        e.u8(2).unwrap().map(1).unwrap();
+        e.str("id").unwrap().str(&rp).unwrap();
+        e.u8(3).unwrap().map(1).unwrap();
+        e.str("id").unwrap().bytes(&uid).unwrap(); // no name → small create box
+        e.u8(4).unwrap().array(1).unwrap().map(2).unwrap();
+        e.str("alg").unwrap().i64(ALG_ES256).unwrap();
+        e.str("type").unwrap().str("public-key").unwrap();
+        e.u8(6).unwrap().map(1).unwrap();
+        e.str("credBlob").unwrap().bytes(&[0x5A; 127]).unwrap();
+        e.u8(7).unwrap().map(1).unwrap();
+        e.str("rk").unwrap().bool(true).unwrap();
+        e.writer().position()
+    };
+    let mut out = [0u8; 2048];
+    let mut state = FidoState::new();
+    let id_a = {
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 10,
+        };
+        let n = make_credential(&mut ctx, &buf[..n], &mut out).unwrap();
+        parse_mc(&out[..n]).0
+    };
+
+    let new_name = "u".repeat(64);
+    let mut sp = [0u8; 512];
+    let n = {
+        let mut e = Encoder::new(Cursor::new(&mut sp[..]));
+        e.map(2).unwrap();
+        e.u8(2).unwrap().map(2).unwrap();
+        e.str("id").unwrap().bytes(&id_a).unwrap();
+        e.str("type").unwrap().str("public-key").unwrap();
+        e.u8(3).unwrap().map(3).unwrap();
+        e.str("id").unwrap().bytes(&uid).unwrap();
+        e.str("name").unwrap().str(&new_name).unwrap();
+        e.str("displayName").unwrap().str(&new_name).unwrap();
+        e.writer().position()
+    };
+    let subpara = sp[..n].to_vec();
+
+    let mut state = armed(PERM_CM);
+    let mut out = [0u8; 1024];
+    let n = run(
+        &mut fs,
+        &mut state,
+        &cm_request(0x07, Some(&subpara), &TOKEN),
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(n, 0);
+
+    let rp_hash = sha256(rp.as_bytes());
+    let n = run(
+        &mut fs,
+        &mut state,
+        &cm_request(0x04, Some(&subpara_rpidhash(&rp_hash)), &TOKEN),
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(cred_user_name(&out[..n]), new_name);
+}
