@@ -1,0 +1,106 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 RS-Key contributors -->
+<svg viewBox="0 0 780 396" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="ttl dsc" font-family="'Segoe UI', system-ui, -apple-system, sans-serif">
+  <title id="ttl">RS-Key crate dependency layers</title>
+  <desc id="dsc">The firmware binary sits on top of seven applet crates (fido, openpgp, piv, oath, otp, mgmt, rescue), which in turn build on the platform libraries (sdk, fs, crypto, usb, rsa-asm, led). Each tier depends on the tier below. Extra edges: piv depends on openpgp, otp on mgmt, openpgp on rsa-asm, and fs and usb on sdk. The display build adds ui, bip39 and slip39.</desc>
+  <defs>
+    <style>
+      .h1{font-size:23px;font-weight:700;fill:#2B2723}
+      .sub{font-size:12.5px;fill:#948A7F}
+      .lg{font-size:11px;fill:#6B645C}
+      .tier{font-size:11px;font-weight:700;fill:#948A7F;letter-spacing:.5px}
+      .node{font-size:11px;font-weight:700;fill:#fff;font-family:'SF Mono','Roboto Mono',ui-monospace,monospace}
+      .dep{font-size:10.5px;fill:#948A7F;font-style:italic}
+      .dash{font-size:11px;fill:#5A534B}
+      .dashk{font-family:'SF Mono','Roboto Mono',ui-monospace,monospace;font-weight:700;fill:#A9764F}
+      .note{font-size:10.5px;fill:#5A534B}
+      .notek{font-family:'SF Mono','Roboto Mono',ui-monospace,monospace;font-weight:700;fill:#2F7E75}
+      .foot{font-size:10.5px;fill:#ADA398}
+    </style>
+    <marker id="ar" viewBox="0 0 8 8" refX="6.5" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0 0 L8 4 L0 8 z" fill="#A9764F"/>
+    </marker>
+    <marker id="ard" viewBox="0 0 8 8" refX="6.5" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L8 4 L0 8 z" fill="#948A7F"/>
+    </marker>
+  </defs>
+  <rect x="6" y="6" width="768" height="384" rx="16" fill="#FBFAF8" stroke="#E4DED5" stroke-width="1.5"/>
+
+  <text class="h1" x="34" y="46">Crate dependency layers</text>
+  <text class="sub" x="34" y="68">rsk-* crates · each tier depends on the one below · all host-tested (no_std)</text>
+
+  <!-- legend -->
+  <rect x="486" y="34" width="13" height="13" rx="3" fill="#3E3A36"/>
+  <text class="lg" x="506" y="45">binary</text>
+  <rect x="566" y="34" width="13" height="13" rx="3" fill="#C0562B"/>
+  <text class="lg" x="586" y="45">applet</text>
+  <rect x="646" y="34" width="13" height="13" rx="3" fill="#2F7E75"/>
+  <text class="lg" x="666" y="45">library</text>
+
+  <!-- tier arrows (depends on, downward) -->
+  <g stroke="#D9D2C8" stroke-width="9" marker-end="url(#ard)">
+    <line x1="390" y1="120" x2="390" y2="150"/>
+    <line x1="390" y1="200" x2="390" y2="222"/>
+  </g>
+  <text class="dep" x="404" y="140">depends on ▾</text>
+  <text class="dep" x="404" y="216">depends on ▾</text>
+
+  <!-- firmware -->
+  <rect x="290" y="90" width="200" height="30" rx="8" fill="#3E3A36"/>
+  <text class="node" x="390" y="109" text-anchor="middle">firmware · the RP2350 binary</text>
+
+  <!-- applets -->
+  <text class="tier" x="44" y="150">APPLETS</text>
+  <g fill="#C0562B">
+    <rect x="44"  y="156" width="93" height="30" rx="7"/>
+    <rect x="143" y="156" width="93" height="30" rx="7"/>
+    <rect x="242" y="156" width="93" height="30" rx="7"/>
+    <rect x="341" y="156" width="93" height="30" rx="7"/>
+    <rect x="440" y="156" width="93" height="30" rx="7"/>
+    <rect x="539" y="156" width="93" height="30" rx="7"/>
+    <rect x="638" y="156" width="93" height="30" rx="7"/>
+  </g>
+  <g class="node" text-anchor="middle">
+    <text x="90"  y="175">rsk-fido</text>
+    <text x="189" y="175">rsk-openpgp</text>
+    <text x="288" y="175">rsk-piv</text>
+    <text x="387" y="175">rsk-oath</text>
+    <text x="486" y="175">rsk-otp</text>
+    <text x="585" y="175">rsk-mgmt</text>
+    <text x="684" y="175">rsk-rescue</text>
+  </g>
+  <!-- intra-applet edges: piv->openpgp, otp->mgmt -->
+  <g fill="none" stroke="#A9764F" stroke-width="1.5" marker-end="url(#ar)">
+    <path d="M270 186 Q239 204 208 187"/>
+    <path d="M468 186 Q537 204 566 187"/>
+  </g>
+
+  <!-- platform -->
+  <text class="tier" x="60" y="222">PLATFORM LIBRARIES</text>
+  <g fill="#2F7E75">
+    <rect x="60"  y="228" width="100" height="30" rx="7"/>
+    <rect x="172" y="228" width="100" height="30" rx="7"/>
+    <rect x="284" y="228" width="100" height="30" rx="7"/>
+    <rect x="396" y="228" width="100" height="30" rx="7"/>
+    <rect x="508" y="228" width="100" height="30" rx="7"/>
+    <rect x="620" y="228" width="100" height="30" rx="7"/>
+  </g>
+  <g class="node" text-anchor="middle">
+    <text x="110" y="247">rsk-sdk</text>
+    <text x="222" y="247">rsk-fs</text>
+    <text x="334" y="247">rsk-crypto</text>
+    <text x="446" y="247">rsk-usb</text>
+    <text x="558" y="247">rsk-rsa-asm</text>
+    <text x="670" y="247">rsk-led</text>
+  </g>
+
+  <!-- display-only annex -->
+  <rect x="44" y="278" width="687" height="30" rx="8" fill="#FBF6F2" stroke="#E0C7B6" stroke-dasharray="5 4"/>
+  <text class="dash" x="58" y="297"><tspan font-weight="700">display build only</tspan> (feature-gated):  <tspan class="dashk">rsk-ui</tspan> · <tspan class="dashk">rsk-bip39</tspan> · <tspan class="dashk">rsk-slip39</tspan>   →  rsk-crypto</text>
+
+  <!-- notes -->
+  <text class="note" x="34" y="330">Every applet builds on <tspan class="notek">rsk-sdk</tspan> (dispatch) · <tspan class="notek">rsk-fs</tspan> (storage) · <tspan class="notek">rsk-crypto</tspan>.  Extra edges beyond the tiers:</text>
+  <text class="note" x="34" y="348"><tspan class="notek">rsk-piv → rsk-openpgp</tspan> · <tspan class="notek">rsk-otp → rsk-mgmt</tspan> · <tspan class="notek">rsk-openpgp → rsk-rsa-asm</tspan> · <tspan class="notek">rsk-fs &amp; rsk-usb → rsk-sdk</tspan>.</text>
+
+  <text class="foot" x="34" y="378">Source: workspace Cargo.toml manifests · firmware/ is the thin glue that wires the applets onto the transports.</text>
+</svg>

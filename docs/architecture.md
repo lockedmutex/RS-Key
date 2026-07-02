@@ -73,6 +73,12 @@ only after everything else is ready.
 
 ## Crates
 
+The workspace splits along a strict dependency gradient: the `firmware` binary
+is thin glue over the applet crates, which build on a handful of host-tested
+platform libraries. The per-crate detail is in the table; the shape is:
+
+![Crate dependency layers — the firmware binary on top, then the seven applet crates (fido, openpgp, piv, oath, otp, mgmt, rescue), then the platform libraries (sdk, fs, crypto, usb, rsa-asm, led); each tier depends on the one below, with piv→openpgp, otp→mgmt and openpgp→rsa-asm as the cross-edges](images/crate-graph.svg)
+
 | Crate | Contents |
 |---|---|
 | `firmware` | the only crate that touches the HAL: board bring-up, USB descriptors, executors, the worker, OTP fuse access, LED, BOOTSEL touch |
