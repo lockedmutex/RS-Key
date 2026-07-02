@@ -22,6 +22,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 REPORT_LEN = 64
 CTAPHID_INIT = 0x86
 CTAPHID_CBOR = 0x90
+CTAP_CLIENT_PIN = 0x06  # CTAP2 authenticatorClientPIN (naming mirrors tools/rsk/ctaphid.py)
 
 
 def _hdr(major, n):
@@ -144,7 +145,7 @@ def send_cbor(dev, cid, payload):
 
 
 def client_pin(dev, cid, fields):
-    return send_cbor(dev, cid, bytes([0x06]) + enc(fields))
+    return send_cbor(dev, cid, bytes([CTAP_CLIENT_PIN]) + enc(fields))
 
 
 class Protocol2:
