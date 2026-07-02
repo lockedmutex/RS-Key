@@ -25,14 +25,14 @@ use crate::credential::{
 
 /// The device-local PIN seam for a display-initiated action, re-exported here so the
 /// trusted display reaches the whole on-device Passkeys/PIN seam — read walks,
-/// [`delete_cred`], the PIN check ([`verify_local_pin`]) and the on-device set/change
+/// [`delete_cred`], the PIN check ([`spend_and_verify_local_pin`]) and the on-device set/change
 /// ([`store_local_pin`]) — through one module. Defined next to the canonical
 /// `spend_and_verify_pin_hash` in `clientpin`. [`min_pin_length`] is the floor the set
 /// flow shows on the pad and enforces.
 pub use crate::clientpin::{
     LocalPin, MAX_PIN_LENGTH, SetPinError, device_pin_is_set, device_pin_retries_left,
-    min_pin_length, pin_is_set, pin_retries_left, store_device_pin, store_local_pin,
-    verify_device_pin, verify_local_pin,
+    min_pin_length, pin_is_set, pin_retries_left, spend_and_verify_device_pin,
+    spend_and_verify_local_pin, store_device_pin, store_local_pin,
 };
 /// The compile-time PIN-length floor (CTAP default 4, or the `fips-profile` minimum) that
 /// [`store_device_pin`] enforces — the trusted-display device-PIN pad must use it as its

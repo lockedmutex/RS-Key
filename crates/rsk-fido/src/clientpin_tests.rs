@@ -401,18 +401,18 @@ fn ef_pin_retries(fs: &mut Fs<RamStorage>) -> u8 {
 fn local_pin_correct_wrong_and_reset() {
     let (mut fs, _rng, _state, _plat) = setup_with_pin(b"1234");
     assert!(matches!(
-        verify_local_pin(&dev(), &mut fs, b"1234"),
+        spend_and_verify_local_pin(&dev(), &mut fs, b"1234"),
         LocalPin::Ok
     ));
     assert_eq!(ef_pin_retries(&mut fs), MAX_PIN_RETRIES);
-    match verify_local_pin(&dev(), &mut fs, b"9999") {
+    match spend_and_verify_local_pin(&dev(), &mut fs, b"9999") {
         LocalPin::Wrong { retries_left } => assert_eq!(retries_left, MAX_PIN_RETRIES - 1),
         _ => panic!("expected Wrong"),
     }
     assert_eq!(ef_pin_retries(&mut fs), MAX_PIN_RETRIES - 1);
     // A later correct PIN restores the full budget.
     assert!(matches!(
-        verify_local_pin(&dev(), &mut fs, b"1234"),
+        spend_and_verify_local_pin(&dev(), &mut fs, b"1234"),
         LocalPin::Ok
     ));
     assert_eq!(ef_pin_retries(&mut fs), MAX_PIN_RETRIES);
@@ -425,17 +425,17 @@ fn local_pin_blocks_at_zero() {
     let (mut fs, _rng, _state, _plat) = setup_with_pin(b"1234");
     for _ in 0..MAX_PIN_RETRIES - 1 {
         assert!(matches!(
-            verify_local_pin(&dev(), &mut fs, b"0000"),
+            spend_and_verify_local_pin(&dev(), &mut fs, b"0000"),
             LocalPin::Wrong { .. }
         ));
     }
     assert!(matches!(
-        verify_local_pin(&dev(), &mut fs, b"0000"),
+        spend_and_verify_local_pin(&dev(), &mut fs, b"0000"),
         LocalPin::Blocked
     ));
     assert_eq!(ef_pin_retries(&mut fs), 0);
     assert!(matches!(
-        verify_local_pin(&dev(), &mut fs, b"1234"),
+        spend_and_verify_local_pin(&dev(), &mut fs, b"1234"),
         LocalPin::Blocked
     ));
 }
@@ -449,7 +449,7 @@ fn local_pin_is_set_and_unset() {
     let (mut bare, _rng2) = setup();
     assert!(!pin_is_set(&mut bare));
     assert!(matches!(
-        verify_local_pin(&dev(), &mut bare, b"1234"),
+        spend_and_verify_local_pin(&dev(), &mut bare, b"1234"),
         LocalPin::Blocked
     ));
 }
@@ -465,7 +465,7 @@ fn pin_retries_left_reads_the_budget_without_spending_it() {
     // A read does not decrement; the counter only moves on a real verify.
     assert_eq!(pin_retries_left(&mut fs), Some(MAX_PIN_RETRIES));
     assert!(matches!(
-        verify_local_pin(&dev(), &mut fs, b"9999"),
+        spend_and_verify_local_pin(&dev(), &mut fs, b"9999"),
         LocalPin::Wrong { .. }
     ));
     assert_eq!(pin_retries_left(&mut fs), Some(MAX_PIN_RETRIES - 1));
@@ -487,7 +487,7 @@ fn store_local_pin_matches_the_host_verifier() {
 
     assert_eq!(host_pf, local_pf, "local set must match the host verifier");
     assert!(matches!(
-        verify_local_pin(&dev(), &mut fs, b"246810"),
+        spend_and_verify_local_pin(&dev(), &mut fs, b"246810"),
         LocalPin::Ok
     ));
 }
@@ -502,7 +502,7 @@ fn device_pin_is_independent_of_fido_pin() {
     assert!(!device_pin_is_set(&mut fs));
     assert_eq!(device_pin_retries_left(&mut fs), None);
     assert!(matches!(
-        verify_device_pin(&dev(), &mut fs, b"1234"),
+        spend_and_verify_device_pin(&dev(), &mut fs, b"1234"),
         LocalPin::Blocked
     ));
     // Set the device PIN: it is set, the FIDO clientPIN stays unset.
@@ -514,11 +514,11 @@ fn device_pin_is_independent_of_fido_pin() {
     );
     // Correct device PIN verifies; a wrong one spends only its own counter.
     assert!(matches!(
-        verify_device_pin(&dev(), &mut fs, b"4321"),
+        spend_and_verify_device_pin(&dev(), &mut fs, b"4321"),
         LocalPin::Ok
     ));
     assert!(matches!(
-        verify_device_pin(&dev(), &mut fs, b"0000"),
+        spend_and_verify_device_pin(&dev(), &mut fs, b"0000"),
         LocalPin::Wrong { .. }
     ));
     assert_eq!(device_pin_retries_left(&mut fs), Some(MAX_PIN_RETRIES - 1));
@@ -527,16 +527,16 @@ fn device_pin_is_independent_of_fido_pin() {
     store_local_pin(&dev(), &mut fs, b"246810").unwrap();
     assert!(pin_is_set(&mut fs) && device_pin_is_set(&mut fs));
     assert!(matches!(
-        verify_local_pin(&dev(), &mut fs, b"246810"),
+        spend_and_verify_local_pin(&dev(), &mut fs, b"246810"),
         LocalPin::Ok
     ));
     assert!(matches!(
-        verify_device_pin(&dev(), &mut fs, b"4321"),
+        spend_and_verify_device_pin(&dev(), &mut fs, b"4321"),
         LocalPin::Ok
     ));
     assert!(
         matches!(
-            verify_device_pin(&dev(), &mut fs, b"246810"),
+            spend_and_verify_device_pin(&dev(), &mut fs, b"246810"),
             LocalPin::Wrong { .. }
         ),
         "the FIDO PIN value must not open the device PIN"
@@ -564,7 +564,7 @@ fn store_local_pin_enforces_min_length() {
     store_local_pin(&dev(), &mut fs, b"123456").unwrap();
     assert!(pin_is_set(&mut fs));
     assert!(matches!(
-        verify_local_pin(&dev(), &mut fs, b"123456"),
+        spend_and_verify_local_pin(&dev(), &mut fs, b"123456"),
         LocalPin::Ok
     ));
 }
@@ -578,7 +578,7 @@ fn store_local_pin_enforces_max_length() {
     let at_max = [b'1'; MAX_PIN_LENGTH];
     store_local_pin(&dev(), &mut fs, &at_max).unwrap();
     assert!(matches!(
-        verify_local_pin(&dev(), &mut fs, &at_max),
+        spend_and_verify_local_pin(&dev(), &mut fs, &at_max),
         LocalPin::Ok
     ));
     // …one byte over is refused and stores nothing.
@@ -596,18 +596,18 @@ fn store_local_pin_enforces_max_length() {
 fn store_local_pin_change_resets_budget_and_rotates() {
     let (mut fs, _rng, _state, _plat) = setup_with_pin(b"1234");
     assert!(matches!(
-        verify_local_pin(&dev(), &mut fs, b"9999"),
+        spend_and_verify_local_pin(&dev(), &mut fs, b"9999"),
         LocalPin::Wrong { .. }
     ));
     assert_eq!(ef_pin_retries(&mut fs), MAX_PIN_RETRIES - 1);
     store_local_pin(&dev(), &mut fs, b"4711").unwrap();
     assert_eq!(ef_pin_retries(&mut fs), MAX_PIN_RETRIES);
     assert!(matches!(
-        verify_local_pin(&dev(), &mut fs, b"1234"),
+        spend_and_verify_local_pin(&dev(), &mut fs, b"1234"),
         LocalPin::Wrong { .. }
     ));
     assert!(matches!(
-        verify_local_pin(&dev(), &mut fs, b"4711"),
+        spend_and_verify_local_pin(&dev(), &mut fs, b"4711"),
         LocalPin::Ok
     ));
 }

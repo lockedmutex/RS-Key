@@ -141,12 +141,12 @@ impl Ui {
                 rsk_fido::PinEntry::Entered(len) => {
                     let dev = self.keys.device();
                     let verdict = match scope {
-                        PinScope::Device => rsk_fido::passkeys::verify_device_pin(
+                        PinScope::Device => rsk_fido::passkeys::spend_and_verify_device_pin(
                             &dev,
                             &mut self.fs.borrow_mut(),
                             &pin[..len.min(pin.len())],
                         ),
-                        PinScope::Fido => rsk_fido::passkeys::verify_local_pin(
+                        PinScope::Fido => rsk_fido::passkeys::spend_and_verify_local_pin(
                             &dev,
                             &mut self.fs.borrow_mut(),
                             &pin[..len.min(pin.len())],

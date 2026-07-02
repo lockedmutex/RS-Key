@@ -778,7 +778,7 @@ impl<'a> OathApplet<'a> {
 
     /// Persist one retry decrement and confirm it stuck before an OTP-PIN compare,
     /// so a glitched or failed flash program can't widen the limiter (mirrors the
-    /// FIDO clientPIN verify_pin_hash read-back). `false` = fail closed, no compare.
+    /// FIDO clientPIN spend_and_verify_pin_hash read-back). `false` = fail closed, no compare.
     fn spend_otp_retry<S: Storage>(fs: &mut Fs<S>, rec: &mut [u8], size: usize) -> bool {
         rec[0] = rec[0].saturating_sub(1);
         if fs.put(EF_OTP_PIN, &rec[..size]).is_err() {

@@ -685,7 +685,7 @@ fn pinproto_ct_eq(a: &[u8], b: &[u8]) -> bool {
     rsk_crypto::ct_eq(a, b)
 }
 
-/// Outcome of a device-local PIN verify ([`verify_local_pin`]).
+/// Outcome of a device-local PIN verify ([`spend_and_verify_local_pin`]).
 pub enum LocalPin {
     /// Correct PIN; the retry counter was reset to the full budget.
     Ok,
@@ -716,7 +716,7 @@ pub fn pin_is_set<S: Storage>(fs: &mut Fs<S>) -> bool {
 }
 
 /// The PIN's remaining retry budget (the `EF_PIN` counter), or `None` when no PIN is
-/// set. Read-only — unlike [`verify_local_pin`] it never decrements — so the trusted
+/// set. Read-only — unlike [`spend_and_verify_local_pin`] it never decrements — so the trusted
 /// display can show "N tries remaining" up front on the unlock pad without spending a
 /// try. It is the same persistent counter the host clientPIN path enforces.
 pub fn pin_retries_left<S: Storage>(fs: &mut Fs<S>) -> Option<u8> {
@@ -756,15 +756,23 @@ fn retries_left_at<S: Storage>(fid: u16, fs: &mut Fs<S>) -> Option<u8> {
 /// The persistent 8-try counter is the real gate and is identical here, so this
 /// opens no faster path to grind the PIN than USB already does. The caller
 /// zeroizes `pin`.
-pub fn verify_local_pin<S: Storage>(dev: &Device, fs: &mut Fs<S>, pin: &[u8]) -> LocalPin {
+pub fn spend_and_verify_local_pin<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    pin: &[u8],
+) -> LocalPin {
     spend_and_verify_pin_at(EF_PIN, dev, fs, pin, true)
 }
 
 /// Verify the trusted-display **device PIN** ([`EF_DEVICE_PIN`]) — the same fail-closed
-/// retry-counter gate as [`verify_local_pin`], but against the device PIN's own record and
+/// retry-counter gate as [`spend_and_verify_local_pin`], but against the device PIN's own record and
 /// **without** the seed migration (the device PIN never wraps the seed; that is the FIDO
 /// clientPIN's job). Used by the display lock / on-device delete / factory-reset gates.
-pub fn verify_device_pin<S: Storage>(dev: &Device, fs: &mut Fs<S>, pin: &[u8]) -> LocalPin {
+pub fn spend_and_verify_device_pin<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    pin: &[u8],
+) -> LocalPin {
     spend_and_verify_pin_at(EF_DEVICE_PIN, dev, fs, pin, false)
 }
 
@@ -846,7 +854,7 @@ fn spend_and_verify_pin_at<S: Storage>(
 /// device-sealed, format 1, with a fresh retry budget — so the host afterwards sees a
 /// clientPIN exactly as if it had been set over USB. It enforces both `minPINLength` and
 /// the host-representable [`MAX_PIN_LENGTH`] ceiling (so a panel-set PIN stays usable over
-/// USB) but, mirroring [`verify_local_pin`], deliberately omits the CTAP-session
+/// USB) but, mirroring [`spend_and_verify_local_pin`], deliberately omits the CTAP-session
 /// side effects (token regeneration, the journal) that need a `Ctx` the display task
 /// does not hold and are meaningless with no host session. The CALLER verifies the
 /// *current* PIN first when one is set (so a change still proves knowledge of the old
