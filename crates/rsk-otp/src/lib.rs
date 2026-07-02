@@ -65,11 +65,13 @@ impl UserPresence for AlwaysConfirm {
 // are reached over CCID via the P2 slot offset and typed by three/four BOOTSEL clicks.
 pub(crate) const EF_OTP_SLOT1: u16 = 0xBB00;
 const EF_OTP_SLOT2: u16 = 0xBB01;
+/// Number of OTP slots (1/2 classic short/long press, 3/4 via CCID P2 offset).
+pub(crate) const SLOT_COUNT: usize = 4;
 /// Highest addressable slot FID. Only slots 1..=4 (0xBB00..=0xBB03) are ever read
 /// back (button_ticket, status, migrate_seal, power_up_bump); every command that
 /// derives a FID from a host offset must reject anything past this, or a slot can
 /// be written/relocated to an FID no code ever reaches again.
-const EF_OTP_SLOT_LAST: u16 = EF_OTP_SLOT1 + 3;
+const EF_OTP_SLOT_LAST: u16 = EF_OTP_SLOT1 + SLOT_COUNT as u16 - 1;
 
 /// Slot-config field offsets (packed, 52 bytes).
 pub(crate) const FIXED_SIZE: usize = 16;
@@ -117,7 +119,21 @@ const CFG_CHAL_HMAC: u8 = 0x22;
 pub(crate) const CFG_OATH_HOTP8: u8 = 0x02;
 const CFGFLAG_UPDATE_MASK: u8 = 0x0C; // PACING_10MS | PACING_20MS
 
+/// Yubico OTP use-counter ceiling — the counter is 15-bit, high bit reserved.
+pub(crate) const USE_COUNTER_MAX: u16 = 0x7FFF;
+
 const INS_OTP: u8 = 0x01;
+
+// Slot-command P1 codes (ykman's SLOT.* vocabulary).
+const P1_CONFIG_SLOT1: u8 = 0x01;
+const P1_CONFIG_SLOT2: u8 = 0x03;
+const P1_UPDATE_SLOT1: u8 = 0x04;
+const P1_UPDATE_SLOT2: u8 = 0x05;
+const P1_SWAP: u8 = 0x06;
+const P1_CHAL_OTP_SLOT1: u8 = 0x20;
+const P1_CHAL_OTP_SLOT2: u8 = 0x28;
+const P1_CHAL_HMAC_SLOT1: u8 = 0x30;
+const P1_CHAL_HMAC_SLOT2: u8 = 0x38;
 
 /// "Wrong data" in this protocol is reported as `0x6700` (wrong length).
 const SW_WRONG_DATA: Sw = Sw::WRONG_LENGTH;
@@ -134,7 +150,7 @@ pub struct OtpApplet<'a> {
     config_seq: u8,
     /// Per-slot RAM session-use counter mixed into a typed Yubico-OTP token;
     /// resets each power cycle. One entry per slot (1–4).
-    session_counter: [u8; 4],
+    session_counter: [u8; SLOT_COUNT],
 }
 
 impl<'a> OtpApplet<'a> {
@@ -152,7 +168,7 @@ impl<'a> OtpApplet<'a> {
             rng,
             presence,
             config_seq: 1,
-            session_counter: [0; 4],
+            session_counter: [0; SLOT_COUNT],
         }
     }
 
@@ -201,7 +217,7 @@ impl<'a> OtpApplet<'a> {
         fs: &mut Fs<S>,
         out: &mut [u8; ticket::MAX_TICKET],
     ) -> Option<(usize, bool)> {
-        if !(1..=4).contains(&slot) {
+        if !(1..=SLOT_COUNT as u8).contains(&slot) {
             return None;
         }
         let fid = EF_OTP_SLOT1 + (slot as u16 - 1);
@@ -279,8 +295,7 @@ impl<'a> OtpApplet<'a> {
     /// at `[1..4]`, the program sequence at `[4]` and the slot valid/touch bits
     /// at `[5]`.
     pub fn hid_status_frame<S: Storage>(&mut self, fs: &mut Fs<S>) -> [u8; 8] {
-        let b = self.status_bytes(fs);
-        [0, b[0], b[1], b[2], b[3], b[4], b[5], b[6]]
+        hid::status_frame(self.status_bytes(fs))
     }
 
     /// Run one keyboard-interface frame command: the 64-byte payload becomes the
@@ -290,12 +305,12 @@ impl<'a> OtpApplet<'a> {
     pub fn process_hid<S: Storage>(
         &mut self,
         slot_id: u8,
-        payload: &[u8; 64],
+        payload: &[u8; hid::PAYLOAD_SIZE],
         fs: &mut Fs<S>,
         res: &mut ResBuf,
     ) -> Sw {
-        let mut raw = [0u8; 5 + 64];
-        raw[..5].copy_from_slice(&[0x00, INS_OTP, slot_id, 0x00, 64]);
+        let mut raw = [0u8; 5 + hid::PAYLOAD_SIZE];
+        raw[..5].copy_from_slice(&[0x00, INS_OTP, slot_id, 0x00, hid::PAYLOAD_SIZE as u8]);
         raw[5..].copy_from_slice(payload);
         match Apdu::parse(&raw) {
             Ok(apdu) => self.process(&apdu, fs, res),
@@ -305,10 +320,10 @@ impl<'a> OtpApplet<'a> {
 
     /// P1 = 0x01/0x03: write or delete a slot config.
     fn cmd_configure<S: Storage>(&mut self, apdu: &Apdu, fs: &mut Fs<S>, res: &mut ResBuf) -> Sw {
-        if apdu.p1 == 0x03 && apdu.p2 != 0 {
+        if apdu.p1 == P1_CONFIG_SLOT2 && apdu.p2 != 0 {
             return Sw::INCORRECT_P1P2;
         }
-        let base = if apdu.p1 == 0x01 {
+        let base = if apdu.p1 == P1_CONFIG_SLOT1 {
             EF_OTP_SLOT1
         } else {
             EF_OTP_SLOT2
@@ -354,10 +369,10 @@ impl<'a> OtpApplet<'a> {
     /// P1 = 0x04/0x05: update the flag bytes of an existing config, keeping its
     /// fixed part / UID / key.
     fn cmd_update<S: Storage>(&mut self, apdu: &Apdu, fs: &mut Fs<S>, res: &mut ResBuf) -> Sw {
-        if apdu.p1 == 0x05 && apdu.p2 != 0 {
+        if apdu.p1 == P1_UPDATE_SLOT2 && apdu.p2 != 0 {
             return Sw::INCORRECT_P1P2;
         }
-        let base = if apdu.p1 == 0x04 {
+        let base = if apdu.p1 == P1_UPDATE_SLOT1 {
             EF_OTP_SLOT1
         } else {
             EF_OTP_SLOT2
@@ -471,7 +486,7 @@ impl<'a> OtpApplet<'a> {
     /// P1 = 0x14: per-slot flag/fixed-part TLVs (extended status).
     fn cmd_status_ext<S: Storage>(&mut self, fs: &mut Fs<S>, res: &mut ResBuf) -> Sw {
         let mut slot = [0u8; SLOT_SIZE];
-        for i in 0..4u16 {
+        for i in 0..SLOT_COUNT as u16 {
             if self.read_slot_m(fs, EF_OTP_SLOT1 + i, &mut slot).is_none() {
                 continue;
             }
@@ -499,10 +514,10 @@ impl<'a> OtpApplet<'a> {
     /// P1 = 0x20/0x28 (Yubico mode) / 0x30/0x38 (HMAC-SHA1): challenge-response.
     /// Challenge lengths are required up front — never overread the body.
     fn cmd_calculate<S: Storage>(&mut self, apdu: &Apdu, fs: &mut Fs<S>, res: &mut ResBuf) -> Sw {
-        if (apdu.p1 == 0x38 || apdu.p1 == 0x28) && apdu.p2 != 0 {
+        if (apdu.p1 == P1_CHAL_HMAC_SLOT2 || apdu.p1 == P1_CHAL_OTP_SLOT2) && apdu.p2 != 0 {
             return Sw::INCORRECT_P1P2;
         }
-        let base = if apdu.p1 == 0x30 || apdu.p1 == 0x20 {
+        let base = if apdu.p1 == P1_CHAL_HMAC_SLOT1 || apdu.p1 == P1_CHAL_OTP_SLOT1 {
             EF_OTP_SLOT1
         } else {
             EF_OTP_SLOT2
@@ -531,11 +546,11 @@ impl<'a> OtpApplet<'a> {
             return Sw::CONDITIONS_NOT_SATISFIED;
         }
         let data = &apdu.data[..apdu.nc];
-        if apdu.p1 == 0x30 || apdu.p1 == 0x38 {
+        if apdu.p1 == P1_CHAL_HMAC_SLOT1 || apdu.p1 == P1_CHAL_HMAC_SLOT2 {
             if cfg & CFG_CHAL_HMAC == 0 {
                 return SW_WRONG_DATA;
             }
-            if data.len() < 64 {
+            if data.len() < hid::PAYLOAD_SIZE {
                 return Sw::WRONG_LENGTH;
             }
             // HMAC key = AES field + all 6 UID bytes (22 total). HMAC zero-pads
@@ -545,9 +560,9 @@ impl<'a> OtpApplet<'a> {
             key[KEY_SIZE..].copy_from_slice(&slot[OFF_UID..OFF_UID + UID_SIZE]);
             // Variable-length challenges are padded by repeating the final
             // byte; trim that padding back off.
-            let mut chal_len = 64usize;
+            let mut chal_len = hid::PAYLOAD_SIZE;
             if cfg & CFG_HMAC_LT64 != 0 {
-                while chal_len > 0 && data[chal_len - 1] == data[63] {
+                while chal_len > 0 && data[chal_len - 1] == data[hid::PAYLOAD_SIZE - 1] {
                     chal_len -= 1;
                 }
             }
@@ -573,16 +588,18 @@ impl<'a> OtpApplet<'a> {
 
     fn cmd_otp<S: Storage>(&mut self, apdu: &Apdu, fs: &mut Fs<S>, res: &mut ResBuf) -> Sw {
         match apdu.p1 {
-            0x01 | 0x03 => self.cmd_configure(apdu, fs, res),
-            0x04 | 0x05 => self.cmd_update(apdu, fs, res),
-            0x06 => self.cmd_swap(apdu, fs, res),
+            P1_CONFIG_SLOT1 | P1_CONFIG_SLOT2 => self.cmd_configure(apdu, fs, res),
+            P1_UPDATE_SLOT1 | P1_UPDATE_SLOT2 => self.cmd_update(apdu, fs, res),
+            P1_SWAP => self.cmd_swap(apdu, fs, res),
             0x10 => {
                 res.extend(&rsk_mgmt::serial4(self.serial_id));
                 Sw::OK
             }
             0x13 => rsk_mgmt::config_tlv(&rsk_mgmt::serial4(self.serial_id), fs, res),
             0x14 => self.cmd_status_ext(fs, res),
-            0x20 | 0x28 | 0x30 | 0x38 => self.cmd_calculate(apdu, fs, res),
+            P1_CHAL_OTP_SLOT1 | P1_CHAL_OTP_SLOT2 | P1_CHAL_HMAC_SLOT1 | P1_CHAL_HMAC_SLOT2 => {
+                self.cmd_calculate(apdu, fs, res)
+            }
             // Unknown P1 values fall through to a bare OK.
             _ => Sw::OK,
         }
@@ -639,7 +656,7 @@ pub fn migrate_seal<S: Storage>(dev: &Device, fs: &mut Fs<S>, rng: &mut dyn Rng)
     // (e.g. a foreign serial) reads back at its true length and is skipped
     // rather than truncated and mis-resealed.
     let mut raw = [0u8; seal::MAX_BLOB];
-    for i in 0..4u16 {
+    for i in 0..SLOT_COUNT as u16 {
         let fid = KeyFid::new(EF_OTP_SLOT1 + i);
         if seal::seal_read(dev, fs, fid, &mut out).is_some() {
             continue; // already sealed under the current arm
@@ -671,7 +688,7 @@ pub fn migrate_seal<S: Storage>(dev: &Device, fs: &mut Fs<S>, rng: &mut dyn Rng)
 /// at startup.
 pub fn power_up_bump<S: Storage>(dev: &Device, fs: &mut Fs<S>, rng: &mut dyn Rng) {
     let mut slot = [0u8; SLOT_SIZE];
-    for i in 0..4u16 {
+    for i in 0..SLOT_COUNT as u16 {
         let fid = EF_OTP_SLOT1 + i;
         let Some(n) = read_slot(dev, fs, fid, &mut slot) else {
             continue;
@@ -687,7 +704,7 @@ pub fn power_up_bump<S: Storage>(dev: &Device, fs: &mut Fs<S>, rng: &mut dyn Rng
             rec[CONFIG_SIZE..].fill(0);
         }
         let counter = u16::from_be_bytes([rec[CONFIG_SIZE], rec[CONFIG_SIZE + 1]]).wrapping_add(1);
-        if counter <= 0x7FFF {
+        if counter <= USE_COUNTER_MAX {
             rec[CONFIG_SIZE..CONFIG_SIZE + 2].copy_from_slice(&counter.to_be_bytes());
             let _ = seal::seal_put(dev, fs, rng, KeyFid::new(fid), &rec);
         }

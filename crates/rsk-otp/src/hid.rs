@@ -15,6 +15,8 @@ pub const REPORT_DATA: usize = REPORT_SIZE - 1;
 pub const FRAME_SIZE: usize = 70;
 /// Command payload size.
 pub const PAYLOAD_SIZE: usize = 64;
+/// Offset of the frame CRC: payload ‖ slot ‖ CRC(2).
+const FRAME_CRC_OFF: usize = PAYLOAD_SIZE + 1;
 
 /// Host→device flag: a data frame (the low 5 bits are the sequence number).
 const FLAG_WRITE: u8 = 0x80;
@@ -86,7 +88,7 @@ impl FrameRx {
             return RxOutcome::None;
         }
         // Final slice: validate the frame CRC (plain CRC-16 over the payload).
-        let want = u16::from_le_bytes([self.buf[65], self.buf[66]]);
+        let want = u16::from_le_bytes([self.buf[FRAME_CRC_OFF], self.buf[FRAME_CRC_OFF + 1]]);
         if crc16(&self.buf[..PAYLOAD_SIZE]) != want {
             return RxOutcome::BadCrc;
         }
@@ -187,7 +189,7 @@ pub fn split_frame(payload: &[u8; PAYLOAD_SIZE], slot: u8) -> [[u8; REPORT_SIZE]
     frame[..PAYLOAD_SIZE].copy_from_slice(payload);
     frame[PAYLOAD_SIZE] = slot;
     let crc = crc16(payload);
-    frame[65..67].copy_from_slice(&crc.to_le_bytes());
+    frame[FRAME_CRC_OFF..FRAME_CRC_OFF + 2].copy_from_slice(&crc.to_le_bytes());
     let mut reports = [[0u8; REPORT_SIZE]; 10];
     for (seq, rep) in reports.iter_mut().enumerate() {
         rep[..REPORT_DATA]
