@@ -4,6 +4,11 @@
 [![deep-checks](https://github.com/TheMaxMur/RS-Key/actions/workflows/deep-checks.yml/badge.svg)](https://github.com/TheMaxMur/RS-Key/actions/workflows/deep-checks.yml)
 [![docs](https://github.com/TheMaxMur/RS-Key/actions/workflows/pages.yml/badge.svg)](https://themaxmur.github.io/RS-Key/)
 
+<p align="center">
+  <img src="assets/hero-boards.jpg" width="440"
+       alt="Three RS-Key boards on a blueprint background: a bare RP2350 USB stick on the left, the trusted-display variant in the centre showing its Home &quot;Ready&quot; screen (USB connected, Device PIN set, 2 passkeys), and a Waveshare RP2350-One on the right">
+</p>
+
 RS-Key (RSK, *Raspberry Security Key* — also a nod to its being written in Rust)
 is open-source security-key firmware for the Raspberry Pi **RP2350**. It makes an
 RP2350 board behave like a USB authenticator and ships the host tooling to drive
