@@ -23,6 +23,8 @@ The whole feature is `dep:`-gated. A standard key without a screen compiles
 from the default firmware image — so an ordinary build is byte-for-byte
 unaffected.
 
+![The RS-Key trusted display (Waveshare RP2350-Touch-LCD-2.8) showing its Home screen: a bright "Ready" status beside a check, a status card reading USB connected / Device PIN set / Passkeys 0, and a bottom navigation bar with Home, Passkeys, Apps and Settings tabs](../images/display-home.jpg)
+
 ## Building and flashing
 
 The panel takes over the addressable-LED pin, so the display flavor is built
@@ -81,6 +83,8 @@ masquerade as the real one.
 
 ## Entering a PIN on the trusted screen
 
+![The trusted display's Device PIN screen: a row of masked entry dots and an eye reveal toggle above a 3×4 numeric keypad (1–9, a backspace key, 0, and a blue confirm key), with "8 tries remaining" beneath](../images/display-pin.jpg)
+
 The panel has an on-screen numeric **PIN pad**: digits are masked, an **eye
 toggle** reveals them briefly so you can check before committing, and the minimum
 length shows as placeholder dots. Every PIN screen **names which credential it is
@@ -104,6 +108,8 @@ This backs three things:
 
 ## Passkeys
 
+![The trusted display's Passkeys tab on a device with no resident credentials, showing a key glyph and the empty-state message "No passkeys yet"](../images/display-passkeys.jpg)
+
 The Passkeys tab lists resident credentials by relying party (real `rpId` +
 account count) and drills into a per-account detail where a passkey can be
 **deleted** on-device (gated by the device PIN, then a hold) — decrypted on the
@@ -115,6 +121,8 @@ credential, so the passkey keeps working. The trade-off: the nickname is
 device-local and not seen by host credential managers.
 
 ## Apps — a read-only credential browser
+
+![The trusted display's Apps tab listing three applets as read-only rows: OpenPGP (0 keys), PIV (0 slots) and OATH (0 codes), each with a chevron to drill in](../images/display-apps.jpg)
 
 The Apps tab reads applet state **without a PIN**; no key material, PIN or public
 point is ever shown, and no OATH code is computed (the device has no clock).
@@ -134,6 +142,8 @@ point is ever shown, and no OATH code is computed (the device has no clock).
   touch-gated), each with a detail (type, HMAC algorithm, digits, TOTP step).
 
 ## Settings
+
+![The trusted display's Settings menu with three entries — Display, Security, and Firmware (showing the running bcdDevice build) — above the navigation bar](../images/display-settings.jpg)
 
 Grouped into three domains, plus the journal / backup / reset actions:
 
@@ -169,6 +179,8 @@ Grouped into three domains, plus the journal / backup / reset actions:
   a hold). Only the org attestation and the fused OTP / secure-boot state survive.
 
 ## Security model
+
+![The trusted display's Locked screen: a padlock glyph centred above "Locked" and the hint "Touch to unlock"](../images/display-locked.jpg)
 
 The device PIN (`EF_DEVICE_PIN`, its own sealed record + retry counter) gates the
 on-device UI — unlock, on-device delete, factory reset — independently of FIDO.

@@ -36,3 +36,9 @@ the mdBook site.
 | `soft-lock-states.svg` | Soft-lock state machine (Sealed / Locked / Unlocked) | original — from `guides/soft-lock.md` |
 | `seed-backup-window.svg` | Seed-export one-time window (No seed / Open / Finalized) | original — from `guides/seed-backup.md` |
 | `backup-key-redundancy.svg` | Primary + backup key enrolled at each account | original — from `guides/backup-key.md` |
+| `display-home.jpg` | Photo — trusted display, Home / "Ready" screen | own device photo (Waveshare RP2350-Touch-LCD-2.8), cropped, EXIF stripped |
+| `display-pin.jpg` | Photo — trusted display, Device PIN pad | own device photo, cropped, EXIF stripped |
+| `display-passkeys.jpg` | Photo — trusted display, Passkeys (empty) | own device photo, cropped, EXIF stripped |
+| `display-apps.jpg` | Photo — trusted display, Apps browser | own device photo, cropped, EXIF stripped |
+| `display-settings.jpg` | Photo — trusted display, Settings menu | own device photo, cropped, EXIF stripped |
+| `display-locked.jpg` | Photo — trusted display, Locked screen | own device photo, cropped, EXIF stripped |
