@@ -23,6 +23,13 @@ replacement for an audited commercial key.
 > [threat model](docs/threat-model.md) and [limitations](docs/limitations.md)
 > before trusting it with anything real.
 
+<p align="center">
+  <img src="assets/webauthn-demo.gif" width="260"
+       alt="Registering a passkey on webauthn.io with the trusted-display build: the device screen shows a Device PIN pad, then an Approve / Save-passkey prompt, and the browser confirms you are logged in — the PIN and the approval both happen on the device's own screen">
+  <br>
+  <sub>Registering a passkey on the trusted-display build — the PIN and the Approve / Deny happen on the device's own screen.</sub>
+</p>
+
 ## Documentation
 
 The docs live in [docs/](docs/) and are published as a site:
