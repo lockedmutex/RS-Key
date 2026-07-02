@@ -746,7 +746,7 @@ where
         Role::Body,
         theme::MUTED,
     )?;
-    group_card(t, PIV_KEYGEN_PICK_TOP, 5)?;
+    group_card(t, PIV_KEYGEN_PICK_TOP, PIV_KEYGEN_PICK_ROWS)?;
     row_body(
         t,
         crate::row_rect(PIV_KEYGEN_PICK_TOP, 0),
@@ -819,7 +819,7 @@ where
         Role::Body,
         theme::MUTED,
     )?;
-    group_card(t, PIV_KEYGEN_PICK_TOP, 3)?;
+    group_card(t, PIV_KEYGEN_PICK_TOP, PIV_RSA_PICK_ROWS)?;
     row_body(
         t,
         crate::row_rect(PIV_KEYGEN_PICK_TOP, 0),
@@ -867,7 +867,7 @@ where
     t.clear(BG)?;
     status_bar(t)?;
     title_bar_wide(t, "PIV PIN", theme::ACCENT, true)?;
-    group_card(t, PIV_KEYGEN_PICK_TOP, 4)?;
+    group_card(t, PIV_KEYGEN_PICK_TOP, PIV_PIN_MENU_ROWS)?;
     row_body(
         t,
         crate::row_rect(PIV_KEYGEN_PICK_TOP, 0),

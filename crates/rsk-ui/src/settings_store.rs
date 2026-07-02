@@ -40,9 +40,9 @@ const CORE_LEN: usize = 3;
 /// offered the prompt once.
 pub const FLAG_PIN_DECLINED: u8 = 0x01;
 
-/// Default display-sleep timeout in seconds — mirrors the firmware's
-/// `DEFAULT_SLEEP_MS` (60 s) so a device with no record blanks on the same schedule
-/// it did before this record existed.
+/// Default display-sleep timeout in seconds — the single source of truth: the
+/// firmware derives its `DEFAULT_SLEEP_MS` from it, so a device with no record
+/// blanks on the same schedule it did before this record existed.
 pub const DEFAULT_SLEEP_SECS: u16 = 60;
 
 /// The persisted display settings: backlight level, the display-sleep timeout, and

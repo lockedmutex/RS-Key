@@ -505,7 +505,7 @@ impl Ui {
                 .factory_wipe(rsk_fido::survives_factory_reset);
             // Confirm the wipe on the trusted screen before the reboot re-provisions a
             // fresh device (the grey rotate pop reads as "erased / restarting").
-            self.show_success(SuccessKind::Wiped, Some(1100));
+            self.show_success(SuccessKind::Wiped, Some(SUCCESS_POP_MS));
             cortex_m::peripheral::SCB::sys_reset();
         }
         self.end_modal();
@@ -626,7 +626,9 @@ impl Ui {
                     if rsk_ui::hit_title_back(p) {
                         return;
                     }
-                    if let Some(i) = rsk_ui::hit_list(p, rsk_ui::PIV_KEYGEN_PICK_TOP, 4) {
+                    if let Some(i) =
+                        rsk_ui::hit_list(p, rsk_ui::PIV_KEYGEN_PICK_TOP, rsk_ui::PIV_PIN_MENU_ROWS)
+                    {
                         break i;
                     }
                     self.touch.wait_release(last, idle);
@@ -766,7 +768,7 @@ impl Ui {
         };
         cur_pad.zeroize();
         if applied {
-            self.show_success(SuccessKind::Approved, Some(1100));
+            self.show_success(SuccessKind::Approved, Some(SUCCESS_POP_MS));
         } else {
             self.end_modal();
         }
@@ -806,7 +808,7 @@ impl Ui {
         };
         puk_pad.zeroize();
         if applied {
-            self.show_success(SuccessKind::Approved, Some(1100));
+            self.show_success(SuccessKind::Approved, Some(SUCCESS_POP_MS));
         } else {
             self.end_modal();
         }
@@ -847,7 +849,7 @@ impl Ui {
             rsk_piv::protect_mgm_key(&dev, &mut fs, &mut *rng) == rsk_sdk::Sw::OK
         };
         if ok {
-            self.show_success(SuccessKind::Approved, Some(1100));
+            self.show_success(SuccessKind::Approved, Some(SUCCESS_POP_MS));
         } else {
             self.end_modal();
         }

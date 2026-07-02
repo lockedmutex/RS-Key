@@ -166,7 +166,7 @@ impl Ui {
         for (w, &i) in words.iter_mut().zip(indices.iter()) {
             *w = rsk_bip39::word(i);
         }
-        let pages: u16 = 2;
+        let pages: u16 = rsk_bip39::WORD_COUNT.div_ceil(rsk_ui::SEED_WORDS_PER_PAGE) as u16;
         let mut page: u16 = 0;
         let _ = rsk_ui::render_seed_phrase(&mut self.panel, &words, page, pages);
         self.shown = None;
@@ -299,7 +299,8 @@ impl Ui {
     ) {
         let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
         let total = total as u16;
-        let per_share: u16 = (rsk_slip39::WORDS_PER_SHARE as u16).div_ceil(12); // 3 pages/share
+        let per_share: u16 =
+            (rsk_slip39::WORDS_PER_SHARE as u16).div_ceil(rsk_ui::SEED_WORDS_PER_PAGE as u16); // 3 pages/share
         let pages = total * per_share;
         let mut words: [&str; rsk_slip39::WORDS_PER_SHARE] = [""; rsk_slip39::WORDS_PER_SHARE];
         let mut page: u16 = 0;

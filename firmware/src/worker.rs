@@ -221,10 +221,12 @@ impl ApduHandler for ClientCcid {
 #[cfg(feature = "display")]
 fn secure_pin_meta(template: &[u8]) -> (&'static str, usize) {
     let title = match template.get(3).copied() {
-        Some(0x81) => "OpenPGP Sign PIN",
-        Some(0x82) => "OpenPGP PIN",
-        Some(0x83) => "OpenPGP Admin PIN",
-        Some(rsk_usb::secure_pin::PIV_PIN_P2) => "PIV PIN",
+        Some(rsk_openpgp::consts::PW1_MODE81) => "OpenPGP Sign PIN",
+        Some(rsk_openpgp::consts::PW1_MODE82) => "OpenPGP PIN",
+        Some(rsk_openpgp::consts::PW3_MODE83) => "OpenPGP Admin PIN",
+        Some(rsk_usb::secure_pin::PIV_PIN_P2) => {
+            crate::display::piv_ref_title(rsk_piv::PinRef::Pin)
+        }
         _ => "Enter PIN",
     };
     (title, 6)

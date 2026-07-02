@@ -437,6 +437,10 @@ where
     render_pager(t, page, pages)
 }
 
+/// Words per page of the word grid — the paging contract shared with the firmware's
+/// backup pager (its page counts derive from this).
+pub const SEED_WORDS_PER_PAGE: usize = 12;
+
 /// Paint up to twelve numbered words of `words` for `page` (0-based, 12 per page) in two
 /// columns of six — the shared body of the recovery-phrase and SLIP-39 share screens. The
 /// 1-based word number (within `words`, so per-phrase or per-share) is dimmed to the left of
@@ -445,7 +449,7 @@ fn word_grid<D>(t: &mut D, words: &[&str], page: u16) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb565>,
 {
-    let per_page = 12usize;
+    let per_page = SEED_WORDS_PER_PAGE;
     let start = page as usize * per_page;
     for c in 0..per_page {
         let gi = start + c;
@@ -513,7 +517,9 @@ where
         theme::ACCENT,
         true,
     )?;
-    let per_share = (words.len() as u16).div_ceil(12).max(1);
+    let per_share = (words.len() as u16)
+        .div_ceil(SEED_WORDS_PER_PAGE as u16)
+        .max(1);
     word_grid(t, words, page % per_share)?;
     render_pager(t, page, pages)
 }

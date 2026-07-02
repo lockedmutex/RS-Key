@@ -3,6 +3,7 @@
 
 //! The touch presence backend: trusted Approve/Deny prompts for host ceremonies.
 
+use super::gates::PinScope;
 use super::*;
 
 /// The on-screen presence backend — the `display` build's
@@ -179,9 +180,14 @@ impl TouchPresence {
         let expected = min_len.min(u8::MAX as usize) as u8;
         // The host built-in-UV PIN is the FIDO clientPIN — name it, so the user knows it
         // isn't the device-unlock or PIV PIN (the reported confusion behind a reset).
-        self.ui
-            .borrow_mut()
-            .collect_pin("FIDO PIN", None, min_len, expected, out, false)
+        self.ui.borrow_mut().collect_pin(
+            PinScope::Fido.pin_title(),
+            None,
+            min_len,
+            expected,
+            out,
+            false,
+        )
     }
 
     /// Collect a PIN on the on-screen pad for a host CCID secure-PIN-entry request

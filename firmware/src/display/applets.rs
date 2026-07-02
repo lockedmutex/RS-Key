@@ -709,12 +709,16 @@ impl Ui {
                     if rsk_ui::hit_title_back(p) {
                         return;
                     }
-                    if let Some(i) = rsk_ui::hit_list(p, rsk_ui::PIV_KEYGEN_PICK_TOP, 5) {
+                    if let Some(i) = rsk_ui::hit_list(
+                        p,
+                        rsk_ui::PIV_KEYGEN_PICK_TOP,
+                        rsk_ui::PIV_KEYGEN_PICK_ROWS,
+                    ) {
                         break match i {
-                            0 => Some((rsk_piv::files::ALGO_ECCP256, "NIST P-256")),
-                            1 => Some((rsk_piv::files::ALGO_ECCP384, "NIST P-384")),
-                            2 => Some((rsk_piv::files::ALGO_ED25519, "Ed25519")),
-                            3 => Some((rsk_piv::files::ALGO_X25519, "X25519")),
+                            0 => Some(rsk_piv::files::ALGO_ECCP256),
+                            1 => Some(rsk_piv::files::ALGO_ECCP384),
+                            2 => Some(rsk_piv::files::ALGO_ED25519),
+                            3 => Some(rsk_piv::files::ALGO_X25519),
                             _ => None,
                         };
                     }
@@ -742,11 +746,13 @@ impl Ui {
                     if rsk_ui::hit_title_back(p) {
                         break None;
                     }
-                    if let Some(i) = rsk_ui::hit_list(p, rsk_ui::PIV_KEYGEN_PICK_TOP, 3) {
+                    if let Some(i) =
+                        rsk_ui::hit_list(p, rsk_ui::PIV_KEYGEN_PICK_TOP, rsk_ui::PIV_RSA_PICK_ROWS)
+                    {
                         break Some(match i {
-                            0 => (rsk_piv::files::ALGO_RSA2048, "RSA 2048"),
-                            1 => (rsk_piv::files::ALGO_RSA3072, "RSA 3072"),
-                            _ => (rsk_piv::files::ALGO_RSA4096, "RSA 4096"),
+                            0 => rsk_piv::files::ALGO_RSA2048,
+                            1 => rsk_piv::files::ALGO_RSA3072,
+                            _ => rsk_piv::files::ALGO_RSA4096,
                         });
                     }
                     self.touch.wait_release(last, idle_limit);
@@ -762,7 +768,11 @@ impl Ui {
             // Otherwise the user backed out of the sub-picker — re-show the main chooser.
         };
         // A deliberate hold before the write.
-        let _ = rsk_ui::render_piv_keygen_confirm(&mut self.panel, slot, algo.1);
+        let _ = rsk_ui::render_piv_keygen_confirm(
+            &mut self.panel,
+            slot,
+            rsk_piv::info::algo_name(algo),
+        );
         self.shown = None;
         self.touch.wait_release(Instant::now(), idle_limit);
         if !self.hold_to_confirm("Hold to generate", rsk_ui::theme::ACCENT_FILL) {
@@ -771,7 +781,7 @@ impl Ui {
         // The keygen + seal holds the dev/rng/fs borrows across a synchronous, no-await
         // span, so the worker can't preempt and the borrows stay safe. The free slot is
         // re-checked under the borrow in case state moved while the chooser was open.
-        let rsa_nbits = match algo.0 {
+        let rsa_nbits = match algo {
             rsk_piv::files::ALGO_RSA2048 => Some(2048usize),
             rsk_piv::files::ALGO_RSA3072 => Some(3072),
             rsk_piv::files::ALGO_RSA4096 => Some(4096),
@@ -821,13 +831,13 @@ impl Ui {
             let mut fs = self.fs.borrow_mut();
             match rsk_piv::info::next_free_retired(&mut fs) {
                 Some(s) => {
-                    rsk_piv::info::generate_slot_key(&dev, &mut fs, &mut *rng, s, algo.0).is_ok()
+                    rsk_piv::info::generate_slot_key(&dev, &mut fs, &mut *rng, s, algo).is_ok()
                 }
                 None => false,
             }
         };
         if ok {
-            self.show_success(SuccessKind::Generated, Some(1100));
+            self.show_success(SuccessKind::Generated, Some(SUCCESS_POP_MS));
         }
     }
 

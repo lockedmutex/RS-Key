@@ -71,6 +71,7 @@ mod settings;
 mod status;
 mod touch;
 
+pub(crate) use gates::piv_ref_title;
 pub use presence::TouchPresence;
 pub use status::status_task;
 
@@ -109,6 +110,9 @@ const MENU_INACTIVITY_MS: u64 = 60_000;
 /// button fills as the hold builds, and lifting the finger early resets it.
 const HOLD_MS: u64 = 800;
 
+/// Auto-dismiss dwell for a success "pop" with no Done button (see [`Ui::show_success`]).
+const SUCCESS_POP_MS: u64 = 1100;
+
 /// PIN-title marquee: hold the head of an overflowing title visible this long, then scroll
 /// one pixel per [`MARQUEE_MS_PER_PX`] ms (≈45 px/s) so a long title like "OpenPGP Sign
 /// PIN" reads in full without colliding with the back chevron.
@@ -125,10 +129,10 @@ const MARQUEE_MASK_BYTES: usize =
 /// value `0..=BL_TOP`.
 const BL_TOP: u16 = 255;
 
-/// Built-in display-sleep timeout (ms): blank the panel after this long idle to stop
-/// image retention on the IPS glass. Runtime-adjustable from the Settings → Display
-/// sleep page ([`SLEEP_TIMEOUT_MS`]); `0` there means never sleep.
-const DEFAULT_SLEEP_MS: u32 = 60_000;
+/// Built-in display-sleep timeout (ms), derived from the EF_DISPLAY codec's
+/// [`rsk_ui::settings_store::DEFAULT_SLEEP_SECS`]. Runtime-adjustable from the Settings
+/// → Display sleep page ([`SLEEP_TIMEOUT_MS`]); `0` there means never sleep.
+const DEFAULT_SLEEP_MS: u32 = rsk_ui::settings_store::DEFAULT_SLEEP_SECS as u32 * 1000;
 /// Display-sleep timeout in ms, edited live by the menu. `0` = Off (never blanks).
 /// Read each tick by the ambient loop; reboot reseeds the default.
 static SLEEP_TIMEOUT_MS: AtomicU32 = AtomicU32::new(DEFAULT_SLEEP_MS);

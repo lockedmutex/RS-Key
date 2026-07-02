@@ -24,17 +24,17 @@ pub mod theme;
 pub mod touch;
 pub use glyph::Glyph;
 pub use render::{
-    PIN_TITLE_BAND, STATUS_ARC_START, pin_title_overflows, render, render_add_passkey, render_apps,
-    render_audit_log, render_backup, render_backup_format, render_confirm_delete,
-    render_confirm_factory_reset, render_erasing, render_firmware, render_hold_button,
-    render_hold_fill, render_locked_breathe, render_oath, render_oath_cred, render_openpgp,
-    render_openpgp_cardholder, render_openpgp_key, render_passkeys_list, render_pin_blocked,
-    render_pin_dots, render_pin_title, render_piv, render_piv_extra, render_piv_keygen_confirm,
-    render_piv_keygen_pick, render_piv_keygen_rsa_pick, render_piv_keygen_working,
-    render_piv_pin_menu, render_piv_protect_confirm, render_piv_slot, render_rebooting,
-    render_rename, render_rename_caret, render_reveal_warning, render_seal_confirm,
-    render_seed_phrase, render_service, render_share_picker, render_slip39_share,
-    render_status_arc, render_success, render_success_circle,
+    PIN_TITLE_BAND, SEED_WORDS_PER_PAGE, STATUS_ARC_START, pin_title_overflows, render,
+    render_add_passkey, render_apps, render_audit_log, render_backup, render_backup_format,
+    render_confirm_delete, render_confirm_factory_reset, render_erasing, render_firmware,
+    render_hold_button, render_hold_fill, render_locked_breathe, render_oath, render_oath_cred,
+    render_openpgp, render_openpgp_cardholder, render_openpgp_key, render_passkeys_list,
+    render_pin_blocked, render_pin_dots, render_pin_title, render_piv, render_piv_extra,
+    render_piv_keygen_confirm, render_piv_keygen_pick, render_piv_keygen_rsa_pick,
+    render_piv_keygen_working, render_piv_pin_menu, render_piv_protect_confirm, render_piv_slot,
+    render_rebooting, render_rename, render_rename_caret, render_reveal_warning,
+    render_seal_confirm, render_seed_phrase, render_service, render_share_picker,
+    render_slip39_share, render_status_arc, render_success, render_success_circle,
 };
 pub use settings_store::{CONF_LEN as DISPLAY_CONF_LEN, DisplayConfig};
 
@@ -1503,6 +1503,17 @@ pub const PIV_ROWS: u16 = 5;
 const _: () = assert!(OPENPGP_ROWS <= PK_ROWS_MAX as u16);
 const _: () = assert!(PIV_ROWS <= PK_ROWS_MAX as u16);
 const _: () = assert!(PK_LIST_TOP + PIV_ROWS * (LIST_ROW_H + LIST_ROW_GAP) <= NAV_TOP - 10);
+
+/// PIV keygen algorithm-chooser rows (the four curves + the RSA drill-in row);
+/// paint and the firmware hit-test share this count.
+pub const PIV_KEYGEN_PICK_ROWS: u16 = 5;
+/// RSA size sub-picker rows (2048 / 3072 / 4096).
+pub const PIV_RSA_PICK_ROWS: u16 = 3;
+/// PIV PIN menu rows (change PIN / change PUK / unblock PIN / protect mgmt key).
+pub const PIV_PIN_MENU_ROWS: u16 = 4;
+const _: () = assert!(PIV_KEYGEN_PICK_ROWS <= PK_ROWS_MAX as u16);
+const _: () = assert!(PIV_RSA_PICK_ROWS <= PK_ROWS_MAX as u16);
+const _: () = assert!(PIV_PIN_MENU_ROWS <= PK_ROWS_MAX as u16);
 
 /// Which applet, if any, a tap selects on the Apps chooser. The chooser reuses the
 /// tab-list row geometry ([`row_rect`] from [`PK_LIST_TOP`]), so paint + hit share it.

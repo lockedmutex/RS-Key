@@ -27,12 +27,13 @@ use crate::{
     DENY_RECT, FMT_PHRASE_RECT, FMT_SHARES_RECT, Glyph, HomeView, Label, NAV_H, NAV_TABS, NAV_TOP,
     NavTab, ONBOARD_SET_RECT, ONBOARD_SKIP_RECT, OPENPGP_ROWS, PAGER_NEXT_RECT, PAGER_PREV_RECT,
     PANEL_H, PANEL_W, PICK_CONTINUE_RECT, PICK_N_MINUS_RECT, PICK_N_PLUS_RECT, PICK_T_MINUS_RECT,
-    PICK_T_PLUS_RECT, PIN_CANCEL_RECT, PIN_COLS, PIN_EYE_RECT, PIN_ROWS, PIV_KEYGEN_PICK_TOP,
-    PIV_ROWS, PK_BACK_RECT, PK_LIST_TOP, PinCaption, PinKey, PinPad, Point, RN_BKSP_RECT,
-    RN_DOWN_RECT, RN_FIELD_RECT, RN_INS_RECT, RN_SAVE_RECT, RN_UP_RECT, Rect, RevealKind, RpRow,
-    STATUS_BAR_H, Screen, SettingsPage, SettingsView, StatusKind, SuccessKind, TITLE_BACK_RECT,
-    TITLE_BAR_H, TITLE_EDIT_RECT, font, font::Role, glyph, hex_u16, hex_u64, nav_tab_rect,
-    page_count, pin_grid_key, pin_key_rect, settings_row_rect, theme,
+    PICK_T_PLUS_RECT, PIN_CANCEL_RECT, PIN_COLS, PIN_EYE_RECT, PIN_ROWS, PIV_KEYGEN_PICK_ROWS,
+    PIV_KEYGEN_PICK_TOP, PIV_PIN_MENU_ROWS, PIV_ROWS, PIV_RSA_PICK_ROWS, PK_BACK_RECT, PK_LIST_TOP,
+    PinCaption, PinKey, PinPad, Point, RN_BKSP_RECT, RN_DOWN_RECT, RN_FIELD_RECT, RN_INS_RECT,
+    RN_SAVE_RECT, RN_UP_RECT, Rect, RevealKind, RpRow, STATUS_BAR_H, Screen, SettingsPage,
+    SettingsView, StatusKind, SuccessKind, TITLE_BACK_RECT, TITLE_BAR_H, TITLE_EDIT_RECT, font,
+    font::Role, glyph, hex_u16, hex_u64, nav_tab_rect, page_count, pin_grid_key, pin_key_rect,
+    settings_row_rect, theme,
 };
 use crate::{
     AppsView, CardholderView, OathDetailView, OathRow, OpenpgpView, PgpKeyView, PivExtraRow,
@@ -58,8 +59,8 @@ pub use applets::{
 };
 pub use audit::render_audit_log;
 pub use backup::{
-    render_backup, render_backup_format, render_reveal_warning, render_seal_confirm,
-    render_seed_phrase, render_share_picker, render_slip39_share,
+    SEED_WORDS_PER_PAGE, render_backup, render_backup_format, render_reveal_warning,
+    render_seal_confirm, render_seed_phrase, render_share_picker, render_slip39_share,
 };
 pub use boot::render_locked_breathe;
 pub use ceremony::render_add_passkey;
