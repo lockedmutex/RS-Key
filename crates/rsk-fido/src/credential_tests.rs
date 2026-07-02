@@ -272,3 +272,44 @@ fn nick_too_long_is_rejected_by_seal() {
     let long = core::str::from_utf8(&long).unwrap();
     assert!(seal_nick(&SEED, &rp_hash, long, &mut out).is_err());
 }
+
+// `truncate_utf8` must never panic and must return a char-boundary byte-prefix
+// no longer than `max`. The function's domain is small, so prove it by
+// EXHAUSTION over a stress alphabet spanning every UTF-8 length class (1..4
+// bytes), for every string of up to 3 such chars and every cap 0..=input len.
+#[test]
+fn truncate_utf8_is_exhaustively_safe() {
+    // ASCII 'a' (1B), 'é' (2B), '€' (3B), '𝔸' (4B) — one representative per class.
+    let alphabet = ['a', 'é', '€', '𝔸'];
+    let mut corpus = std::vec::Vec::new();
+    corpus.push(std::string::String::new());
+    for &a in &alphabet {
+        corpus.push(a.to_string());
+        for &b in &alphabet {
+            corpus.push(std::format!("{a}{b}"));
+            for &c in &alphabet {
+                corpus.push(std::format!("{a}{b}{c}"));
+            }
+        }
+    }
+    for s in &corpus {
+        for max in 0..=s.len() + 1 {
+            let t = truncate_utf8(s, max);
+            assert!(t.len() <= max, "{s:?} @ {max}: len {} > cap", t.len());
+            assert!(
+                s.as_bytes().starts_with(t.as_bytes()),
+                "{s:?} @ {max}: not a prefix"
+            );
+            // The cut is a real char boundary: `t` re-parses as the char prefix
+            // that fits, and dropping one more char would exceed `max`.
+            assert!(s.starts_with(t));
+            if t.len() < s.len() {
+                let next = s[..].chars().nth(t.chars().count()).unwrap();
+                assert!(
+                    t.len() + next.len_utf8() > max,
+                    "{s:?} @ {max}: truncated too early"
+                );
+            }
+        }
+    }
+}
