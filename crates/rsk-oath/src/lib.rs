@@ -72,6 +72,10 @@ const MAX_OTP_COUNTER: u8 = 3;
 /// tag) is a serial-only fast hash; it is recognised and upgraded to v1 on the
 /// next successful VERIFY / CHANGE. See #35/#42 (pico-keys carryover).
 const OTP_PIN_FMT_V1: u8 = 0x01;
+/// `EF_OTP_PIN` record lengths: legacy `[counter, double_hash(32)]`, v1
+/// `[counter, fmt, verifier(32)]`.
+const OTP_PIN_REC_LEGACY: usize = 33;
+const OTP_PIN_REC_V1: usize = 34;
 
 // Data-object tags.
 const TAG_NAME: u8 = 0x71;
@@ -726,8 +730,8 @@ impl<'a> OathApplet<'a> {
     fn otp_pin_matches(&self, rec: &[u8], pw: &[u8]) -> bool {
         let dev = self.device();
         match rec.len() {
-            34 if rec[1] == OTP_PIN_FMT_V1 => {
-                let stored = &rec[2..34];
+            OTP_PIN_REC_V1 if rec[1] == OTP_PIN_FMT_V1 => {
+                let stored = &rec[2..OTP_PIN_REC_V1];
                 ct_eq(&dev.pin_derive_verifier(pw), stored)
                     // kbase-migration fallback: a v1 verifier stored before the
                     // OTP key was provisioned. On a match the caller re-stores it
@@ -738,14 +742,14 @@ impl<'a> OathApplet<'a> {
                     || (dev.otp_key.is_some()
                         && ct_eq(&dev.without_otp().pin_derive_verifier(pw), stored))
             }
-            33 => ct_eq(&dev.double_hash_pin(pw), &rec[1..33]),
+            OTP_PIN_REC_LEGACY => ct_eq(&dev.double_hash_pin(pw), &rec[1..OTP_PIN_REC_LEGACY]),
             _ => false,
         }
     }
 
     /// A fresh v1 record: `[MAX_OTP_COUNTER, 0x01, pin_derive_verifier(pw)]`.
-    fn otp_pin_record_v1(&self, pw: &[u8]) -> [u8; 34] {
-        let mut rec = [0u8; 34];
+    fn otp_pin_record_v1(&self, pw: &[u8]) -> [u8; OTP_PIN_REC_V1] {
+        let mut rec = [0u8; OTP_PIN_REC_V1];
         rec[0] = MAX_OTP_COUNTER;
         rec[1] = OTP_PIN_FMT_V1;
         rec[2..].copy_from_slice(&self.device().pin_derive_verifier(pw));
@@ -780,7 +784,7 @@ impl<'a> OathApplet<'a> {
         if fs.put(EF_OTP_PIN, &rec[..size]).is_err() {
             return false;
         }
-        let mut back = [0u8; 34];
+        let mut back = [0u8; OTP_PIN_REC_V1];
         matches!(
             fs.read(EF_OTP_PIN, &mut back),
             Some(n) if n == size && back[0] == rec[0]
@@ -815,9 +819,9 @@ impl<'a> OathApplet<'a> {
     }
 
     fn cmd_change_otp_pin<S: Storage>(&mut self, apdu: &Apdu, fs: &mut Fs<S>) -> Sw {
-        let mut rec = [0u8; 34];
+        let mut rec = [0u8; OTP_PIN_REC_V1];
         let size = match fs.read(EF_OTP_PIN, &mut rec) {
-            Some(n) if (33..=34).contains(&n) => n,
+            Some(n) if (OTP_PIN_REC_LEGACY..=OTP_PIN_REC_V1).contains(&n) => n,
             _ => return Sw::CONDITIONS_NOT_SATISFIED,
         };
         let data = &apdu.data[..apdu.nc];
@@ -840,9 +844,9 @@ impl<'a> OathApplet<'a> {
     }
 
     fn cmd_verify_otp_pin<S: Storage>(&mut self, apdu: &Apdu, fs: &mut Fs<S>) -> Sw {
-        let mut rec = [0u8; 34];
+        let mut rec = [0u8; OTP_PIN_REC_V1];
         let size = match fs.read(EF_OTP_PIN, &mut rec) {
-            Some(n) if (33..=34).contains(&n) => n,
+            Some(n) if (OTP_PIN_REC_LEGACY..=OTP_PIN_REC_V1).contains(&n) => n,
             _ => return Sw::CONDITIONS_NOT_SATISFIED,
         };
         let Some(pw) = find_tag(&apdu.data[..apdu.nc], TAG_PASSWORD as u16) else {

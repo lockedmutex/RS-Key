@@ -17,6 +17,10 @@ use rsk_openpgp::keys::{Curve, PrivKey};
 use rsk_sdk::Sw;
 use zeroize::Zeroize;
 
+use crate::files::{
+    SLOT_ATTESTATION, SLOT_AUTHENTICATION, SLOT_CARDAUTH, SLOT_RETIRED_FIRST, SLOT_RETIRED_LAST,
+};
+
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
 /// Largest sealed plaintext: RSA-4096 `P ‖ Q` (two 256-byte primes — the
@@ -122,7 +126,9 @@ pub fn migrate_kbase<S: Storage>(dev: &Device, fs: &mut Fs<S>, rng: &mut dyn Rng
     }
     let old = dev.without_otp();
     // Retired (82–95), active (9A–9E incl. the 9B management key), attestation.
-    let slots = (0x82..=0x95).chain(0x9A..=0x9E).chain([0xF9u8]);
+    let slots = (SLOT_RETIRED_FIRST..=SLOT_RETIRED_LAST)
+        .chain(SLOT_AUTHENTICATION..=SLOT_CARDAUTH)
+        .chain([SLOT_ATTESTATION]);
     for slot in slots {
         let fid = crate::files::key_fid(slot);
         if !fs.has_key(fid) {

@@ -30,6 +30,23 @@ pub const ALGO_RSA4096: u8 = 0x16;
 pub const ALGO_ED25519: u8 = 0xE0;
 pub const ALGO_X25519: u8 = 0xE1;
 
+/// SEC1 uncompressed point: `0x04` + two 48-byte P-384 coordinates (the largest
+/// PIV curve).
+pub(crate) const MAX_EC_POINT: usize = 97;
+
+/// GENERATE ASYMMETRIC KEY PAIR request template tag (SP 800-73-4).
+pub const TAG_GEN_TEMPLATE: u8 = 0xAC;
+
+/// Management-key length for a 9B algorithm id; `None` for a non-mgm algorithm.
+pub(crate) fn mgm_key_len(algo: u8) -> Option<usize> {
+    match algo {
+        ALGO_AES128 => Some(16),
+        ALGO_AES192 | ALGO_3DES => Some(24),
+        ALGO_AES256 => Some(32),
+        _ => None,
+    }
+}
+
 // PIN / touch policies (Yubico metadata values).
 pub const PINPOLICY_DEFAULT: u8 = 0;
 pub const PINPOLICY_NEVER: u8 = 1;
@@ -49,10 +66,23 @@ pub const SLOT_SIGNATURE: u8 = 0x9C;
 pub const SLOT_KEYMGM: u8 = 0x9D;
 pub const SLOT_CARDAUTH: u8 = 0x9E;
 pub const SLOT_ATTESTATION: u8 = 0xF9;
+/// The twenty retired key-management slots, `82`–`95`.
+pub const SLOT_RETIRED_FIRST: u8 = 0x82;
+pub const SLOT_RETIRED_LAST: u8 = 0x95;
+// SP 800-73 PIN / PUK key references (VERIFY / CHANGE / RESET RETRY / metadata P2).
+pub const REF_PIN: u8 = 0x80;
+pub const REF_PUK: u8 = 0x81;
+
+// GENERAL AUTHENTICATE dynamic-auth template tags (SP 800-73-4).
+pub const TAG_DYN_AUTH: u8 = 0x7C;
+pub const TAG_AUTH_WITNESS: u8 = 0x80;
+pub const TAG_AUTH_CHALLENGE: u8 = 0x81;
+pub const TAG_AUTH_RESPONSE: u8 = 0x82;
+pub const TAG_AUTH_EXPONENTIATION: u8 = 0x85;
 
 /// The twenty retired key-management slots.
 pub fn is_retired(slot: u8) -> bool {
-    (0x82..=0x95).contains(&slot)
+    (SLOT_RETIRED_FIRST..=SLOT_RETIRED_LAST).contains(&slot)
 }
 
 /// The four primary asymmetric slots.
@@ -109,10 +139,8 @@ pub const EF_PIVMAN_DATA: u16 = 0xD2F0;
 /// object (`5FFF00`). The PRINTED object (`5FC109`) is handled specially in
 /// GET/PUT DATA (the PIN-protected mgmt key), not through this generic table.
 pub fn object_fid(id: u32) -> Option<u16> {
-    // `5FC100..5FC1EF` only — the `0xD2F0`/`0xD2F1` fids are reserved for the
-    // ADMIN-DATA / attestation objects, so a `5FC1F0/F1` id must not alias them.
-    if id & 0xFFFF00 == 0x5FC100 && (id & 0xFF) < 0xF0 {
-        return Some(0xD200 | (id & 0xFF) as u16);
+    if id & 0xFFFF00 == 0x5FC100 {
+        return data_object_fid((id & 0xFF) as u8);
     }
     match id & 0xFFFF {
         0xFF01 => Some(EF_ATTESTATION_CERT),
@@ -120,6 +148,13 @@ pub fn object_fid(id: u32) -> Option<u16> {
         0x7F61 => Some(0xD2B6), // BITGT: a valid id with no data → 6A82
         _ => None,
     }
+}
+
+/// The generic `5FC1xx` data-object fid (`0xD200 | xx`). `5FC1F0/F1` are
+/// refused: the `0xD2F0`/`0xD2F1` fids are reserved for the ADMIN-DATA /
+/// attestation objects and must not be aliased.
+pub(crate) fn data_object_fid(low: u8) -> Option<u16> {
+    (low < 0xF0).then_some(0xD200 | low as u16)
 }
 
 pub const DISCOVERY_ID: u32 = 0x7E;
@@ -131,17 +166,23 @@ pub const DISCOVERY: &[u8] = &[
     0x2F, 0x02, 0x40, 0x10,
 ];
 
+/// SP 800-73 padded PIN-block wire length (PIN/PUK padded to 8 with `0xFF`).
+pub const PIN_WIRE_LEN: usize = 8;
+
 /// Default credentials: PIN `123456` padded to 8 with `0xFF`, PUK `12345678`,
 /// management key `0102…08` ×3 typed as AES-192 (the YubiKey 5.7-era default
 /// key type).
-pub const DEFAULT_PIN: [u8; 8] = [0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0xFF, 0xFF];
-pub const DEFAULT_PUK: [u8; 8] = [0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38];
+pub const DEFAULT_PIN: [u8; PIN_WIRE_LEN] = [0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0xFF, 0xFF];
+pub const DEFAULT_PUK: [u8; PIN_WIRE_LEN] = [0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38];
 pub const DEFAULT_MGM: [u8; 24] = [
     0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, //
     0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, //
     0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
 ];
 pub const DEFAULT_RETRIES: u8 = 3;
+
+/// PIN/PUK verifier record length: `[len, fmt=0x01, verifier(32)]`.
+pub(crate) const PIN_REC_LEN: usize = 34;
 
 /// Write a PIN/PUK verifier file: `[len, 0x01, pin_derive_verifier(pin)]`.
 pub fn put_pin_verifier<S: Storage>(
@@ -150,7 +191,7 @@ pub fn put_pin_verifier<S: Storage>(
     fid: u16,
     pin: &[u8],
 ) -> Result<(), Sw> {
-    let mut rec = [0u8; 34];
+    let mut rec = [0u8; PIN_REC_LEN];
     rec[0] = pin.len() as u8;
     rec[1] = 0x01;
     rec[2..].copy_from_slice(&dev.pin_derive_verifier(pin));
@@ -191,7 +232,7 @@ pub fn scan_files<S: Storage>(dev: &Device, fs: &mut Fs<S>, rng: &mut dyn Rng) -
     if !fs.has_key(key_fid(SLOT_ATTESTATION)) {
         let key = PrivKey::generate(Curve::P384, rng).ok_or(Sw::EXEC_ERROR)?;
         seal::store_ec_key(dev, fs, rng, key_fid(SLOT_ATTESTATION), &key)?;
-        let mut point = [0u8; 97];
+        let mut point = [0u8; MAX_EC_POINT];
         let plen = key.public_point(&mut point)?;
         let mut cert = [0u8; x509::MAX_CERT];
         let n = x509::build_cert(

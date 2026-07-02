@@ -24,7 +24,7 @@ use core::cell::RefCell;
 use rsk_crypto::Device;
 use rsk_fs::{Fs, Sealed, Storage};
 pub use rsk_openpgp::Rng;
-use rsk_openpgp::keys::make_rsa_response;
+use rsk_openpgp::keys::{MAX_RSA_PUBDO, make_rsa_response};
 // PIV reuses the OpenPGP user-presence trait, so the firmware's existing
 // `impl rsk_openpgp::UserPresence for ButtonPresence` already drives PIV touch.
 use rsa::RsaPrivateKey;
@@ -90,6 +90,9 @@ const PIVMAN_MAX: usize = 2 + 3 + 2 + PIVMAN_TS_MAX;
 /// PivmanProtectedData TLV: outer `0x88 { 0x89 = raw management key }`.
 const PROTECTED_TAG: u8 = 0x88;
 const PROTECTED_MGM_TAG: u8 = 0x89;
+// GET/PUT DATA (SP 800-73-4): 5C = the object-id path, 53 = the data object.
+const TAG_DATA_PATH: u8 = 0x5C;
+const TAG_DATA_OBJECT: u8 = 0x53;
 
 /// Which GENERAL AUTHENTICATE handshake issued the pending `challenge`. The two
 /// flows attach opposite confidentiality to that field — mutual auth returns the
@@ -183,13 +186,7 @@ impl<'a> PivApplet<'a> {
             return None;
         }
         let req = keygen::parse_gen_template(data).ok()?;
-        let nbits = match req.algo {
-            ALGO_RSA1024 => 1024,
-            ALGO_RSA2048 => 2048,
-            ALGO_RSA3072 => 3072,
-            ALGO_RSA4096 => 4096,
-            _ => return None,
-        };
+        let nbits = keygen::rsa_size_from_algo(req.algo)? * 8;
         let pol = keygen::resolved_policies(p2, req.pin_policy, req.touch_policy);
         Some((p2, nbits, pol))
     }
@@ -354,7 +351,7 @@ impl PivApplet<'_> {
         if apdu.p1 != 0x00 && apdu.p1 != 0xFF {
             return Sw::INCORRECT_P1P2;
         }
-        if apdu.p2 != 0x80 {
+        if apdu.p2 != REF_PIN {
             return Sw::REFERENCE_NOT_FOUND;
         }
         if !fs.has_data(EF_PIN) {
@@ -379,7 +376,7 @@ impl PivApplet<'_> {
             if self.sess.has_pin {
                 return Sw::OK;
             }
-            return Sw::new(0x63, 0xC0 | left);
+            return sw_retries(left);
         }
         match check_ref(dev, fs, EF_PIN, RETRY_PIN, apdu.data) {
             Sw::OK => {
@@ -397,8 +394,8 @@ impl PivApplet<'_> {
             return Sw::INCORRECT_P1P2;
         }
         let which = match apdu.p2 {
-            0x80 => PinRef::Pin,
-            0x81 => PinRef::Puk,
+            REF_PIN => PinRef::Pin,
+            REF_PUK => PinRef::Puk,
             _ => return Sw::INCORRECT_P1P2,
         };
         let (fid, _) = which.fid_retry();
@@ -414,7 +411,7 @@ impl PivApplet<'_> {
 
     /// RESET RETRY COUNTER (INS 0x2C): unblock/replace the PIN with the PUK.
     fn reset_retry<S: Storage>(&mut self, dev: &Device, fs: &mut Fs<S>, apdu: &Apdu) -> Sw {
-        if apdu.p1 != 0x00 || apdu.p2 != 0x80 {
+        if apdu.p1 != 0x00 || apdu.p2 != REF_PIN {
             return Sw::INCORRECT_P1P2;
         }
         let puk_len = match stored_pin_len(fs, EF_PUK) {
@@ -487,7 +484,7 @@ impl PivApplet<'_> {
         if apdu.nc == 0 {
             return Sw::WRONG_LENGTH;
         }
-        if apdu.data[0] != 0xAC {
+        if apdu.data[0] != TAG_GEN_TEMPLATE {
             return WRONG_DATA;
         }
         if !self.sess.has_mgm {
@@ -518,7 +515,7 @@ impl PivApplet<'_> {
             return Sw::INCORRECT_P1P2;
         }
         let d = apdu.data;
-        if d.len() < 3 || d[0] != 0x5C {
+        if d.len() < 3 || d[0] != TAG_DATA_PATH {
             return WRONG_DATA;
         }
         let l = d[1] as usize;
@@ -548,7 +545,7 @@ impl PivApplet<'_> {
             Some(n) if n > 0 => n.min(obj.len()),
             _ => return Sw::FILE_NOT_FOUND,
         };
-        if push_tlv(res, 0x53, &obj[..n]).is_err() {
+        if push_tlv(res, TAG_DATA_OBJECT, &obj[..n]).is_err() {
             return Sw::WRONG_LENGTH;
         }
         Sw::OK
@@ -584,7 +581,7 @@ impl PivApplet<'_> {
         body[3] = klen as u8;
         body[4..4 + klen].copy_from_slice(&key[..klen]);
         key.zeroize();
-        let r = if push_tlv(res, 0x53, &body[..4 + klen]).is_err() {
+        let r = if push_tlv(res, TAG_DATA_OBJECT, &body[..4 + klen]).is_err() {
             Sw::WRONG_LENGTH
         } else {
             Sw::OK
@@ -605,7 +602,10 @@ impl PivApplet<'_> {
         if !apdu.data.is_empty() && (apdu.data[0] == 0x7E || apdu.data[0] == 0x7F) {
             return Sw::OK;
         }
-        let (Some(path), Some(obj)) = (find_tag(apdu.data, 0x5C), find_tag(apdu.data, 0x53)) else {
+        let (Some(path), Some(obj)) = (
+            find_tag(apdu.data, TAG_DATA_PATH as u16),
+            find_tag(apdu.data, TAG_DATA_OBJECT as u16),
+        ) else {
             return WRONG_DATA;
         };
         if path.len() != 3 {
@@ -619,8 +619,10 @@ impl PivApplet<'_> {
             // copy isn't persisted (GET DATA synthesizes it), so acknowledge the
             // write without storing the key plaintext at rest.
             (0x5F, 0xC1, 0x09) => return Sw::OK,
-            // `5FC100..5FC1EF` only — F0/F1 are reserved for the ADMIN/attestation fids.
-            (0x5F, 0xC1, b) if b < 0xF0 => 0xD200 | b as u16,
+            (0x5F, 0xC1, b) => match data_object_fid(b) {
+                Some(fid) => fid,
+                None => return WRONG_DATA,
+            },
             _ => return WRONG_DATA,
         };
         if obj.is_empty() {
@@ -649,17 +651,17 @@ impl PivApplet<'_> {
         }
         let key_ref = apdu.p2;
         match key_ref {
-            0x80 | 0x81 => {
-                let (fid, retry, default) = if key_ref == 0x80 {
+            REF_PIN | REF_PUK => {
+                let (fid, retry, default) = if key_ref == REF_PIN {
                     (EF_PIN, RETRY_PIN, &DEFAULT_PIN)
                 } else {
                     (EF_PUK, RETRY_PUK, &DEFAULT_PUK)
                 };
-                let mut rec = [0u8; 34];
-                let Some(34) = fs.read(fid, &mut rec) else {
+                let mut rec = [0u8; PIN_REC_LEN];
+                let Some(PIN_REC_LEN) = fs.read(fid, &mut rec) else {
                     return Sw::REFERENCE_NOT_FOUND;
                 };
-                let is_default = ct_eq(&rec[2..34], &dev.pin_derive_verifier(default));
+                let is_default = ct_eq(&rec[2..PIN_REC_LEN], &dev.pin_derive_verifier(default));
                 let (total, left) = match retries(fs, retry) {
                     Ok(t) => t,
                     Err(sw) => return sw,
@@ -718,7 +720,7 @@ impl PivApplet<'_> {
         algo: u8,
         res: &mut ResBuf,
     ) -> Sw {
-        let mut body = [0u8; 5 + 4 + 512 + 2 + 8];
+        let mut body = [0u8; MAX_RSA_PUBDO];
         let n = match algo {
             ALGO_RSA1024 | ALGO_RSA2048 | ALGO_RSA3072 | ALGO_RSA4096 => {
                 let key = match seal::load_rsa_key(dev, fs, key_fid(slot)) {
@@ -736,7 +738,7 @@ impl PivApplet<'_> {
                     Ok(k) => k,
                     Err(_) => return Sw::EXEC_ERROR,
                 };
-                let mut point = [0u8; 97];
+                let mut point = [0u8; MAX_EC_POINT];
                 let plen = match key.public_point(&mut point) {
                     Ok(p) => p,
                     Err(e) => return e,
@@ -775,10 +777,7 @@ impl PivApplet<'_> {
         // (SP 800-131A); an existing 3DES key still authenticates, so a
         // reflashed device can migrate itself to AES.
         let tdes = cfg!(not(feature = "fips-profile"));
-        let len_ok = matches!(
-            (algo, klen),
-            (ALGO_AES128, 16) | (ALGO_AES192, 24) | (ALGO_AES256, 32)
-        ) || (tdes && (algo, klen) == (ALGO_3DES, 24));
+        let len_ok = mgm_key_len(algo) == Some(klen) && (tdes || algo != ALGO_3DES);
         if key_ref != SLOT_CARDMGM || !len_ok {
             return WRONG_DATA;
         }
@@ -919,11 +918,16 @@ fn reset_counter<S: Storage>(fs: &mut Fs<S>, idx: usize) -> Sw {
 }
 
 fn stored_pin_len<S: Storage>(fs: &mut Fs<S>, fid: u16) -> Result<usize, Sw> {
-    let mut rec = [0u8; 34];
-    let Some(34) = fs.read(fid, &mut rec) else {
+    let mut rec = [0u8; PIN_REC_LEN];
+    let Some(PIN_REC_LEN) = fs.read(fid, &mut rec) else {
         return Err(Sw::MEMORY_FAILURE);
     };
     Ok(rec[0] as usize)
+}
+
+/// ISO 7816-4 `63Cx`: verification failed, `x` retries remaining.
+const fn sw_retries(left: u8) -> Sw {
+    Sw::new(0x63, 0xC0 | left)
 }
 
 /// Boot-pass migration: re-seal every sealed PIV key slot under the OTP kbase
@@ -943,15 +947,18 @@ fn check_ref<S: Storage>(dev: &Device, fs: &mut Fs<S>, fid: u16, retry: usize, p
     if left == 0 {
         return Sw::PIN_BLOCKED;
     }
-    let mut rec = [0u8; 34];
-    let Some(34) = fs.read(fid, &mut rec) else {
+    let mut rec = [0u8; PIN_REC_LEN];
+    let Some(PIN_REC_LEN) = fs.read(fid, &mut rec) else {
         return Sw::MEMORY_FAILURE;
     };
     let ver = dev.pin_derive_verifier(pin);
-    let mut matched = ct_eq(&ver, &rec[2..34]);
+    let mut matched = ct_eq(&ver, &rec[2..PIN_REC_LEN]);
     if !matched
         && dev.otp_key.is_some()
-        && ct_eq(&dev.without_otp().pin_derive_verifier(pin), &rec[2..34])
+        && ct_eq(
+            &dev.without_otp().pin_derive_verifier(pin),
+            &rec[2..PIN_REC_LEN],
+        )
     {
         // kbase-migration fallback: the correct PIN against a verifier stored
         // before the OTP key was provisioned — re-store it under the OTP arm
@@ -974,7 +981,7 @@ fn check_ref<S: Storage>(dev: &Device, fs: &mut Fs<S>, fid: u16, retry: usize, p
     if left == 0 {
         Sw::PIN_BLOCKED
     } else {
-        Sw::new(0x63, 0xC0 | left)
+        sw_retries(left)
     }
 }
 
@@ -998,11 +1005,11 @@ impl PinRef {
 /// (trailing `0xFF`), matching ykman / yubico-piv-tool. On-device (panel) entry
 /// MUST store the verifier over this padded form, or a host `VERIFY` — which
 /// always pads — will not match. `None` for empty / over-long input.
-pub fn pad_pin(entered: &[u8]) -> Option<[u8; 8]> {
-    if entered.is_empty() || entered.len() > 8 {
+pub fn pad_pin(entered: &[u8]) -> Option<[u8; PIN_WIRE_LEN]> {
+    if entered.is_empty() || entered.len() > PIN_WIRE_LEN {
         return None;
     }
-    let mut out = [0xFFu8; 8];
+    let mut out = [0xFFu8; PIN_WIRE_LEN];
     out[..entered.len()].copy_from_slice(entered);
     Some(out)
 }
@@ -1018,7 +1025,7 @@ pub fn change_reference<S: Storage>(
     old: &[u8],
     new: &[u8],
 ) -> Sw {
-    if new.is_empty() || new.len() > 8 {
+    if new.is_empty() || new.len() > PIN_WIRE_LEN {
         return Sw::WRONG_LENGTH;
     }
     let (fid, retry) = which.fid_retry();
@@ -1040,7 +1047,7 @@ pub fn unblock_pin_with_puk<S: Storage>(
     puk: &[u8],
     new: &[u8],
 ) -> Sw {
-    if new.is_empty() || new.len() > 8 {
+    if new.is_empty() || new.len() > PIN_WIRE_LEN {
         return Sw::WRONG_LENGTH;
     }
     match check_ref(dev, fs, EF_PUK, RETRY_PUK, puk) {
@@ -1212,7 +1219,7 @@ pub(crate) fn dyn_auth_resp(res: &mut ResBuf, tag: u8, payload: &[u8]) -> Result
     let inner = 1 + format_len(payload.len() as u16, &mut ll) as u16 + payload.len() as u16;
     let mut oll = [0u8; 3];
     let on = format_len(inner, &mut oll);
-    if !res.push(0x7C) || !res.extend(&oll[..on]) {
+    if !res.push(TAG_DYN_AUTH) || !res.extend(&oll[..on]) {
         return Err(Sw::WRONG_LENGTH);
     }
     push_tlv(res, tag, payload)

@@ -22,6 +22,7 @@ use rsk_sdk::{ResBuf, Sw};
 use zeroize::Zeroize;
 
 use crate::files::*;
+use crate::keygen;
 use crate::seal;
 use crate::x509;
 use crate::{ChallengeKind, RngAdapter, Session, WRONG_DATA, ct_eq, dyn_auth_resp};
@@ -85,10 +86,10 @@ pub(crate) fn general_authenticate<S: Storage>(
     if data.is_empty() {
         return Sw::WRONG_LENGTH;
     }
-    if data[0] != 0x7C {
+    if data[0] != TAG_DYN_AUTH {
         return WRONG_DATA;
     }
-    let Some(dyn_auth) = find_tag(data, 0x7C) else {
+    let Some(dyn_auth) = find_tag(data, TAG_DYN_AUTH as u16) else {
         return WRONG_DATA;
     };
     if dyn_auth.is_empty() {
@@ -99,17 +100,12 @@ pub(crate) fn general_authenticate<S: Storage>(
     let mut mgm_key = [0u8; 32];
     let mut mgm_len = 0usize;
     if key_ref == SLOT_CARDMGM {
-        if !matches!(algo, ALGO_3DES | ALGO_AES128 | ALGO_AES192 | ALGO_AES256) {
+        let Some(want) = mgm_key_len(algo) else {
             return Sw::INCORRECT_P1P2;
-        }
+        };
         mgm_len = match seal::seal_read(dev, fs, key_fid(SLOT_CARDMGM), &mut mgm_key) {
             Ok(n) => n,
             Err(_) => return Sw::MEMORY_FAILURE,
-        };
-        let want = match algo {
-            ALGO_AES128 => 16,
-            ALGO_AES192 | ALGO_3DES => 24,
-            _ => 32,
         };
         if mgm_len != want {
             mgm_key.zeroize();
@@ -139,10 +135,10 @@ pub(crate) fn general_authenticate<S: Storage>(
     let touch_policy = meta[2];
 
     let chal_len: usize = if algo == ALGO_3DES { 8 } else { 16 };
-    let t80 = find_tag(dyn_auth, 0x80);
-    let t81 = find_tag(dyn_auth, 0x81);
-    let t82 = find_tag(dyn_auth, 0x82);
-    let t85 = find_tag(dyn_auth, 0x85);
+    let t80 = find_tag(dyn_auth, TAG_AUTH_WITNESS as u16);
+    let t81 = find_tag(dyn_auth, TAG_AUTH_CHALLENGE as u16);
+    let t82 = find_tag(dyn_auth, TAG_AUTH_RESPONSE as u16);
+    let t85 = find_tag(dyn_auth, TAG_AUTH_EXPONENTIATION as u16);
 
     let sw = (|| -> Result<(), Sw> {
         if let Some(w) = t80 {
@@ -166,7 +162,7 @@ pub(crate) fn general_authenticate<S: Storage>(
                 sess.has_challenge = true;
                 sess.chal_kind = ChallengeKind::MutualWitness;
                 sess.chal_algo = algo;
-                dyn_auth_resp(res, 0x80, &enc[..chal_len])?;
+                dyn_auth_resp(res, TAG_AUTH_WITNESS, &enc[..chal_len])?;
                 return Ok(());
             }
             // Mutual auth step 2: host returns the decrypted witness + its own
@@ -200,7 +196,7 @@ pub(crate) fn general_authenticate<S: Storage>(
                 &mut enc[..chal_len],
                 Dir::Encrypt,
             )?;
-            dyn_auth_resp(res, 0x82, &enc[..chal_len])?;
+            dyn_auth_resp(res, TAG_AUTH_RESPONSE, &enc[..chal_len])?;
             return Ok(());
         }
 
@@ -211,7 +207,7 @@ pub(crate) fn general_authenticate<S: Storage>(
                 sess.has_challenge = true;
                 sess.chal_kind = ChallengeKind::SingleChallenge;
                 sess.chal_algo = algo;
-                dyn_auth_resp(res, 0x81, &sess.challenge[..chal_len])?;
+                dyn_auth_resp(res, TAG_AUTH_CHALLENGE, &sess.challenge[..chal_len])?;
                 return Ok(());
             }
             match algo {
@@ -231,17 +227,13 @@ pub(crate) fn general_authenticate<S: Storage>(
                     let off = key.size() - bytes.len();
                     out[..off].fill(0);
                     out[off..key.size()].copy_from_slice(&bytes);
-                    dyn_auth_resp(res, 0x82, &out[..key.size()])?;
+                    dyn_auth_resp(res, TAG_AUTH_RESPONSE, &out[..key.size()])?;
                     out.zeroize();
                 }
                 ALGO_ECCP256 | ALGO_ECCP384 => {
                     check_touch(touch_policy, presence)?;
                     let key = seal::load_ec_key(dev, fs, key_fid(key_ref))?;
-                    let want = if algo == ALGO_ECCP256 {
-                        Curve::P256
-                    } else {
-                        Curve::P384
-                    };
+                    let want = keygen::curve_for_algo(algo).ok_or(Sw::INCORRECT_P1P2)?;
                     if key.curve() != want {
                         return Err(Sw::INCORRECT_P1P2);
                     }
@@ -249,7 +241,7 @@ pub(crate) fn general_authenticate<S: Storage>(
                     let rn = key.sign(c, rng, &mut raw)?;
                     let mut der = [0u8; 112];
                     let dn = x509::ecdsa_sig_der(&raw[..rn], &mut der)?;
-                    dyn_auth_resp(res, 0x82, &der[..dn])?;
+                    dyn_auth_resp(res, TAG_AUTH_RESPONSE, &der[..dn])?;
                 }
                 ALGO_ED25519 => {
                     check_touch(touch_policy, presence)?;
@@ -261,7 +253,7 @@ pub(crate) fn general_authenticate<S: Storage>(
                     // returned bare (no ASN.1 wrapping).
                     let mut sig = [0u8; 64];
                     let n = key.sign(c, rng, &mut sig)?;
-                    dyn_auth_resp(res, 0x82, &sig[..n])?;
+                    dyn_auth_resp(res, TAG_AUTH_RESPONSE, &sig[..n])?;
                 }
                 ALGO_3DES | ALGO_AES128 | ALGO_AES192 | ALGO_AES256 => {
                     // "Internal authenticate" — encrypting caller-chosen data under
@@ -325,17 +317,13 @@ pub(crate) fn general_authenticate<S: Storage>(
             }
             check_touch(touch_policy, presence)?;
             let key = seal::load_ec_key(dev, fs, key_fid(key_ref))?;
-            let want = match algo {
-                ALGO_ECCP256 => Curve::P256,
-                ALGO_ECCP384 => Curve::P384,
-                _ => Curve::X25519,
-            };
+            let want = keygen::curve_for_algo(algo).ok_or(Sw::INCORRECT_P1P2)?;
             if key.curve() != want {
                 return Err(Sw::INCORRECT_P1P2);
             }
             let mut shared = [0u8; 48];
             let n = key.ecdh(pp, &mut shared)?;
-            dyn_auth_resp(res, 0x82, &shared[..n])?;
+            dyn_auth_resp(res, TAG_AUTH_RESPONSE, &shared[..n])?;
             shared.zeroize();
             return Ok(());
         }

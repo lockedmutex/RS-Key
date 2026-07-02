@@ -21,7 +21,7 @@ use rsk_openpgp::Rng;
 use rsk_openpgp::keys::{Curve, PrivKey, rsa_sign};
 use rsk_sdk::Sw;
 
-use crate::files::{ALGO_ECCP384, SLOT_ATTESTATION};
+use crate::files::{ALGO_ECCP384, MAX_EC_POINT, SLOT_ATTESTATION};
 
 /// Largest certificate the builder emits (RSA-4096 SPKI + a 512-byte signature
 /// + extensions ≈ 1.4 KB, with margin).
@@ -403,7 +403,7 @@ pub fn build_cert(
     let subject_hash = pub_hash(&p.spki)?;
     let issuer_hash = match signer {
         Signer::Ec(k) | Signer::Ed25519(k) => {
-            let mut pt = [0u8; 97];
+            let mut pt = [0u8; MAX_EC_POINT];
             let n = k.public_point(&mut pt)?;
             sha1(&pt[..n])
         }

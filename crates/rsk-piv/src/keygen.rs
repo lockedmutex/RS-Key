@@ -12,7 +12,7 @@ use rsk_crypto::Device;
 use rsk_fs::{Fs, Storage};
 use rsk_openpgp::Rng;
 use rsk_openpgp::keys::{
-    Curve, PrivKey, generate_rsa, make_ec_pubkey_do, make_rsa_response, rsa_from_pqe,
+    Curve, MAX_RSA_PUBDO, PrivKey, generate_rsa, make_ec_pubkey_do, make_rsa_response, rsa_from_pqe,
 };
 use rsk_sdk::tlv::find_tag;
 use rsk_sdk::{ResBuf, Sw};
@@ -22,6 +22,10 @@ use crate::files::*;
 use crate::seal;
 use crate::x509;
 use crate::{Session, WRONG_DATA, wrap_cert_object};
+
+// Yubico generation/import template policy tags.
+const TAG_PIN_POLICY: u16 = 0xAA;
+const TAG_TOUCH_POLICY: u16 = 0xAB;
 
 /// Parsed `AC` generation template: algorithm + optional policy tags.
 pub(crate) struct GenReq {
@@ -34,10 +38,10 @@ pub(crate) fn parse_gen_template(data: &[u8]) -> Result<GenReq, Sw> {
     if data.is_empty() {
         return Err(Sw::WRONG_LENGTH);
     }
-    if data[0] != 0xAC {
+    if data[0] != TAG_GEN_TEMPLATE {
         return Err(WRONG_DATA);
     }
-    let ac = find_tag(data, 0xAC)
+    let ac = find_tag(data, TAG_GEN_TEMPLATE as u16)
         .filter(|v| !v.is_empty())
         .ok_or(WRONG_DATA)?;
     let algo = find_tag(ac, 0x80)
@@ -48,8 +52,8 @@ pub(crate) fn parse_gen_template(data: &[u8]) -> Result<GenReq, Sw> {
     if cfg!(feature = "fips-profile") && algo == ALGO_RSA1024 {
         return Err(WRONG_DATA);
     }
-    let pin_policy = find_tag(ac, 0xAA).and_then(|v| v.first().copied());
-    let touch_policy = find_tag(ac, 0xAB).and_then(|v| v.first().copied());
+    let pin_policy = find_tag(ac, TAG_PIN_POLICY).and_then(|v| v.first().copied());
+    let touch_policy = find_tag(ac, TAG_TOUCH_POLICY).and_then(|v| v.first().copied());
     Ok(GenReq {
         algo,
         pin_policy,
@@ -67,6 +71,18 @@ pub(crate) fn rsa_algo_from_size(modulus_bytes: usize) -> Option<u8> {
         256 => ALGO_RSA2048,
         384 => ALGO_RSA3072,
         512 => ALGO_RSA4096,
+        _ => return None,
+    })
+}
+
+/// Inverse of [`rsa_algo_from_size`]: modulus length in bytes for a PIV RSA
+/// algorithm id.
+pub(crate) fn rsa_size_from_algo(algo: u8) -> Option<usize> {
+    Some(match algo {
+        ALGO_RSA1024 => 128,
+        ALGO_RSA2048 => 256,
+        ALGO_RSA3072 => 384,
+        ALGO_RSA4096 => 512,
         _ => return None,
     })
 }
@@ -115,7 +131,7 @@ fn store_slot_cert<S: Storage>(
 }
 
 /// The EC/EdDSA curve a non-RSA GENERATE algorithm produces.
-fn curve_for_algo(algo: u8) -> Option<Curve> {
+pub(crate) fn curve_for_algo(algo: u8) -> Option<Curve> {
     Some(match algo {
         ALGO_ECCP256 => Curve::P256,
         ALGO_ECCP384 => Curve::P384,
@@ -167,7 +183,7 @@ pub(crate) fn generate_ec<S: Storage>(
     let Some(key) = PrivKey::generate(curve, rng) else {
         return Sw::EXEC_ERROR;
     };
-    let mut point = [0u8; 97];
+    let mut point = [0u8; MAX_EC_POINT];
     let plen = match key.public_point(&mut point) {
         Ok(n) => n,
         Err(e) => return e,
@@ -234,7 +250,7 @@ pub(crate) fn finish_rsa<S: Storage>(
     {
         return Sw::MEMORY_FAILURE;
     }
-    let mut out = [0u8; 5 + 4 + 512 + 2 + 8];
+    let mut out = [0u8; MAX_RSA_PUBDO];
     let dn = make_rsa_response(key, &mut out);
     if !res.extend(&out[..dn]) {
         return Sw::WRONG_LENGTH;
@@ -252,14 +268,10 @@ pub(crate) fn generate_rsa_blocking<S: Storage>(
     req: &GenReq,
     res: &mut ResBuf,
 ) -> Sw {
-    let nbits = match req.algo {
-        ALGO_RSA1024 => 1024,
-        ALGO_RSA2048 => 2048,
-        ALGO_RSA3072 => 3072,
-        ALGO_RSA4096 => 4096,
-        _ => return WRONG_DATA,
+    let Some(nbytes) = rsa_size_from_algo(req.algo) else {
+        return WRONG_DATA;
     };
-    let key = match generate_rsa(rng, nbits) {
+    let key = match generate_rsa(rng, nbytes * 8) {
         Ok(k) => k,
         Err(e) => return e,
     };
@@ -294,7 +306,7 @@ pub(crate) fn generate_retired_ec<S: Storage>(
     let Some(key) = PrivKey::generate(curve, rng) else {
         return Err(Sw::EXEC_ERROR);
     };
-    let mut point = [0u8; 97];
+    let mut point = [0u8; MAX_EC_POINT];
     let plen = key.public_point(&mut point)?;
     store_generated_cert(fs, rng, slot, algo, curve, &point[..plen], &key)?;
     seal::store_ec_key(dev, fs, rng, key_fid(slot), &key)?;
@@ -364,8 +376,8 @@ pub(crate) fn import<S: Storage>(
     if cfg!(feature = "fips-profile") && algo == ALGO_RSA1024 {
         return WRONG_DATA;
     }
-    let pin_policy = find_tag(data, 0xAA).and_then(|v| v.first().copied());
-    let touch_policy = find_tag(data, 0xAB).and_then(|v| v.first().copied());
+    let pin_policy = find_tag(data, TAG_PIN_POLICY).and_then(|v| v.first().copied());
+    let touch_policy = find_tag(data, TAG_TOUCH_POLICY).and_then(|v| v.first().copied());
     match algo {
         ALGO_RSA1024 | ALGO_RSA2048 | ALGO_RSA3072 | ALGO_RSA4096 => {
             let p = find_tag(data, 0x01).filter(|v| !v.is_empty());
@@ -376,11 +388,8 @@ pub(crate) fn import<S: Storage>(
             let Some(key) = rsa_from_pqe(&[0x01, 0x00, 0x01], p, q) else {
                 return Sw::EXEC_ERROR;
             };
-            let want = match algo {
-                ALGO_RSA1024 => 128,
-                ALGO_RSA2048 => 256,
-                ALGO_RSA3072 => 384,
-                _ => 512,
+            let Some(want) = rsa_size_from_algo(algo) else {
+                return WRONG_DATA;
             };
             if key.size() != want {
                 return WRONG_DATA;
@@ -393,10 +402,8 @@ pub(crate) fn import<S: Storage>(
             let Some(scalar) = find_tag(data, 0x06).filter(|v| !v.is_empty()) else {
                 return WRONG_DATA;
             };
-            let curve = if algo == ALGO_ECCP256 {
-                Curve::P256
-            } else {
-                Curve::P384
+            let Some(curve) = curve_for_algo(algo) else {
+                return WRONG_DATA;
             };
             let field = if algo == ALGO_ECCP256 { 32 } else { 48 };
             if scalar.len() > field {
@@ -407,7 +414,7 @@ pub(crate) fn import<S: Storage>(
             };
             // Reject the zero/invalid scalar early: deriving the public point
             // fails for out-of-range keys.
-            let mut pt = [0u8; 97];
+            let mut pt = [0u8; MAX_EC_POINT];
             if key.public_point(&mut pt).is_err() {
                 return WRONG_DATA;
             }
@@ -529,7 +536,7 @@ pub(crate) fn attest<S: Storage>(
                 Ok(k) => k,
                 Err(e) => return e,
             };
-            let mut point = [0u8; 97];
+            let mut point = [0u8; MAX_EC_POINT];
             let plen = match key.public_point(&mut point) {
                 Ok(n) => n,
                 Err(e) => return e,
@@ -555,7 +562,7 @@ pub(crate) fn attest<S: Storage>(
                 Ok(k) => k,
                 Err(e) => return e,
             };
-            let mut point = [0u8; 97];
+            let mut point = [0u8; MAX_EC_POINT];
             let plen = match key.public_point(&mut point) {
                 Ok(n) => n,
                 Err(e) => return e,

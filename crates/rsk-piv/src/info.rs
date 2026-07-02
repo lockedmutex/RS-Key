@@ -161,7 +161,7 @@ pub fn read_slot<S: Storage>(fs: &mut Fs<S>, slot: u8) -> PivSlot {
 /// the on-device generate action). Returns the count written to `out`.
 pub fn read_extra<S: Storage>(fs: &mut Fs<S>, out: &mut [PivSlot]) -> usize {
     let mut n = 0;
-    for slot in core::iter::once(SLOT_ATTESTATION).chain(0x82u8..=0x95) {
+    for slot in core::iter::once(SLOT_ATTESTATION).chain(SLOT_RETIRED_FIRST..=SLOT_RETIRED_LAST) {
         if n >= out.len() {
             break;
         }
@@ -184,7 +184,7 @@ pub fn extra_count<S: Storage>(fs: &mut Fs<S>) -> u8 {
 /// The lowest-numbered retired slot (82–95) that holds no key, or `None` when all
 /// twenty are taken — the target for the on-device generate action.
 pub fn next_free_retired<S: Storage>(fs: &mut Fs<S>) -> Option<u8> {
-    (0x82u8..=0x95).find(|&slot| !fs.has_key(key_fid(slot)))
+    (SLOT_RETIRED_FIRST..=SLOT_RETIRED_LAST).find(|&slot| !fs.has_key(key_fid(slot)))
 }
 
 /// Generate an instant (EC / Ed25519 / X25519) key on-device into an empty retired slot.
