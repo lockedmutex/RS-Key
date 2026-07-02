@@ -28,9 +28,10 @@ nix develop -c ./scripts/check.sh
 ```
 
 runs fmt, clippy (embedded **and** host targets, `-D warnings`), all host
-tests, both firmware builds (touch + no-touch), the rsk-wipe build,
-`cargo-audit`, `cargo-deny` and `gitleaks`. Green check.sh is the bar for
-every commit.
+tests, both firmware builds (touch + no-touch), the rsk-wipe build, a firmware
+flash-size budget (the shipping image must stay under a soft ceiling of the
+2560K code region), `cargo-audit`, `cargo-deny`, `cargo-vet` and `gitleaks`.
+Green check.sh is the bar for every commit.
 
 ## Host tests
 
@@ -114,7 +115,7 @@ checker — undefined behavior instead of panics (`fuzz/tests/miri.rs`; the
 nix develop .#fuzz -c cargo miri test --manifest-path fuzz/Cargo.toml
 ```
 
-Neither suite gates a commit. CI runs both weekly — the `deep-checks`
+Neither suite gates a commit. CI runs both daily — the `deep-checks`
 workflow: the Miri suite, plus a timed libFuzzer pass over every target with
 the corpus carried between runs, crash artifacts uploaded.
 
@@ -180,7 +181,7 @@ proof harness sized to what CBMC can swallow — functional where it converges,
 structural (`< m`, panic-free) where it doesn't, or relational against a
 division-free reformulation; anything bigger gets a fuzz target.
 
-CI: the weekly `deep-checks` workflow has a `kani` job (rustup-based, version
+CI: the daily `deep-checks` workflow has a `kani` job (rustup-based, version
 pinned, `~/.kani` cached) running the same `cargo kani` line.
 
 ## On-device tests
@@ -265,13 +266,32 @@ parser rejected the reply.
 `check.sh` is plain bash over the Nix dev shell — a CI job is
 `nix develop -c ./scripts/check.sh` plus, on a runner with the board
 attached, the `tests/` scripts. The scheduled `deep-checks` workflow is the
-Miri, fuzz and Kani commands from this page, weekly, plus a `repro` job
-that builds the hermetic firmware twice and requires bit-identical outputs
-([build.md](build.md#nix-build-hermetic-no-dev-shell)). No hidden state.
+Miri, fuzz and Kani commands from this page, daily, plus a `repro` job that
+builds the hermetic firmware twice and requires bit-identical outputs
+([build.md](build.md#nix-build-hermetic-no-dev-shell)) and an `llvm-cov` job
+that floors host-crate line coverage. No hidden state.
 
 ```mermaid
 flowchart TB
-    a["Merge gate — every commit / PR<br/>check.sh: fmt · clippy · host tests · firmware builds · audit · deny · gitleaks"]
-    b["Weekly — deep-checks<br/>Miri · timed libFuzzer · Kani · repro (bit-identical build)"]
+    a["Merge gate — every commit / PR<br/>check.sh: fmt · clippy · host tests · firmware builds · size budget · audit · deny · vet · gitleaks"]
+    b["Daily — deep-checks<br/>Miri · timed libFuzzer · Kani · repro (bit-identical build) · llvm-cov (coverage floor)"]
     a ~~~ b
 ```
+
+## Refactor metrics (advisory)
+
+`scripts/metrics.sh` is reconnaissance, **not** a gate — run it to decide
+*where* to refactor. It reports the heaviest functions by cognitive/cyclomatic
+complexity (rust-code-analysis), firmware size by crate and function
+(cargo-bloat), and generic monomorphization (cargo-llvm-lines). The tools are
+pulled ad-hoc via `nix shell nixpkgs#…`, so they never join the pinned dev
+shell or a shipping build:
+
+```sh
+nix develop -c ./scripts/metrics.sh            # applet handlers by default
+nix develop -c ./scripts/metrics.sh crates/rsk-piv/src
+```
+
+Read the cognitive column, not cyclomatic: a high cyclomatic with a low
+cognitive is a flat serializer (a long `match` that just encodes), not a
+refactor target.

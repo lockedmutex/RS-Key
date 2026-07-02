@@ -13,6 +13,24 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+### Added
+
+- **Firmware flash-size budget in the gate.** `check.sh` fails if the shipping
+  image exceeds a soft ceiling (1 MiB of the 2560K code region) — a runaway
+  dependency trips it long before the linker's hard limit. Bump
+  `FIRMWARE_FLASH_BUDGET_KIB` intentionally for a legitimate feature.
+- **Host-crate coverage floor.** `deep-checks` gained an `llvm-cov` job that
+  floors host-crate line coverage (a regression alarm; the embedded image is
+  not host-measurable).
+- **`scripts/metrics.sh`** — advisory refactor reconnaissance (function
+  complexity, firmware size, generic monomorphization). Not a gate; the tools
+  are pulled ad-hoc so they never join the pinned dev shell.
+
+### Changed
+
+- **`deep-checks` runs daily** rather than weekly (Miri, fuzz, Kani, repro,
+  coverage).
+
 ## [0.3.0] — 2026-07-03
 
 ### Added
