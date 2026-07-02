@@ -16,7 +16,7 @@ use crate::consts::{
     CTAP_AUTHENTICATE, CTAP_REGISTER, CTAP_VERSION, EF_ATT_CHAIN, EF_EE_DEV, U2F_AUTH_CHECK_ONLY,
     U2F_AUTH_ENFORCE, U2F_AUTH_FLAG_TUP, U2F_REGISTER_ID,
 };
-use crate::credential::credential_load;
+use crate::credential::{CRED_REC_MAX, credential_load};
 use crate::ec::{MAX_DER_SIG, P256Key};
 use crate::journal;
 use crate::keyderiv::{KEY_HANDLE_LEN, derive_new, fido_load_key, verify_key};
@@ -110,7 +110,7 @@ fn cmd_register<S: Storage, R: Rng>(
     let mut sig = [0u8; MAX_DER_SIG];
     let sl = device_key.sign_der(&base[..p], &mut sig);
 
-    let mut cert = [0u8; 2064];
+    let mut cert = [0u8; crate::cert::ATT_CHAIN_REC_MAX];
     let clen = if org {
         // The chain's leaf — a U2F response carries exactly one certificate.
         let n = match ctx.fs.read(EF_ATT_CHAIN, &mut cert) {
@@ -190,7 +190,7 @@ fn cmd_authenticate<S: Storage, R: Rng>(
     // latter via `u2f`: a box signs with fido_load_key, a handle with its path-as-is
     // scalar (verify_key, which fido_load_key would clobber by rewriting path[0]).
     // U2F is P-256 only, so take the leading 32 bytes of the ratchet as the scalar.
-    let mut scratch = [0u8; 1024];
+    let mut scratch = [0u8; CRED_REC_MAX];
     let scalar: Option<[u8; 32]> =
         match credential_load(&seed, key_handle, &app, &mut scratch).map(|c| c.u2f) {
             Some(false) => fido_load_key(&seed, key_handle).map(|raw| {

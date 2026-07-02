@@ -217,7 +217,7 @@ fn write_info<W: Write>(
     // 0x1D maxPINLength — max PIN length in Unicode code points. The PIN is padded
     // to 64 bytes on the wire, so the content is at most 63. A 2-byte CBOR key
     // (29 > 23), so it sorts after the 1-byte keys but before 0x1F → canonical.
-    enc.u8(0x1D)?.u8(63)?;
+    enc.u8(0x1D)?.u8(crate::clientpin::MAX_PIN_LENGTH as u8)?;
 
     // 0x1F authenticatorConfigCommands — the authenticatorConfig (0x0D) subcommands
     // we support: enableEnterpriseAttestation (0x01), toggleAlwaysUv (0x02) and

@@ -19,6 +19,13 @@ use crate::cbordec::{cbor, def_map};
 use crate::credential::derive_hmac_key;
 use crate::error::CtapError;
 
+/// Max saltEnc: two 32-byte salts + the PIN-protocol-2 IV — also the max [`eval`]
+/// output length (`pinproto::encrypt` output = IV overhead + plaintext).
+pub const SALT_ENC_MAX: usize = 64 + 16;
+/// Headroom over the 32-byte protocol-2 saltAuth MAC — kept at the existing
+/// size, not a spec formula.
+pub const SALT_AUTH_MAX: usize = 48;
+
 /// A parsed hmac-secret / hmac-secret-mc request map.
 pub struct HmacSecretReq<'a> {
     pub peer_x: [u8; 32],

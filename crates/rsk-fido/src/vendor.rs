@@ -49,10 +49,9 @@ use crate::journal;
 use crate::seed::{
     LOCK_BLOB_LEN, encrypt_keydev_f1, ensure_seed, lock_engaged, open_seed_locked, store_att_key,
 };
-use crate::state::PERM_ACFG;
+use crate::state::{PERM_ACFG, puat_subcommand_msg};
 use crate::{Ctx, Rng};
 
-const BLOB_LEN: usize = 12 + 32 + 16; // nonce ‖ ciphertext(seed) ‖ tag
 // Sized for ATT_IMPORT's wrapped key + a full cert chain (≤ 2048 B); every
 // other subcommand stays tiny. The pinUvAuth MAC covers these bytes verbatim.
 const MAX_RAW_SUBPARA: usize = 2200;
@@ -173,7 +172,7 @@ pub fn vendor<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, data: &[u8], out: &mut [u
 /// move (MSE + PIN + touch). Survives authenticatorReset — it is
 /// org-provisioned *device* identity; ATT_CLEAR removes it.
 fn att_import<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req) -> CtapResult {
-    let mut packed = [0u8; cert::ATT_CHAIN_MAX + 1 + 2 * cert::ATT_CHAIN_MAX_CERTS];
+    let mut packed = [0u8; cert::ATT_CHAIN_REC_MAX];
     let plen = cert::att_chain_pack(req.chain, &mut packed).ok_or(CtapError::InvalidParameter)?;
     gate(ctx, req)?;
     let mut scalar = open_channel_key(ctx, req.blob)?;
@@ -203,7 +202,7 @@ fn att_clear<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req) -> CtapResult {
 /// `ATT_STATE`: `{1: present, 2: sha256(packed chain)}` — ungated, like
 /// BACKUP_STATE; the chain itself is public.
 fn att_state<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, out: &mut [u8]) -> CtapResult {
-    let mut chain = [0u8; cert::ATT_CHAIN_MAX + 1 + 2 * cert::ATT_CHAIN_MAX_CERTS];
+    let mut chain = [0u8; cert::ATT_CHAIN_REC_MAX];
     let present = ctx.fs.has_key(EF_ATT_KEY);
     let n = ctx.fs.read(EF_ATT_CHAIN, &mut chain).unwrap_or(0);
     encode(out, |e| {
@@ -434,11 +433,8 @@ fn pin_gate<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req) -> Result<(), Ct
             return Err(CtapError::RequestTooLarge);
         }
         let mut vp = [0u8; 32 + 2 + MAX_RAW_SUBPARA];
-        vp[..32].fill(0xff);
-        vp[32] = CTAP_VENDOR;
-        vp[33] = req.subcommand as u8;
-        vp[34..34 + req.raw_subpara.len()].copy_from_slice(req.raw_subpara);
-        let vp_len = 34 + req.raw_subpara.len();
+        let vp_len =
+            puat_subcommand_msg(&mut vp, CTAP_VENDOR, req.subcommand as u8, req.raw_subpara);
         if !ctx.state.verify_token(proto, &vp[..vp_len], param)
             || ctx.state.paut.permissions & PERM_ACFG == 0
         {
@@ -470,7 +466,7 @@ fn backup_export<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [
     ct.copy_from_slice(&seed);
     seed.zeroize();
     let tag = chacha20poly1305_encrypt(&ctx.state.mse_key, &nonce, &ctx.state.mse_pub, &mut ct);
-    let mut blob = [0u8; BLOB_LEN];
+    let mut blob = [0u8; LOCK_BLOB_LEN]; // nonce ‖ ciphertext(seed) ‖ tag
     blob[..12].copy_from_slice(&nonce);
     blob[12..44].copy_from_slice(&ct);
     blob[44..].copy_from_slice(&tag);
@@ -492,7 +488,7 @@ fn backup_export<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [
 /// live wrapped blob would leave two competing seeds; disable the lock (or
 /// reset) first.
 fn backup_load<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req) -> CtapResult {
-    if req.blob.len() != BLOB_LEN {
+    if req.blob.len() != LOCK_BLOB_LEN {
         return Err(CtapError::MissingParameter);
     }
     if lock_engaged(ctx.fs) {

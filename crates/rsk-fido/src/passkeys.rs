@@ -19,16 +19,16 @@ use rsk_fs::{Fs, Storage};
 
 use crate::consts::{EF_CRED, EF_RP, EF_RPNICK, MAX_RESIDENT_CREDENTIALS};
 use crate::credential::{
-    NICK_BOX_MAX, RECORD_PREFIX, RP_PREFIX, credential_load, seal_nick, slot_map, unseal_nick,
-    unseal_rp_id,
+    CRED_REC_MAX, NICK_BOX_MAX, RECORD_PREFIX, RP_PREFIX, RP_REC_MAX, credential_load, seal_nick,
+    slot_map, unseal_nick, unseal_rp_id,
 };
 
 /// The device-local PIN seam for a display-initiated action, re-exported here so the
 /// trusted display reaches the whole on-device Passkeys/PIN seam — read walks,
 /// [`delete_cred`], the PIN check ([`verify_local_pin`]) and the on-device set/change
 /// ([`store_local_pin`]) — through one module. Defined next to the canonical
-/// `verify_pin_hash` in `clientpin`. [`min_pin_length`] is the floor the set flow shows
-/// on the pad and enforces.
+/// `spend_and_verify_pin_hash` in `clientpin`. [`min_pin_length`] is the floor the set
+/// flow shows on the pad and enforces.
 pub use crate::clientpin::{
     LocalPin, MAX_PIN_LENGTH, SetPinError, device_pin_is_set, device_pin_retries_left,
     min_pin_length, pin_is_set, pin_retries_left, store_device_pin, store_local_pin,
@@ -46,11 +46,6 @@ pub use crate::consts::RP_NICK_MAX_LEN;
 /// seal action and the seed read the recovery-phrase reveal needs.
 pub use crate::seed::load_keydev;
 pub use crate::vendor::{BackupStatus, backup_sealed, backup_status, mark_backup_sealed};
-
-/// Largest EF_RP record (count + rpIdHash + boxed domain); domains are short.
-const RP_REC_MAX: usize = 256;
-/// Largest EF_CRED record — up to ~1 KiB with a large credBlob.
-const CRED_REC_MAX: usize = 1024;
 
 /// A resident relying party as shown on-device.
 pub struct RpView<'a> {

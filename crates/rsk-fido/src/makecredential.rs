@@ -26,23 +26,23 @@ use crate::consts::{
     ALG_ESP384, ALG_ESP512, ALG_MLDSA44, CRED_PROT_UV_REQUIRED, CURVE_ED25519, CURVE_MLDSA44,
     CURVE_P256, CURVE_P256K1, CURVE_P384, CURVE_P521, EF_ALWAYS_UV, EF_ATT_CHAIN, EF_EA_ENABLED,
     EF_EE_DEV, EF_MINPINLEN, EF_PIN, FLAG_AT, FLAG_ED, FLAG_UP, FLAG_UV, MAX_CREDBLOB_LENGTH,
-    MAX_RESIDENT_CREDENTIALS, PREFER_PQC,
+    MAX_CREDENTIAL_COUNT_IN_LIST, MAX_MIN_PIN_RPIDS, MAX_RESIDENT_CREDENTIALS, PREFER_PQC,
 };
 use crate::credential::{
-    CRED_RESIDENT_LEN, CredExt, CredInput, Credential, RECORD_PREFIX, credential_create,
-    credential_load, credential_store, derive_large_blob_key, derive_resident, is_resident,
-    slot_map,
+    CRED_REC_MAX, CRED_RESIDENT_LEN, CredExt, CredInput, Credential, RECORD_PREFIX,
+    credential_create, credential_load, credential_store, derive_large_blob_key, derive_resident,
+    is_resident, slot_map,
 };
 use crate::ec::{CredKey, MAX_SIG_LEN, P256Key};
 use crate::error::{CtapError, CtapResult};
-use crate::hmacsecret::{self, HmacSecretReq};
+use crate::hmacsecret::{self, HmacSecretReq, SALT_ENC_MAX};
 use crate::journal;
 use crate::keyderiv::fido_load_key;
 use crate::seed::{bump_sign_counter, get_sign_counter, load_att_key};
 use crate::state::PERM_MC;
 use crate::{Ctx, Rng};
 
-const MAX_EXCLUDE: usize = 16;
+const MAX_EXCLUDE: usize = MAX_CREDENTIAL_COUNT_IN_LIST as usize;
 
 /// Map a requested COSE alg (incl. the curve-explicit aliases) to its canonical
 /// `(alg, curve)`, or `None` if unsupported.
@@ -436,7 +436,7 @@ fn make_credential_inner<S: Storage, R: Rng>(
     raw.zeroize();
 
     // hmac-secret-mc output (an hmac-secret evaluation at registration time).
-    let mut hs = [0u8; 80];
+    let mut hs = [0u8; SALT_ENC_MAX];
     let hs_len = if req.hmac_secret_mc.present {
         let ephemeral = *ctx.state.ephemeral_scalar();
         hmacsecret::eval(
@@ -533,7 +533,7 @@ fn make_credential_inner<S: Storage, R: Rng>(
         None
     };
     let mut sig = [0u8; MAX_SIG_LEN];
-    let mut chain = [0u8; cert::ATT_CHAIN_MAX + 1 + 2 * cert::ATT_CHAIN_MAX_CERTS];
+    let mut chain = [0u8; cert::ATT_CHAIN_REC_MAX];
     let (att_alg, sig_len, chain_len, certs) = if full_attestation {
         if let Some(mut scalar) = org_key {
             let k = P256Key::from_scalar(&scalar);
@@ -639,12 +639,12 @@ fn exclude_hit<S: Storage>(
     uv: bool,
 ) -> bool {
     let visible = |c: &Credential| c.ext.cred_protect != CRED_PROT_UV_REQUIRED || uv;
-    let mut scratch = [0u8; 1024];
+    let mut scratch = [0u8; CRED_REC_MAX];
     if is_resident(id) {
         if id.len() != CRED_RESIDENT_LEN {
             return false;
         }
-        let mut rec = [0u8; 1024];
+        let mut rec = [0u8; CRED_REC_MAX];
         let mut occupied = [false; MAX_RESIDENT_CREDENTIALS as usize];
         slot_map(fs, crate::consts::EF_CRED, &mut occupied);
         for i in 0..MAX_RESIDENT_CREDENTIALS {
@@ -727,7 +727,7 @@ fn encode_mc_extensions<S: Storage>(
 /// The per-RP minimum PIN length from EF_MINPINLEN (`[len, force, rpIdHash…]`), or
 /// 0 if this rp is not in the authorised list (set via authenticatorConfig).
 fn rp_min_pin_len<S: Storage>(fs: &mut Fs<S>, rp_id_hash: &[u8; 32]) -> u8 {
-    let mut buf = [0u8; 2 + 32 * 8];
+    let mut buf = [0u8; 2 + 32 * MAX_MIN_PIN_RPIDS];
     let Some(n) = fs.read(EF_MINPINLEN, &mut buf) else {
         return 0;
     };

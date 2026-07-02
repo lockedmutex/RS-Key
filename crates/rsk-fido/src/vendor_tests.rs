@@ -421,7 +421,7 @@ fn mse_then_export_roundtrips_seed() {
     assert_eq!(d.map().unwrap(), Some(1));
     assert_eq!(d.u8().unwrap(), 1);
     let blob = d.bytes().unwrap();
-    assert_eq!(blob.len(), BLOB_LEN);
+    assert_eq!(blob.len(), LOCK_BLOB_LEN);
     let mut nonce = [0u8; 12];
     nonce.copy_from_slice(&blob[..12]);
     let mut buf = [0u8; 32];
@@ -460,7 +460,7 @@ fn mse_hybrid_then_export_roundtrips_seed() {
     assert_eq!(d.map().unwrap(), Some(1));
     assert_eq!(d.u8().unwrap(), 1);
     let blob = d.bytes().unwrap();
-    assert_eq!(blob.len(), BLOB_LEN);
+    assert_eq!(blob.len(), LOCK_BLOB_LEN);
     let mut nonce = [0u8; 12];
     nonce.copy_from_slice(&blob[..12]);
     let mut buf = [0u8; 32];
@@ -538,7 +538,7 @@ fn load_installs_seed_and_rebuilds_attestation() {
     let nonce = [0x07u8; 12];
     let mut buf = new_seed;
     let tag = chacha20poly1305_encrypt(&host.key, &nonce, &host.aad, &mut buf);
-    let mut blob = [0u8; BLOB_LEN];
+    let mut blob = [0u8; LOCK_BLOB_LEN];
     blob[..12].copy_from_slice(&nonce);
     blob[12..44].copy_from_slice(&buf);
     blob[44..].copy_from_slice(&tag);
@@ -636,7 +636,7 @@ fn load_rejects_tampered_blob() {
     let nonce = [0x07u8; 12];
     let mut buf = [0x33u8; 32];
     let tag = chacha20poly1305_encrypt(&host.key, &nonce, &host.aad, &mut buf);
-    let mut blob = [0u8; BLOB_LEN];
+    let mut blob = [0u8; LOCK_BLOB_LEN];
     blob[..12].copy_from_slice(&nonce);
     blob[12..44].copy_from_slice(&buf);
     blob[44..].copy_from_slice(&tag);

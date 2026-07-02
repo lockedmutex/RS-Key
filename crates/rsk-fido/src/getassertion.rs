@@ -19,15 +19,15 @@ use rsk_fs::Storage;
 use crate::cbordec::{cbor, def_arr, def_map};
 use crate::consts::{
     CRED_PROT_UV_OPTIONAL_WITH_LIST, CRED_PROT_UV_REQUIRED, CURVE_P256, EF_ALWAYS_UV, EF_CRED,
-    EF_PIN, FLAG_ED, FLAG_UP, FLAG_UV, MAX_RESIDENT_CREDENTIALS,
+    EF_PIN, FLAG_ED, FLAG_UP, FLAG_UV, MAX_CREDENTIAL_COUNT_IN_LIST, MAX_RESIDENT_CREDENTIALS,
 };
 use crate::credential::{
-    CRED_RESIDENT_LEN, Credential, RECORD_PREFIX, credential_load, derive_large_blob_key,
-    is_resident, slot_map,
+    CRED_REC_MAX, CRED_RESIDENT_LEN, Credential, RECORD_PREFIX, credential_load,
+    derive_large_blob_key, is_resident, slot_map,
 };
 use crate::ec::{CredKey, MAX_SIG_LEN};
 use crate::error::{CtapError, CtapResult};
-use crate::hmacsecret::{self, HmacSecretReq};
+use crate::hmacsecret::{self, HmacSecretReq, SALT_AUTH_MAX, SALT_ENC_MAX};
 use crate::journal;
 use crate::keyderiv::{KEY_HANDLE_LEN, fido_load_key, verify_key};
 use crate::seed::{bump_sign_counter, get_sign_counter};
@@ -35,7 +35,7 @@ use crate::state::{MAX_ASSERTION_CREDS, PERM_GA};
 use crate::{Ctx, Rng};
 use rsk_crypto::pinproto::PinProto;
 
-const MAX_ALLOW: usize = 16;
+const MAX_ALLOW: usize = MAX_CREDENTIAL_COUNT_IN_LIST as usize;
 const MAX_CRED_ID: usize = 512;
 const MAX_USER_ID: usize = 64;
 
@@ -347,8 +347,8 @@ fn get_assertion_inner<S: Storage, R: Rng>(
     // assertion. getNextAssertion reuses it via `gna.up`.
     let want_up = cfg!(feature = "strict-up") || req.up;
     let mut best = Best::new();
-    let mut scratch = [0u8; 1024];
-    let mut rec = [0u8; 1024];
+    let mut scratch = [0u8; CRED_REC_MAX];
+    let mut rec = [0u8; CRED_REC_MAX];
 
     // One storage pass for the EF_CRED occupancy; both arms only `read` live slots.
     let mut occupied = [false; MAX_RESIDENT_CREDENTIALS as usize];
@@ -460,13 +460,13 @@ fn get_assertion_inner<S: Storage, R: Rng>(
     }
 
     // Re-load the selected credential for its stored extension data + curve.
-    let mut sel_scratch = [0u8; 1024];
+    let mut sel_scratch = [0u8; CRED_REC_MAX];
     let sel = credential_load(seed, &best.id[..best.len], rp_id_hash, &mut sel_scratch);
     let sel_large_blob = sel.as_ref().map(|c| c.ext.large_blob_key).unwrap_or(false);
     let curve = sel.as_ref().map_or(CURVE_P256 as i64, |c| c.curve);
 
     // hmac-secret output (needs the clientPIN ephemeral key + the RNG for the IV).
-    let mut hs = [0u8; 80];
+    let mut hs = [0u8; SALT_ENC_MAX];
     let hs_len = if req.hmac_secret.present {
         let ephemeral = *ctx.state.ephemeral_scalar();
         hmacsecret::eval(
@@ -681,7 +681,7 @@ pub fn get_next_assertion<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, out: &mut [u8
     let up = ctx.state.gna.up;
 
     // Re-read the credential record; the resident id is its stored 42-byte prefix.
-    let mut rec = [0u8; 1024];
+    let mut rec = [0u8; CRED_REC_MAX];
     let n = match ctx.fs.read(EF_CRED + slot, &mut rec) {
         Some(n) if n.min(rec.len()) >= RECORD_PREFIX => n.min(rec.len()),
         _ => {
@@ -730,7 +730,7 @@ fn next_assertion_response<S: Storage, R: Rng>(
     seed: &[u8; 32],
     out: &mut [u8],
 ) -> CtapResult {
-    let mut scratch = [0u8; 1024];
+    let mut scratch = [0u8; CRED_REC_MAX];
     let cred = credential_load(seed, cred_box, rp_id_hash, &mut scratch)
         .ok_or(CtapError::NoCredentials)?;
     let curve = cred.curve;
@@ -749,11 +749,11 @@ fn next_assertion_response<S: Storage, R: Rng>(
     display[..display_len].copy_from_slice(&cred.user_display_name.as_bytes()[..display_len]);
 
     // Re-evaluate hmac-secret for this credential from the carried request.
-    let mut hs = [0u8; 80];
+    let mut hs = [0u8; SALT_ENC_MAX];
     let hs_len = if ctx.state.gna.hmac_present {
         let g = &ctx.state.gna;
         let (se, sa) = (g.hmac_salt_enc_len as usize, g.hmac_salt_auth_len as usize);
-        let (mut salt_enc, mut salt_auth) = ([0u8; 80], [0u8; 48]);
+        let (mut salt_enc, mut salt_auth) = ([0u8; SALT_ENC_MAX], [0u8; SALT_AUTH_MAX]);
         salt_enc[..se].copy_from_slice(&g.hmac_salt_enc[..se]);
         salt_auth[..sa].copy_from_slice(&g.hmac_salt_auth[..sa]);
         let req = HmacSecretReq {

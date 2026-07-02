@@ -414,8 +414,14 @@ pub fn derive_large_blob_key(seed: &[u8; 32], cred_id: &[u8]) -> [u8; 32] {
 /// A resident record is `rp_id_hash(32) ‖ resident_id(42) ‖ full_cred_id`.
 pub const RECORD_PREFIX: usize = 32 + CRED_RESIDENT_LEN;
 
+/// Largest EF_CRED record — up to ~1 KiB with a large credBlob.
+pub(crate) const CRED_REC_MAX: usize = 1024;
+
 /// EF_RP head before the (boxed) rpId tail: `count(1) ‖ rpIdHash(32)`.
 pub(crate) const RP_PREFIX: usize = 1 + 32;
+
+/// Largest EF_RP record (count + rpIdHash + boxed domain); domains are short.
+pub(crate) const RP_REC_MAX: usize = 256;
 
 /// Mark, in one storage pass, which slots `base+0..base+out.len()` hold a live
 /// record (`out[i]` is occupied iff a key `base+i` exists). One pass is
@@ -457,8 +463,8 @@ pub fn credential_store<S: Storage>(
 ) -> Result<()> {
     let mut slot: Option<u16> = None;
     let mut new_record = true;
-    let mut rec = [0u8; 1024];
-    let mut scratch = [0u8; 1024];
+    let mut rec = [0u8; CRED_REC_MAX];
+    let mut scratch = [0u8; CRED_REC_MAX];
 
     let mut occupied = [false; MAX_RESIDENT_CREDENTIALS as usize];
     slot_map(fs, EF_CRED, &mut occupied);
@@ -512,7 +518,7 @@ fn bump_rp<S: Storage>(
     rp_id_hash: &[u8; 32],
     rp_id: &str,
 ) -> Result<()> {
-    let mut rec = [0u8; 256];
+    let mut rec = [0u8; RP_REC_MAX];
     let mut free: Option<u16> = None;
     let mut occupied = [false; MAX_RESIDENT_CREDENTIALS as usize];
     slot_map(fs, EF_RP, &mut occupied);
@@ -696,9 +702,9 @@ pub fn migrate_rp_seal<S: Storage>(dev: &Device, fs: &mut Fs<S>) {
     let Some(mut seed) = crate::seed::load_keydev(dev, fs) else {
         return;
     };
-    let mut buf = [0u8; 256];
-    let mut plain = [0u8; 256];
-    let mut out = [0u8; 256];
+    let mut buf = [0u8; RP_REC_MAX];
+    let mut plain = [0u8; RP_REC_MAX];
+    let mut out = [0u8; RP_REC_MAX];
     for i in 0..MAX_RESIDENT_CREDENTIALS {
         if !occupied[i as usize] {
             continue;

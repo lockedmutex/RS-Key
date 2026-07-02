@@ -91,6 +91,9 @@ pub fn build_attestation_cert(key: &P256Key, serial: &[u8; 16], out: &mut [u8]) 
 pub(crate) const ATT_CHAIN_MAX: usize = 2048;
 pub(crate) const ATT_CHAIN_MAX_CERTS: usize = 4;
 
+/// Max packed `EF_ATT_CHAIN` record: `count(1) ‖ (len(2 LE) ‖ der)*`.
+pub(crate) const ATT_CHAIN_REC_MAX: usize = ATT_CHAIN_MAX + 1 + 2 * ATT_CHAIN_MAX_CERTS;
+
 /// Total length of the DER TLV at the head of `b` (SEQUENCE tag), or `None`.
 fn der_seq_len(b: &[u8]) -> Option<usize> {
     if b.len() < 2 || b[0] != 0x30 {

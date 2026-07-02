@@ -16,7 +16,9 @@ use rsk_crypto::pinproto::PinProto;
 use rsk_crypto::sha256;
 
 use crate::cbordec::{cbor, def_map};
-use crate::consts::{CTAP_LARGE_BLOBS, EF_LARGEBLOB, MAX_FRAGMENT_LENGTH, MAX_LARGE_BLOB_SIZE};
+use crate::consts::{
+    CTAP_LARGE_BLOBS, EF_LARGEBLOB, LARGEBLOB_MIN, MAX_FRAGMENT_LENGTH, MAX_LARGE_BLOB_SIZE,
+};
 use crate::error::{CtapError, CtapResult};
 use crate::state::PERM_LBW;
 use crate::{Ctx, Rng};
@@ -138,7 +140,7 @@ fn write_fragment<S: Storage, R: Rng>(
         if req.length as usize > MAX_LARGE_BLOB_SIZE {
             return Err(CtapError::LargeBlobStorageFull);
         }
-        if req.length < 17 {
+        if req.length < LARGEBLOB_MIN as u64 {
             return Err(CtapError::InvalidParameter);
         }
         ctx.state.lba.expected_length = req.length as usize;
@@ -180,7 +182,7 @@ fn write_fragment<S: Storage, R: Rng>(
         // The platform appends left16(SHA-256(body)) as an integrity tag; verify
         // it (skipped for the 17-byte empty-array minimum, body = 1 byte).
         let sha = sha256(&ctx.state.lba.temp[..total - 16]);
-        if total > 17 && sha[..16] != ctx.state.lba.temp[total - 16..total] {
+        if total > LARGEBLOB_MIN && sha[..16] != ctx.state.lba.temp[total - 16..total] {
             return Err(CtapError::IntegrityFailure);
         }
         ctx.fs

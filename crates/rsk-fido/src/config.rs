@@ -17,16 +17,14 @@ use crate::cbordec::{cbor, def_arr, def_map};
 use crate::consts::{
     CONFIG_AUT_DISABLE, CONFIG_AUT_ENABLE, CONFIG_ENABLE_EA, CONFIG_SET_MIN_PIN,
     CONFIG_TOGGLE_ALWAYS_UV, CONFIG_VENDOR, CTAP_CONFIG, EF_ALWAYS_UV, EF_EA_ENABLED, EF_KEY_DEV,
-    EF_KEY_DEV_ENC, EF_MINPINLEN, EF_PIN, MAX_MIN_PIN_RPIDS, MIN_PIN_LENGTH,
+    EF_KEY_DEV_ENC, EF_MINPINLEN, EF_PIN, MAX_MIN_PIN_RPIDS, MAX_RAW_SUBPARA, MIN_PIN_LENGTH,
 };
 use crate::error::{CtapError, CtapResult};
 use crate::journal;
 use crate::seed::{encrypt_keydev_f1, load_keydev, lock_engaged, seal_seed_locked};
-use crate::state::PERM_ACFG;
+use crate::state::{PERM_ACFG, puat_subcommand_msg};
 use crate::vendor::open_channel_key;
 use crate::{Ctx, Rng};
-
-const MAX_RAW_SUBPARA: usize = 256;
 
 struct Req<'a> {
     subcommand: u64,
@@ -134,11 +132,7 @@ pub fn authenticator_config<S: Storage, R: Rng>(
 
     // verify_payload = 0xff×32 ‖ 0x0d ‖ subcommand ‖ raw subCommandParams.
     let mut vp = [0u8; 32 + 2 + MAX_RAW_SUBPARA];
-    vp[..32].fill(0xff);
-    vp[32] = CTAP_CONFIG;
-    vp[33] = req.subcommand as u8;
-    vp[34..34 + req.raw_subpara.len()].copy_from_slice(req.raw_subpara);
-    let vp_len = 34 + req.raw_subpara.len();
+    let vp_len = puat_subcommand_msg(&mut vp, CTAP_CONFIG, req.subcommand as u8, req.raw_subpara);
 
     if !ctx.state.verify_token(proto, &vp[..vp_len], param)
         || ctx.state.paut.permissions & PERM_ACFG == 0
@@ -278,7 +272,7 @@ fn set_min_pin_length<S: Storage, R: Rng>(
     // A PIN shorter than the new minimum must be changed before next use.
     let mut force = force_change;
     if pin_set {
-        let mut pf = [0u8; 35];
+        let mut pf = [0u8; crate::clientpin::PIN_FILE_LEN];
         if let Some(n) = ctx.fs.read(EF_PIN, &mut pf)
             && n >= 2
             && (pf[1] as u64) < new_min

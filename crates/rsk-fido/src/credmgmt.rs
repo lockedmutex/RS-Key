@@ -21,11 +21,11 @@ use crate::cbordec::{cbor, def_arr, def_map};
 use crate::consts::{
     CM_DELETE_CREDENTIAL, CM_ENUMERATE_CREDS_BEGIN, CM_ENUMERATE_CREDS_NEXT,
     CM_ENUMERATE_RPS_BEGIN, CM_ENUMERATE_RPS_NEXT, CM_GET_CREDS_METADATA, CM_UPDATE_USER_INFO,
-    CRED_PROT_UV_OPTIONAL, EF_CRED, EF_RP, MAX_RESIDENT_CREDENTIALS,
+    CRED_PROT_UV_OPTIONAL, EF_CRED, EF_RP, MAX_RAW_SUBPARA, MAX_RESIDENT_CREDENTIALS,
 };
 use crate::credential::{
-    CRED_RESIDENT_LEN, CredInput, RECORD_PREFIX, RP_PREFIX, credential_create, credential_load,
-    derive_large_blob_key, slot_map, unseal_rp_id,
+    CRED_REC_MAX, CRED_RESIDENT_LEN, CredInput, RECORD_PREFIX, RP_PREFIX, RP_REC_MAX,
+    credential_create, credential_load, derive_large_blob_key, slot_map, unseal_rp_id,
 };
 use crate::ec::CredKey;
 use crate::error::{CtapError, CtapResult};
@@ -33,7 +33,6 @@ use crate::keyderiv::fido_load_key;
 use crate::state::{FidoState, PERM_CM};
 use crate::{Ctx, Rng};
 
-const MAX_RAW_SUBPARA: usize = 256;
 // EF_RP record: `count(1) ‖ rpIdHash(32) ‖ box(rpId_text)` — the rpId domain is
 // boxed under the device seed (see `credential::seal_rp_id`); `RP_PREFIX` spans
 // the cleartext `count ‖ rpIdHash` head.
@@ -279,9 +278,9 @@ fn enumerate_rps<S: Storage, R: Rng>(
     let mut skip = 0u16;
     let mut total = 0u16;
     let mut found = false;
-    let mut rp = [0u8; 256];
+    let mut rp = [0u8; RP_REC_MAX];
     let mut rp_len = 0usize;
-    let mut buf = [0u8; 256];
+    let mut buf = [0u8; RP_REC_MAX];
     let mut occupied = [false; MAX_RESIDENT_CREDENTIALS as usize];
     slot_map(ctx.fs, EF_RP, &mut occupied);
     for i in 0..MAX_RESIDENT_CREDENTIALS {
@@ -319,7 +318,7 @@ fn enumerate_rps<S: Storage, R: Rng>(
     let mut rp_id_hash = [0u8; 32];
     rp_id_hash.copy_from_slice(&rp[1..RP_PREFIX]);
     let mut seed = ctx.load_keydev().ok_or(CtapError::NotAllowed)?;
-    let mut scratch = [0u8; 256];
+    let mut scratch = [0u8; RP_REC_MAX];
     let unsealed = unseal_rp_id(&seed, &rp_id_hash, &rp[RP_PREFIX..rp_len], &mut scratch);
     seed.zeroize();
     let (rp_id, _) = unsealed.ok_or(CtapError::Other)?;
@@ -357,9 +356,9 @@ fn enumerate_creds<S: Storage, R: Rng>(
     let mut skip = 0u16;
     let mut total = 0u16;
     let mut found = false;
-    let mut rec = [0u8; 1024];
+    let mut rec = [0u8; CRED_REC_MAX];
     let mut rec_len = 0usize;
-    let mut buf = [0u8; 1024];
+    let mut buf = [0u8; CRED_REC_MAX];
     let mut occupied = [false; MAX_RESIDENT_CREDENTIALS as usize];
     slot_map(ctx.fs, EF_CRED, &mut occupied);
     for i in 0..MAX_RESIDENT_CREDENTIALS {
@@ -413,7 +412,7 @@ fn enumerate_creds_response(
     let resident_id = &rec[32..RECORD_PREFIX];
     let cred_box = &rec[RECORD_PREFIX..];
 
-    let mut scratch = [0u8; 1024];
+    let mut scratch = [0u8; CRED_REC_MAX];
     let cred =
         credential_load(seed, cred_box, rp_id_hash, &mut scratch).ok_or(CtapError::NotAllowed)?;
 
@@ -506,7 +505,7 @@ fn delete_credential<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, cred_id: &[u8]) ->
     if cred_id.len() != CRED_RESIDENT_LEN {
         return Err(CtapError::NoCredentials);
     }
-    let mut buf = [0u8; 1024];
+    let mut buf = [0u8; CRED_REC_MAX];
     let mut occupied = [false; MAX_RESIDENT_CREDENTIALS as usize];
     slot_map(ctx.fs, EF_CRED, &mut occupied);
     for i in 0..MAX_RESIDENT_CREDENTIALS {
@@ -538,7 +537,7 @@ pub(crate) fn decrement_rp<S: Storage>(
     fs: &mut Fs<S>,
     rp_id_hash: &[u8; 32],
 ) -> Result<(), CtapError> {
-    let mut rp = [0u8; 256];
+    let mut rp = [0u8; RP_REC_MAX];
     let mut occupied = [false; MAX_RESIDENT_CREDENTIALS as usize];
     slot_map(fs, EF_RP, &mut occupied);
     for j in 0..MAX_RESIDENT_CREDENTIALS {
@@ -583,7 +582,7 @@ fn update_user<S: Storage, R: Rng>(
     if cred_id.len() != CRED_RESIDENT_LEN {
         return Err(CtapError::NoCredentials);
     }
-    let mut buf = [0u8; 1024];
+    let mut buf = [0u8; CRED_REC_MAX];
     let mut occupied = [false; MAX_RESIDENT_CREDENTIALS as usize];
     slot_map(ctx.fs, EF_CRED, &mut occupied);
     for i in 0..MAX_RESIDENT_CREDENTIALS {
@@ -641,7 +640,7 @@ fn reseal_user<S: Storage, R: Rng>(
     let resident_id = &record[32..RECORD_PREFIX];
     let cred_box = &record[RECORD_PREFIX..];
 
-    let mut scratch = [0u8; 1024];
+    let mut scratch = [0u8; CRED_REC_MAX];
     let cred =
         credential_load(seed, cred_box, &rp_id_hash, &mut scratch).ok_or(CtapError::NotAllowed)?;
     // The supplied user id must match the credential's exactly. CTAP 2.1
@@ -671,7 +670,7 @@ fn reseal_user<S: Storage, R: Rng>(
 
     // Rewrite the slot: rp_id_hash ‖ (preserved) resident_id ‖ new box.
     let total = RECORD_PREFIX + len;
-    let mut rec = [0u8; 1024];
+    let mut rec = [0u8; CRED_REC_MAX];
     if total > rec.len() {
         return Err(CtapError::KeyStoreFull);
     }

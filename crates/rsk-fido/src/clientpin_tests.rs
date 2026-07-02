@@ -1118,7 +1118,7 @@ fn pin_verifier_and_pinwrapped_seed_migrate_at_verify() {
         state: &mut state2,
         now_ms: 0,
     };
-    verify_pin_hash(&mut ctx, &pin_hash[..16]).unwrap();
+    spend_and_verify_pin_hash(&mut ctx, &pin_hash[..16]).unwrap();
     let mut pin_rec = [0u8; PIN_FILE_LEN];
     ctx.fs.read(EF_PIN, &mut pin_rec).unwrap();
     assert_eq!(pin_rec[0], MAX_PIN_RETRIES);
@@ -1137,7 +1137,7 @@ fn pin_verifier_and_pinwrapped_seed_migrate_at_verify() {
         state: &mut state3,
         now_ms: 0,
     };
-    verify_pin_hash(&mut ctx3, &pin_hash[..16]).unwrap();
+    spend_and_verify_pin_hash(&mut ctx3, &pin_hash[..16]).unwrap();
 }
 
 #[test]
@@ -1148,7 +1148,7 @@ fn pin_verify_fails_closed_when_the_retry_write_does_not_persist() {
     // A backend that, once armed, accepts the EF_PIN write (returns Ok) but
     // silently fails to persist it — modelling a glitch / partial flash
     // program. The decremented retry counter never reaches storage, so a later
-    // read sees the stale (higher) count: exactly what verify_pin_hash's
+    // read sees the stale (higher) count: exactly what spend_and_verify_pin_hash's
     // read-back must catch before trusting the count.
     struct StaleEfPin {
         inner: RamStorage,
@@ -1216,7 +1216,7 @@ fn pin_verify_fails_closed_when_the_retry_write_does_not_persist() {
             state: &mut FidoState::new(),
             now_ms: 0,
         };
-        verify_pin_hash(&mut ctx, &pin_hash[..16]).unwrap();
+        spend_and_verify_pin_hash(&mut ctx, &pin_hash[..16]).unwrap();
     }
 
     // Arm the fault: the decremented counter no longer reaches storage. Even
@@ -1233,7 +1233,7 @@ fn pin_verify_fails_closed_when_the_retry_write_does_not_persist() {
         now_ms: 0,
     };
     assert_eq!(
-        verify_pin_hash(&mut ctx, &pin_hash[..16]),
+        spend_and_verify_pin_hash(&mut ctx, &pin_hash[..16]),
         Err(CtapError::PinBlocked),
     );
 }

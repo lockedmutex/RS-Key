@@ -59,6 +59,11 @@ pub const CONFIG_VENDOR: u64 = 0xFF; // vendor subcommands, selected by a u64 id
 pub const CONFIG_AUT_ENABLE: u64 = 0x03e43f56b34285e2;
 pub const CONFIG_AUT_DISABLE: u64 = 0x1831a40f04a25ed9;
 
+// authenticatorClientPIN subcommands compared at more than one site (the rest
+// are dispatched once as literals).
+pub const CP_GET_PIN_TOKEN: u64 = 0x05;
+pub const CP_GET_PIN_UV_TOKEN_USING_PIN: u64 = 0x09; // getPinUvAuthTokenUsingPinWithPermissions
+
 // authenticatorCredentialManagement subcommands.
 pub const CM_GET_CREDS_METADATA: u64 = 0x01;
 pub const CM_ENUMERATE_RPS_BEGIN: u64 = 0x02;
@@ -148,6 +153,10 @@ pub const MAX_MSG_SIZE: u64 = 7609;
 pub const MAX_CRED_ID_LENGTH: u64 = 1024;
 pub const MAX_CREDENTIAL_COUNT_IN_LIST: u64 = 16;
 
+// pinUvAuthParam MAC covers subCommand ‖ subCommandParams; cap on the raw bytes
+// (vendor.rs deliberately overrides with its own larger cap).
+pub const MAX_RAW_SUBPARA: usize = 256;
+
 /// Max serialized large-blob array stored; also the getInfo
 /// `maxSerializedLargeBlobArray` (0x0B).
 pub const MAX_LARGE_BLOB_SIZE: usize = 2048;
@@ -159,6 +168,9 @@ pub const LARGEBLOB_INITIAL: [u8; 17] = [
     0x80, 0x76, 0xbe, 0x8b, 0x52, 0x8d, 0x00, 0x75, 0xf7, 0xaa, 0xe9, 0x8d, 0x6f, 0xa5, 0x7a, 0x6d,
     0x3c,
 ];
+/// Minimum serialized large-blob array: the empty CBOR array `0x80` + 16-byte
+/// SHA-256 tail — the CTAP2.1 default.
+pub const LARGEBLOB_MIN: usize = LARGEBLOB_INITIAL.len();
 
 /// Max resident credentials / relying parties.
 pub const MAX_RESIDENT_CREDENTIALS: u16 = 256;

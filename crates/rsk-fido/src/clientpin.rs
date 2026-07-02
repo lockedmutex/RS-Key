@@ -21,7 +21,10 @@ use rsk_crypto::{Device, sha256};
 use rsk_fs::{Fs, Storage};
 
 use crate::cbordec::{cbor, def_map};
-use crate::consts::{EF_DEVICE_PIN, EF_MINPINLEN, EF_PIN, MAX_PIN_RETRIES, MIN_PIN_LENGTH};
+use crate::consts::{
+    CP_GET_PIN_TOKEN, CP_GET_PIN_UV_TOKEN_USING_PIN, EF_DEVICE_PIN, EF_MINPINLEN, EF_PIN,
+    MAX_MIN_PIN_RPIDS, MAX_PIN_RETRIES, MIN_PIN_LENGTH,
+};
 use crate::cose::cose_key_ecdh;
 use crate::error::{CtapError, CtapResult};
 use crate::journal;
@@ -29,7 +32,7 @@ use crate::seed::migrate_keydev_pin;
 use crate::state::{PERM_BE, PERM_GA, PERM_MC, PERM_PCMR};
 use crate::{Ctx, PinEntry, Rng};
 
-const PIN_FILE_LEN: usize = 35; // retries(1) + len(1) + format(1) + verifier(32)
+pub(crate) const PIN_FILE_LEN: usize = 35; // retries(1) + len(1) + format(1) + verifier(32)
 const PADDED_PIN_LEN: usize = 64;
 /// The longest PIN the host clientPIN path can represent: CTAP pads the PIN into a
 /// 64-byte buffer that must keep a trailing zero, so 63 bytes is the ceiling (the host
@@ -120,7 +123,7 @@ pub fn client_pin<S: Storage, R: Rng>(
         0x2 => get_key_agreement(ctx, &req, out),
         0x3 => set_pin(ctx, &req, out),
         0x4 => change_pin(ctx, &req, out),
-        0x5 | 0x9 => get_pin_token(ctx, &req, out),
+        CP_GET_PIN_TOKEN | CP_GET_PIN_UV_TOKEN_USING_PIN => get_pin_token(ctx, &req, out),
         // Built-in UV (0x06 token / 0x07 retries) exists only where the firmware can
         // collect a PIN on its own UI; elsewhere it falls through to UnsupportedOption.
         0x6 if ctx.presence.uv_available() => get_uv_token(ctx, &req, out),
@@ -169,7 +172,7 @@ fn set_pin<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [u8]) -
         return Err(CtapError::NotAllowed);
     }
     let new_pin_enc = req.new_pin_enc.unwrap();
-    let want = 64 + proto.iv_overhead();
+    let want = PADDED_PIN_LEN + proto.iv_overhead();
     // A padded new PIN longer than 64 bytes means the PIN exceeds the 63-byte
     // maximum → a policy violation, not a malformed request (conformance
     // ClientPin*-Policy F-2; protocol 2's 16-byte IV made this hit the strict
@@ -208,10 +211,10 @@ fn change_pin<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [u8]
     let new_pin_enc = req.new_pin_enc.unwrap();
     pin_set_and_unblocked(ctx)?;
     // An over-long padded new PIN is a policy violation (see `set_pin`).
-    if new_pin_enc.len() > 64 + proto.iv_overhead() {
+    if new_pin_enc.len() > PADDED_PIN_LEN + proto.iv_overhead() {
         return Err(CtapError::PinPolicyViolation);
     }
-    if new_pin_enc.len() != 64 + proto.iv_overhead()
+    if new_pin_enc.len() != PADDED_PIN_LEN + proto.iv_overhead()
         || pin_hash_enc.len() != 16 + proto.iv_overhead()
     {
         return Err(CtapError::InvalidParameter);
@@ -243,7 +246,7 @@ fn change_pin<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [u8]
         shared.zeroize();
         return Err(CtapError::PinAuthInvalid);
     }
-    if let Err(e) = verify_pin_hash(ctx, &old_hash[..16]) {
+    if let Err(e) = spend_and_verify_pin_hash(ctx, &old_hash[..16]) {
         shared.zeroize();
         old_hash.zeroize();
         return Err(e);
@@ -275,7 +278,7 @@ fn change_pin<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [u8]
 fn get_pin_token<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [u8]) -> CtapResult {
     let proto = require_pin_inputs(req, false, true)?;
     let permissions = req.permissions as u8;
-    if req.subcommand == 0x5 {
+    if req.subcommand == CP_GET_PIN_TOKEN {
         if req.permissions != 0 || req.rp_id.is_some() {
             return Err(CtapError::InvalidParameter);
         }
@@ -304,7 +307,7 @@ fn get_pin_token<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [
         shared.zeroize();
         return Err(CtapError::PinAuthInvalid);
     }
-    if let Err(e) = verify_pin_hash(ctx, &pin_hash[..16]) {
+    if let Err(e) = spend_and_verify_pin_hash(ctx, &pin_hash[..16]) {
         shared.zeroize();
         pin_hash.zeroize();
         return Err(e);
@@ -321,7 +324,7 @@ fn get_pin_token<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [
     // (0x37) (ClientPin2-GetPinUvAuthTokenUsingPinWithPermissions F-1). The PIN
     // verify above already succeeded, so the retry counter is untouched either way.
     if force_change_pending(ctx) {
-        return Err(if req.subcommand == 0x5 {
+        return Err(if req.subcommand == CP_GET_PIN_TOKEN {
             CtapError::PinInvalid
         } else {
             CtapError::PinPolicyViolation
@@ -330,7 +333,7 @@ fn get_pin_token<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [
 
     // The legacy getPinToken (0x05) grants the fixed mc|ga permission set; the
     // permissions-based variant (0x09) uses exactly what was requested.
-    let permissions = if req.subcommand == 0x5 {
+    let permissions = if req.subcommand == CP_GET_PIN_TOKEN {
         PERM_MC | PERM_GA
     } else {
         permissions
@@ -428,7 +431,7 @@ fn get_uv_token<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [u
 }
 
 /// Verify a PIN entered via built-in UV against EF_PIN, mapping the entry outcome
-/// and translating the host-PIN error dialect of [`verify_pin_hash`] into the
+/// and translating the host-PIN error dialect of [`spend_and_verify_pin_hash`] into the
 /// built-in-UV codes a platform expects (UV_INVALID / UV_BLOCKED). A non-entry
 /// (decline / timeout / cancel) returns before the verify, so it never spends a
 /// retry; only a real mismatch does.
@@ -445,7 +448,7 @@ fn perform_builtin_uv<S: Storage, R: Rng>(
         PinEntry::Unsupported => return Err(CtapError::UnsupportedOption),
     };
     let mut dhash = sha256(&pin[..len]);
-    let res = verify_pin_hash(ctx, &dhash[..16]);
+    let res = spend_and_verify_pin_hash(ctx, &dhash[..16]);
     dhash.zeroize();
     res.map_err(|e| match e {
         CtapError::PinInvalid => CtapError::UvInvalid,
@@ -526,7 +529,7 @@ fn derive_shared<S: Storage, R: Rng>(
 
 /// Compare a candidate 16-byte PIN hash against the stored verifier. Decrements
 /// the retry counter first; on mismatch applies the lockout ladder.
-fn verify_pin_hash<S: Storage, R: Rng>(
+fn spend_and_verify_pin_hash<S: Storage, R: Rng>(
     ctx: &mut Ctx<S, R>,
     pin_hash: &[u8],
 ) -> Result<(), CtapError> {
@@ -541,7 +544,7 @@ fn verify_pin_hash<S: Storage, R: Rng>(
     // Self-defend the decrement rather than trusting the external
     // pin_set_and_unblocked() gate: release builds have no overflow-checks, so a
     // future caller reaching here at 0 would wrap the retry budget to 255. The
-    // sibling verify_pin_at has the same in-function guard.
+    // sibling spend_and_verify_pin_at has the same in-function guard.
     if pin_data[0] == 0 {
         return Err(CtapError::PinBlocked);
     }
@@ -628,7 +631,7 @@ fn write_pin_verifier<S: Storage>(
 /// path).
 fn store_new_pin<S: Storage, R: Rng>(
     ctx: &mut Ctx<S, R>,
-    padded: &[u8; 64],
+    padded: &[u8; PADDED_PIN_LEN],
 ) -> Result<(), CtapError> {
     if padded[PADDED_PIN_LEN - 1] != 0 {
         return Err(CtapError::PinPolicyViolation);
@@ -666,7 +669,7 @@ fn force_change_pending<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>) -> bool {
 /// A successful changePIN satisfies the policy: drop the flag, keep the
 /// minimum and the RP-id hash list (EF_MINPINLEN = [min, force, hashes…]).
 fn clear_force_change<S: Storage>(fs: &mut Fs<S>) -> Result<(), CtapError> {
-    let mut buf = [0u8; 2 + 32 * 8]; // matches config's MAX_MIN_PIN_RPIDS cap
+    let mut buf = [0u8; 2 + 32 * MAX_MIN_PIN_RPIDS];
     if let Some(n) = fs.read(EF_MINPINLEN, &mut buf)
         && n >= 2
         && buf[1] != 0
@@ -744,7 +747,7 @@ fn retries_left_at<S: Storage>(fid: u16, fs: &mut Fs<S>) -> Option<u8> {
 
 /// Verify a PIN typed on the device's own pad for a display-initiated action (a
 /// local Passkeys delete — there is no host and no CTAP session). It reuses
-/// [`verify_pin_hash`]'s persistent anti-bruteforce gate verbatim — the EF_PIN
+/// [`spend_and_verify_pin_hash`]'s persistent anti-bruteforce gate verbatim — the EF_PIN
 /// retry counter is decremented before the compare and read back fail-closed, a
 /// correct PIN resets it and migrates a legacy PIN-wrapped seed, a wrong attempt
 /// at zero is a hard block — but deliberately omits the CTAP-session side effects
@@ -754,7 +757,7 @@ fn retries_left_at<S: Storage>(fid: u16, fs: &mut Fs<S>) -> Option<u8> {
 /// opens no faster path to grind the PIN than USB already does. The caller
 /// zeroizes `pin`.
 pub fn verify_local_pin<S: Storage>(dev: &Device, fs: &mut Fs<S>, pin: &[u8]) -> LocalPin {
-    verify_pin_at(EF_PIN, dev, fs, pin, true)
+    spend_and_verify_pin_at(EF_PIN, dev, fs, pin, true)
 }
 
 /// Verify the trusted-display **device PIN** ([`EF_DEVICE_PIN`]) — the same fail-closed
@@ -762,7 +765,7 @@ pub fn verify_local_pin<S: Storage>(dev: &Device, fs: &mut Fs<S>, pin: &[u8]) ->
 /// **without** the seed migration (the device PIN never wraps the seed; that is the FIDO
 /// clientPIN's job). Used by the display lock / on-device delete / factory-reset gates.
 pub fn verify_device_pin<S: Storage>(dev: &Device, fs: &mut Fs<S>, pin: &[u8]) -> LocalPin {
-    verify_pin_at(EF_DEVICE_PIN, dev, fs, pin, false)
+    spend_and_verify_pin_at(EF_DEVICE_PIN, dev, fs, pin, false)
 }
 
 /// Shared core for the device-local PIN verifies. Reads `fid`'s `[retries, len, format,
@@ -770,7 +773,7 @@ pub fn verify_device_pin<S: Storage>(dev: &Device, fs: &mut Fs<S>, pin: &[u8]) -
 /// fail-closed, resets it on a match, and (only when `migrate_seed`) migrates a legacy
 /// PIN-wrapped seed — the EF_PIN path keeps that; the device PIN does not. The caller
 /// zeroizes `pin`.
-fn verify_pin_at<S: Storage>(
+fn spend_and_verify_pin_at<S: Storage>(
     fid: u16,
     dev: &Device,
     fs: &mut Fs<S>,
@@ -789,7 +792,7 @@ fn verify_pin_at<S: Storage>(
         return LocalPin::Blocked;
     }
     // Trust the decremented counter only after reading it back — the same
-    // fail-closed anti-glitch gate `verify_pin_hash` applies (a torn program could
+    // fail-closed anti-glitch gate `spend_and_verify_pin_hash` applies (a torn program could
     // otherwise persist the old, higher count while RAM marched on).
     let mut readback = [0u8; PIN_FILE_LEN];
     match fs.read(fid, &mut readback) {
@@ -802,7 +805,7 @@ fn verify_pin_at<S: Storage>(
     let cand = dev.pin_derive_verifier(&pin_hash[..16]);
     let mut matched = pinproto_ct_eq(&cand, &pin_data[3..PIN_FILE_LEN]);
     if !matched && dev.otp_key.is_some() {
-        // Pre-OTP verifier fallback, identical to `verify_pin_hash`.
+        // Pre-OTP verifier fallback, identical to `spend_and_verify_pin_hash`.
         let cand_old = dev.without_otp().pin_derive_verifier(&pin_hash[..16]);
         if pinproto_ct_eq(&cand_old, &pin_data[3..PIN_FILE_LEN]) {
             pin_data[3..PIN_FILE_LEN].copy_from_slice(&cand);
