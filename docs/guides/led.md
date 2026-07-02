@@ -60,6 +60,8 @@ effect setting — they lack per-LED control and pixel-level colour.
 | **waiting for touch** | `bounce` — smooth bounce | yellow | press the button to confirm |
 | boot | `sparkle` — random sparkle | red | the brief power-up state |
 
+![Status-LED cheat sheet — idle breathes green (vapor), processing flows a yellow-to-red gradient (flow), waiting-for-touch bounces yellow (bounce), and boot sparkles red (sparkle); the swatches and animations show each state's default colour and effect](../images/led-status.svg)
+
 A few honest details:
 
 - **No dedicated error colour.** The firmware does not light a distinct "error"

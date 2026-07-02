@@ -29,3 +29,4 @@ the mdBook site.
 | `otp-fuse-map.svg` | OTP rows RS-Key provisions, by page + write path | original — from `tools/rsk/otp.py` / `secureboot.py` |
 | `secure-boot-chain.svg` | Host sign → BOOTSEL flash → bootrom verify chain | original — from `production.md` / `picotool seal` |
 | `rollback-timeline.svg` | 48-bit rollback thermometer + boot decision | original — from `anti-rollback.md` |
+| `led-status.svg` | Status-LED cheat sheet (state → colour/effect), SMIL-animated | original — from `guides/led.md` |
