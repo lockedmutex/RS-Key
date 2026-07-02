@@ -12,8 +12,9 @@
       .base{fill:#C4CBD1}
       .lbl{fill:#828C95}
       .dim{fill:#8A96A0}
-      .olive{fill:#A6B26B}
-      .warn{fill:#D9B44A}
+      .olive{fill:#8FBB6F}
+      .warn{fill:#E0A74A}
+      .ttl{fill:#5FAFA5;font-weight:700}
       .white{fill:#F0ECE4;font-weight:700}
     </style>
     <clipPath id="term"><rect x="20" y="84" width="740" height="498" rx="9"/></clipPath>
@@ -24,87 +25,87 @@
   <text class="sub" x="34" y="66">the live terminal dashboard — Overview section on a provisioned device (serial redacted)</text>
 
   <!-- terminal window -->
-  <rect x="20" y="84" width="740" height="498" rx="9" fill="#22262B" stroke="#465059" stroke-width="1.5"/>
+  <rect x="20" y="84" width="740" height="498" rx="9" fill="#22262B" stroke="#4A525C" stroke-width="1.5"/>
   <circle cx="42" cy="102" r="4.5" fill="#E0665A"/>
   <circle cx="58" cy="102" r="4.5" fill="#E8B23A"/>
   <circle cx="74" cy="102" r="4.5" fill="#3F9E5A"/>
   <text class="m dim" x="96" y="106">rsk-tui</text>
-  <line x1="20" y1="118" x2="760" y2="118" stroke="#465059" stroke-width="1"/>
+  <line x1="20" y1="118" x2="760" y2="118" stroke="#4A525C" stroke-width="1"/>
 
   <!-- header box -->
-  <rect x="32" y="126" width="716" height="30" rx="3" fill="none" stroke="#465059"/>
-  <rect x="40" y="134" width="52" height="16" rx="3" fill="#9CAF88"/>
+  <rect x="32" y="126" width="716" height="30" rx="3" fill="none" stroke="#4A525C"/>
+  <rect x="40" y="134" width="52" height="16" rx="3" fill="#5FAFA5"/>
   <text class="m" x="47" y="146" fill="#22262B" font-weight="700" font-size="10.5">rs-key</text>
   <text class="m base" x="102" y="146">cockpit</text>
-  <circle cx="166" cy="142" r="3.5" fill="#A6B26B"/>
+  <circle cx="166" cy="142" r="3.5" fill="#8FBB6F"/>
   <text class="m olive" x="176" y="146">OK</text>
   <text class="m dim" x="204" y="146" font-size="10.5">serial 9f3c1e7a4b20 · fw 5.7.4 · bcd 0x07ec</text>
   <text class="m" x="632" y="146" fill="#6E7880" font-size="10.5">refreshed 4s ago</text>
 
   <!-- sidebar box -->
-  <rect x="32" y="164" width="186" height="360" rx="3" fill="none" stroke="#465059"/>
+  <rect x="32" y="164" width="186" height="360" rx="3" fill="none" stroke="#4A525C"/>
   <rect x="42" y="159" width="56" height="10" fill="#22262B"/>
-  <text class="m dim" x="46" y="168" font-size="10.5">sections</text>
+  <text class="m ttl" x="46" y="168" font-size="10.5">sections</text>
   <!-- selected: Overview -->
-  <rect x="36" y="181" width="178" height="18" rx="2" fill="#CFCBC1"/>
-  <text class="m" x="40" y="194" fill="#22262B">▸</text>
-  <circle cx="54" cy="190" r="3" fill="#6B7A3A"/>
-  <text class="m" x="62" y="194" fill="#22262B" font-weight="700">Overview</text>
+  <rect x="36" y="181" width="178" height="18" rx="2" fill="#333B45"/>
+  <text class="m" x="40" y="194" fill="#C4CBD1">▸</text>
+  <circle cx="54" cy="190" r="3" fill="#8FBB6F"/>
+  <text class="m" x="62" y="194" fill="#F0ECE4" font-weight="700">Overview</text>
   <g>
-    <circle cx="46" cy="215" r="3" fill="#A6B26B"/><text class="m base" x="56" y="219">FIDO</text>
-    <circle cx="46" cy="235" r="3" fill="#A6B26B"/><text class="m base" x="56" y="239">OpenPGP</text>
-    <circle cx="46" cy="255" r="3" fill="#A6B26B"/><text class="m base" x="56" y="259">PIV</text>
-    <circle cx="46" cy="275" r="3" fill="#A6B26B"/><text class="m base" x="56" y="279">OATH / OTP</text>
-    <circle cx="46" cy="295" r="3" fill="#A6B26B"/><text class="m base" x="56" y="299">Backup</text>
-    <circle cx="46" cy="315" r="3" fill="#A6B26B"/><text class="m base" x="56" y="319">LED</text>
-    <circle cx="46" cy="335" r="3" fill="#A6B26B"/><text class="m base" x="56" y="339">Audit</text>
-    <circle cx="46" cy="355" r="3" fill="#A6B26B"/><text class="m base" x="56" y="359">Reboot / Maintenan</text>
+    <circle cx="46" cy="215" r="3" fill="#8FBB6F"/><text class="m base" x="56" y="219">FIDO</text>
+    <circle cx="46" cy="235" r="3" fill="#8FBB6F"/><text class="m base" x="56" y="239">OpenPGP</text>
+    <circle cx="46" cy="255" r="3" fill="#8FBB6F"/><text class="m base" x="56" y="259">PIV</text>
+    <circle cx="46" cy="275" r="3" fill="#8FBB6F"/><text class="m base" x="56" y="279">OATH / OTP</text>
+    <circle cx="46" cy="295" r="3" fill="#8FBB6F"/><text class="m base" x="56" y="299">Backup</text>
+    <circle cx="46" cy="315" r="3" fill="#8FBB6F"/><text class="m base" x="56" y="319">LED</text>
+    <circle cx="46" cy="335" r="3" fill="#8FBB6F"/><text class="m base" x="56" y="339">Audit</text>
+    <circle cx="46" cy="355" r="3" fill="#8FBB6F"/><text class="m base" x="56" y="359">Reboot / Maintenan</text>
     <circle cx="46" cy="375" r="3" fill="#6E7880"/><text class="m dim" x="56" y="379">Help</text>
   </g>
 
   <!-- overview box -->
-  <rect x="228" y="164" width="520" height="294" rx="3" fill="none" stroke="#465059"/>
+  <rect x="228" y="164" width="520" height="294" rx="3" fill="none" stroke="#4A525C"/>
   <rect x="238" y="159" width="62" height="10" fill="#22262B"/>
-  <text class="m dim" x="242" y="168" font-size="10.5">Overview</text>
+  <text class="m ttl" x="242" y="168" font-size="10.5">Overview</text>
   <g class="m">
     <text class="white" x="240" y="188">Identity</text>
-    <circle cx="242" cy="200" r="3" fill="#A6B26B"/><text class="lbl" x="256" y="204">serial</text>    <text class="base" x="360" y="204">9f3c1e7a4b20cd51</text>
-    <circle cx="242" cy="215" r="3" fill="#A6B26B"/><text class="lbl" x="256" y="219">firmware</text>  <text class="base" x="360" y="219">5.7.4</text>
-    <circle cx="242" cy="230" r="3" fill="#A6B26B"/><text class="lbl" x="256" y="234">bcdDevice</text> <text class="base" x="360" y="234">0x07ec</text>
-    <circle cx="242" cy="245" r="3" fill="#A6B26B"/><text class="lbl" x="256" y="249">sdk</text>       <text class="base" x="360" y="249">8.6</text>
-    <circle cx="242" cy="260" r="3" fill="none" stroke="#A6B26B"/><text class="lbl" x="256" y="264">aaguid</text> <text class="base" x="360" y="264">2479c7bf6b305683…</text>
+    <circle cx="242" cy="200" r="3" fill="#8FBB6F"/><text class="lbl" x="256" y="204">serial</text>    <text class="base" x="360" y="204">9f3c1e7a4b20cd51</text>
+    <circle cx="242" cy="215" r="3" fill="#8FBB6F"/><text class="lbl" x="256" y="219">firmware</text>  <text class="base" x="360" y="219">5.7.4</text>
+    <circle cx="242" cy="230" r="3" fill="#8FBB6F"/><text class="lbl" x="256" y="234">bcdDevice</text> <text class="base" x="360" y="234">0x07ec</text>
+    <circle cx="242" cy="245" r="3" fill="#8FBB6F"/><text class="lbl" x="256" y="249">sdk</text>       <text class="base" x="360" y="249">8.6</text>
+    <circle cx="242" cy="260" r="3" fill="none" stroke="#808A92"/><text class="lbl" x="256" y="264">aaguid</text> <text class="base" x="360" y="264">2479c7bf6b305683…</text>
 
     <text class="white" x="240" y="288">Transports</text>
-    <circle cx="242" cy="300" r="3" fill="#A6B26B"/><text class="lbl" x="256" y="304">FIDO HID</text>    <text class="base" x="360" y="304">present</text>
-    <circle cx="242" cy="315" r="3" fill="#A6B26B"/><text class="lbl" x="256" y="319">PC/SC</text>       <text class="base" x="360" y="319">present</text>
-    <circle cx="242" cy="330" r="3" fill="#A6B26B"/><text class="lbl" x="256" y="334">CCID applet</text> <text class="base" x="360" y="334">present</text>
+    <circle cx="242" cy="300" r="3" fill="#8FBB6F"/><text class="lbl" x="256" y="304">FIDO HID</text>    <text class="base" x="360" y="304">present</text>
+    <circle cx="242" cy="315" r="3" fill="#8FBB6F"/><text class="lbl" x="256" y="319">PC/SC</text>       <text class="base" x="360" y="319">present</text>
+    <circle cx="242" cy="330" r="3" fill="#8FBB6F"/><text class="lbl" x="256" y="334">CCID applet</text> <text class="base" x="360" y="334">present</text>
 
     <text class="white" x="240" y="358">Security</text>
-    <circle cx="242" cy="370" r="3" fill="#A6B26B"/><text class="lbl" x="256" y="374">backup</text>        <text class="base" x="360" y="374">sealed=false  has_seed=true</text>
-    <circle cx="242" cy="385" r="3" fill="#A6B26B"/><text class="lbl" x="256" y="389">seed lock</text>     <text class="base" x="360" y="389">off</text>
+    <circle cx="242" cy="370" r="3" fill="#8FBB6F"/><text class="lbl" x="256" y="374">backup</text>        <text class="base" x="360" y="374">sealed=false  has_seed=true</text>
+    <circle cx="242" cy="385" r="3" fill="#8FBB6F"/><text class="lbl" x="256" y="389">seed lock</text>     <text class="base" x="360" y="389">off</text>
     <text class="warn" x="239" y="404" font-size="12">▲</text><text class="lbl" x="256" y="404">secure boot</text>  <text class="warn" x="360" y="404">ENABLED (not locked)</text><text class="base" x="516" y="404">bootkey 0x0</text>
-    <circle cx="242" cy="415" r="3" fill="#A6B26B"/><text class="lbl" x="256" y="419">anti-rollback</text> <text class="base" x="360" y="419">required  v1/48</text>
-    <circle cx="242" cy="430" r="3" fill="#A6B26B"/><text class="lbl" x="256" y="434">org attest</text>    <text class="base" x="360" y="434">installed</text>
-    <circle cx="242" cy="445" r="3" fill="#A6B26B"/><text class="lbl" x="256" y="449">flash</text>         <text class="base" x="360" y="449">21123/1572864 B used, 1223 files</text>
+    <circle cx="242" cy="415" r="3" fill="#8FBB6F"/><text class="lbl" x="256" y="419">anti-rollback</text> <text class="base" x="360" y="419">required  v1/48</text>
+    <circle cx="242" cy="430" r="3" fill="#8FBB6F"/><text class="lbl" x="256" y="434">org attest</text>    <text class="base" x="360" y="434">installed</text>
+    <circle cx="242" cy="445" r="3" fill="#8FBB6F"/><text class="lbl" x="256" y="449">flash</text>         <text class="base" x="360" y="449">21123/1572864 B used, 1223 files</text>
   </g>
 
   <!-- actions box -->
-  <rect x="228" y="464" width="520" height="60" rx="3" fill="none" stroke="#465059"/>
+  <rect x="228" y="464" width="520" height="60" rx="3" fill="none" stroke="#4A525C"/>
   <rect x="238" y="459" width="52" height="10" fill="#22262B"/>
-  <text class="m dim" x="242" y="468" font-size="10.5">actions</text>
-  <rect x="232" y="478" width="512" height="17" rx="2" fill="#333A42"/>
+  <text class="m ttl" x="242" y="468" font-size="10.5">actions</text>
+  <rect x="232" y="478" width="512" height="17" rx="2" fill="#333B45"/>
   <text class="m" x="236" y="491" fill="#C4CBD1">▸</text>
-  <circle cx="250" cy="487" r="3" fill="#A6B26B"/>
+  <circle cx="250" cy="487" r="3" fill="#8FBB6F"/>
   <text class="m" x="258" y="491" fill="#EDEAE2" font-weight="700">Refresh status</text>
   <text class="m dim" x="358" y="491">· re-read all channels</text>
-  <circle cx="242" cy="510" r="3" fill="#A6B26B"/>
+  <circle cx="242" cy="510" r="3" fill="#8FBB6F"/>
   <text class="m base" x="258" y="514">Verify device identity</text>
   <text class="m dim" x="410" y="514">· signed challenge · touch</text>
 
   <!-- events box -->
-  <rect x="32" y="528" width="716" height="30" rx="3" fill="none" stroke="#465059"/>
+  <rect x="32" y="528" width="716" height="30" rx="3" fill="none" stroke="#4A525C"/>
   <rect x="42" y="523" width="48" height="10" fill="#22262B"/>
-  <text class="m dim" x="46" y="532" font-size="10.5">events</text>
+  <text class="m ttl" x="46" y="532" font-size="10.5">events</text>
   <text class="m olive" x="46" y="548" font-size="10.5">connected: serial 9f3c1e7a4b20 · fw 5.7.4 · bcd 0x07ec</text>
 
   <!-- key bar -->
