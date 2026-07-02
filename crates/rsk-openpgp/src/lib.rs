@@ -184,6 +184,82 @@ impl<'a> OpenpgpApplet<'a> {
         };
         keypairgen::rsa_generate_finish(&dev, fs, &self.sess, rng, fid, key, out)
     }
+
+    /// GET DATA (0xCA): the cardholder-certificate occurrence (7F21) is a free
+    /// read of the SELECT-DATA-selected slot; every other DO goes through
+    /// `getdata::get_data` (PW2/PW3-gated).
+    fn handle_get_data<S: Storage>(
+        &mut self,
+        fid: u16,
+        apdu: &Apdu,
+        fs: &mut Fs<S>,
+        res: &mut ResBuf,
+    ) -> Sw {
+        if apdu.nc > 0 {
+            return Sw::WRONG_LENGTH;
+        }
+        if fid == consts::EF_CH_CERT {
+            // Cardholder certificate (7F21): return the SELECT-DATA-selected
+            // occurrence (EF_CH_1/2/3). A free read; an unset cert is empty.
+            let stor = consts::EF_CH_1 + self.sess.cert_occ as u16;
+            if let Some(n) = fs.read(stor, &mut self.scratch) {
+                // `fs.read` returns the value's FULL stored length while the
+                // backend copies only what fit; clamp before slicing so an
+                // over-long stored cert cannot force an OOB panic (reset).
+                res.extend(&self.scratch[..n.min(self.scratch.len())]);
+            }
+            return Sw::OK;
+        }
+        let (n, sw) = getdata::get_data(
+            fid,
+            self.sess.has_pw2,
+            self.sess.has_pw3,
+            fs,
+            &self.full_aid,
+            &mut self.current_ef,
+            &mut self.scratch,
+        );
+        if sw.is_ok() {
+            let n = n.min(self.scratch.len());
+            res.extend(&self.scratch[..n]);
+        }
+        sw
+    }
+
+    /// PUT DATA (0xDA): the cardholder cert (7F21), reset code (0xD3) and PW
+    /// status (0xC4) touch the cert / DEK / status files and route to their own
+    /// handlers; every other DO is a generic write.
+    fn handle_put_data<S: Storage>(&mut self, fid: u16, apdu: &Apdu, fs: &mut Fs<S>) -> Sw {
+        if fid == consts::EF_CH_CERT {
+            // Cardholder certificate write (PW3): the SELECT-DATA occurrence
+            // picks the EF_CH_1/2/3 instance; empty data deletes it.
+            if !self.sess.has_pw3 {
+                Sw::SECURITY_STATUS_NOT_SATISFIED
+            } else {
+                let stor = consts::EF_CH_1 + self.sess.cert_occ as u16;
+                if apdu.data.is_empty() {
+                    let _ = fs.delete(stor);
+                    Sw::OK
+                } else if fs.put(stor, apdu.data).is_err() {
+                    Sw::MEMORY_FAILURE
+                } else {
+                    Sw::OK
+                }
+            }
+        } else if fid == consts::EF_RESET_CODE {
+            let dev = Device {
+                serial_hash: &self.serial_hash,
+                serial_id: &self.serial_id,
+                otp_key: self.otp_key.as_ref(),
+            };
+            let mut rng = self.rng.borrow_mut();
+            pin::put_reset_code(&dev, fs, &mut self.sess, &mut *rng, apdu.data)
+        } else if fid == consts::EF_PW_STATUS {
+            putdata::put_pw_status(fs, &self.sess, apdu.data)
+        } else {
+            putdata::put_data(fs, &self.sess, fid, apdu.data)
+        }
+    }
 }
 
 impl<S: Storage> Applet<Fs<S>> for OpenpgpApplet<'_> {
@@ -208,37 +284,7 @@ impl<S: Storage> Applet<Fs<S>> for OpenpgpApplet<'_> {
     fn process(&mut self, apdu: &Apdu, fs: &mut Fs<S>, res: &mut ResBuf) -> Sw {
         let fid = ((apdu.p1 as u16) << 8) | apdu.p2 as u16;
         match apdu.ins {
-            consts::INS_GET_DATA => {
-                if apdu.nc > 0 {
-                    return Sw::WRONG_LENGTH;
-                }
-                if fid == consts::EF_CH_CERT {
-                    // Cardholder certificate (7F21): return the SELECT-DATA-selected
-                    // occurrence (EF_CH_1/2/3). A free read; an unset cert is empty.
-                    let stor = consts::EF_CH_1 + self.sess.cert_occ as u16;
-                    if let Some(n) = fs.read(stor, &mut self.scratch) {
-                        // `fs.read` returns the value's FULL stored length while the
-                        // backend copies only what fit; clamp before slicing so an
-                        // over-long stored cert cannot force an OOB panic (reset).
-                        res.extend(&self.scratch[..n.min(self.scratch.len())]);
-                    }
-                    return Sw::OK;
-                }
-                let (n, sw) = getdata::get_data(
-                    fid,
-                    self.sess.has_pw2,
-                    self.sess.has_pw3,
-                    fs,
-                    &self.full_aid,
-                    &mut self.current_ef,
-                    &mut self.scratch,
-                );
-                if sw.is_ok() {
-                    let n = n.min(self.scratch.len());
-                    res.extend(&self.scratch[..n]);
-                }
-                sw
-            }
+            consts::INS_GET_DATA => self.handle_get_data(fid, apdu, fs, res),
             consts::INS_GET_NEXT_DATA => {
                 if apdu.nc > 0 {
                     return Sw::WRONG_LENGTH;
@@ -317,39 +363,7 @@ impl<S: Storage> Applet<Fs<S>> for OpenpgpApplet<'_> {
                     apdu.data,
                 )
             }
-            consts::INS_PUT_DATA => {
-                // The reset code (0xD3) and PW status (0xC4) touch the DEK / status
-                // file; everything else is a generic DO write.
-                if fid == consts::EF_CH_CERT {
-                    // Cardholder certificate write (PW3): the SELECT-DATA occurrence
-                    // picks the EF_CH_1/2/3 instance; empty data deletes it.
-                    if !self.sess.has_pw3 {
-                        Sw::SECURITY_STATUS_NOT_SATISFIED
-                    } else {
-                        let stor = consts::EF_CH_1 + self.sess.cert_occ as u16;
-                        if apdu.data.is_empty() {
-                            let _ = fs.delete(stor);
-                            Sw::OK
-                        } else if fs.put(stor, apdu.data).is_err() {
-                            Sw::MEMORY_FAILURE
-                        } else {
-                            Sw::OK
-                        }
-                    }
-                } else if fid == consts::EF_RESET_CODE {
-                    let dev = Device {
-                        serial_hash: &self.serial_hash,
-                        serial_id: &self.serial_id,
-                        otp_key: self.otp_key.as_ref(),
-                    };
-                    let mut rng = self.rng.borrow_mut();
-                    pin::put_reset_code(&dev, fs, &mut self.sess, &mut *rng, apdu.data)
-                } else if fid == consts::EF_PW_STATUS {
-                    putdata::put_pw_status(fs, &self.sess, apdu.data)
-                } else {
-                    putdata::put_data(fs, &self.sess, fid, apdu.data)
-                }
-            }
+            consts::INS_PUT_DATA => self.handle_put_data(fid, apdu, fs),
             consts::INS_PUT_DATA_ODD => {
                 // IMPORT (extended header list). Public-key derivation is
                 // deterministic, so no RNG is needed here.

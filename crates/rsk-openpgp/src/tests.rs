@@ -65,6 +65,40 @@ fn get_data_pw_status_via_process() {
 }
 
 #[test]
+fn put_data_pw_status_routes_to_handler() {
+    // PUT DATA 0xC4 (PW status) must route to put_pw_status, which needs PW3 →
+    // SECURITY_STATUS_NOT_SATISFIED without it. The generic DO path rejects 0xC4
+    // with CONDITIONS_NOT_SATISFIED, so this error code pins the dispatch route.
+    let rng = RefCell::new(CountRng(0));
+    let mut fs = make_fs();
+    let presence = RefCell::new(crate::AlwaysConfirm);
+    let mut app = OpenpgpApplet::new(SERIAL_ID, SERIAL_HASH, None, &rng, &presence);
+    let (_b, sw) = run(
+        &mut app,
+        &mut fs,
+        &[0x00, consts::INS_PUT_DATA, 0x00, 0xC4, 0x01, 0xFF],
+    );
+    assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
+}
+
+#[test]
+fn put_data_reset_code_routes_to_handler() {
+    // PUT DATA 0xD3 (resetting code) must route to put_reset_code, which needs
+    // PW3 → SECURITY_STATUS_NOT_SATISFIED without it (not the generic path's
+    // CONDITIONS_NOT_SATISFIED), pinning the dispatch route.
+    let rng = RefCell::new(CountRng(0));
+    let mut fs = make_fs();
+    let presence = RefCell::new(crate::AlwaysConfirm);
+    let mut app = OpenpgpApplet::new(SERIAL_ID, SERIAL_HASH, None, &rng, &presence);
+    let (_b, sw) = run(
+        &mut app,
+        &mut fs,
+        &[0x00, consts::INS_PUT_DATA, 0x00, 0xD3, 0x02, 0xAB, 0xCD],
+    );
+    assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
+}
+
+#[test]
 fn get_challenge_returns_ne_random_bytes() {
     let rng = RefCell::new(CountRng(0));
     let mut fs = make_fs();
