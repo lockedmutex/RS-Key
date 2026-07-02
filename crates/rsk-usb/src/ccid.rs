@@ -65,11 +65,15 @@ const WTX_INTERVAL_MS: u64 = 200;
 /// `write_transfer().await` — that would stop the bulk-OUT read and wedge the
 /// interface (the same failure mode the FIDO transport guards against). PC/SC
 /// reads each response promptly, so a gap this long means the host is gone.
-const TX_TIMEOUT_MS: u64 = 500;
+use crate::TX_TIMEOUT_MS;
 
 const HEADER: usize = 10;
 /// `dwMaxCCIDMessageLength` from the class descriptor.
 pub const MAX_CCID_MSG: usize = 2048;
+/// `wMaxPacketSize` of the three CCID endpoints (full-speed USB). A bulk-IN
+/// transfer whose length is an exact multiple needs a terminating ZLP — keep
+/// the `is_multiple_of` modulus and the endpoint allocations in lockstep.
+const EP_PACKET_SIZE: usize = 64;
 
 /// ATR for the FIDO card.
 pub const ATR_FIDO: &[u8] = &[
@@ -263,9 +267,9 @@ impl<'d, D: Driver<'d>, H: ApduHandler> Ccid<'d, D, H> {
         desc.copy_from_slice(CCID_FUNCTIONAL_DESC);
         desc[50] = pin_support;
         alt.descriptor(CCID_DESC_TYPE, &desc);
-        let read_ep = alt.endpoint_bulk_out(None, 64);
-        let write_ep = alt.endpoint_bulk_in(None, 64);
-        let int_ep = alt.endpoint_interrupt_in(None, 64, 10);
+        let read_ep = alt.endpoint_bulk_out(None, EP_PACKET_SIZE as u16);
+        let write_ep = alt.endpoint_bulk_in(None, EP_PACKET_SIZE as u16);
+        let int_ep = alt.endpoint_interrupt_in(None, EP_PACKET_SIZE as u16, 10);
         drop(func);
 
         Self {
@@ -312,7 +316,7 @@ impl<'d, D: Driver<'d>, H: ApduHandler> Ccid<'d, D, H> {
                         if n > 0 {
                             // A short packet (or ZLP on an exact multiple) ends the
                             // bulk IN transfer for the host.
-                            let zlp = n.is_multiple_of(64);
+                            let zlp = n.is_multiple_of(EP_PACKET_SIZE);
                             let _ = select(
                                 self.write_ep.write_transfer(&self.tx[..n], zlp),
                                 Timer::after_millis(TX_TIMEOUT_MS),
@@ -373,7 +377,7 @@ impl<'d, D: Driver<'d>, H: ApduHandler> Ccid<'d, D, H> {
         let n = n.min(tx.len() - HEADER);
         put_header(tx, CCID_DATA_BLOCK_RET, n as u32, seq, *status);
         let total = HEADER + n;
-        let zlp = total.is_multiple_of(64);
+        let zlp = total.is_multiple_of(EP_PACKET_SIZE);
         let _ = select(
             write_ep.write_transfer(&tx[..total], zlp),
             Timer::after_millis(TX_TIMEOUT_MS),
@@ -431,7 +435,7 @@ impl<'d, D: Driver<'d>, H: ApduHandler> Ccid<'d, D, H> {
         put_header(tx, CCID_DATA_BLOCK_RET, n as u32, seq, hdr_status);
         tx[8] = result.error; // bError (put_header clears it; set the pad cancel/timeout code)
         let total = HEADER + n;
-        let zlp = total.is_multiple_of(64);
+        let zlp = total.is_multiple_of(EP_PACKET_SIZE);
         let _ = select(
             write_ep.write_transfer(&tx[..total], zlp),
             Timer::after_millis(TX_TIMEOUT_MS),

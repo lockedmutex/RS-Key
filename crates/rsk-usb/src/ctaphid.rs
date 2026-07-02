@@ -90,7 +90,7 @@ const RX_TIMEOUT_MS: u64 = 500;
 // (it then stops reading OUT → every further host write NAKs → the whole FIDO
 // interface wedges until a replug). The host polls FIDO HID every few ms, so a
 // gap this long means it is gone.
-const TX_TIMEOUT_MS: u64 = 500;
+use crate::TX_TIMEOUT_MS;
 
 const CTAPHID_IF_VERSION: u8 = 2;
 const CAPFLAG_WINK: u8 = 0x01;

@@ -5,6 +5,11 @@
 
 use crate::error::{Error, Result};
 
+/// ISO 7816-4: Ne when Le is absent or encoded as 0 (short form).
+pub const NE_SHORT_MAX: usize = 256;
+/// ISO 7816-4: Ne when extended Le is encoded as 0.
+pub const NE_EXT_MAX: usize = 65536;
+
 #[inline]
 fn be16(b: &[u8]) -> u16 {
     ((b[0] as u16) << 8) | b[1] as u16
@@ -40,18 +45,18 @@ impl<'a> Apdu<'a> {
 
         if size == 4 {
             // Case 1 (Ne still defaults to 256).
-            ne = 256;
+            ne = NE_SHORT_MAX;
         } else if size == 5 {
             // Case 2 short.
             ne = match buf[4] {
-                0 => 256,
+                0 => NE_SHORT_MAX,
                 n => n as usize,
             };
         } else if buf[4] == 0 && size >= 7 {
             // Extended length (leading 0 marker).
             if size == 7 {
                 ne = match be16(&buf[5..7]) {
-                    0 => 65536,
+                    0 => NE_EXT_MAX,
                     n => n as usize,
                 };
             } else {
@@ -63,7 +68,7 @@ impl<'a> Apdu<'a> {
                 data = &buf[start..start + nc];
                 if nc + 7 + 2 == size {
                     ne = match be16(&buf[size - 2..]) {
-                        0 => 65536,
+                        0 => NE_EXT_MAX,
                         n => n as usize,
                     };
                 }
@@ -78,7 +83,7 @@ impl<'a> Apdu<'a> {
             data = &buf[start..start + nc];
             if nc + 5 + 1 == size {
                 ne = match buf[size - 1] {
-                    0 => 256,
+                    0 => NE_SHORT_MAX,
                     n => n as usize,
                 };
             }

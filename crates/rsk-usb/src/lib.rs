@@ -8,3 +8,8 @@
 pub mod ccid;
 pub mod ctaphid;
 pub mod secure_pin;
+
+/// Abandon an IN-endpoint response when the host stops draining it for this
+/// long — an unbounded write blocks the transport task and wedges the whole
+/// interface; a live host drains within milliseconds.
+pub(crate) const TX_TIMEOUT_MS: u64 = 500;

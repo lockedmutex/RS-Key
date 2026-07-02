@@ -13,6 +13,9 @@ use crate::{EF_META, FILE_EF_TRANSPARENT, FILE_TYPE_WORKING_EF, MAX_DYNAMIC_FILE
 /// Max size of the meta side-store blob.
 const META_MAX: usize = 1024;
 
+/// EF_META record header: `[fid: u16 BE][len: u16 BE]`.
+const META_REC_HDR: usize = 4;
+
 /// One bit per 16-bit FID: the full `0x0000..=0xFFFF` space as a present/absent
 /// bitmap (8 KiB). Backs the fast-negative cache in [`Fs`].
 const FID_PRESENT_BYTES: usize = (u16::MAX as usize + 1) / 8;
@@ -394,10 +397,10 @@ impl<S: Storage> Fs<S> {
         let n = read?.min(scratch.len());
         let blob = &scratch[..n];
         let mut i = 0;
-        while i + 4 <= blob.len() {
+        while i + META_REC_HDR <= blob.len() {
             let rec_fid = u16::from_be_bytes([blob[i], blob[i + 1]]);
             let len = u16::from_be_bytes([blob[i + 2], blob[i + 3]]) as usize;
-            let start = i + 4;
+            let start = i + META_REC_HDR;
             let end = start + len;
             if end > blob.len() {
                 break;
@@ -470,10 +473,10 @@ impl<S: Storage> Fs<S> {
 fn rebuild_meta(blob: &[u8], fid: u16, new: Option<&[u8]>, out: &mut [u8]) -> Result<usize> {
     let mut w = 0usize;
     let mut i = 0usize;
-    while i + 4 <= blob.len() {
+    while i + META_REC_HDR <= blob.len() {
         let rec_fid = u16::from_be_bytes([blob[i], blob[i + 1]]);
         let len = u16::from_be_bytes([blob[i + 2], blob[i + 3]]) as usize;
-        let start = i + 4;
+        let start = i + META_REC_HDR;
         let end = start + len;
         if end > blob.len() {
             break;
@@ -489,13 +492,13 @@ fn rebuild_meta(blob: &[u8], fid: u16, new: Option<&[u8]>, out: &mut [u8]) -> Re
         i = end;
     }
     if let Some(data) = new {
-        if w + 4 + data.len() > out.len() {
+        if w + META_REC_HDR + data.len() > out.len() {
             return Err(Error::NoMemory);
         }
         out[w..w + 2].copy_from_slice(&fid.to_be_bytes());
-        out[w + 2..w + 4].copy_from_slice(&(data.len() as u16).to_be_bytes());
-        out[w + 4..w + 4 + data.len()].copy_from_slice(data);
-        w += 4 + data.len();
+        out[w + 2..w + META_REC_HDR].copy_from_slice(&(data.len() as u16).to_be_bytes());
+        out[w + META_REC_HDR..w + META_REC_HDR + data.len()].copy_from_slice(data);
+        w += META_REC_HDR + data.len();
     }
     Ok(w)
 }

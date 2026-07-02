@@ -5,7 +5,7 @@
 
 use zeroize::Zeroize;
 
-use crate::apdu::Apdu;
+use crate::apdu::{Apdu, NE_SHORT_MAX};
 use crate::sw::Sw;
 
 /// A response buffer an applet writes its RAPDU body into. The status word is
@@ -94,6 +94,11 @@ const CHAIN_BUF_SIZE: usize = 2038;
 /// RESPONSE. Sized to the largest response buffer a caller passes (the CCID
 /// handler's 2046-byte body cap).
 const RESP_CHAIN_CAP: usize = 2048;
+
+/// `61 XX` bytes-remaining; SW2 saturates to `00` (= 256+ left) per ISO 7816-4.
+const fn bytes_remaining(left: usize) -> Sw {
+    Sw::new(0x61, if left > 0xFF { 0 } else { left as u8 })
+}
 
 /// Routes APDUs to applets: SELECT-by-AID, command chaining (CLA bit 0x10),
 /// outgoing response chaining (`61xx` / GET RESPONSE), and dispatch to the
@@ -284,14 +289,14 @@ impl Dispatcher {
     /// Serve the next chunk of a chained response to a GET RESPONSE (`0xC0`).
     /// Returns `61xx` while bytes remain, then the original status word.
     fn serve_pending(&mut self, ne: usize, res: &mut ResBuf) -> Sw {
-        let want = if ne == 0 { 256 } else { ne };
+        let want = if ne == 0 { NE_SHORT_MAX } else { ne };
         let remaining = self.pending_len - self.pending_off;
         let take = want.min(remaining);
         res.extend(&self.pending[self.pending_off..self.pending_off + take]);
         self.pending_off += take;
         let left = self.pending_len - self.pending_off;
         if left > 0 {
-            Sw::new(0x61, if left > 0xFF { 0 } else { left as u8 })
+            bytes_remaining(left)
         } else {
             let sw = self.pending_sw;
             self.clear_pending();
@@ -318,7 +323,7 @@ impl Dispatcher {
         self.pending_off = 0;
         self.pending_sw = sw;
         res.truncate(ne);
-        Sw::new(0x61, if tail_len > 0xFF { 0 } else { tail_len as u8 })
+        bytes_remaining(tail_len)
     }
 }
 
