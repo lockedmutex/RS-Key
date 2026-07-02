@@ -163,6 +163,13 @@ impl DeviceProvider for HardwareProvider {
                 },
                 Err(e) => ActionResult::Failed(format!("export failed: {e}")),
             },
+            Action::BackupExportSlip39 => match backup_export_slip39(pin) {
+                Ok(body) => ActionResult::Reveal {
+                    title: "seed · SLIP-39 (2-of-3 shares)".into(),
+                    body: Zeroizing::new(body),
+                },
+                Err(e) => ActionResult::Failed(format!("export failed: {e}")),
+            },
             Action::BackupRestore => {
                 let phrase = input.phrase.as_deref().map(String::as_str).unwrap_or("");
                 match backup_restore(phrase, pin) {
@@ -1016,7 +1023,10 @@ fn gate_param(token: Option<&[u8; 32]>, subcmd: u8, raw_subpara: &[u8]) -> Optio
 }
 
 /// Export the 32-byte seed and return it as a 24-word BIP-39 phrase.
-pub fn backup_export(pin: Option<&str>) -> Result<String, String> {
+/// Run the MSE channel + vendor BACKUP_EXPORT and decrypt the blob to the raw
+/// 32-byte seed. Shared by the BIP-39 and SLIP-39 export paths; the returned
+/// buffer zeroizes on drop.
+fn fetch_backup_seed(pin: Option<&str>) -> Result<Zeroizing<Vec<u8>>, String> {
     let dev = hid_open().ok_or("no FIDO device")?;
     let cid = ctaphid_init(&dev).ok_or("CTAPHID init failed")?;
     let token = pin.map(|p| acfg_token(&dev, cid, p)).transpose()?;
@@ -1042,13 +1052,50 @@ pub fn backup_export(pin: Option<&str>) -> Result<String, String> {
         Some(Value::Bytes(b)) if b.len() == 60 => b.clone(),
         _ => return Err("bad export blob".into()),
     };
-    let mut seed =
-        chacha_decrypt(&key, &blob[..12], &aad, &blob[12..]).ok_or("AEAD decrypt failed")?;
-    let mnemonic = bip39::Mnemonic::from_entropy(&seed)
+    let seed = chacha_decrypt(&key, &blob[..12], &aad, &blob[12..]).ok_or("AEAD decrypt failed")?;
+    Ok(Zeroizing::new(seed))
+}
+
+pub fn backup_export(pin: Option<&str>) -> Result<String, String> {
+    let seed = fetch_backup_seed(pin)?;
+    Ok(bip39::Mnemonic::from_entropy(&seed)
         .map_err(|e| e.to_string())?
-        .to_string();
-    seed.zeroize();
-    Ok(mnemonic)
+        .to_string())
+}
+
+/// Export the seed as a printable SLIP-39 share set (2-of-3, the host CLI's
+/// default). Generate-only via the in-tree `rsk-slip39` crate; recombining the
+/// shares to restore stays in the CLI.
+pub fn backup_export_slip39(pin: Option<&str>) -> Result<String, String> {
+    let seed = fetch_backup_seed(pin)?;
+    let mut secret = <[u8; 32]>::try_from(&seed[..]).map_err(|_| "seed not 32 bytes")?;
+    let body = slip39_body(&secret, 2, 3);
+    secret.zeroize();
+    body
+}
+
+/// Split a 32-byte secret into a printable `threshold`-of-`count` SLIP-39 share
+/// block, bit-compatible with `rsk backup restore --scheme slip39`. The returned
+/// string is secret — the caller wraps it in `Zeroizing`.
+fn slip39_body(secret: &[u8; 32], threshold: u8, count: u8) -> Result<String, String> {
+    let mut out = [[0u16; rsk_slip39::WORDS_PER_SHARE]; rsk_slip39::MAX_SHARES];
+    let mut fill = |b: &mut [u8]| OsRng.fill_bytes(b);
+    rsk_slip39::generate(secret, threshold, count, &mut fill, &mut out)
+        .map_err(|e| format!("slip39 encode failed: {e:?}"))?;
+    let mut body = format!(
+        "Any {threshold} of these {count} SLIP-39 shares reconstruct the seed.\n\
+         Write each on its own card; keep them apart.\n"
+    );
+    for (s, share) in out.iter().take(count as usize).enumerate() {
+        body.push_str(&format!("\nshare {} of {count}\n", s + 1));
+        for (j, &idx) in share.iter().enumerate() {
+            body.push_str(rsk_slip39::word(idx));
+            let last = j + 1 == share.len();
+            body.push(if last || (j + 1) % 7 == 0 { '\n' } else { ' ' });
+        }
+    }
+    out.zeroize();
+    Ok(body)
 }
 
 /// Seal the one-time backup export window (vendor BACKUP_FINALIZE, subcmd 4).
@@ -1250,6 +1297,14 @@ impl DeviceProvider for MockProvider {
                 ActionResult::Reveal {
                     title: "seed · BIP-39 (DEMO — not a real key)".into(),
                     body: Zeroizing::new(words),
+                }
+            }
+            Action::BackupExportSlip39 => {
+                // Obviously-fake shares from an all-zero secret.
+                let body = slip39_body(&[0u8; 32], 2, 3).unwrap_or_default();
+                ActionResult::Reveal {
+                    title: "seed · SLIP-39 2-of-3 (DEMO — not a real key)".into(),
+                    body: Zeroizing::new(body),
                 }
             }
             Action::BackupRestore => ActionResult::Ok("[demo] seed restored".into()),

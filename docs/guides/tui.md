@@ -153,7 +153,7 @@ as you type, `↑`/`↓` pick, `Enter` jumps to that action's section and starts
 | OpenPGP | applet presence | — |
 | PIV | applet presence | — |
 | OATH / OTP | applet presence | — |
-| Backup | seed / sealed / lock state | Export, Restore, Finalize (BIP-39) |
+| Backup | seed / sealed / lock state | Export (BIP-39 · SLIP-39 2-of-3), Restore, Finalize |
 | LED | LED mode + per-state color/brightness | Read state, Cycle idle color |
 | Audit | journal head + checkpoint key hint | Read journal, Verify identity |
 | Reboot / Maintenance | device summary | Reboot → app, Reboot → BOOTSEL |
@@ -209,8 +209,10 @@ to run — they are never performed from the cockpit:
   `ykman piv reset`, …). The `ykman` commands gate on the "Yubico YubiKey"
   reader name, so they only see the device on the opt-in `VIDPID=Yubikey5`
   build; `gpg` and `rsk` work on the default RS-Key build.
-- **Backup**: SLIP-39 (Shamir T-of-N) export/restore — `rsk backup export
-  --scheme slip39` ([seed-backup.md](seed-backup.md))
+- **Backup**: SLIP-39 *restore* (recombining shares) — `rsk backup restore
+  --scheme slip39`. SLIP-39 *export* is now in the cockpit (2-of-3 shares, via
+  the in-tree `rsk-slip39` crate); other T-of-N splits stay in the CLI
+  ([seed-backup.md](seed-backup.md))
 - **Maintenance** (Reboot section): seed soft-lock (`rsk lock enable | unlock |
   disable`), org-attestation import/clear (`rsk fido attestation import | clear`),
   secure-boot staging, OTP fuses — see [production.md](../production.md) and

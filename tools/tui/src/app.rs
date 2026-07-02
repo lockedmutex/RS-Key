@@ -30,6 +30,7 @@ pub enum Flow {
 #[derive(Clone, Copy, Debug)]
 pub enum Step {
     ExportConfirmed,
+    ExportSlip39Confirmed,
     RestorePhrase,
     RestoreConfirmed,
     FinalizeConfirmed,
@@ -291,6 +292,18 @@ impl App {
                 );
                 Flow::Continue
             }
+            Action::BackupExportSlip39 => {
+                self.open_confirm(
+                    "export seed (SLIP-39)".into(),
+                    "Reveals your FIDO seed as 3 SLIP-39 shares (any 2 reconstruct it) on this \
+                     screen. Anyone who reads 2 shares can clone your identity. Make sure nobody \
+                     is watching."
+                        .into(),
+                    "EXPORT",
+                    Step::ExportSlip39Confirmed,
+                );
+                Flow::Continue
+            }
             Action::BackupRestore => {
                 self.mode = AppMode::Modal(Modal::Input {
                     title: "restore seed".into(),
@@ -374,6 +387,7 @@ impl App {
     fn advance(&mut self, step: Step) -> Flow {
         match step {
             Step::ExportConfirmed => self.gate_pin(Action::BackupExport),
+            Step::ExportSlip39Confirmed => self.gate_pin(Action::BackupExportSlip39),
             Step::RestorePhrase => {
                 self.open_confirm(
                     "restore seed".into(),
@@ -574,6 +588,16 @@ fn menu_for(section: Section, snap: &DeviceSnapshot) -> Vec<MenuItem> {
                 },
                 kind: MenuKind::Run(Action::BackupExport),
             }];
+            v.push(MenuItem {
+                label: "Export seed (SLIP-39)".into(),
+                hint: "touch · 2-of-3 shares".into(),
+                health: if snap.sealed() {
+                    Health::Warn
+                } else {
+                    Health::Ok
+                },
+                kind: MenuKind::Run(Action::BackupExportSlip39),
+            });
             v.push(run(
                 "Restore seed (BIP-39)",
                 "touch · overwrites seed",
@@ -596,10 +620,10 @@ fn menu_for(section: Section, snap: &DeviceSnapshot) -> Vec<MenuItem> {
                 ));
             }
             v.push(note(
-                "SLIP-39 (Shamir T-of-N)",
+                "SLIP-39 restore (combine shares)",
                 "CLI",
-                "SLIP-39 backup",
-                "SLIP-39 export/restore (split shares) stays in the CLI:\n  rsk backup export --scheme slip39",
+                "SLIP-39 restore",
+                "Recombining SLIP-39 shares to restore stays in the CLI:\n  rsk backup restore --scheme slip39",
             ));
             v
         }

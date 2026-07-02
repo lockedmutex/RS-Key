@@ -13,6 +13,15 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+### Added
+
+- **`rsk-tui` can export the seed as SLIP-39 shares** (tools/tui 0.2.3 → 0.2.4).
+  The Backup section gains "Export seed (SLIP-39)" next to the BIP-39 export: it
+  reveals the seed as a 2-of-3 Shamir share set (the host CLI's default) on
+  screen, generated via the in-tree `rsk-slip39` crate so the shares recombine
+  with `rsk backup restore --scheme slip39`. Recombining shares to restore stays
+  in the CLI. (Pulls `rsk-crypto` transitively into the host tool.)
+
 ### Fixed
 
 - **The credential-box ceiling was too small for a maximal request.** Unifying

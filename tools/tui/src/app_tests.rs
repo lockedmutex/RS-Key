@@ -102,6 +102,48 @@ fn export_without_pin_skips_straight_to_run() {
 }
 
 #[test]
+fn export_slip39_flow_confirm_then_pin_then_run() {
+    let mut a = app(); // mock has client_pin = true
+    assert_eq!(a.begin_action(Action::BackupExportSlip39), Flow::Continue);
+    if let AppMode::Modal(Modal::Confirm { buf, want, .. }) = &mut a.mode {
+        assert_eq!(*want, "EXPORT");
+        *buf = "EXPORT".into();
+    } else {
+        panic!("expected EXPORT confirm");
+    }
+    // → opens a masked PIN input, exactly like the BIP-39 path.
+    assert_eq!(a.submit_modal(), Flow::Continue);
+    match &mut a.mode {
+        AppMode::Modal(Modal::Input { mask, buf, .. }) => {
+            assert!(*mask);
+            *buf = "1234".into();
+        }
+        _ => panic!("expected PIN input"),
+    }
+    assert_eq!(a.submit_modal(), Flow::Run(Action::BackupExportSlip39));
+    assert_eq!(a.staging.pin.as_deref().map(String::as_str), Some("1234"));
+}
+
+#[test]
+fn demo_slip39_export_shows_three_labelled_shares() {
+    use crate::device::DeviceProvider;
+    use crate::model::{ActionInput, ActionResult};
+    let mut p = crate::device::MockProvider::new();
+    match p.run(Action::BackupExportSlip39, &ActionInput::default()) {
+        ActionResult::Reveal { body, .. } => {
+            for n in 1..=3 {
+                assert!(
+                    body.contains(&format!("share {n} of 3")),
+                    "missing share {n}"
+                );
+            }
+            assert!(!body.contains("share 4 of 3"));
+        }
+        _ => panic!("expected reveal"),
+    }
+}
+
+#[test]
 fn verify_gates_pin_through_the_chokepoint() {
     let mut a = app(); // mock has client_pin = true
     // A directly-gated action (no typed confirm first) opens the masked PIN.

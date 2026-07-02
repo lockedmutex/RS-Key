@@ -73,6 +73,7 @@ fn working_message(action: Action) -> &'static str {
         Action::LedGet => "reading LED…",
         Action::LedCycle => "setting LED…",
         Action::BackupExport => "exporting — touch the device if it asks…",
+        Action::BackupExportSlip39 => "exporting shares — touch the device if it asks…",
         Action::BackupRestore => "restoring — touch the device if it asks…",
         Action::BackupFinalize => "sealing — touch the device if it asks…",
         Action::AuditRead => "reading audit journal…",

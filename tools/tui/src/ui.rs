@@ -638,7 +638,13 @@ fn modal(f: &mut Frame, theme: Theme, m: &Modal) {
             );
         }
         Modal::Reveal { title, body } => {
-            let r = centered(area, 88, 11);
+            // Grow to the body (SLIP-39 spans several shares) but never shrink
+            // below the single-line BIP-39 layout; clamp to the screen.
+            let lines = (body.lines().count() as u16 + 6)
+                .max(11)
+                .min(area.height.saturating_sub(2))
+                .max(3);
+            let r = centered(area, 88, lines);
             f.render_widget(Clear, r);
             f.render_widget(
                 Paragraph::new(vec![

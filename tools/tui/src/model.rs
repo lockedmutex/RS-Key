@@ -612,6 +612,7 @@ pub enum Action {
     LedGet,
     LedCycle,
     BackupExport,
+    BackupExportSlip39,
     BackupRestore,
     BackupFinalize,
     AuditRead,
@@ -628,6 +629,7 @@ impl Action {
             Action::LedGet => "LED · read state",
             Action::LedCycle => "LED · cycle idle color",
             Action::BackupExport => "Backup · export (BIP-39)",
+            Action::BackupExportSlip39 => "Backup · export (SLIP-39)",
             Action::BackupRestore => "Backup · restore (BIP-39)",
             Action::BackupFinalize => "Backup · finalize (seal window)",
             Action::AuditRead => "Audit · read journal",
@@ -641,21 +643,23 @@ impl Action {
         match self {
             Action::Refresh | Action::Verify => Section::Overview,
             Action::LedGet | Action::LedCycle => Section::Led,
-            Action::BackupExport | Action::BackupRestore | Action::BackupFinalize => {
-                Section::Backup
-            }
+            Action::BackupExport
+            | Action::BackupExportSlip39
+            | Action::BackupRestore
+            | Action::BackupFinalize => Section::Backup,
             Action::AuditRead => Section::Audit,
             Action::RebootApp | Action::RebootBootsel => Section::Reboot,
         }
     }
 
     /// The whole catalog, for the `/` search palette.
-    pub const ALL: [Action; 10] = [
+    pub const ALL: [Action; 11] = [
         Action::Refresh,
         Action::Verify,
         Action::LedGet,
         Action::LedCycle,
         Action::BackupExport,
+        Action::BackupExportSlip39,
         Action::BackupRestore,
         Action::BackupFinalize,
         Action::AuditRead,
