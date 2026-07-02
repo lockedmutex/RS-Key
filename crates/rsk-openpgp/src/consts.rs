@@ -2,9 +2,10 @@
 // Copyright (C) 2026 RS-Key contributors
 
 //! OpenPGP applet constants: AID/ATR, instruction bytes, EF/DO FIDs, PIN modes,
-//! and DEK sizing.
+//! status aliases, and DEK sizing.
 
 use rsk_fs::KeyFid;
+use rsk_sdk::Sw;
 
 /// OpenPGP application identifier.
 pub const OPENPGP_AID: &[u8] = &[0xD2, 0x76, 0x00, 0x01, 0x24, 0x01];
@@ -27,6 +28,14 @@ pub const ALGO_AES: u8 = 0x70;
 pub const ALGO_AES_128: u8 = 0x71;
 pub const ALGO_AES_192: u8 = 0x72;
 pub const ALGO_AES_256: u8 = 0x74;
+
+/// Default algorithm attribute when the slot has no `EF_ALGO_PRIV*` —
+/// RSA-2048, gpg's default. dobj.rs's C1/C2/C3 GET DATA fallback
+/// (`ATTR_RSA2K`) encodes the same default and must change with it.
+pub(crate) const DEFAULT_ALGO: &[u8] = &[ALGO_RSA, 0x08, 0x00, 0x00, 0x20, 0x00];
+
+/// Status 0x6A80 (wrong data).
+pub(crate) const WRONG_DATA: Sw = Sw::INCORRECT_PARAMS;
 
 /// ATR for the OpenPGP card.
 pub const ATR_OPENPGP: &[u8] = &[
@@ -125,6 +134,45 @@ pub(crate) fn slot_uif(pk: KeyFid) -> u16 {
         EF_UIF_DEC
     }
 }
+
+/// The public-key DO (`EF_PB_*`) for a private key slot — the layout invariant
+/// is public-key DO FID = private slot FID + 3.
+pub(crate) fn slot_pub_fid(pk: KeyFid) -> u16 {
+    if pk == EF_PK_SIG {
+        EF_PB_SIG
+    } else if pk == EF_PK_AUT {
+        EF_PB_AUT
+    } else {
+        EF_PB_DEC
+    }
+}
+
+/// The algorithm-attribute EF for a private key slot — `EF_ALGO_PRIV{1,2,3}`
+/// sits 0x10 below its `EF_PK_*` FID.
+pub(crate) fn slot_algo_fid(pk: KeyFid) -> u16 {
+    pk.get() - 0x10
+}
+
+/// The private companion EF of a C1/C2/C3 algorithm-attribute tag:
+/// `EF_ALGO_PRIV{1,2,3}` = `0x1000 | tag`.
+pub(crate) fn algo_tag_to_priv(tag: u16) -> u16 {
+    0x1000 | tag
+}
+
+// Control-reference template tags (GENERATE / IMPORT) naming the key slot.
+pub const CRT_SIG: u8 = 0xB6;
+pub const CRT_DEC: u8 = 0xB8;
+pub const CRT_AUT: u8 = 0xA4;
+
+/// OpenPGP CRT tag selecting the key slot.
+pub(crate) fn crt_slot(tag: u8) -> Option<KeyFid> {
+    match tag {
+        CRT_SIG => Some(EF_PK_SIG),
+        CRT_DEC => Some(EF_PK_DEC),
+        CRT_AUT => Some(EF_PK_AUT),
+        _ => None,
+    }
+}
 pub const EF_KEY_INFO: u16 = 0x00de; // S
 pub const EF_KDF: u16 = 0x00f9; // C — KDF parameters
 pub const EF_ALGO_INFO: u16 = 0x00fa; // C — algorithm info
@@ -158,8 +206,19 @@ pub const fn pin_kdf_size(plaintext: usize) -> usize {
 pub const DEK_AAD_SIZE: usize = pin_kdf_size(DEK_SIZE);
 /// Format byte + wrapped DEK blob (77 bytes).
 pub const DEK_FILE_SIZE: usize = 1 + DEK_AAD_SIZE;
+/// Format-version byte at offset 0 of every wrapped-DEK record.
+pub const DEK_FORMAT_V3: u8 = 0x03;
+/// Format byte of a PIN verifier record `[len, 0x01, verifier(32)]`.
+pub const PIN_FORMAT_V1: u8 = 0x01;
 /// Default retry counters (PW1, RC, PW3) initialised by the applet.
 pub const PW_RETRIES_DEFAULT: u8 = 3;
+/// EF_PW_PRIV mirrors DO C4: `[flag, max-len ×3, retry PW1/RC/PW3]`. The PIN
+/// fid's low nibble is its 1-based slot (also the EF_PW_RETRIES index).
+pub const fn pw_retry_idx(fid: u16) -> usize {
+    3 + (fid & 0xf) as usize
+}
+pub const PW1_RETRY_IDX: usize = pw_retry_idx(EF_PW1);
+pub const PW3_RETRY_IDX: usize = pw_retry_idx(EF_PW3);
 /// Default user PIN `123456`, admin PIN `12345678` (the OpenPGP defaults).
 pub const PW1_DEFAULT: &[u8] = &[0x31, 0x32, 0x33, 0x34, 0x35, 0x36];
 pub const PW3_DEFAULT: &[u8] = &[0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38];

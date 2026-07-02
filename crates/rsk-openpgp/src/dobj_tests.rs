@@ -21,7 +21,7 @@ fn algo_default_is_rsa2k() {
         let mut w = DoWriter::new(&mut out, &mut fs, &aid);
         w.build(EF_ALGO_SIG)
     };
-    // parse_algo always self-writes the tag + length (C1 06) ahead of the
+    // emit_algo always self-writes the tag + length (C1 06) ahead of the
     // value; GET DATA strips the outer tag for FUNC DOs.
     assert_eq!(
         &out[..n],
@@ -86,7 +86,7 @@ fn over_long_flash_do_does_not_overflow_the_output_buffer() {
 #[test]
 fn discrete_do_nests_algo_pw_fp() {
     let mut fs = fs();
-    // seed a PW status so parse_pw_status emits its 7 bytes.
+    // seed a PW status so emit_pw_status emits its 7 bytes.
     fs.put(EF_PW_PRIV, crate::files::PW_STATUS_DEFAULT).unwrap();
     let aid = full_aid(&[0; 4]);
     let mut out = [0u8; 512];

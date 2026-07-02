@@ -36,17 +36,17 @@ pub const PW_STATUS_DEFAULT: &[u8] = &[
 /// The computed/composite data objects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FuncDo {
-    ChData,     // 0x65 parse_ch_data
-    SecTpl,     // 0x7A parse_sec_tpl
+    ChData,     // 0x65 emit_ch_data
+    SecTpl,     // 0x7A emit_sec_tpl
     ChCert,     // 0x7F21 — GET/PUT routed to EF_CH_1/2/3 by the dispatcher (occurrence)
-    Fp,         // 0xC5 parse_fp
-    CaFp,       // 0xC6 parse_cafp
-    Ts,         // 0xCD parse_ts
-    KeyInfo,    // 0xDE parse_keyinfo
-    AlgoInfo,   // 0xC1/0xC2/0xC3/0xFA parse_algoinfo
-    AppData,    // 0x6E parse_app_data
-    DiscreteDo, // 0x73 parse_discrete_do
-    PwStatus,   // 0xC4 parse_pw_status
+    Fp,         // 0xC5 emit_fp
+    CaFp,       // 0xC6 emit_cafp
+    Ts,         // 0xCD emit_ts
+    KeyInfo,    // 0xDE emit_keyinfo
+    AlgoInfo,   // 0xC1/0xC2/0xC3/0xFA emit_algoinfo
+    AppData,    // 0x6E emit_app_data
+    DiscreteDo, // 0x73 emit_discrete_do
+    PwStatus,   // 0xC4 emit_pw_status
 }
 
 /// Where a DO's data comes from.
@@ -115,24 +115,12 @@ pub fn source(fid: u16) -> DoSource {
 /// Build the 16-byte full AID with the 4-byte device serial spliced in at
 /// offset 10.
 pub fn full_aid(serial: &[u8; 4]) -> [u8; 16] {
-    let mut aid = [
-        0xD2,
-        0x76,
-        0x00,
-        0x01,
-        0x24,
-        0x01,
-        OPGP_VERSION_MAJOR,
-        OPGP_VERSION_MINOR,
-        0xff,
-        0xfe,
-        0xff,
-        0xff,
-        0xff,
-        0xff,
-        0x00,
-        0x00,
-    ];
+    let mut aid = [0u8; 16];
+    aid[..6].copy_from_slice(OPENPGP_AID);
+    aid[6] = OPGP_VERSION_MAJOR;
+    aid[7] = OPGP_VERSION_MINOR;
+    aid[8] = 0xff;
+    aid[9] = 0xfe;
     aid[10..14].copy_from_slice(serial);
     aid
 }

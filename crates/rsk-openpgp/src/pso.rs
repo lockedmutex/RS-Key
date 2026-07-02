@@ -18,10 +18,6 @@ use crate::keys::{inc_sig_count, load_aes_key, load_ec_key, load_rsa_key, rsa_de
 use crate::pin::Session;
 use crate::{Rng, UserPresence, check_uif};
 
-/// Status 0x6A80 (wrong data).
-const WRONG_DATA: Sw = Sw::INCORRECT_PARAMS;
-const DEFAULT_ALGO: &[u8] = &[ALGO_RSA, 0x08, 0x00, 0x00, 0x20, 0x00];
-
 /// Read the algorithm attribute stored at `algo_fid` into `buf`, defaulting to
 /// RSA-2048.
 fn algo_id<S: Storage>(fs: &mut Fs<S>, algo_fid: u16, buf: &mut [u8; 16]) -> u8 {

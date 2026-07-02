@@ -34,9 +34,6 @@ use crate::consts::*;
 use crate::dobj::{ATTR_CV25519, ATTR_ED25519, ATTR_P256K1, ATTR_P256R1, ATTR_P384R1, ATTR_P521R1};
 use crate::pin::{Session, load_dek};
 
-/// Status 0x6A80 (wrong data).
-const WRONG_DATA: Sw = Sw::INCORRECT_PARAMS;
-
 /// Largest raw ECDSA signature: P-521 `r ‖ s` = 2×66 bytes.
 pub const MAX_EC_SIG: usize = 132;
 /// Largest EC public point: P-521 uncompressed `04 ‖ x ‖ y` = 1 + 2×66 bytes.
@@ -1033,8 +1030,7 @@ pub fn load_rsa_key<S: Storage>(
         let half = n / 2;
         let p = BigUint::from_bytes_be(&kdata[..half]);
         let q = BigUint::from_bytes_be(&kdata[half..n]);
-        let key =
-            RsaPrivateKey::from_p_q(p, q, BigUint::from(65_537u32)).map_err(|_| WRONG_DATA)?;
+        let key = RsaPrivateKey::from_p_q(p, q, BigUint::from(RSA_E)).map_err(|_| WRONG_DATA)?;
         Ok((key, legacy))
     })();
     kdata.zeroize();
@@ -1096,14 +1092,8 @@ pub fn rsa_sign_em(data: &[u8], em: &mut [u8; MAX_RSA_DIGESTINFO]) -> Option<usi
     let (prefix, hash): (&[u8], &[u8]) = if let Some(di) = match_digestinfo(data) {
         di
     } else {
-        match data.len() {
-            20 => (DI_SHA1, data),
-            28 => (DI_SHA224, data),
-            32 => (DI_SHA256, data),
-            48 => (DI_SHA384, data),
-            64 => (DI_SHA512, data),
-            _ => return None,
-        }
+        let &(prefix, _) = DIGESTINFOS.iter().find(|&&(_, hlen)| hlen == data.len())?;
+        (prefix, data)
     };
     let dlen = prefix.len() + hash.len();
     em[..prefix.len()].copy_from_slice(prefix);

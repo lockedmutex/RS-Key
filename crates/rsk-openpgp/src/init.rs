@@ -23,13 +23,16 @@ pub enum Error {
     Crypto,
 }
 
-const FORMAT_V3: u8 = 0x03;
-const PIN_FORMAT_V1: u8 = 0x01;
 const KDF_DEFAULT: &[u8] = &[0x81, 0x01, 0x00];
 const UIF_DEFAULT: &[u8] = &[0x00, 0x20];
 const SEX_DEFAULT: &[u8] = &[0x30];
 const SIG_COUNT_ZERO: &[u8] = &[0x00, 0x00, 0x00];
-const PW_RETRIES_INIT: &[u8] = &[0x01, 3, 3, 3];
+const PW_RETRIES_INIT: &[u8] = &[
+    0x01,
+    PW_RETRIES_DEFAULT,
+    PW_RETRIES_DEFAULT,
+    PW_RETRIES_DEFAULT,
+];
 
 fn put<S: Storage>(fs: &mut Fs<S>, fid: u16, data: &[u8]) -> Result<(), Error> {
     fs.put(fid, data).map_err(|_| Error::Storage)
@@ -42,13 +45,7 @@ fn put_pin_verifier<S: Storage>(
     fid: u16,
     pin: &[u8],
 ) -> Result<(), Error> {
-    let mut rec = [0u8; 34];
-    rec[0] = pin.len() as u8;
-    rec[1] = PIN_FORMAT_V1;
-    rec[2..].copy_from_slice(&dev.pin_derive_verifier(pin));
-    let r = put(fs, fid, &rec);
-    rec.zeroize();
-    r
+    crate::pin::put_verifier(dev, fs, fid, pin).map_err(|_| Error::Storage)
 }
 
 /// Initialise the OpenPGP EFs: the DEK (sealed under the default PINs), the PIN
@@ -70,7 +67,7 @@ pub fn scan_files<S: Storage>(
         let mut session_pw1 = dev.pin_derive_session(PW1_DEFAULT);
         let mut session_pw3 = dev.pin_derive_session(PW3_DEFAULT);
         let mut def = [0u8; DEK_FILE_SIZE];
-        def[0] = FORMAT_V3;
+        def[0] = DEK_FORMAT_V3;
         let mut nonce = [0u8; 12];
 
         rng.fill(&mut nonce);

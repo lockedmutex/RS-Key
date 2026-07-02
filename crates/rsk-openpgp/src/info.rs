@@ -157,7 +157,7 @@ pub fn read_info<S: Storage>(fs: &mut Fs<S>) -> OpenpgpInfo {
 
     let mut pw = [0u8; 7];
     let (pw1_retries, pw3_retries) = match fs.read(EF_PW_PRIV, &mut pw) {
-        Some(n) if n >= 7 => (pw[4], pw[6]),
+        Some(n) if n >= 7 => (pw[PW1_RETRY_IDX], pw[PW3_RETRY_IDX]),
         _ => (PW_RETRIES_DEFAULT, PW_RETRIES_DEFAULT),
     };
 

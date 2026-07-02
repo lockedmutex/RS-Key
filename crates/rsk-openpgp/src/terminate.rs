@@ -71,8 +71,8 @@ pub fn terminate_df<S: Storage>(
         Some(n) => n,
         None => return Sw::REFERENCE_NOT_FOUND,
     };
-    // EF_PW_PRIV[6] is the live PW3 retry counter (`pin_wrong_retry` decrements it).
-    if !has_pw3 && n > 6 && pw[6] > 0 {
+    // The live PW3 retry counter (`pin_wrong_retry` decrements it).
+    if !has_pw3 && n > PW3_RETRY_IDX && pw[PW3_RETRY_IDX] > 0 {
         return Sw::SECURITY_STATUS_NOT_SATISFIED;
     }
     if apdu.nc != 0 {

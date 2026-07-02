@@ -98,7 +98,7 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 fn pin_wrong_retry<S: Storage>(fs: &mut Fs<S>, fid: u16) -> Result<u8, ()> {
     let mut pw = [0u8; 8];
     let n = fs.read(EF_PW_PRIV, &mut pw).ok_or(())?;
-    let idx = 3 + (fid & 0xf) as usize;
+    let idx = pw_retry_idx(fid);
     if idx >= n || pw[idx] == 0 {
         return Err(());
     }
@@ -124,7 +124,7 @@ fn pin_reset_retries<S: Storage>(fs: &mut Fs<S>, fid: u16, force: bool) -> Resul
         .read(EF_PW_RETRIES, &mut retr)
         .ok_or(Sw::REFERENCE_NOT_FOUND)?;
     let slot = (fid & 0xf) as usize;
-    let idx = 3 + slot;
+    let idx = pw_retry_idx(fid);
     if idx >= n || slot >= rn {
         return Err(Sw::MEMORY_FAILURE);
     }
@@ -218,7 +218,7 @@ fn migrate_pin_kbase<S: Storage>(
     };
     let mut blob = [0u8; DEK_FILE_SIZE];
     if let Some(n) = fs.read_key(dek_fid, &mut blob).map(|n| n.min(blob.len())) {
-        if n < 1 || blob[0] != 0x03 {
+        if n < 1 || blob[0] != DEK_FORMAT_V3 {
             return Err(Sw::EXEC_ERROR);
         }
         let old = dev.without_otp();
@@ -271,12 +271,18 @@ pub fn load_dek<S: Storage>(
         .read_key(fid, &mut blob)
         .ok_or(Sw::REFERENCE_NOT_FOUND)?
         .min(blob.len());
-    if n < 1 || blob[0] != 0x03 {
+    if n < 1 || blob[0] != DEK_FORMAT_V3 {
         return Err(Sw::EXEC_ERROR);
     }
     dev.decrypt_with_aad(key, &blob[1..n], PinKdf::V2, out)
         .map_err(|_| Sw::EXEC_ERROR)?;
     Ok(())
+}
+
+/// The verifier EF for a VERIFY/CHANGE PIN mode: the internal-EF namespace puts
+/// PW verifiers at `0x1000 | mode` (`EF_PW1`/`EF_RC`/`EF_PW3`).
+fn pw_fid(p2: u8) -> u16 {
+    0x1000 | p2 as u16
 }
 
 /// VERIFY (INS 0x20).
@@ -304,7 +310,7 @@ pub fn verify<S: Storage>(
     if p1 != 0x00 || (p2 & 0x60) != 0x00 {
         return Sw::WRONG_P1P2;
     }
-    let mut fid = 0x1000 | p2 as u16;
+    let mut fid = pw_fid(p2);
     if fid == EF_RC && !data.is_empty() {
         fid = EF_PW1; // PW2 (p2 = 0x82) verifies against the PW1 verifier
     }
@@ -320,7 +326,7 @@ pub fn verify<S: Storage>(
     // Status query: report the remaining retries / current auth state.
     let mut pw = [0u8; 8];
     let pn = fs.read(EF_PW_PRIV, &mut pw).unwrap_or(0);
-    let idx = 3 + (fid & 0xf) as usize;
+    let idx = pw_retry_idx(fid);
     let retries = if idx < pn { pw[idx] } else { 0 };
     if retries == 0 {
         return Sw::PIN_BLOCKED;
@@ -336,10 +342,15 @@ pub fn verify<S: Storage>(
 }
 
 /// Write a verifier record `[len, 0x01, verifier(32)]` for `pin`.
-fn put_verifier<S: Storage>(dev: &Device, fs: &mut Fs<S>, fid: u16, pin: &[u8]) -> Result<(), Sw> {
+pub(crate) fn put_verifier<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    fid: u16,
+    pin: &[u8],
+) -> Result<(), Sw> {
     let mut rec = [0u8; 34];
     rec[0] = pin.len() as u8;
-    rec[1] = 0x01;
+    rec[1] = PIN_FORMAT_V1;
     rec[2..].copy_from_slice(&dev.pin_derive_verifier(pin));
     let r = fs.put(fid, &rec).map_err(|_| Sw::MEMORY_FAILURE);
     rec.zeroize();
@@ -358,7 +369,7 @@ fn rewrap_dek<S: Storage>(
 ) -> Result<[u8; 32], Sw> {
     let session = dev.pin_derive_session(pin);
     let mut def = [0u8; DEK_FILE_SIZE];
-    def[0] = 0x03;
+    def[0] = DEK_FORMAT_V3;
     let mut nonce = [0u8; 12];
     rng.fill(&mut nonce);
     dev.encrypt_with_aad(&session, dek, PinKdf::V2, &nonce, &mut def[1..])
@@ -384,7 +395,7 @@ pub fn change_pin<S: Storage>(
     if p1 != 0x00 {
         return Sw::WRONG_P1P2;
     }
-    let fid = 0x1000 | p2 as u16;
+    let fid = pw_fid(p2);
     let mut rec = [0u8; 64];
     let old_len = match fs.read(fid, &mut rec) {
         Some(n) if n >= 1 => rec[0] as usize,

@@ -21,9 +21,7 @@ pub fn put_data<S: Storage>(fs: &mut Fs<S>, sess: &Session, fid: u16, data: &[u8
         // here so a direct call cannot write them as raw DOs.
         EF_RESET_CODE | EF_PW_STATUS => return Sw::CONDITIONS_NOT_SATISFIED,
         // Algorithm attributes write to the private storage read back by `dobj`.
-        EF_ALGO_SIG => EF_ALGO_PRIV1,
-        EF_ALGO_DEC => EF_ALGO_PRIV2,
-        EF_ALGO_AUT => EF_ALGO_PRIV3,
+        EF_ALGO_SIG | EF_ALGO_DEC | EF_ALGO_AUT => algo_tag_to_priv(fid),
         f if matches!(source(f), DoSource::Flash) => f,
         _ => return Sw::REFERENCE_NOT_FOUND,
     };

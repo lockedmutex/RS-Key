@@ -18,13 +18,6 @@ use crate::keys::{
 use crate::pin::Session;
 use rsa::RsaPrivateKey;
 
-/// Status 0x6A80 (wrong data).
-const WRONG_DATA: Sw = Sw::INCORRECT_PARAMS;
-
-/// Default algorithm attribute when the slot has no `EF_ALGO_PRIV*` —
-/// RSA-2048, gpg's default.
-const DEFAULT_ALGO: &[u8] = &[ALGO_RSA, 0x08, 0x00, 0x00, 0x20, 0x00];
-
 /// GENERATE ASYMMETRIC KEY PAIR (INS 0x47). Returns `(response_len, status)`;
 /// the response (written to `out`) is the public-key DO `7F49 { … }`.
 #[allow(clippy::too_many_arguments)]
@@ -49,11 +42,8 @@ pub fn keypair_gen<S: Storage>(
     if !sess.has_pw3 && p1 == 0x80 {
         return (0, Sw::SECURITY_STATUS_NOT_SATISFIED);
     }
-    let fid = match data.first() {
-        Some(0xB6) => EF_PK_SIG,
-        Some(0xB8) => EF_PK_DEC,
-        Some(0xA4) => EF_PK_AUT,
-        _ => return (0, WRONG_DATA),
+    let Some(fid) = data.first().and_then(|&t| crt_slot(t)) else {
+        return (0, WRONG_DATA);
     };
 
     let r = match p1 {
@@ -80,7 +70,7 @@ fn generate<S: Storage>(
     // Clamp to the buffer: `Storage::read` reports the DO's full stored length and
     // PUT DATA caps nothing, so an over-long C1/C2/C3 must not slice OOB = brick.
     let mut algo_buf = [0u8; 16];
-    let algo: &[u8] = match fs.read(fid.get() - 0x10, &mut algo_buf) {
+    let algo: &[u8] = match fs.read(slot_algo_fid(fid), &mut algo_buf) {
         Some(n) if n > 0 => &algo_buf[..n.min(algo_buf.len())],
         _ => DEFAULT_ALGO,
     };
@@ -148,7 +138,7 @@ fn store_public<S: Storage>(
     pub_do: &[u8],
     out: &mut [u8],
 ) -> Result<usize, Sw> {
-    fs.put(fid.get() + 3, pub_do)
+    fs.put(slot_pub_fid(fid), pub_do)
         .map_err(|_| Sw::MEMORY_FAILURE)?;
     out[..pub_do.len()].copy_from_slice(pub_do);
     Ok(pub_do.len())
@@ -156,13 +146,13 @@ fn store_public<S: Storage>(
 
 /// `P1 = 0x81`: return the stored public-key DO from `EF_PB_*` (slot FID + 3).
 fn read_public<S: Storage>(fs: &mut Fs<S>, fid: KeyFid, out: &mut [u8]) -> Result<usize, Sw> {
-    if !fs.has_data(fid.get() + 3) {
+    if !fs.has_data(slot_pub_fid(fid)) {
         return Err(Sw::REFERENCE_NOT_FOUND);
     }
     // Fs::read returns the value's full stored length; the backend copied only
     // min(len, out.len()). Clamp before returning, like every other reader in the
     // crate, so the caller's `scratch[..n]` slice can never run past `out`.
-    fs.read(fid.get() + 3, out)
+    fs.read(slot_pub_fid(fid), out)
         .map(|n| n.min(out.len()))
         .ok_or(Sw::REFERENCE_NOT_FOUND)
 }
@@ -197,14 +187,9 @@ pub fn rsa_generate_params<S: Storage>(
     if !sess.has_pw3 {
         return Err(Sw::SECURITY_STATUS_NOT_SATISFIED);
     }
-    let fid = match data.first() {
-        Some(0xB6) => EF_PK_SIG,
-        Some(0xB8) => EF_PK_DEC,
-        Some(0xA4) => EF_PK_AUT,
-        _ => return Err(WRONG_DATA),
-    };
+    let fid = data.first().and_then(|&t| crt_slot(t)).ok_or(WRONG_DATA)?;
     let mut algo_buf = [0u8; 16];
-    let algo: &[u8] = match fs.read(fid.get() - 0x10, &mut algo_buf) {
+    let algo: &[u8] = match fs.read(slot_algo_fid(fid), &mut algo_buf) {
         // Clamp: full stored length may exceed the buffer (see `generate`).
         Some(n) if n > 0 => &algo_buf[..n.min(algo_buf.len())],
         _ => DEFAULT_ALGO,

@@ -86,9 +86,9 @@ pub(crate) fn check_uif<S: Storage>(
         // The trusted screen names which key operation the UIF is gating (the
         // OpenPGP UIF DOs: 0xD6 signature, 0xD7 decryption, 0xD8 authentication).
         let title = match fid {
-            0xD6 => "Sign data?",
-            0xD7 => "Decrypt data?",
-            0xD8 => "Authenticate?",
+            consts::EF_UIF_SIG => "Sign data?",
+            consts::EF_UIF_DEC => "Decrypt data?",
+            consts::EF_UIF_AUT => "Authenticate?",
             _ => "Confirm?",
         };
         if presence.request(Confirm::titled(title)) != Presence::Confirmed {

@@ -14,8 +14,6 @@ use crate::keys::{load_ec_key, load_rsa_key, rsa_sign};
 use crate::pin::Session;
 use crate::{Rng, UserPresence, check_uif};
 
-const DEFAULT_ALGO: &[u8] = &[ALGO_RSA, 0x08, 0x00, 0x00, 0x20, 0x00];
-
 /// INTERNAL AUTHENTICATE (INS 0x88, P1P2 = 00 00).
 pub fn internal_aut<S: Storage>(
     dev: &Device,

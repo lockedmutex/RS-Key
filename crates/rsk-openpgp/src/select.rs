@@ -6,7 +6,7 @@
 
 use rsk_sdk::{Apdu, Sw};
 
-use crate::consts::{EF_CH_CERT, OPENPGP_AID};
+use crate::consts::{EF_CH_CERT, OPENPGP_AID, WRONG_DATA};
 use crate::files::{DoSource, source};
 use crate::pin::Session;
 
@@ -19,15 +19,16 @@ const HEAP_FREE: u32 = 0x0008_0000;
 /// | 64 06 53 04 <heap32>` — the application DF (fid 0x0000, name = the full
 /// 6-byte AID, working EF, transparent, activated).
 pub fn build_fci(out: &mut [u8]) -> usize {
-    const FCP: [u8; 22] = [
+    const FCP_HEAD: [u8; 13] = [
         0x81, 0x02, 0x00, 0x00, // file size (DF → 0)
         0x82, 0x01, 0x01, // descriptor: working EF, transparent
         0x83, 0x02, 0x00, 0x00, // file id 0x0000
-        0x84, 0x06, 0xD2, 0x76, 0x00, 0x01, 0x24, 0x01, // DF name = AID
-        0x8A, 0x01, 0x05, // life-cycle: activated
+        0x84, 0x06, // DF name = AID (spliced in below)
     ];
+    const FCP_TAIL: [u8; 3] = [0x8A, 0x01, 0x05]; // life-cycle: activated
+    let fcp_len = FCP_HEAD.len() + OPENPGP_AID.len() + FCP_TAIL.len();
     let heap = HEAP_FREE.to_be_bytes();
-    let body_len = 2 + FCP.len() + 8; // 62-template + the 8-byte 64 DO
+    let body_len = 2 + fcp_len + 8; // 62-template + the 8-byte 64 DO
     let total = 2 + body_len;
     if out.len() < total {
         return 0;
@@ -37,10 +38,14 @@ pub fn build_fci(out: &mut [u8]) -> usize {
     out[p + 1] = body_len as u8;
     p += 2;
     out[p] = 0x62;
-    out[p + 1] = FCP.len() as u8;
+    out[p + 1] = fcp_len as u8;
     p += 2;
-    out[p..p + FCP.len()].copy_from_slice(&FCP);
-    p += FCP.len();
+    out[p..p + FCP_HEAD.len()].copy_from_slice(&FCP_HEAD);
+    p += FCP_HEAD.len();
+    out[p..p + OPENPGP_AID.len()].copy_from_slice(OPENPGP_AID);
+    p += OPENPGP_AID.len();
+    out[p..p + FCP_TAIL.len()].copy_from_slice(&FCP_TAIL);
+    p += FCP_TAIL.len();
     out[p..p + 4].copy_from_slice(&[0x64, 0x06, 0x53, 0x04]);
     p += 4;
     out[p..p + 4].copy_from_slice(&heap);
@@ -99,7 +104,7 @@ pub fn select_data(apdu: &Apdu, sess: &mut Session) -> Sw {
     }
     let taglen = d[3] as usize;
     if d[2] != 0x5C || taglen == 0 || taglen > 2 || d.len() < 4 + taglen {
-        return Sw::INCORRECT_PARAMS; // 0x6A80 (wrong data)
+        return WRONG_DATA;
     }
     let tag = if taglen == 2 {
         ((d[4] as u16) << 8) | d[5] as u16

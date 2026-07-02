@@ -39,7 +39,7 @@ fn creates_all_default_files() {
         assert_eq!(fs.size(fid.get()), Some(DEK_FILE_SIZE));
         let mut b = [0u8; 1];
         fs.read(fid.get(), &mut b);
-        assert_eq!(b[0], FORMAT_V3);
+        assert_eq!(b[0], DEK_FORMAT_V3);
     }
     // PIN verifiers: [len, 1, verifier(32)].
     let mut rec = [0u8; 34];
@@ -68,7 +68,7 @@ fn dek_decrypts_under_default_pin() {
     // The wrapped DEK is recoverable with the default PW1 session key.
     let mut blob = [0u8; DEK_FILE_SIZE];
     let n = fs.read(EF_DEK_PW1.get(), &mut blob).unwrap();
-    assert_eq!(blob[0], FORMAT_V3);
+    assert_eq!(blob[0], DEK_FORMAT_V3);
     let session = d.pin_derive_session(PW1_DEFAULT);
     let mut dek = [0u8; DEK_SIZE];
     let m = d
