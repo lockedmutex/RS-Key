@@ -571,6 +571,60 @@ fn missing_mandatory_param_rejected() {
     );
 }
 
+#[test]
+fn out_of_order_optional_keys_rejected() {
+    // Canonical CBOR requires ascending map keys. Key 6 after key 7 (both
+    // optional) descends → INVALID_CBOR (the `key < expected` guard), never a
+    // silent second pass over an already-seen field.
+    let req = mc_build(6, |e| {
+        good_params(e);
+        e.u8(7).unwrap().map(1).unwrap();
+        e.str("rk").unwrap().bool(true).unwrap();
+        e.u8(6).unwrap().map(1).unwrap();
+        e.str("credProtect").unwrap().u64(1).unwrap();
+    });
+    assert_eq!(run_err(&req), CtapError::InvalidCbor);
+}
+
+#[test]
+fn unknown_top_level_key_ignored() {
+    // An unrecognized top-level key (0x0B) is skipped, not an error — the map
+    // still parses and the credential is created.
+    let req = mc_build(5, |e| {
+        good_params(e);
+        e.u8(11).unwrap().u8(0).unwrap();
+    });
+    assert!(!run(&req).0.is_empty());
+}
+
+#[test]
+fn unknown_option_key_ignored() {
+    // An unrecognized option sub-key is skipped; the recognized `rk` still applies.
+    let req = mc_build(5, |e| {
+        good_params(e);
+        e.u8(7).unwrap().map(2).unwrap();
+        e.str("rk").unwrap().bool(true).unwrap();
+        e.str("bogus").unwrap().bool(true).unwrap();
+    });
+    let (resp, mut fs) = run(&req);
+    assert!(!resp.is_empty());
+    assert!(fs.has_data(crate::consts::EF_CRED));
+}
+
+#[test]
+fn third_party_payment_extension_accepted() {
+    // thirdPartyPayment is parsed and sealed into the box (no authData echo); a
+    // request carrying it registers successfully.
+    let req = mc_build(6, |e| {
+        good_params(e);
+        e.u8(6).unwrap().map(1).unwrap();
+        e.str("thirdPartyPayment").unwrap().bool(true).unwrap();
+        e.u8(7).unwrap().map(1).unwrap();
+        e.str("rk").unwrap().bool(true).unwrap();
+    });
+    assert!(!run(&req).0.is_empty());
+}
+
 fn dev() -> Device<'static> {
     Device {
         serial_hash: &[0xAB; 32],

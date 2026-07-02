@@ -134,127 +134,12 @@ fn parse(data: &[u8]) -> Result<Request<'_>, CtapError> {
         expected = key + 1;
         match key {
             1 => req.client_data_hash = cbor(d.bytes())?,
-            2 => {
-                let m = def_map(&mut d)?;
-                for _ in 0..m {
-                    match cbor(d.str())? {
-                        "id" => req.rp_id = cbor(d.str())?,
-                        // rp.name must be a text string when present (conformance
-                        // MakeCredential Req-2 F-2); read-as-text so a non-text
-                        // value surfaces as CBOR_UNEXPECTED_TYPE.
-                        "name" => {
-                            let _: &str = cbor(d.str())?;
-                        }
-                        _ => cbor(d.skip())?,
-                    }
-                }
-            }
-            3 => {
-                let m = def_map(&mut d)?;
-                for _ in 0..m {
-                    match cbor(d.str())? {
-                        "id" => req.user_id = cbor(d.bytes())?,
-                        "name" => req.user_name = cbor(d.str())?,
-                        "displayName" => req.user_display_name = cbor(d.str())?,
-                        _ => cbor(d.skip())?,
-                    }
-                }
-            }
-            4 => {
-                let a = def_arr(&mut d)?;
-                for _ in 0..a {
-                    req.has_pubkey_param = true;
-                    let m = def_map(&mut d)?;
-                    let (mut ty, mut alg, mut ty_present, mut alg_present) =
-                        ("", 0i64, false, false);
-                    for _ in 0..m {
-                        match cbor(d.str())? {
-                            "type" => {
-                                ty = cbor(d.str())?;
-                                ty_present = true;
-                            }
-                            "alg" => {
-                                alg = cbor(d.i64())?;
-                                alg_present = true;
-                            }
-                            _ => cbor(d.skip())?,
-                        }
-                    }
-                    // Every entry is a PublicKeyCredentialParameters and must carry
-                    // both "type" and "alg" (conformance MakeCredential Req-4 F-4).
-                    if !ty_present || !alg_present {
-                        return Err(CtapError::InvalidCbor);
-                    }
-                    // Pick the first supported algorithm offered. Under PREFER_PQC
-                    // a later ML-DSA-44 entry overrides a classic pick — see the
-                    // const's rationale.
-                    if ty == "public-key"
-                        && let Some((ca, cv)) = alg_to_curve(alg)
-                    {
-                        let upgrade = PREFER_PQC && ca == ALG_MLDSA44 && req.sel_alg != ALG_MLDSA44;
-                        if req.sel_alg == 0 || upgrade {
-                            req.sel_alg = ca;
-                            req.sel_curve = cv as i64;
-                        }
-                    }
-                }
-            }
-            5 => {
-                let a = def_arr(&mut d)?;
-                for _ in 0..a {
-                    let m = def_map(&mut d)?;
-                    let mut id: &[u8] = &[];
-                    let (mut id_present, mut type_present) = (false, false);
-                    for _ in 0..m {
-                        match cbor(d.str())? {
-                            "id" => {
-                                id = cbor(d.bytes())?;
-                                id_present = true;
-                            }
-                            // Read "type" as text so a byte-string yields CborUnexpectedType.
-                            "type" => {
-                                let _: &str = cbor(d.str())?;
-                                type_present = true;
-                            }
-                            _ => cbor(d.skip())?,
-                        }
-                    }
-                    // A credential descriptor needs both "type" and "id".
-                    if !type_present || !id_present {
-                        return Err(CtapError::MissingParameter);
-                    }
-                    if req.exclude_len < MAX_EXCLUDE {
-                        req.exclude[req.exclude_len] = id;
-                        req.exclude_len += 1;
-                    }
-                }
-            }
-            6 => {
-                let m = def_map(&mut d)?;
-                for _ in 0..m {
-                    match cbor(d.str())? {
-                        "credProtect" => req.ext_cred_protect = cbor(d.u32())? as u64,
-                        "credBlob" => req.ext_cred_blob = cbor(d.bytes())?,
-                        "minPinLength" => req.ext_min_pin_length = cbor(d.bool())?,
-                        "thirdPartyPayment" => req.ext_third_party_payment = cbor(d.bool())?,
-                        "hmac-secret" => req.ext_hmac_secret = cbor(d.bool())?,
-                        "hmac-secret-mc" => req.hmac_secret_mc = hmacsecret::parse(&mut d)?,
-                        "largeBlobKey" => req.ext_large_blob_key = Some(cbor(d.bool())?),
-                        _ => cbor(d.skip())?,
-                    }
-                }
-            }
-            7 => {
-                let m = def_map(&mut d)?;
-                for _ in 0..m {
-                    match cbor(d.str())? {
-                        "rk" => req.rk = cbor(d.bool())?,
-                        "up" => req.up = Some(cbor(d.bool())?),
-                        "uv" => req.uv = cbor(d.bool())?,
-                        _ => cbor(d.skip())?,
-                    }
-                }
-            }
+            2 => parse_rp_entity(&mut d, &mut req)?,
+            3 => parse_user_entity(&mut d, &mut req)?,
+            4 => parse_pubkey_params(&mut d, &mut req)?,
+            5 => parse_exclude_list(&mut d, &mut req)?,
+            6 => parse_extensions(&mut d, &mut req)?,
+            7 => parse_options(&mut d, &mut req)?,
             8 => req.pin_uv_auth_param = Some(cbor(d.bytes())?),
             9 => req.pin_uv_auth_protocol = cbor(d.u32())? as u64,
             10 => req.enterprise_attestation = cbor(d.u32())? as u64,
@@ -262,6 +147,142 @@ fn parse(data: &[u8]) -> Result<Request<'_>, CtapError> {
         }
     }
     Ok(req)
+}
+
+/// Parse the `rp` PublicKeyCredentialRpEntity (request key 2) into `req`.
+fn parse_rp_entity<'a>(d: &mut Decoder<'a>, req: &mut Request<'a>) -> Result<(), CtapError> {
+    let m = def_map(d)?;
+    for _ in 0..m {
+        match cbor(d.str())? {
+            "id" => req.rp_id = cbor(d.str())?,
+            // rp.name must be a text string when present (conformance
+            // MakeCredential Req-2 F-2); read-as-text so a non-text value
+            // surfaces as CBOR_UNEXPECTED_TYPE.
+            "name" => {
+                let _: &str = cbor(d.str())?;
+            }
+            _ => cbor(d.skip())?,
+        }
+    }
+    Ok(())
+}
+
+/// Parse the `user` PublicKeyCredentialUserEntity (request key 3) into `req`.
+fn parse_user_entity<'a>(d: &mut Decoder<'a>, req: &mut Request<'a>) -> Result<(), CtapError> {
+    let m = def_map(d)?;
+    for _ in 0..m {
+        match cbor(d.str())? {
+            "id" => req.user_id = cbor(d.bytes())?,
+            "name" => req.user_name = cbor(d.str())?,
+            "displayName" => req.user_display_name = cbor(d.str())?,
+            _ => cbor(d.skip())?,
+        }
+    }
+    Ok(())
+}
+
+/// Parse `pubKeyCredParams` (request key 4), selecting the first supported
+/// algorithm — under PREFER_PQC a later ML-DSA-44 entry overrides a classic pick.
+fn parse_pubkey_params(d: &mut Decoder<'_>, req: &mut Request<'_>) -> Result<(), CtapError> {
+    let a = def_arr(d)?;
+    for _ in 0..a {
+        req.has_pubkey_param = true;
+        let m = def_map(d)?;
+        let (mut ty, mut alg, mut ty_present, mut alg_present) = ("", 0i64, false, false);
+        for _ in 0..m {
+            match cbor(d.str())? {
+                "type" => {
+                    ty = cbor(d.str())?;
+                    ty_present = true;
+                }
+                "alg" => {
+                    alg = cbor(d.i64())?;
+                    alg_present = true;
+                }
+                _ => cbor(d.skip())?,
+            }
+        }
+        // Every entry is a PublicKeyCredentialParameters and must carry both
+        // "type" and "alg" (conformance MakeCredential Req-4 F-4).
+        if !ty_present || !alg_present {
+            return Err(CtapError::InvalidCbor);
+        }
+        if ty == "public-key"
+            && let Some((ca, cv)) = alg_to_curve(alg)
+        {
+            let upgrade = PREFER_PQC && ca == ALG_MLDSA44 && req.sel_alg != ALG_MLDSA44;
+            if req.sel_alg == 0 || upgrade {
+                req.sel_alg = ca;
+                req.sel_curve = cv as i64;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Parse `excludeList` (request key 5) into `req.exclude` (capped at MAX_EXCLUDE).
+fn parse_exclude_list<'a>(d: &mut Decoder<'a>, req: &mut Request<'a>) -> Result<(), CtapError> {
+    let a = def_arr(d)?;
+    for _ in 0..a {
+        let m = def_map(d)?;
+        let mut id: &[u8] = &[];
+        let (mut id_present, mut type_present) = (false, false);
+        for _ in 0..m {
+            match cbor(d.str())? {
+                "id" => {
+                    id = cbor(d.bytes())?;
+                    id_present = true;
+                }
+                // Read "type" as text so a byte-string yields CborUnexpectedType.
+                "type" => {
+                    let _: &str = cbor(d.str())?;
+                    type_present = true;
+                }
+                _ => cbor(d.skip())?,
+            }
+        }
+        // A credential descriptor needs both "type" and "id".
+        if !type_present || !id_present {
+            return Err(CtapError::MissingParameter);
+        }
+        if req.exclude_len < MAX_EXCLUDE {
+            req.exclude[req.exclude_len] = id;
+            req.exclude_len += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Parse the makeCredential `extensions` map (request key 6) into `req`.
+fn parse_extensions<'a>(d: &mut Decoder<'a>, req: &mut Request<'a>) -> Result<(), CtapError> {
+    let m = def_map(d)?;
+    for _ in 0..m {
+        match cbor(d.str())? {
+            "credProtect" => req.ext_cred_protect = cbor(d.u32())? as u64,
+            "credBlob" => req.ext_cred_blob = cbor(d.bytes())?,
+            "minPinLength" => req.ext_min_pin_length = cbor(d.bool())?,
+            "thirdPartyPayment" => req.ext_third_party_payment = cbor(d.bool())?,
+            "hmac-secret" => req.ext_hmac_secret = cbor(d.bool())?,
+            "hmac-secret-mc" => req.hmac_secret_mc = hmacsecret::parse(d)?,
+            "largeBlobKey" => req.ext_large_blob_key = Some(cbor(d.bool())?),
+            _ => cbor(d.skip())?,
+        }
+    }
+    Ok(())
+}
+
+/// Parse the `options` map (request key 7: rk / up / uv) into `req`.
+fn parse_options(d: &mut Decoder<'_>, req: &mut Request<'_>) -> Result<(), CtapError> {
+    let m = def_map(d)?;
+    for _ in 0..m {
+        match cbor(d.str())? {
+            "rk" => req.rk = cbor(d.bool())?,
+            "up" => req.up = Some(cbor(d.bool())?),
+            "uv" => req.uv = cbor(d.bool())?,
+            _ => cbor(d.skip())?,
+        }
+    }
+    Ok(())
 }
 
 /// `authenticatorMakeCredential`: write the response CBOR into `out`, returning
