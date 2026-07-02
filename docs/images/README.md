@@ -26,3 +26,4 @@ the mdBook site.
 | `cred-box.svg` | FIDO credential box + 42-byte resident id byte layout | original — from `crates/rsk-fido/src/credential.rs` |
 | `boot-flow.svg` | Boot sequence: bootrom → provision (pre-attach) → serve | original — from `firmware/src/main.rs` |
 | `crate-graph.svg` | Crate dependency layers (binary → applets → platform libs) | original — from the workspace `Cargo.toml` manifests |
+| `otp-fuse-map.svg` | OTP rows RS-Key provisions, by page + write path | original — from `tools/rsk/otp.py` / `secureboot.py` |
