@@ -21,6 +21,26 @@ lock_in_sync() {
   git diff --exit-code -- flake.lock
 }
 
+# The shipping image must fit the 2560K code region (firmware/memory.x). This
+# soft ceiling sits well under that hard limit, so it trips on a *runaway* — an
+# accidental fat dependency (one extra EC curve is ~150 KiB) — not on ordinary
+# growth. Raise it, in the same commit, when a real feature legitimately crosses
+# it. Measured on the default (shipping) build before the display/no-touch
+# rebuilds overwrite the ELF; arm-none-eabi-size ships in the dev shell.
+FIRMWARE_FLASH_BUDGET_KIB=1024
+firmware_size_budget() {
+  local elf="target/thumbv8m.main-none-eabihf/release/firmware"
+  local bytes kib
+  bytes=$(arm-none-eabi-size "$elf" | awk 'NR==2 { print $1 + $2 }')
+  kib=$(( (bytes + 1023) / 1024 ))
+  echo "flash image ${kib} KiB / ${FIRMWARE_FLASH_BUDGET_KIB} KiB ceiling ($(( kib * 100 / FIRMWARE_FLASH_BUDGET_KIB ))%); code region is 2560K"
+  if [ "$kib" -gt "$FIRMWARE_FLASH_BUDGET_KIB" ]; then
+    echo "FAIL: firmware image ${kib} KiB exceeds the ${FIRMWARE_FLASH_BUDGET_KIB} KiB budget." >&2
+    echo "      If the growth is intended, raise FIRMWARE_FLASH_BUDGET_KIB in scripts/check.sh." >&2
+    exit 1
+  fi
+}
+
 run "fmt"                      cargo fmt --all --check
 run "clippy (embedded)"        cargo clippy --workspace -- -D warnings
 run "clippy (host tests)"      cargo clippy -p rsk-sdk -p rsk-fs -p rsk-usb -p rsk-crypto -p rsk-fido -p rsk-openpgp -p rsk-rsa-asm -p rsk-mgmt -p rsk-oath -p rsk-otp -p rsk-piv -p rsk-rescue -p rsk-led -p rsk-ui -p rsk-bip39 -p rsk-slip39 --target "$HOST" --all-targets -- -D warnings
@@ -60,6 +80,7 @@ run "clippy (fips firmware)"   cargo clippy -p firmware --features fips-profile 
 # embedded clippy above never lints it — gate it explicitly, like the fips firmware.
 run "clippy (display firmware)" env LED_KIND=none cargo clippy -p firmware --features display -- -D warnings
 run "build firmware (release)" cargo build --release -p firmware
+run "firmware size budget"     firmware_size_budget
 # The trusted-display flavor must keep building from the same tree. Built
 # `LED_KIND=none` (the panel replaces the addressable LED and its backlight uses
 # GPIO16 — the compile_error guard in main.rs enforces this), and before the
