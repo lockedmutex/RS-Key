@@ -6,26 +6,31 @@
 #   miri — fuzz/tests/miri.rs: every fuzz target's logic under Miri's UB
 #          checker. MIRIFLAGS policy comes from the .#fuzz dev shell.
 #   fuzz — a timed libFuzzer pass over every cargo-fuzz target. The corpus
-#          is carried between runs via the actions cache, so coverage
-#          accumulates week over week; crash artifacts are uploaded.
+#          is carried between runs via the actions cache, so its coverage
+#          accumulates day over day; crash artifacts are uploaded.
 #   kani — the #[kani::proof] bounded model-checking harnesses (docs/
 #          testing.md). Kani is not in nixpkgs and its setup downloads a
 #          prebuilt CBMC bundle, so this one job is rustup-based, not nix.
 #   repro — `nix build .#firmware` twice (`--rebuild` diffs every output
 #          byte): proves the hermetic image is bit-reproducible and publishes
 #          the canonical sha256 for this flake.lock (docs/build.md).
+#   coverage — `cargo llvm-cov` line coverage over the host crates, floored:
+#          a regression alarm on the host-testable surface (the embedded
+#          firmware image is not host-measurable). scripts/metrics.sh is the
+#          separate, un-gated refactor-reconnaissance tool.
 #
-# Runs weekly, on demand (workflow_dispatch, with a per-target time knob),
+# Runs daily, on demand (workflow_dispatch, with a per-target time knob),
 # and self-tests on any push that edits this file. Local equivalents:
 #   nix develop .#fuzz -c cargo miri test --manifest-path fuzz/Cargo.toml
 #   nix develop .#fuzz -c cargo fuzz run <target> -- -max_total_time=120
 #   cargo kani -p rsk-sdk -p rsk-fs -p rsk-rsa-asm -p rsk-crypto -p rsk-rescue -p rsk-openpgp -p rsk-otp -p rsk-piv -p rsk-oath -p rsk-usb  (cargo install kani-verifier)
+#   nix develop -c cargo llvm-cov --summary-only --fail-under-lines 80 --target <host> -p rsk-sdk … -p rsk-slip39
 
 name: deep-checks
 
 on:
   schedule:
-    - cron: "17 5 * * 1" # Mondays 05:17 UTC
+    - cron: "17 5 * * *" # 05:17 UTC daily
   workflow_dispatch:
     inputs:
       fuzz_seconds:
@@ -188,3 +193,38 @@ jobs:
             (cd result-repro && sha256sum firmware.uf2 firmware.elf)
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: coverage-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: coverage-${{ runner.os }}-
+
+      # Host crates only — the embedded firmware image is not host-measurable, so
+      # its coverage is 0 by construction and excluded. The 80% floor is a
+      # regression alarm (the host surface currently sits ~88% line), not a
+      # target: a real drop fails, normal fluctuation does not. Mirrors the host
+      # package set in scripts/check.sh.
+      - name: llvm-cov — host-crate line coverage, floored at 80%
+        run: |
+          nix develop -c cargo llvm-cov --summary-only --fail-under-lines 80 \
+            --target x86_64-unknown-linux-gnu \
+            -p rsk-sdk -p rsk-fs -p rsk-usb -p rsk-crypto -p rsk-fido -p rsk-openpgp \
+            -p rsk-rsa-asm -p rsk-mgmt -p rsk-oath -p rsk-otp -p rsk-piv -p rsk-rescue \
+            -p rsk-led -p rsk-ui -p rsk-bip39 -p rsk-slip39
