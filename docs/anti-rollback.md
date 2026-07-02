@@ -57,6 +57,8 @@ image's rollback version against your board's floor:
 - **above** → boots **and immediately burns** the thermometer up to the image's
   version.
 
+![Anti-rollback thermometer — a 48-bit OTP floor with three bits burned; an image below the floor is refused, one at the floor boots, and one above boots and burns the thermometer up to its version](images/rollback-timeline.svg)
+
 The whole mechanism has an on/off fuse, `ROLLBACK_REQUIRED`. Until it is burned,
 images carrying **no** rollback version boot regardless (anti-rollback has no
 teeth). You burn it from firmware:

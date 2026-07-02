@@ -27,3 +27,5 @@ the mdBook site.
 | `boot-flow.svg` | Boot sequence: bootrom → provision (pre-attach) → serve | original — from `firmware/src/main.rs` |
 | `crate-graph.svg` | Crate dependency layers (binary → applets → platform libs) | original — from the workspace `Cargo.toml` manifests |
 | `otp-fuse-map.svg` | OTP rows RS-Key provisions, by page + write path | original — from `tools/rsk/otp.py` / `secureboot.py` |
+| `secure-boot-chain.svg` | Host sign → BOOTSEL flash → bootrom verify chain | original — from `production.md` / `picotool seal` |
+| `rollback-timeline.svg` | 48-bit rollback thermometer + boot decision | original — from `anti-rollback.md` |
