@@ -75,7 +75,7 @@
       1
     ],
     "maxCredentialCountInList": 16,
-    "maxCredentialIdLength": 1024,
+    "maxCredentialIdLength": 748,
     "algorithms": [
       { "alg": -7, "type": "public-key" },
       { "alg": -35, "type": "public-key" },

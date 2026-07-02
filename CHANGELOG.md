@@ -26,7 +26,9 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   `NOT_ALLOWED`. `CRED_BOX_MAX` is now **derived** from the field maxima (748),
   so it can never again drift below what the device accepts; makeCredential
   rejects an over-maximum rpId/user.id explicitly with `CTAP1_ERR_INVALID_LENGTH`
-  rather than as a box overflow; getInfo's `maxCredentialIdLength` follows (748).
+  rather than as a box overflow; getInfo's `maxCredentialIdLength` follows (748),
+  and the published metadata statements (`rs-key.metadata.json` and the
+  `-conformance` variant) are synced to it (were a stale 1024).
   bcdDevice `0x07EB` → `0x07EC`.
 
 ### Changed
