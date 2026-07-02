@@ -156,8 +156,10 @@ pub const MAX_CRED_ID_LENGTH: u64 = crate::credential::CRED_BOX_MAX as u64;
 pub const MAX_CREDENTIAL_COUNT_IN_LIST: u64 = 16;
 
 // pinUvAuthParam MAC covers subCommand ‖ subCommandParams; cap on the raw bytes
-// (vendor.rs deliberately overrides with its own larger cap).
-pub const MAX_RAW_SUBPARA: usize = 256;
+// (vendor.rs deliberately overrides with its own larger cap). A maximal legal
+// updateUserInformation — 42-byte resident credId + 64-byte user.id + 64-byte
+// name + 64-byte displayName — encodes to 286; a full transports echo adds ~40.
+pub const MAX_RAW_SUBPARA: usize = 384;
 
 /// Max serialized large-blob array stored; also the getInfo
 /// `maxSerializedLargeBlobArray` (0x0B).

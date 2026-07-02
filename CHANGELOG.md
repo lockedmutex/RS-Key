@@ -15,6 +15,13 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Fixed
 
+- **Maximal credential-management updates were rejected.** The raw
+  `subCommandParams` cap (`MAX_RAW_SUBPARA`, 256) was smaller than a legal
+  updateUserInformation payload — a 42-byte resident credentialId plus a
+  64-byte user.id, name and displayName encodes to 286 bytes — so such
+  updates failed with `CTAP2_ERR_REQUEST_TOO_LARGE`. The cap is now 384
+  (the 286-byte normative maximum plus a full descriptor `transports` echo).
+  bcdDevice `0x07E8` → `0x07E9`.
 - **Large credentials could never assert.** makeCredential sealed credential
   boxes up to 640 bytes, but getAssertion's candidate filter and credMgmt's
   updateUserInformation reseal buffer stopped at 512 — a long-rpId

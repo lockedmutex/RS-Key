@@ -973,9 +973,11 @@ fn update_user_reseals_near_ceiling_box() {
         parse_mc(&out[..n]).0
     };
 
-    // Update to 40-byte name/displayName (the largest that also fits the raw
-    // subCommandParams echo buffer, MAX_RAW_SUBPARA): the resealed box exceeds 512.
-    let new_name = "u".repeat(40);
+    // A MAXIMAL legal update — 64-byte name/displayName alongside the 64-byte
+    // uid and 42-byte credId: the resealed box exceeds 512 AND the raw
+    // subCommandParams exceed the old 256-byte MAX_RAW_SUBPARA (which rejected
+    // exactly this request with RequestTooLarge).
+    let new_name = "u".repeat(64);
     let mut sp = [0u8; 512];
     let n = {
         let mut e = Encoder::new(Cursor::new(&mut sp[..]));
@@ -990,6 +992,11 @@ fn update_user_reseals_near_ceiling_box() {
         e.writer().position()
     };
     let subpara = sp[..n].to_vec();
+    assert!(
+        subpara.len() > 256 && subpara.len() <= MAX_RAW_SUBPARA,
+        "subpara must cross the old cap (len {})",
+        subpara.len()
+    );
 
     let mut state = armed(PERM_CM);
     let mut out = [0u8; 1024];
