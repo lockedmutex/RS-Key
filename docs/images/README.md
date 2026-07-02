@@ -45,3 +45,4 @@ the mdBook site.
 | `board-one.jpg` | Photo — Waveshare RP2350-One (reference board) | **Waveshare product photo**, used with attribution (hardware.md) |
 | `board-zero.jpg` | Photo — Waveshare RP2350-Zero (mini USB-C stick) | **Waveshare product photo**, used with attribution |
 | `board-display.jpg` | Photo — Waveshare RP2350-Touch-LCD-2.8 (display board) | **Waveshare product photo**, used with attribution |
+| `board-tenstar.jpg` | Photo — TenStar RP2350-USB (mini USB-A stick) | own device photo, composited on white, EXIF stripped |
