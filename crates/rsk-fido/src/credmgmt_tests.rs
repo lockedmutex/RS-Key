@@ -927,10 +927,10 @@ fn legacy_plaintext_rp_migrates_and_stays_usable() {
 }
 
 // updateUserInformation must reseal a ceiling-sized box. The registered box
-// (a 195-byte rpId — the largest whose sealed EF_RP record still fits
-// RP_REC_MAX — 64-byte uid, max credBlob) plus 64-byte updated names crosses
-// the OLD 512-byte reseal buffer — updates on such credentials used to fail
-// NotAllowed while smaller ones worked.
+// (195-byte rpId, 64-byte uid, max credBlob — sized so the UPDATED box stays
+// inside CRED_BOX_MAX) plus 64-byte updated names crosses the OLD 512-byte
+// reseal buffer — updates on such credentials used to fail NotAllowed while
+// smaller ones worked.
 #[test]
 fn update_user_reseals_near_ceiling_box() {
     let (mut fs, mut rng) = setup();
@@ -1019,4 +1019,30 @@ fn update_user_reseals_near_ceiling_box() {
     )
     .unwrap();
     assert_eq!(cred_user_name(&out[..n]), new_name);
+}
+
+// A resident credential at the DNS rpId ceiling (253 bytes). Its EF_RP
+// bookkeeping record is RP_PREFIX + iv + rpId + tag = 314 bytes — the old
+// RP_REC_MAX = 256 failed this create with KeyStoreFull while the same rpId
+// registered fine non-resident. enumerateRPs proves the record (and its boxed
+// rpId) round-trips.
+#[test]
+fn resident_rp_id_at_dns_max_registers() {
+    let (mut fs, mut rng) = setup();
+    let rp = "a".repeat(249) + ".com";
+    register(&mut fs, &mut rng, &rp, &[7, 7], "ceil");
+
+    let mut state = armed(PERM_CM);
+    let mut out = [0u8; 512];
+    let n = run(
+        &mut fs,
+        &mut state,
+        &cm_request(0x02, None, &TOKEN),
+        &mut out,
+    )
+    .unwrap();
+    let (id, hash, total) = parse_rp(&out[..n], true);
+    assert_eq!(id, rp);
+    assert_eq!(hash, sha256(rp.as_bytes()));
+    assert_eq!(total, Some(1));
 }

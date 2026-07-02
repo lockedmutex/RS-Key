@@ -15,6 +15,13 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Fixed
 
+- **Resident credentials capped the rpId at ~195 bytes.** The EF_RP
+  bookkeeping record (`count ‖ rpIdHash ‖ boxed rpId`) had to fit a 256-byte
+  ceiling, so a resident makeCredential for an rpId longer than ~195 bytes
+  failed with `CTAP2_ERR_KEY_STORE_FULL` while the same rpId registered fine
+  non-resident. `RP_REC_MAX` is now derived from the 253-byte DNS name
+  maximum (314); already-provisioned (smaller) EF_RP records load unchanged.
+  bcdDevice `0x07E9` → `0x07EA`.
 - **Maximal credential-management updates were rejected.** The raw
   `subCommandParams` cap (`MAX_RAW_SUBPARA`, 256) was smaller than a legal
   updateUserInformation payload — a 42-byte resident credentialId plus a

@@ -444,8 +444,14 @@ const _: () = assert!(RECORD_PREFIX + CRED_BOX_MAX <= CRED_REC_MAX);
 /// EF_RP head before the (boxed) rpId tail: `count(1) ‖ rpIdHash(32)`.
 pub(crate) const RP_PREFIX: usize = 1 + 32;
 
-/// Largest EF_RP record (count + rpIdHash + boxed domain); domains are short.
-pub(crate) const RP_REC_MAX: usize = 256;
+/// rpId ceiling — the DNS name maximum, so resident bookkeeping accepts every
+/// relying-party id the non-resident box budget does.
+pub(crate) const RP_ID_MAX: usize = 253;
+
+/// Largest EF_RP record: `count ‖ rpIdHash ‖ box(iv ‖ rpId ‖ tag)` at
+/// [`RP_ID_MAX`]. Older (smaller) records load unchanged — reads are
+/// length-driven with no fixed-size assumptions.
+pub(crate) const RP_REC_MAX: usize = RP_PREFIX + IV_LEN + RP_ID_MAX + TAG_LEN;
 
 /// Mark, in one storage pass, which slots `base+0..base+out.len()` hold a live
 /// record (`out[i]` is occupied iff a key `base+i` exists). One pass is
