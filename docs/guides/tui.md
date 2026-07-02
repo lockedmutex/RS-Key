@@ -15,6 +15,8 @@ audit, identity verify). Irreversible production rituals — secure-boot staging
 OTP fuses, factory resets, soft-lock, attestation import — stay in the CLI on
 purpose, and the cockpit points you at the exact command instead of doing them.
 
+![rsk-tui cockpit — a terminal dashboard: a header with the device summary, a sidebar of sections (Overview selected, then FIDO, OpenPGP, PIV, OATH/OTP, Backup, LED, Audit, Reboot/Maintenance, Help), an Overview panel grouping Identity, Transports and Security rows, an actions panel, an events log and a key-binding footer](../images/tui-cockpit.svg)
+
 ```mermaid
 flowchart LR
     tui["rsk-tui (host process)"] -->|hidapi / CTAPHID| fido["Device — FIDO"]

@@ -30,3 +30,4 @@ the mdBook site.
 | `secure-boot-chain.svg` | Host sign → BOOTSEL flash → bootrom verify chain | original — from `production.md` / `picotool seal` |
 | `rollback-timeline.svg` | 48-bit rollback thermometer + boot decision | original — from `anti-rollback.md` |
 | `led-status.svg` | Status-LED cheat sheet (state → colour/effect), SMIL-animated | original — from `guides/led.md` |
+| `tui-cockpit.svg` | rsk-tui cockpit terminal mockup (Overview section) | original — modeled on the running cockpit (`tools/tui`), serial redacted |
