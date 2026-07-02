@@ -13,6 +13,15 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+### Changed
+
+- **`rsk-tui` status labels are single-sourced** (tools/tui 0.2.1 → 0.2.2).
+  The `--once` printer had drifted from the cockpit's canonical wording; both
+  now share the model's label mappings, which changes three `--once` labels:
+  seed lock `LOCKED — FIDO ops disabled` → `… disabled until unlock`,
+  secure boot `ENABLED` → `ENABLED (not locked)`, and un-probed applets
+  `—` → `not probed`.
+
 ### Fixed
 
 - **Resident credentials capped the rpId at ~195 bytes.** The EF_RP

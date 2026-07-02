@@ -193,14 +193,6 @@ fn opt(s: &Option<String>) -> String {
     s.clone().unwrap_or_else(|| "—".into())
 }
 
-fn present_health(p: Option<bool>) -> (Health, &'static str) {
-    match p {
-        Some(true) => (Health::Ok, "present"),
-        Some(false) => (Health::Unknown, "absent"),
-        None => (Health::Unknown, "not probed"),
-    }
-}
-
 fn section_status_lines(app: &App, theme: Theme) -> Vec<Line<'static>> {
     let s = &app.snapshot;
     let mut out = Vec::new();

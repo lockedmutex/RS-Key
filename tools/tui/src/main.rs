@@ -190,63 +190,33 @@ fn print_once(s: &model::DeviceSnapshot) {
         println!("fido       : not found");
     }
     if let Some(b) = s.backup {
-        println!("backup     : sealed={}  has_seed={}", b.sealed, b.has_seed);
+        println!("backup     : {}", b.describe());
     }
     if let Some(l) = s.lock {
-        let state = if l.locked {
-            if l.unlocked {
-                "LOCKED (unlocked this session)"
-            } else {
-                "LOCKED — FIDO ops disabled"
-            }
-        } else {
-            "off"
-        };
-        println!("seed lock  : {state}");
+        println!("seed lock  : {}", l.describe());
     }
     match s.secure_boot {
-        Some(sb) => {
-            let state = if sb.locked {
-                "LOCKED"
-            } else if sb.enabled {
-                "ENABLED"
-            } else {
-                "not enabled"
-            };
-            println!(
-                "secure boot: {state}  (enabled={} locked={} bootkey={:#x})",
-                sb.enabled, sb.locked, sb.bootkey
-            );
-        }
+        Some(sb) => println!(
+            "secure boot: {}  (enabled={} locked={} bootkey={:#x})",
+            sb.describe(),
+            sb.enabled,
+            sb.locked,
+            sb.bootkey
+        ),
         None => println!("secure boot: (CCID unavailable)"),
     }
     if let Some(r) = s.rollback {
         println!(
             "rollback   : {}  boot version {}/{}",
-            if r.required {
-                "required"
-            } else {
-                "not required"
-            },
+            r.describe(),
             r.version,
             r.capacity
         );
     }
     if let Some(a) = &s.attestation {
-        println!(
-            "org attest : {}",
-            if a.installed {
-                "installed"
-            } else {
-                "not installed"
-            }
-        );
+        println!("org attest : {}", a.describe());
     }
-    let applet = |p: Option<bool>| match p {
-        Some(true) => "present",
-        Some(false) => "absent",
-        None => "—",
-    };
+    let applet = |p: Option<bool>| model::present_health(p).1;
     println!(
         "applets    : OpenPGP {}  PIV {}  OATH {}  OTP {}",
         applet(s.applets.openpgp),

@@ -87,7 +87,7 @@ firmware   : 5.7.4  bcdDevice 0x0759  sdk 3.4
 fido       : U2F_V2, FIDO_2_0, FIDO_2_1  clientPin=true
 backup     : sealed=false  has_seed=true
 seed lock  : off
-secure boot: ENABLED  (enabled=true locked=false bootkey=0x1)
+secure boot: ENABLED (not locked)  (enabled=true locked=false bootkey=0x1)
 rollback   : not required  boot version 0/48
 org attest : not installed
 applets    : OpenPGP present  PIV present  OATH present  OTP present

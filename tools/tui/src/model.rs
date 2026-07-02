@@ -127,10 +127,25 @@ pub struct BackupState {
     pub has_seed: bool,
 }
 
+impl BackupState {
+    pub fn describe(self) -> String {
+        format!("sealed={}  has_seed={}", self.sealed, self.has_seed)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct LockState {
     pub locked: bool,
     pub unlocked: bool,
+}
+
+/// Applet-presence probe → health + label: `None` = not probed (CCID down).
+pub fn present_health(p: Option<bool>) -> (Health, &'static str) {
+    match p {
+        Some(true) => (Health::Ok, "present"),
+        Some(false) => (Health::Unknown, "absent"),
+        None => (Health::Unknown, "not probed"),
+    }
 }
 
 impl LockState {
@@ -157,6 +172,18 @@ pub struct SecureBootState {
     pub bootkey: u8,
 }
 
+impl SecureBootState {
+    pub fn describe(self) -> &'static str {
+        if self.locked {
+            "LOCKED"
+        } else if self.enabled {
+            "ENABLED (not locked)"
+        } else {
+            "not enabled"
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct RollbackState {
     pub required: bool,
@@ -164,10 +191,30 @@ pub struct RollbackState {
     pub capacity: u8,
 }
 
+impl RollbackState {
+    pub fn describe(self) -> &'static str {
+        if self.required {
+            "required"
+        } else {
+            "not required"
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AttestationState {
     pub installed: bool,
     pub chain_sha256: Option<String>,
+}
+
+impl AttestationState {
+    pub fn describe(&self) -> &'static str {
+        if self.installed {
+            "installed"
+        } else {
+            "not installed"
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -251,7 +298,7 @@ impl DeviceSnapshot {
             Some(b) => out.push(FeatureStatus::new(
                 if b.has_seed { Health::Ok } else { Health::Warn },
                 "backup",
-                format!("sealed={}  has_seed={}", b.sealed, b.has_seed),
+                b.describe(),
             )),
             None => out.push(FeatureStatus::new(Health::Unknown, "backup", "—")),
         }
@@ -260,13 +307,14 @@ impl DeviceSnapshot {
         }
         match self.secure_boot {
             Some(sb) => {
-                let (h, t) = if sb.locked {
-                    (Health::Ok, "LOCKED")
+                let h = if sb.locked {
+                    Health::Ok
                 } else if sb.enabled {
-                    (Health::Warn, "ENABLED (not locked)")
+                    Health::Warn
                 } else {
-                    (Health::Unknown, "not enabled")
+                    Health::Unknown
                 };
+                let t = sb.describe();
                 out.push(FeatureStatus::new(
                     h,
                     "secure boot",
@@ -287,16 +335,7 @@ impl DeviceSnapshot {
                     Health::Unknown
                 },
                 "anti-rollback",
-                format!(
-                    "{}  v{}/{}",
-                    if r.required {
-                        "required"
-                    } else {
-                        "not required"
-                    },
-                    r.version,
-                    r.capacity
-                ),
+                format!("{}  v{}/{}", r.describe(), r.version, r.capacity),
             ));
         }
         if let Some(a) = &self.attestation {
@@ -307,11 +346,7 @@ impl DeviceSnapshot {
                     Health::Unknown
                 },
                 "org attest",
-                if a.installed {
-                    "installed"
-                } else {
-                    "not installed"
-                },
+                a.describe(),
             ));
         }
         if let Some(fl) = self.flash {
