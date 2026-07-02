@@ -42,3 +42,6 @@ the mdBook site.
 | `display-apps.jpg` | Photo — trusted display, Apps browser | own device photo, cropped, EXIF stripped |
 | `display-settings.jpg` | Photo — trusted display, Settings menu | own device photo, cropped, EXIF stripped |
 | `display-locked.jpg` | Photo — trusted display, Locked screen | own device photo, cropped, EXIF stripped |
+| `board-one.jpg` | Photo — Waveshare RP2350-One (reference board) | **Waveshare product photo**, used with attribution (hardware.md) |
+| `board-zero.jpg` | Photo — Waveshare RP2350-Zero (mini USB-C stick) | **Waveshare product photo**, used with attribution |
+| `board-display.jpg` | Photo — Waveshare RP2350-Touch-LCD-2.8 (display board) | **Waveshare product photo**, used with attribution |

@@ -9,6 +9,21 @@ the short version.
 
 ## Supported boards
 
+<table>
+<tr>
+<td align="center"><img src="images/board-one.jpg" width="200" alt="Waveshare RP2350-One — a USB-A stick board"></td>
+<td align="center"><img src="images/board-zero.jpg" width="200" alt="Waveshare RP2350-Zero — a small USB-C stick board"></td>
+<td align="center"><img src="images/board-display.jpg" width="200" alt="Waveshare RP2350-Touch-LCD-2.8 — a board with a 2.8-inch touch screen"></td>
+</tr>
+<tr>
+<td align="center"><b>RP2350-One</b><br>reference board · USB-A<br>WS2812 on GPIO16</td>
+<td align="center"><b>RP2350-Zero</b><br>mini stick · USB-C</td>
+<td align="center"><b>RP2350-Touch-LCD-2.8</b><br>trusted display<br><code>LED_KIND=none FLASH_SIZE=16M</code></td>
+</tr>
+</table>
+
+<sub>Board photos: Waveshare.</sub>
+
 Any RP2350 board with a USB connector should work. Development and on-device
 testing happen on the **Waveshare RP2350-One**, where the WS2812 status LED on
 GPIO16 works out of the box. Boards without an addressable LED run fine — the
