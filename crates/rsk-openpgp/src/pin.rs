@@ -170,7 +170,7 @@ pub fn check_pin<S: Storage>(
             );
         if !migrated {
             return match pin_wrong_retry(fs, fid) {
-                Ok(retries) => Sw::new(0x63, 0xc0 | retries),
+                Ok(retries) => Sw::retries(retries),
                 Err(()) => Sw::PIN_BLOCKED,
             };
         }
@@ -334,11 +334,7 @@ pub fn verify<S: Storage>(
     let authed = (p2 == PW1_MODE81 && sess.has_pw1)
         || (p2 == PW1_MODE82 && sess.has_pw2)
         || (p2 == PW3_MODE83 && sess.has_pw3);
-    if authed {
-        Sw::OK
-    } else {
-        Sw::new(0x63, 0xc0 | retries)
-    }
+    if authed { Sw::OK } else { Sw::retries(retries) }
 }
 
 /// Write a verifier record `[len, 0x01, verifier(32)]` for `pin`.

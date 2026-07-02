@@ -376,7 +376,7 @@ impl PivApplet<'_> {
             if self.sess.has_pin {
                 return Sw::OK;
             }
-            return sw_retries(left);
+            return Sw::retries(left);
         }
         match check_ref(dev, fs, EF_PIN, RETRY_PIN, apdu.data) {
             Sw::OK => {
@@ -925,11 +925,6 @@ fn stored_pin_len<S: Storage>(fs: &mut Fs<S>, fid: u16) -> Result<usize, Sw> {
     Ok(rec[0] as usize)
 }
 
-/// ISO 7816-4 `63Cx`: verification failed, `x` retries remaining.
-const fn sw_retries(left: u8) -> Sw {
-    Sw::new(0x63, 0xC0 | left)
-}
-
 /// Boot-pass migration: re-seal every sealed PIV key slot under the OTP kbase
 /// (no-op without the OTP key). PIN/PUK verifiers migrate lazily at their own
 /// verify instead — they are one-way derivations of the PIN.
@@ -981,7 +976,7 @@ fn check_ref<S: Storage>(dev: &Device, fs: &mut Fs<S>, fid: u16, retry: usize, p
     if left == 0 {
         Sw::PIN_BLOCKED
     } else {
-        sw_retries(left)
+        Sw::retries(left)
     }
 }
 

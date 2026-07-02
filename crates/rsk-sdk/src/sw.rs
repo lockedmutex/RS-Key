@@ -30,6 +30,12 @@ impl Sw {
         [self.sw1(), self.sw2()]
     }
 
+    /// ISO 7816-4 `63Cx` — verification failed, `x` retries remaining.
+    #[inline]
+    pub const fn retries(left: u8) -> Self {
+        Sw::new(0x63, 0xC0 | left)
+    }
+
     pub const BYTES_REMAINING_00: Sw = Sw::new(0x61, 0x00);
     pub const WARNING_STATE_UNCHANGED: Sw = Sw::new(0x62, 0x00);
     pub const WARNING_EOF: Sw = Sw::new(0x62, 0x82);
