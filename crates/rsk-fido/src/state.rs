@@ -11,7 +11,8 @@ use zeroize::Zeroize;
 use rsk_crypto::pinproto::{self, PinProto, public_xy};
 
 use crate::Rng;
-use crate::consts::MAX_LARGE_BLOB_SIZE;
+use crate::consts::{MAX_CREDENTIAL_COUNT_IN_LIST, MAX_LARGE_BLOB_SIZE};
+use crate::hmacsecret::{SALT_AUTH_MAX, SALT_ENC_MAX};
 
 // pinUvAuthToken permission bits.
 pub const PERM_MC: u8 = 0x01; // makeCredential
@@ -23,7 +24,7 @@ pub const PERM_ACFG: u8 = 0x20; // authenticatorConfiguration
 pub const PERM_PCMR: u8 = 0x40; // per-credential-management read-only
 
 /// Max credentials tracked for `getNextAssertion` (`MAX_CREDENTIAL_COUNT_IN_LIST`).
-pub const MAX_ASSERTION_CREDS: usize = 16;
+pub const MAX_ASSERTION_CREDS: usize = MAX_CREDENTIAL_COUNT_IN_LIST as usize;
 
 /// State carried between `getAssertion` and `getNextAssertion` when resident
 /// discovery finds more than one credential. Holds EF_CRED slot offsets (newest
@@ -48,9 +49,9 @@ pub struct AssertionState {
     pub hmac_proto: u64,
     pub hmac_peer_x: [u8; 32],
     pub hmac_peer_y: [u8; 32],
-    pub hmac_salt_enc: [u8; 80],
+    pub hmac_salt_enc: [u8; SALT_ENC_MAX],
     pub hmac_salt_enc_len: u8,
-    pub hmac_salt_auth: [u8; 48],
+    pub hmac_salt_auth: [u8; SALT_AUTH_MAX],
     pub hmac_salt_auth_len: u8,
     pub ext_cred_blob: bool,
     pub ext_third_party_payment: bool,
@@ -72,9 +73,9 @@ impl AssertionState {
             hmac_proto: 1,
             hmac_peer_x: [0; 32],
             hmac_peer_y: [0; 32],
-            hmac_salt_enc: [0; 80],
+            hmac_salt_enc: [0; SALT_ENC_MAX],
             hmac_salt_enc_len: 0,
-            hmac_salt_auth: [0; 48],
+            hmac_salt_auth: [0; SALT_AUTH_MAX],
             hmac_salt_auth_len: 0,
             ext_cred_blob: false,
             ext_third_party_payment: false,
@@ -95,10 +96,13 @@ impl AssertionState {
 /// The *Begin* subcommands reset the counters; the *Next* variants read them.
 /// `FidoState::reset` clears it.
 pub struct CredMgmtState {
-    pub rp_counter: u8,
-    pub rp_total: u8,
-    pub cred_counter: u8,
-    pub cred_total: u8,
+    // u16 so a fully-provisioned store (MAX_RESIDENT_CREDENTIALS = 256) can be
+    // counted and walked to the last slot; a u8 saturated at 255, hiding the
+    // 256th RP/credential from enumeration.
+    pub rp_counter: u16,
+    pub rp_total: u16,
+    pub cred_counter: u16,
+    pub cred_total: u16,
     pub rp_id_hash: [u8; 32],
 }
 
@@ -312,6 +316,16 @@ impl FidoState {
     pub fn verify_token(&self, proto: PinProto, data: &[u8], param: &[u8]) -> bool {
         pinproto::verify(proto, &self.paut.token, data, param)
     }
+}
+
+/// Build the pinUvAuthParam message `0xff×32 ‖ cmd ‖ subcommand ‖ params` into
+/// `buf`, returning its length (CTAP 2.1 §6.5.5.7).
+pub(crate) fn puat_subcommand_msg(buf: &mut [u8], cmd: u8, subcommand: u8, params: &[u8]) -> usize {
+    buf[..32].fill(0xff);
+    buf[32] = cmd;
+    buf[33] = subcommand;
+    buf[34..34 + params.len()].copy_from_slice(params);
+    34 + params.len()
 }
 
 impl Drop for FidoState {

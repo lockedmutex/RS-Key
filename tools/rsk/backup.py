@@ -26,6 +26,8 @@ from .common import add_pin_arg, connect_fido, device_has_pin, die, resolve_pin
 CTAP_VENDOR = 0x41
 VENDOR_MSE, EXPORT, LOAD, FINALIZE, STATE = 1, 2, 3, 4, 5
 PERM_ACFG = 0x20
+ERR_OPERATION_DENIED, ERR_NOT_ALLOWED, ERR_PIN_REQUIRED = 0x27, 0x30, 0x36
+PINUV_PREFIX = b"\xff" * 32  # CTAP 2.1 pinUvAuthParam prefix; must match firmware (rsk-fido vendor.rs/config.rs)
 
 from cryptography.hazmat.primitives import hashes, hmac as chmac  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric import ec  # noqa: E402
@@ -75,6 +77,16 @@ def register(sub):
 def _vendor(dev, cid, fields):
     r = ctaphid.send_cbor(dev, cid, bytes([CTAP_VENDOR]) + ctaphid.enc(fields))
     return r[0], (ctaphid.decode(r[1:]) if len(r) > 1 and r[0] == 0 else None)
+
+
+def _die_pin_required(st):
+    if st == ERR_PIN_REQUIRED:
+        die("device requires a PIN — pass --pin or enter it when prompted")
+
+
+def _die_touch_denied(st):
+    if st == ERR_OPERATION_DENIED:
+        die("denied — no touch within 30 s; press the button when the LED blinks")
 
 
 def mse_handshake(dev, cid):
@@ -136,7 +148,7 @@ def _gated(subcmd, subpara, dev, cid, pin):
     if pin is not None:
         token = _acfg_token(dev, cid, pin)
         raw = ctaphid.enc(subpara) if subpara is not None else b""
-        vp = b"\xff" * 32 + bytes([CTAP_VENDOR, subcmd]) + raw
+        vp = PINUV_PREFIX + bytes([CTAP_VENDOR, subcmd]) + raw
         h = chmac.HMAC(token, hashes.SHA256())
         h.update(vp)
         fields[3], fields[4] = 2, h.finalize()
@@ -147,9 +159,8 @@ def read_seed(dev, cid, pin):
     """MSE handshake + EXPORT; returns the decrypted 32-byte seed."""
     key, aad = mse_handshake(dev, cid)
     st, m = _vendor(dev, cid, _gated(EXPORT, None, dev, cid, pin))
-    if st == 0x36:
-        die("device requires a PIN — pass --pin or enter it when prompted")
-    if st == 0x30:
+    _die_pin_required(st)
+    if st == ERR_NOT_ALLOWED:
         die("export refused — already sealed (run after a reset)")
     if st != 0:
         die(f"export failed: {st:#x}")
@@ -165,8 +176,7 @@ def write_seed(dev, cid, pin, seed):
     nonce = os.urandom(12)
     blob = nonce + ChaCha20Poly1305(key).encrypt(nonce, seed, aad)
     st, _ = _vendor(dev, cid, _gated(LOAD, {1: blob}, dev, cid, pin))
-    if st == 0x36:
-        die("device requires a PIN — pass --pin or enter it when prompted")
+    _die_pin_required(st)
     if st != 0:
         die(f"restore failed: {st:#x}")
 

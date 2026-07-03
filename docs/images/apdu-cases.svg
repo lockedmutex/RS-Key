@@ -1,0 +1,114 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 RS-Key contributors -->
+<svg viewBox="0 0 780 548" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="ttl dsc" font-family="'Segoe UI', system-ui, -apple-system, sans-serif">
+  <title id="ttl">ISO-7816 short-APDU cases</title>
+  <desc id="dsc">The four ISO-7816 short-APDU command structures RS-Key's CCID applets use. Every command starts with the four-byte header CLA INS P1 P2. Case 1 is header only; Case 2 adds a one-byte Le (expected response length); Case 3 adds Lc plus Lc bytes of command data; Case 4 adds Lc, data, and Le. Header and the Lc/Le length bytes are shown in rust, the command data payload in teal.</desc>
+  <defs>
+    <style>
+      .h1{font-size:23px;font-weight:700;fill:#2B2723}
+      .sub{font-size:12.5px;fill:#948A7F}
+      .lg{font-size:11.5px;fill:#6B645C}
+      .rowlab{font-size:12.5px;font-weight:700;fill:#2B2723}
+      .rowsub{font-size:11px;fill:#948A7F}
+      .cell{font-size:11.5px;font-weight:700;fill:#fff}
+      .cellL{font-size:11.5px;font-weight:700;fill:#C0562B}
+      .blab{font-size:10.5px;fill:#948A7F;font-family:'SF Mono','Roboto Mono',ui-monospace,monospace}
+      .co{font-size:11.5px;fill:#5A534B}
+      .mono{font-family:'SF Mono','Roboto Mono',ui-monospace,monospace;fill:#A9764F;font-weight:700}
+      .foot{font-size:10.5px;fill:#ADA398}
+    </style>
+  </defs>
+  <rect x="6" y="6" width="768" height="536" rx="16" fill="#FBFAF8" stroke="#E4DED5" stroke-width="1.5"/>
+
+  <text class="h1" x="34" y="46">ISO-7816 short-APDU cases</text>
+  <text class="sub" x="34" y="68">CCID applets · the command a selected applet receives · §1.1</text>
+
+  <!-- legend -->
+  <rect x="470" y="34" width="13" height="13" rx="3" fill="#C0562B"/>
+  <text class="lg" x="490" y="45">header</text>
+  <rect x="556" y="34" width="13" height="13" rx="3" fill="#EFE0D6" stroke="#C0562B" stroke-width="1"/>
+  <text class="lg" x="576" y="45">Lc / Le length</text>
+  <rect x="678" y="34" width="13" height="13" rx="3" fill="#2F7E75"/>
+  <text class="lg" x="698" y="45">data</text>
+
+  <!-- ===== CASE 1 ===== -->
+  <text class="rowlab" x="40" y="98">Case 1</text>
+  <text class="rowsub" x="104" y="98">command only — no data, no response body</text>
+  <g>
+    <rect x="40"  y="108" width="66" height="44" fill="#C0562B"/>
+    <rect x="106" y="108" width="66" height="44" fill="#C0562B"/>
+    <rect x="172" y="108" width="66" height="44" fill="#C0562B"/>
+    <rect x="238" y="108" width="66" height="44" fill="#C0562B"/>
+    <g stroke="#FBFAF8" stroke-width="1.5"><line x1="106" y1="108" x2="106" y2="152"/><line x1="172" y1="108" x2="172" y2="152"/><line x1="238" y1="108" x2="238" y2="152"/></g>
+    <text class="cell" x="73"  y="135" text-anchor="middle">CLA</text>
+    <text class="cell" x="139" y="135" text-anchor="middle">INS</text>
+    <text class="cell" x="205" y="135" text-anchor="middle">P1</text>
+    <text class="cell" x="271" y="135" text-anchor="middle">P2</text>
+  </g>
+  <g text-anchor="middle"><text class="blab" x="73" y="169">1</text><text class="blab" x="139" y="169">1</text><text class="blab" x="205" y="169">1</text><text class="blab" x="271" y="169">1 B</text></g>
+
+  <!-- ===== CASE 2 ===== -->
+  <text class="rowlab" x="40" y="196">Case 2</text>
+  <text class="rowsub" x="104" y="196">expects a response — Le = max bytes back (<tspan class="mono">00</tspan> = up to 256)</text>
+  <g>
+    <rect x="40"  y="206" width="66" height="44" fill="#C0562B"/>
+    <rect x="106" y="206" width="66" height="44" fill="#C0562B"/>
+    <rect x="172" y="206" width="66" height="44" fill="#C0562B"/>
+    <rect x="238" y="206" width="66" height="44" fill="#C0562B"/>
+    <rect x="304" y="206" width="60" height="44" fill="#EFE0D6" stroke="#C0562B" stroke-width="1"/>
+    <g stroke="#FBFAF8" stroke-width="1.5"><line x1="106" y1="206" x2="106" y2="250"/><line x1="172" y1="206" x2="172" y2="250"/><line x1="238" y1="206" x2="238" y2="250"/></g>
+    <text class="cell"  x="73"  y="233" text-anchor="middle">CLA</text>
+    <text class="cell"  x="139" y="233" text-anchor="middle">INS</text>
+    <text class="cell"  x="205" y="233" text-anchor="middle">P1</text>
+    <text class="cell"  x="271" y="233" text-anchor="middle">P2</text>
+    <text class="cellL" x="334" y="233" text-anchor="middle">Le</text>
+  </g>
+  <g text-anchor="middle"><text class="blab" x="73" y="267">1</text><text class="blab" x="139" y="267">1</text><text class="blab" x="205" y="267">1</text><text class="blab" x="271" y="267">1</text><text class="blab" x="334" y="267">1 B</text></g>
+
+  <!-- ===== CASE 3 ===== -->
+  <text class="rowlab" x="40" y="294">Case 3</text>
+  <text class="rowsub" x="104" y="294">sends data — no response body</text>
+  <g>
+    <rect x="40"  y="304" width="66"  height="44" fill="#C0562B"/>
+    <rect x="106" y="304" width="66"  height="44" fill="#C0562B"/>
+    <rect x="172" y="304" width="66"  height="44" fill="#C0562B"/>
+    <rect x="238" y="304" width="66"  height="44" fill="#C0562B"/>
+    <rect x="304" y="304" width="54"  height="44" fill="#EFE0D6" stroke="#C0562B" stroke-width="1"/>
+    <rect x="358" y="304" width="360" height="44" fill="#2F7E75"/>
+    <g stroke="#FBFAF8" stroke-width="1.5"><line x1="106" y1="304" x2="106" y2="348"/><line x1="172" y1="304" x2="172" y2="348"/><line x1="238" y1="304" x2="238" y2="348"/></g>
+    <text class="cell"  x="73"  y="331" text-anchor="middle">CLA</text>
+    <text class="cell"  x="139" y="331" text-anchor="middle">INS</text>
+    <text class="cell"  x="205" y="331" text-anchor="middle">P1</text>
+    <text class="cell"  x="271" y="331" text-anchor="middle">P2</text>
+    <text class="cellL" x="331" y="331" text-anchor="middle">Lc</text>
+    <text class="cell"  x="538" y="331" text-anchor="middle">command data</text>
+  </g>
+  <g text-anchor="middle"><text class="blab" x="73" y="365">1</text><text class="blab" x="139" y="365">1</text><text class="blab" x="205" y="365">1</text><text class="blab" x="271" y="365">1</text><text class="blab" x="331" y="365">1</text><text class="blab" x="538" y="365">Lc bytes (1–255)</text></g>
+
+  <!-- ===== CASE 4 ===== -->
+  <text class="rowlab" x="40" y="392">Case 4</text>
+  <text class="rowsub" x="104" y="392">sends data and expects a response</text>
+  <g>
+    <rect x="40"  y="402" width="66"  height="44" fill="#C0562B"/>
+    <rect x="106" y="402" width="66"  height="44" fill="#C0562B"/>
+    <rect x="172" y="402" width="66"  height="44" fill="#C0562B"/>
+    <rect x="238" y="402" width="66"  height="44" fill="#C0562B"/>
+    <rect x="304" y="402" width="54"  height="44" fill="#EFE0D6" stroke="#C0562B" stroke-width="1"/>
+    <rect x="358" y="402" width="300" height="44" fill="#2F7E75"/>
+    <rect x="658" y="402" width="60"  height="44" fill="#EFE0D6" stroke="#C0562B" stroke-width="1"/>
+    <g stroke="#FBFAF8" stroke-width="1.5"><line x1="106" y1="402" x2="106" y2="446"/><line x1="172" y1="402" x2="172" y2="446"/><line x1="238" y1="402" x2="238" y2="446"/></g>
+    <text class="cell"  x="73"  y="429" text-anchor="middle">CLA</text>
+    <text class="cell"  x="139" y="429" text-anchor="middle">INS</text>
+    <text class="cell"  x="205" y="429" text-anchor="middle">P1</text>
+    <text class="cell"  x="271" y="429" text-anchor="middle">P2</text>
+    <text class="cellL" x="331" y="429" text-anchor="middle">Lc</text>
+    <text class="cell"  x="508" y="429" text-anchor="middle">command data</text>
+    <text class="cellL" x="688" y="429" text-anchor="middle">Le</text>
+  </g>
+  <g text-anchor="middle"><text class="blab" x="73" y="463">1</text><text class="blab" x="139" y="463">1</text><text class="blab" x="205" y="463">1</text><text class="blab" x="271" y="463">1</text><text class="blab" x="331" y="463">1</text><text class="blab" x="508" y="463">Lc bytes</text><text class="blab" x="688" y="463">1 B</text></g>
+
+  <!-- notes -->
+  <text class="co" x="40" y="500">Short APDUs only: <tspan class="mono">Lc</tspan>/<tspan class="mono">Le</tspan> are single bytes. SELECT <tspan class="mono">00 A4 04 00 Lc AID 00</tspan> is Case 4; VERIFY <tspan class="mono">00 20 P1 P2 Lc PIN</tspan> is Case 3.</text>
+
+  <text class="foot" x="34" y="528">Reference transport: tools/rsk/ccid.py · selected applet then receives CLA INS P1 P2 [Lc data] [Le]</text>
+</svg>

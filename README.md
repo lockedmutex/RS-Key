@@ -4,6 +4,17 @@
 [![deep-checks](https://github.com/TheMaxMur/RS-Key/actions/workflows/deep-checks.yml/badge.svg)](https://github.com/TheMaxMur/RS-Key/actions/workflows/deep-checks.yml)
 [![docs](https://github.com/TheMaxMur/RS-Key/actions/workflows/pages.yml/badge.svg)](https://themaxmur.github.io/RS-Key/)
 
+<table align="center">
+  <tr>
+    <td align="center" valign="top"><img src="assets/hero-boards.jpg" height="440" alt="Three RS-Key boards on a blueprint background: a bare RP2350 USB stick, the trusted-display variant showing its Home &quot;Ready&quot; screen (USB connected, Device PIN set, 2 passkeys), and a Waveshare RP2350-One"></td>
+    <td align="center" valign="top"><img src="assets/webauthn-demo.gif" height="440" alt="Registering a passkey on webauthn.io with the trusted-display build: the device screen shows a Device PIN pad, then an Approve / Save-passkey prompt, and the browser confirms you are logged in — the PIN and the approval both happen on the device's own screen"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>Three boards, one firmware — stick · trusted display · RP2350-One</sub></td>
+    <td align="center"><sub>Registering a passkey — the PIN &amp; Approve/Deny happen on the device's own screen</sub></td>
+  </tr>
+</table>
+
 RS-Key (RSK, *Raspberry Security Key* — also a nod to its being written in Rust)
 is open-source security-key firmware for the Raspberry Pi **RP2350**. It makes an
 RP2350 board behave like a USB authenticator and ships the host tooling to drive
@@ -17,16 +28,6 @@ replacement for an audited commercial key.
 > guard credentials you can't afford to lose or have stolen. Read the
 > [threat model](docs/threat-model.md) and [limitations](docs/limitations.md)
 > before trusting it with anything real.
-
-## Project status
-
-A working, single-maintainer hobby project under active development. The latest
-tagged release is **v0.2.8**; day to day the supported version is the tip of
-`main`, and every behavior change bumps the USB `bcdDevice` build counter so a
-build can be named precisely. Most of the protocol surface works against real host software; what
-has actually been checked on hardware (with dates) is in
-[docs/interop.md](docs/interop.md). Treat anything not in that matrix as
-unverified.
 
 ## Documentation
 
@@ -104,8 +105,9 @@ nix develop                       # toolchain, picotool, host tools — everythi
 cargo build --release -p firmware
 picotool uf2 convert target/thumbv8m.main-none-eabihf/release/firmware -t elf firmware.uf2
 
-# hold BOOTSEL, plug the board in, then copy the image to the RP2350 drive:
-cp firmware.uf2 /Volumes/RP2350/  # macOS; on Linux, the mounted RP2350 mass-storage volume
+# hold BOOTSEL, plug the board in, then flash — either way:
+cp firmware.uf2 /Volumes/RP2350/                    # macOS drag-and-drop; Linux: the mounted RP2350 volume
+picotool load -v firmware.uf2 && picotool reboot    # more robust; verifies the write (use if cp flakes)
 ```
 
 Re-plug the board and it enumerates as a composite USB authenticator. The default

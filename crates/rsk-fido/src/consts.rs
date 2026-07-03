@@ -59,6 +59,11 @@ pub const CONFIG_VENDOR: u64 = 0xFF; // vendor subcommands, selected by a u64 id
 pub const CONFIG_AUT_ENABLE: u64 = 0x03e43f56b34285e2;
 pub const CONFIG_AUT_DISABLE: u64 = 0x1831a40f04a25ed9;
 
+// authenticatorClientPIN subcommands compared at more than one site (the rest
+// are dispatched once as literals).
+pub const CP_GET_PIN_TOKEN: u64 = 0x05;
+pub const CP_GET_PIN_UV_TOKEN_USING_PIN: u64 = 0x09; // getPinUvAuthTokenUsingPinWithPermissions
+
 // authenticatorCredentialManagement subcommands.
 pub const CM_GET_CREDS_METADATA: u64 = 0x01;
 pub const CM_ENUMERATE_RPS_BEGIN: u64 = 0x02;
@@ -145,8 +150,16 @@ pub const FIRMWARE_VERSION: u32 = rsk_sdk::FIRMWARE_VERSION_U32;
 /// worker exchange, applet response) holds this. `MAX_FRAGMENT_LENGTH` tracks
 /// it per the spec's `maxMsgSize - 64`.
 pub const MAX_MSG_SIZE: u64 = 7609;
-pub const MAX_CRED_ID_LENGTH: u64 = 1024;
+/// Mirrors `credential::CRED_BOX_MAX`: the largest credentialId this device
+/// mints (a non-resident box) — and therefore the largest it will assert.
+pub const MAX_CRED_ID_LENGTH: u64 = crate::credential::CRED_BOX_MAX as u64;
 pub const MAX_CREDENTIAL_COUNT_IN_LIST: u64 = 16;
+
+// pinUvAuthParam MAC covers subCommand ‖ subCommandParams; cap on the raw bytes
+// (vendor.rs deliberately overrides with its own larger cap). A maximal legal
+// updateUserInformation — 42-byte resident credId + 64-byte user.id + 64-byte
+// name + 64-byte displayName — encodes to 286; a full transports echo adds ~40.
+pub const MAX_RAW_SUBPARA: usize = 384;
 
 /// Max serialized large-blob array stored; also the getInfo
 /// `maxSerializedLargeBlobArray` (0x0B).
@@ -159,6 +172,9 @@ pub const LARGEBLOB_INITIAL: [u8; 17] = [
     0x80, 0x76, 0xbe, 0x8b, 0x52, 0x8d, 0x00, 0x75, 0xf7, 0xaa, 0xe9, 0x8d, 0x6f, 0xa5, 0x7a, 0x6d,
     0x3c,
 ];
+/// Minimum serialized large-blob array: the empty CBOR array `0x80` + 16-byte
+/// SHA-256 tail — the CTAP2.1 default.
+pub const LARGEBLOB_MIN: usize = LARGEBLOB_INITIAL.len();
 
 /// Max resident credentials / relying parties.
 pub const MAX_RESIDENT_CREDENTIALS: u16 = 256;
@@ -193,9 +209,23 @@ pub const EF_ALWAYS_UV: u16 = 0xCE13;
 /// This marker gates that lap to the first OTP boot and makes it crash-safe
 /// (absent ⇒ re-run; the lap is idempotent). See `boot`/`main` wiring.
 pub const EF_HARDENED: u16 = 0xCE14;
+/// Trusted-display **device PIN** — gates the on-device UI (unlock, delete, factory
+/// reset), independent of the FIDO clientPIN (`EF_PIN`). Same record format
+/// `[retries, len, format, verifier(32)]`, device-sealed. Wiped by `authenticatorReset`
+/// (so a forgotten device PIN is recoverable by a host reset) and by factory reset. NOT
+/// in the OpenPGP 0x10xx range — kept in FIDO's 0xCExx block to avoid an applet clash.
+pub const EF_DEVICE_PIN: u16 = 0xCE20;
 pub const EF_COUNTER: u16 = 0xC000; // global signature counter
 pub const EF_CRED: u16 = 0xCF00; // resident credentials, 0xCF00..0xCFFF
 pub const EF_RP: u16 = 0xD000; // relying-party metadata, 0xD000..0xD0FF
+// Device-local relying-party display nicknames, 0xD300..0xD3FF (one slot per EF_RP
+// slot). A trusted-display-only label sealed at rest; never crosses the wire and is
+// not part of any credential, so it can't touch the box / signing key (PIV owns
+// 0xD100..=0xD2FF, so this sits clear of it). Additive: absent on devices upgraded
+// from before this region, which simply show the rpId.
+pub const EF_RPNICK: u16 = 0xD300;
+/// Longest device-local RP nickname (bytes) the trusted display stores + accepts.
+pub const RP_NICK_MAX_LEN: usize = 24;
 pub const EF_PIN: u16 = 0x1080; // PIN: [retries, len, format, verifier(32)]
 pub const EF_AUTHTOKEN: u16 = 0x1090; // pinUvAuthToken seed
 pub const EF_PAUTHTOKEN: u16 = 0x1091; // persistent pinUvAuthToken seed

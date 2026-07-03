@@ -1,7 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 RS-Key contributors
 
-"""rsk reboot — hands-free vendor reboot to BOOTSEL or the application."""
+"""rsk reboot — vendor reboot to BOOTSEL or the application.
+
+Reboot-to-BOOTSEL requires an on-device confirmation (the firmware gates it
+against a hostile host); a plain app restart does not."""
+import sys
+
 from . import ccid
 
 
@@ -12,5 +17,16 @@ def register(sub):
 
 
 def run(args):
-    ccid.reboot(bootsel=(args.target == "bootsel"))
+    bootsel = args.target == "bootsel"
+    if bootsel:
+        print(
+            "approve on the device (touch / on-screen Approve) to reboot to BOOTSEL…",
+            file=sys.stderr,
+        )
+    sw = ccid.reboot(bootsel=bootsel)
+    if sw == ccid.SW_COND_NOT_SATISFIED:
+        raise SystemExit(
+            "reboot-to-BOOTSEL declined on the device (no confirmation). Approve on "
+            "the device, or enter BOOTSEL manually (hold BOOTSEL and replug)."
+        )
     print(f"reboot-to-{args.target} sent")

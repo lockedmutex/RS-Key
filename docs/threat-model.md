@@ -4,21 +4,7 @@ What RS-Key defends against, what it deliberately does not, and the honest
 residuals in between. The defenses compose in tiers — each one assumes the
 ones before it.
 
-```mermaid
-flowchart TB
-    attacker["Attacker-controlled USB bytes"]
-    oos["Out of scope:<br/>physical / lab attacks · a compromised, unlocked host<br/>(the RP2350 is not a secure element)"]
-    subgraph rp["RP2350"]
-      parse["Memory-safe parsers<br/>(safe Rust + fuzzing)"]
-      gates["Protocol gates<br/>PIN/UV · touch · mgmt-key"]
-      keys["Key material"]
-      seal["At-rest seal<br/>(meaningful only after the OTP master-key burn)"]
-      parse --> gates --> keys
-      seal --> keys
-    end
-    attacker --> parse
-    oos -. not defended .-> rp
-```
+![What RS-Key defends and what is out of scope — attacker-controlled USB bytes enter the RP2350 and pass through three composing tiers: memory-safe parsers (safe Rust plus fuzzing), then protocol gates (PIN/UV, touch, management key), then the key material, which is additionally protected by an at-rest seal meaningful after the OTP master-key burn; physical and lab attacks and a compromised, unlocked host are explicitly out of scope and reach the device undefended, since the RP2350 is not a secure element](images/threat-tiers.svg)
 
 ## Assets
 
@@ -176,6 +162,17 @@ the seed under the *destination* chip's root. The host driving a backup
 necessarily sees the seed plaintext — do it on a machine you trust.
 Scope: the deterministic identity only (resident passkeys, OpenPGP, PIV are
 not covered).
+
+On the **trusted-display flavor** the host need not be in that trust path: the
+device can render its BIP-39 recovery phrase **on its own screen** (the seed is
+turned into words on-device and never crosses USB), so a backup can be taken
+without trusting any host. That trades the host-observation surface for a
+physical/visual one — the words are briefly on the panel (shoulder-surf, camera).
+It is gated to keep that surface small: it requires a **device PIN** set and
+re-entered, a deliberate hold past an explicit "no one watching" warning, runs
+only inside the same one-time window (and seal closes it), is disabled on the
+`fips-profile` (non-exportable) build, zeroizes the seed/words from RAM on exit,
+and auto-clears the panel after a short idle.
 
 ```mermaid
 sequenceDiagram

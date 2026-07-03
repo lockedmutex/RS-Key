@@ -17,13 +17,6 @@ use crate::keys::{
 };
 use crate::pin::Session;
 
-/// Status 0x6A80 (wrong data).
-const WRONG_DATA: Sw = Sw::INCORRECT_PARAMS;
-
-/// Default algorithm attribute used when no `EF_ALGO_PRIV*` has been
-/// written — RSA-2048.
-const DEFAULT_ALGO: &[u8] = &[ALGO_RSA, 0x08, 0x00, 0x00, 0x20, 0x00];
-
 /// BER length: a byte < 0x80 is the length; `0x81` introduces a 1-byte length,
 /// `0x82` a 2-byte one. Advances `pos`.
 pub(crate) fn tag_len(data: &[u8], pos: &mut usize) -> Option<usize> {
@@ -79,12 +72,7 @@ pub fn parse_ehl_head(data: &[u8]) -> Result<(KeyFid, usize), Sw> {
     tag_len(data, &mut pos).ok_or(WRONG_DATA)?;
 
     // Control-reference template tag selects the key slot.
-    let fid = match *data.get(pos).ok_or(WRONG_DATA)? {
-        0xB6 => EF_PK_SIG,
-        0xB8 => EF_PK_DEC,
-        0xA4 => EF_PK_AUT,
-        _ => return Err(WRONG_DATA),
-    };
+    let fid = crt_slot(*data.get(pos).ok_or(WRONG_DATA)?).ok_or(WRONG_DATA)?;
     pos += 1;
     // Skip the CRT body: a 1-byte length followed by that many bytes.
     let crt_body = *data.get(pos).ok_or(WRONG_DATA)? as usize;
@@ -148,10 +136,12 @@ fn try_import<S: Storage>(
     let (off, len) = parse_ehl_body(data, pos)?;
 
     // The algorithm attribute decides RSA vs EC and (for EC) the curve.
-    let algo_fid = fid.get() - 0x10;
+    let algo_fid = slot_algo_fid(fid);
     let mut algo_buf = [0u8; 16];
     let algo: &[u8] = match fs.read(algo_fid, &mut algo_buf) {
-        Some(n) if n > 0 => &algo_buf[..n],
+        // Clamp: `Storage::read` reports the DO's full stored length and PUT DATA
+        // caps nothing, so an over-long C1/C2/C3 must not slice OOB = brick.
+        Some(n) if n > 0 => &algo_buf[..n.min(algo_buf.len())],
         _ => DEFAULT_ALGO,
     };
     match algo[0] {
@@ -178,7 +168,7 @@ fn try_import<S: Storage>(
             // Public-key DO → EF_PB_* (slot FID + 3).
             let mut pub_do = [0u8; MAX_RSA_PUBDO];
             let don = make_rsa_response(&key, &mut pub_do);
-            fs.put(fid.get() + 3, &pub_do[..don])
+            fs.put(slot_pub_fid(fid), &pub_do[..don])
                 .map_err(|_| Sw::MEMORY_FAILURE)?;
 
             if fid == EF_PK_SIG {
@@ -201,7 +191,7 @@ fn try_import<S: Storage>(
             let plen = key.public_point(&mut point)?;
             let mut pub_do = [0u8; 8 + MAX_EC_POINT];
             let don = make_ec_pubkey_do(&point[..plen], &mut pub_do);
-            fs.put(fid.get() + 3, &pub_do[..don])
+            fs.put(slot_pub_fid(fid), &pub_do[..don])
                 .map_err(|_| Sw::MEMORY_FAILURE)?;
 
             if fid == EF_PK_SIG {
@@ -222,51 +212,5 @@ fn try_import<S: Storage>(
 /// turning an out-of-range offset into `WRONG_DATA`, never a panic — so the
 /// proofs assert panic-freedom, not offset containment.
 #[cfg(kani)]
-mod proofs {
-    use super::{parse_ehl_body, parse_ehl_head, tag_len};
-    use crate::consts::{EF_PK_AUT, EF_PK_DEC, EF_PK_SIG};
-
-    /// `tag_len` never panics on any bytes/position; on success it advances `pos`
-    /// by the 1..=3 in-bounds bytes of the BER length field.
-    #[kani::proof]
-    fn tag_len_total() {
-        const N: usize = 5;
-        let data: [u8; N] = kani::any();
-        let n: usize = kani::any();
-        let start: usize = kani::any();
-        kani::assume(n <= N);
-        kani::assume(start <= n);
-        let mut pos = start;
-        if tag_len(&data[..n], &mut pos).is_some() {
-            assert!(pos >= start + 1 && pos <= start + 3);
-            assert!(pos <= n); // every byte it consumed was in bounds
-        }
-    }
-
-    /// Parsing the `4D … CRT` header never panics; a success selects one of the
-    /// three key slots.
-    #[kani::proof]
-    fn parse_ehl_head_total() {
-        const N: usize = 8;
-        let data: [u8; N] = kani::any();
-        let n: usize = kani::any();
-        kani::assume(n <= N);
-        if let Ok((fid, _)) = parse_ehl_head(&data[..n]) {
-            assert!(fid == EF_PK_SIG || fid == EF_PK_DEC || fid == EF_PK_AUT);
-        }
-    }
-
-    /// Walking the `7F48` template + `5F48` key data never panics and always
-    /// terminates, for any start position and any bytes.
-    #[kani::proof]
-    #[kani::unwind(12)]
-    fn parse_ehl_body_total() {
-        const N: usize = 14;
-        let data: [u8; N] = kani::any();
-        let n: usize = kani::any();
-        let pos: usize = kani::any();
-        kani::assume(n <= N);
-        kani::assume(pos <= n);
-        let _ = parse_ehl_body(&data[..n], pos);
-    }
-}
+#[path = "importdata_kani.rs"]
+mod proofs;

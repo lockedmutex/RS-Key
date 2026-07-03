@@ -77,6 +77,31 @@ fn main() {
     println!("cargo:rustc-env=PK_PRESENCE_PIN={presence_pin}");
     println!("cargo:rerun-if-env-changed=PRESENCE_PIN");
 
+    // GPIO presence polarity: default active-low (button to ground, internal pull-up).
+    // `PRESENCE_ACTIVE_HIGH=1` flips it to active-high (pull-down, pressed = high) for
+    // a touch sensor / button to VCC. Only meaningful with a GPIO `PRESENCE_PIN`.
+    println!(
+        "cargo:rustc-env=PK_PRESENCE_ACTIVE_HIGH={}",
+        if resolve_presence_active_high() { 1 } else { 0 }
+    );
+    println!("cargo:rerun-if-env-changed=PRESENCE_ACTIVE_HIGH");
+
+    // Display-sleep wake button (the `display` build only): default the BAT_PWR button
+    // (GPIO25), `WAKE_PIN=none` for touch-only wake, or any GPIO. Polarity via
+    // `WAKE_ACTIVE_HIGH` (default active-low). Baked as env consts read in `display.rs`.
+    let (wake_enabled, wake_pin) = resolve_wake_pin();
+    println!(
+        "cargo:rustc-env=PK_WAKE_ENABLED={}",
+        if wake_enabled { 1 } else { 0 }
+    );
+    println!("cargo:rustc-env=PK_WAKE_PIN={wake_pin}");
+    println!("cargo:rerun-if-env-changed=WAKE_PIN");
+    println!(
+        "cargo:rustc-env=PK_WAKE_ACTIVE_HIGH={}",
+        if resolve_wake_active_high() { 1 } else { 0 }
+    );
+    println!("cargo:rerun-if-env-changed=WAKE_ACTIVE_HIGH");
+
     // LED backend (default `ws2812`, the Waveshare RP2350-One). Selected at
     // compile time so only the chosen driver — and its dependencies (PIO, PWM) —
     // is built. `gpio` = a plain on/off indicator, `pimoroni` = a 3-pin PWM RGB
@@ -99,8 +124,8 @@ fn main() {
     // Maximum number of addressable LEDs the binary can drive. The PIO state
     // machine and frame buffers are sized to this ceiling; the actual number
     // of connected LEDs is set at **runtime** via the phy record (`rsk hw
-    // --led-num`), which must be ≤ MAX_LEDS. Default 8 covers the common
-    // 1-8 range; boards with more (up to 64) override via `MAX_LEDS=<n>`.
+    // --led-num`), which must be ≤ MAX_LEDS. Default 1 (a single onboard
+    // LED); a board with a chain of N addressable LEDs builds `MAX_LEDS=N` (≤64).
     let max_leds = resolve_max_leds();
     println!("cargo:rustc-env=PK_MAX_LEDS={max_leds}");
     println!("cargo:rerun-if-env-changed=MAX_LEDS");
@@ -219,6 +244,52 @@ fn resolve_presence_pin() -> (bool, u8) {
     (true, pin)
 }
 
+/// Resolve `PRESENCE_ACTIVE_HIGH` to a bool — default `false` (active-low). Accepts
+/// `1`/`true`/`yes`/`on` for true and `0`/`false`/`no`/`off`/empty for false.
+fn resolve_presence_active_high() -> bool {
+    let raw = env::var("PRESENCE_ACTIVE_HIGH").unwrap_or_default();
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "false" | "no" | "off" => false,
+        "1" | "true" | "yes" | "on" => true,
+        other => panic!("PRESENCE_ACTIVE_HIGH={other:?} must be a boolean (0/1, true/false)"),
+    }
+}
+
+/// Resolve `WAKE_PIN` — the GPIO of the button that wakes the panel from display
+/// sleep (the trusted-display build only). Default `25` (the board's BAT_PWR /
+/// `KEY_BAT` button on the Waveshare RP2350-Touch-LCD-2.8); `none` disables the
+/// button so only a touch wakes; any `0..=29` selects another GPIO. Returns
+/// `(enabled, pin)`.
+fn resolve_wake_pin() -> (bool, u8) {
+    let raw = env::var("WAKE_PIN").unwrap_or_default();
+    let v = raw.trim().to_ascii_lowercase();
+    if v.is_empty() {
+        return (true, 25); // default: the BAT_PWR button (GPIO25)
+    }
+    if v == "none" {
+        return (false, 0);
+    }
+    let pin = v
+        .parse::<u8>()
+        .unwrap_or_else(|_| panic!("WAKE_PIN={raw:?} must be `none` or a GPIO number 0..=29"));
+    assert!(
+        pin <= 29,
+        "WAKE_PIN={pin} out of range 0..=29 (RP2350A GPIOs)"
+    );
+    (true, pin)
+}
+
+/// Resolve `WAKE_ACTIVE_HIGH` to a bool — default `false` (active-low, button to
+/// ground with internal pull-up). `1`/`true` flips to active-high (pull-down).
+fn resolve_wake_active_high() -> bool {
+    let raw = env::var("WAKE_ACTIVE_HIGH").unwrap_or_default();
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "false" | "no" | "off" => false,
+        "1" | "true" | "yes" | "on" => true,
+        other => panic!("WAKE_ACTIVE_HIGH={other:?} must be a boolean (0/1, true/false)"),
+    }
+}
+
 /// Resolve `LED_KIND` (the LED driver backend) to a known value; defaults to
 /// `ws2812`. One of: `ws2812` (addressable RGB on `LED_PIN`), `gpio` (a plain
 /// on/off LED on `LED_PIN`), `pimoroni` (3-pin PWM RGB, Pimoroni Tiny 2350), or
@@ -234,10 +305,10 @@ fn resolve_led_kind() -> String {
 }
 
 /// Resolve `MAX_LEDS` (the PIO/array ceiling for addressable LEDs) to a
-/// positive integer; defaults to 8. The runtime count (`rsk hw --led-num`)
-/// must be ≤ this value.
+/// positive integer; defaults to 1 (a single onboard LED). The runtime count
+/// (`rsk hw --led-num`) must be ≤ this value.
 fn resolve_max_leds() -> u32 {
-    let raw = env::var("MAX_LEDS").unwrap_or_else(|_| "8".into());
+    let raw = env::var("MAX_LEDS").unwrap_or_else(|_| "1".into());
     let v = raw
         .trim()
         .parse::<u32>()

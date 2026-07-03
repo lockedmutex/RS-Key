@@ -26,7 +26,11 @@ use rsk_sdk::error::{Error, Result};
 
 use crate::consts::{
     ALG_ES256, CURVE_P256, EF_CRED, EF_RP, MAX_CREDBLOB_LENGTH, MAX_RESIDENT_CREDENTIALS,
+    RP_NICK_MAX_LEN,
 };
+
+// `MAX_CREDBLOB_LENGTH` (128) over-bounds the sealable credBlob (`< 128`), a
+// harmless 1-byte slack in `CRED_BOX_MAX`.
 use crate::keyderiv::{KEY_HANDLE_LEN, verify_key};
 
 const CRED_PROTO: &[u8; 4] = b"\xf1\xd0\x02\x02";
@@ -34,6 +38,9 @@ const CRED_PROTO_RESIDENT: &[u8; 4] = b"\xf1\xd0\x02\x03";
 /// Derive label for the EF_RP rpId box — domain-separated from the credential-id
 /// protos so the rpId box key can never coincide with a cred-box key.
 const RP_PROTO: &[u8] = b"RS-Key/EF_RP/rpId";
+/// Derive label for the device-local EF_RPNICK box — its own domain so the nickname
+/// box key is distinct from the rpId box and every cred-box key.
+const NICK_PROTO: &[u8] = b"RS-Key/EF_RPNICK/nick";
 const PROTO_LEN: usize = 4;
 const IV_LEN: usize = 12;
 const TAG_LEN: usize = 16;
@@ -42,6 +49,67 @@ const SILENT_TAG_LEN: usize = 16;
 const HEAD_LEN: usize = PROTO_LEN + IV_LEN; // 16
 /// Bytes around the ciphertext for proto 0x02: head + poly tag + silent tag.
 const WRAP_LEN_22: usize = HEAD_LEN + TAG_LEN + SILENT_TAG_LEN; // 48
+
+// --- Sealed-field maxima. makeCredential enforces the first three (over-max
+// input → InvalidLength) and truncates the names, so the box ceiling below is a
+// TRUE bound for every accepted request. ---
+
+/// rpId ceiling — the DNS name maximum, shared by the non-resident box and the
+/// resident EF_RP record ([`RP_REC_MAX`]).
+pub(crate) const RP_ID_MAX: usize = 253;
+/// user.id ceiling (WebAuthn: 1..=64 bytes). getAssertion already echoes at most
+/// this many, so the box never stores more.
+pub(crate) const USER_ID_MAX: usize = 64;
+/// user.name / user.displayName ceiling — CTAP 2.1 §6.1.2 sanctions truncating
+/// to it rather than erroring.
+pub(crate) const USER_NAME_MAX: usize = 64;
+
+/// The one credential-box ceiling: create (makeCredential), assert
+/// (getAssertion's `Best::id`) and reseal (credMgmt update) all size from it —
+/// a divergent assert cap strands fresh credentials (create OK, assert skips).
+///
+/// DERIVED from the field maxima so it can never again drift below what the
+/// device accepts (the 640 literal it replaced omitted credBlob + extensions
+/// and under-sized the box once `RP_ID_MAX` rose to 253). Every optional field
+/// present, every string at its cap; `9` is the u64/i64 CBOR worst case, string
+/// headers are 2 bytes at 24..=255.
+const CBOR_KEY: usize = 1;
+const CBOR_STR_HDR: usize = 2;
+const CBOR_U64: usize = 9;
+const MAX_EXT_BODY: usize = CBOR_KEY
+    + 1 // sub-map header
+    + (1 + 8) + CBOR_STR_HDR + MAX_CREDBLOB_LENGTH // "credBlob" + bytes
+    + (1 + 11) + CBOR_U64 // "credProtect" + u64
+    + (1 + 11) + 1 // "hmac-secret" + bool
+    + (1 + 12) + 1 // "largeBlobKey" + bool
+    + (1 + 17) + 1; // "thirdPartyPayment" + bool
+const MAX_BODY: usize = 1 // outer map header (<24 fields)
+    + CBOR_KEY + CBOR_STR_HDR + RP_ID_MAX // 1: rpId
+    + CBOR_KEY + CBOR_STR_HDR + USER_ID_MAX // 3: userId
+    + CBOR_KEY + CBOR_STR_HDR + USER_NAME_MAX // 4: name
+    + CBOR_KEY + CBOR_STR_HDR + USER_NAME_MAX // 5: displayName
+    + CBOR_KEY + CBOR_U64 // 6: createdMs
+    + MAX_EXT_BODY // 7: extensions
+    + CBOR_KEY + 1 // 8: useSignCount
+    + CBOR_KEY + CBOR_U64 // 9: alg
+    + CBOR_KEY + CBOR_U64 // 10: curve
+    + CBOR_KEY + 1; // 11: rk
+pub(crate) const CRED_BOX_MAX: usize = WRAP_LEN_22 + MAX_BODY;
+
+/// Truncate `s` to at most `max` bytes on a UTF-8 character boundary.
+pub(crate) fn truncate_utf8(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Largest EF_RPNICK record: `iv(12) ‖ ciphertext ‖ tag(16)` for a max-length nickname.
+pub(crate) const NICK_BOX_MAX: usize = IV_LEN + RP_NICK_MAX_LEN + TAG_LEN;
 
 /// Resident-id length.
 pub const CRED_RESIDENT_LEN: usize = 42;
@@ -407,8 +475,19 @@ pub fn derive_large_blob_key(seed: &[u8; 32], cred_id: &[u8]) -> [u8; 32] {
 /// A resident record is `rp_id_hash(32) ‖ resident_id(42) ‖ full_cred_id`.
 pub const RECORD_PREFIX: usize = 32 + CRED_RESIDENT_LEN;
 
+/// Largest EF_CRED record — up to ~1 KiB with a large credBlob.
+pub(crate) const CRED_REC_MAX: usize = 1024;
+
+// A ceiling-sized resident box must still fit its EF_CRED record.
+const _: () = assert!(RECORD_PREFIX + CRED_BOX_MAX <= CRED_REC_MAX);
+
 /// EF_RP head before the (boxed) rpId tail: `count(1) ‖ rpIdHash(32)`.
 pub(crate) const RP_PREFIX: usize = 1 + 32;
+
+/// Largest EF_RP record: `count ‖ rpIdHash ‖ box(iv ‖ rpId ‖ tag)` at
+/// [`RP_ID_MAX`]. Older (smaller) records load unchanged — reads are
+/// length-driven with no fixed-size assumptions.
+pub(crate) const RP_REC_MAX: usize = RP_PREFIX + IV_LEN + RP_ID_MAX + TAG_LEN;
 
 /// Mark, in one storage pass, which slots `base+0..base+out.len()` hold a live
 /// record (`out[i]` is occupied iff a key `base+i` exists). One pass is
@@ -450,8 +529,8 @@ pub fn credential_store<S: Storage>(
 ) -> Result<()> {
     let mut slot: Option<u16> = None;
     let mut new_record = true;
-    let mut rec = [0u8; 1024];
-    let mut scratch = [0u8; 1024];
+    let mut rec = [0u8; CRED_REC_MAX];
+    let mut scratch = [0u8; CRED_REC_MAX];
 
     let mut occupied = [false; MAX_RESIDENT_CREDENTIALS as usize];
     slot_map(fs, EF_CRED, &mut occupied);
@@ -505,7 +584,7 @@ fn bump_rp<S: Storage>(
     rp_id_hash: &[u8; 32],
     rp_id: &str,
 ) -> Result<()> {
-    let mut rec = [0u8; 256];
+    let mut rec = [0u8; RP_REC_MAX];
     let mut free: Option<u16> = None;
     let mut occupied = [false; MAX_RESIDENT_CREDENTIALS as usize];
     slot_map(fs, EF_RP, &mut occupied);
@@ -600,6 +679,81 @@ pub(crate) fn unseal_rp_id<'a>(
     None
 }
 
+/// Box a device-local RP nickname under the device seed. Layout written to `out`:
+/// `iv(12) ‖ ciphertext ‖ poly1305_tag(16)`, ChaCha20-Poly1305 with the rpIdHash as
+/// AAD — same shape as [`seal_rp_id`]. Two differences matter:
+///
+/// * The nickname is **mutable** (unlike the immutable rpId domain), so the IV is
+///   synthetic over the *plaintext*: `iv = HMAC(key, rpIdHash ‖ nick)[..12]`. A fixed
+///   (key, iv) thus only ever encrypts the one nickname it was derived from, so a
+///   re-rename to a different string draws a different IV — no nonce reuse. Equal
+///   nicknames under different rpIdHashes also differ (the hash is folded in). The
+///   residual (a rename back to a prior value reproduces a prior box) is
+///   deterministic-encryption-level leakage, matching [`seal_rp_id`]'s own model.
+/// * The rpIdHash AAD binds the box to its RP, so a stale nickname left in a reused
+///   slot fails to open under a different RP — the AEAD itself is the slot-reuse guard,
+///   no cleartext key prefix is stored.
+pub(crate) fn seal_nick(
+    seed: &[u8; 32],
+    rp_id_hash: &[u8; 32],
+    nick: &str,
+    out: &mut [u8],
+) -> Result<usize> {
+    let id = nick.as_bytes();
+    if id.len() > RP_NICK_MAX_LEN {
+        return Err(Error::NoMemory);
+    }
+    let total = IV_LEN + id.len() + TAG_LEN;
+    if total > out.len() {
+        return Err(Error::NoMemory);
+    }
+    let mut key = derive_chacha_key(seed, NICK_PROTO);
+    let mut iv_src = [0u8; 32 + RP_NICK_MAX_LEN];
+    iv_src[..32].copy_from_slice(rp_id_hash);
+    iv_src[32..32 + id.len()].copy_from_slice(id);
+    let iv_full = hmac_sha256(&key, &iv_src[..32 + id.len()]);
+    let mut iv = [0u8; IV_LEN];
+    iv.copy_from_slice(&iv_full[..IV_LEN]);
+    out[..IV_LEN].copy_from_slice(&iv);
+    out[IV_LEN..IV_LEN + id.len()].copy_from_slice(id);
+    let tag = chacha20poly1305_encrypt(&key, &iv, rp_id_hash, &mut out[IV_LEN..IV_LEN + id.len()]);
+    out[IV_LEN + id.len()..total].copy_from_slice(&tag);
+    key.zeroize();
+    Ok(total)
+}
+
+/// Recover a device-local RP nickname from an EF_RPNICK record. Returns the nickname
+/// only if the box opens under this rpIdHash — an absent, short, or stale (slot-reused)
+/// record yields `None`, so the caller falls back to the rpId.
+pub(crate) fn unseal_nick<'a>(
+    seed: &[u8; 32],
+    rp_id_hash: &[u8; 32],
+    tail: &[u8],
+    out: &'a mut [u8],
+) -> Option<&'a str> {
+    let n = tail.len();
+    if n < IV_LEN + TAG_LEN {
+        return None;
+    }
+    let ct_len = n - IV_LEN - TAG_LEN;
+    if ct_len > out.len() {
+        return None; // `out` holds only the plaintext nickname, not the whole box
+    }
+    let mut iv = [0u8; IV_LEN];
+    iv.copy_from_slice(&tail[..IV_LEN]);
+    let mut tag = [0u8; TAG_LEN];
+    tag.copy_from_slice(&tail[n - TAG_LEN..]);
+    out[..ct_len].copy_from_slice(&tail[IV_LEN..IV_LEN + ct_len]);
+    let mut key = derive_chacha_key(seed, NICK_PROTO);
+    let ok = chacha20poly1305_decrypt(&key, &iv, rp_id_hash, &mut out[..ct_len], &tag).is_ok();
+    key.zeroize();
+    if ok {
+        core::str::from_utf8(&out[..ct_len]).ok()
+    } else {
+        None
+    }
+}
+
 /// Boot pass: re-box any legacy cleartext EF_RP record so a flash dump no longer
 /// reveals the cleartext list of relying parties. Idempotent and crash-safe —
 /// already-boxed records authenticate and are skipped, and a partially-migrated
@@ -614,9 +768,9 @@ pub fn migrate_rp_seal<S: Storage>(dev: &Device, fs: &mut Fs<S>) {
     let Some(mut seed) = crate::seed::load_keydev(dev, fs) else {
         return;
     };
-    let mut buf = [0u8; 256];
-    let mut plain = [0u8; 256];
-    let mut out = [0u8; 256];
+    let mut buf = [0u8; RP_REC_MAX];
+    let mut plain = [0u8; RP_REC_MAX];
+    let mut out = [0u8; RP_REC_MAX];
     for i in 0..MAX_RESIDENT_CREDENTIALS {
         if !occupied[i as usize] {
             continue;
@@ -649,232 +803,5 @@ pub fn migrate_rp_seal<S: Storage>(dev: &Device, fs: &mut Fs<S>) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use rsk_fs::storage::ram::RamStorage;
-
-    fn dev() -> Device<'static> {
-        Device {
-            serial_hash: &[0xAB; 32],
-            serial_id: &[1, 2, 3, 4, 5, 6, 7, 8],
-            otp_key: None,
-        }
-    }
-
-    const SEED: [u8; 32] = [0x42; 32];
-    const IV: [u8; 12] = [0x11; 12];
-
-    fn input() -> CredInput<'static> {
-        CredInput {
-            rp_id: "example.com",
-            user_id: &[0xDE, 0xAD, 0xBE, 0xEF],
-            user_name: "alice",
-            user_display_name: "Alice Smith",
-            use_sign_count: true,
-            rk: false,
-            created_ms: 12345,
-            alg: ALG_ES256,
-            curve: CURVE_P256 as i64,
-            ext: CredExt::default(),
-        }
-    }
-
-    #[test]
-    fn create_load_roundtrip() {
-        let d = dev();
-        let rp_hash = sha256(b"example.com");
-        let mut out = [0u8; 512];
-        let len = credential_create(&SEED, &d, &input(), &rp_hash, &IV, &mut out).unwrap();
-        assert_eq!(&out[..4], CRED_PROTO);
-
-        let mut scratch = [0u8; 512];
-        let c = credential_load(&SEED, &out[..len], &rp_hash, &mut scratch).unwrap();
-        assert_eq!(c.rp_id, "example.com");
-        assert_eq!(c.user_id, &[0xDE, 0xAD, 0xBE, 0xEF]);
-        assert_eq!(c.user_name, "alice");
-        assert_eq!(c.user_display_name, "Alice Smith");
-        assert!(c.use_sign_count);
-        assert_eq!(c.alg, ALG_ES256);
-        assert_eq!(c.curve, CURVE_P256 as i64);
-    }
-
-    #[test]
-    fn non_p256_alg_curve_roundtrip() {
-        use crate::consts::{ALG_ES512, CURVE_P521};
-        let d = dev();
-        let rp_hash = sha256(b"example.com");
-        let mut inp = input();
-        inp.alg = ALG_ES512;
-        inp.curve = CURVE_P521 as i64;
-        let mut out = [0u8; 512];
-        let len = credential_create(&SEED, &d, &inp, &rp_hash, &IV, &mut out).unwrap();
-        let mut scratch = [0u8; 512];
-        let c = credential_load(&SEED, &out[..len], &rp_hash, &mut scratch).unwrap();
-        assert_eq!(c.alg, ALG_ES512);
-        assert_eq!(c.curve, CURVE_P521 as i64);
-    }
-
-    #[test]
-    fn extensions_roundtrip_through_box() {
-        let d = dev();
-        let rp_hash = sha256(b"example.com");
-        let mut inp = input();
-        inp.rk = true;
-        inp.ext = CredExt {
-            cred_protect: 2,
-            cred_blob: &[0xBE, 0xEF, 0x42],
-            hmac_secret: true,
-            large_blob_key: true,
-            third_party_payment: true,
-        };
-        let mut out = [0u8; 512];
-        let len = credential_create(&SEED, &d, &inp, &rp_hash, &IV, &mut out).unwrap();
-
-        let mut scratch = [0u8; 512];
-        let c = credential_load(&SEED, &out[..len], &rp_hash, &mut scratch).unwrap();
-        assert_eq!(c.ext.cred_protect, 2);
-        assert_eq!(c.ext.cred_blob, &[0xBE, 0xEF, 0x42]);
-        assert!(c.ext.hmac_secret);
-        assert!(c.ext.large_blob_key);
-        assert!(c.ext.third_party_payment);
-        assert!(c.rk);
-    }
-
-    #[test]
-    fn oversized_cred_blob_is_dropped() {
-        let d = dev();
-        let rp_hash = sha256(b"example.com");
-        let big = [0u8; MAX_CREDBLOB_LENGTH + 1];
-        let mut inp = input();
-        inp.ext.cred_blob = &big;
-        let mut out = [0u8; 512];
-        let len = credential_create(&SEED, &d, &inp, &rp_hash, &IV, &mut out).unwrap();
-        let mut scratch = [0u8; 512];
-        let c = credential_load(&SEED, &out[..len], &rp_hash, &mut scratch).unwrap();
-        assert!(
-            c.ext.cred_blob.is_empty(),
-            "oversized credBlob is not sealed"
-        );
-    }
-
-    #[test]
-    fn wrong_rp_hash_fails_to_decrypt() {
-        let d = dev();
-        let rp_hash = sha256(b"example.com");
-        let mut out = [0u8; 512];
-        let len = credential_create(&SEED, &d, &input(), &rp_hash, &IV, &mut out).unwrap();
-        let other = sha256(b"evil.com");
-        let mut scratch = [0u8; 512];
-        assert!(credential_load(&SEED, &out[..len], &other, &mut scratch).is_none());
-    }
-
-    #[test]
-    fn tampered_box_fails() {
-        let d = dev();
-        let rp_hash = sha256(b"example.com");
-        let mut out = [0u8; 512];
-        let len = credential_create(&SEED, &d, &input(), &rp_hash, &IV, &mut out).unwrap();
-        out[HEAD_LEN] ^= 0x01; // flip a ciphertext byte
-        let mut scratch = [0u8; 512];
-        assert!(credential_load(&SEED, &out[..len], &rp_hash, &mut scratch).is_none());
-    }
-
-    #[test]
-    fn hmac_key_deterministic_uv_halves_differ() {
-        let box1 = [0x55u8; 80];
-        let mut box2 = box1;
-        box2[40] ^= 0xFF;
-        let k1 = derive_hmac_key(&SEED, &box1);
-        assert_eq!(k1, derive_hmac_key(&SEED, &box1), "deterministic");
-        // The CredRandomWithUV ([32..64]) and CredRandomWithoutUV ([0..32]) differ.
-        assert_ne!(&k1[..32], &k1[32..]);
-        // A different box yields a different cred_random.
-        assert_ne!(k1, derive_hmac_key(&SEED, &box2));
-        // The proto prefix (first 4 bytes) is folded in, so it is path-sensitive.
-        assert_ne!(
-            derive_hmac_key(&SEED, &box1),
-            derive_hmac_key(&[0x43; 32], &box1)
-        );
-    }
-
-    #[test]
-    fn large_blob_key_deterministic_and_box_sensitive() {
-        let box1 = [0x55u8; 80];
-        let mut box2 = box1;
-        box2[10] ^= 0xFF;
-        let k1 = derive_large_blob_key(&SEED, &box1);
-        assert_eq!(k1, derive_large_blob_key(&SEED, &box1));
-        assert_ne!(k1, derive_large_blob_key(&SEED, &box2));
-        assert_ne!(k1, derive_hmac_key(&SEED, &box1)[..32]);
-    }
-
-    #[test]
-    fn resident_id_format_and_determinism() {
-        let d = dev();
-        let cred_id = [0x55u8; 80];
-        let r1 = derive_resident(&cred_id, &d);
-        let r2 = derive_resident(&cred_id, &d);
-        assert_eq!(r1, r2);
-        assert_eq!(r1.len(), CRED_RESIDENT_LEN);
-        assert_eq!(&r1[4..8], CRED_PROTO_RESIDENT);
-        assert!(is_resident(&r1));
-    }
-
-    #[test]
-    fn store_then_dedup_and_rp_count() {
-        let d = dev();
-        let mut fs: Fs<RamStorage> = Fs::new(RamStorage::new(), &[]);
-        let rp_hash = sha256(b"example.com");
-
-        let mut out = [0u8; 512];
-        let len = credential_create(&SEED, &d, &input(), &rp_hash, &IV, &mut out).unwrap();
-        credential_store(
-            &SEED,
-            &d,
-            &mut fs,
-            &out[..len],
-            &rp_hash,
-            "example.com",
-            &[0xDE, 0xAD, 0xBE, 0xEF],
-        )
-        .unwrap();
-
-        // Stored in the first EF_CRED slot, record = rp_hash ‖ resident ‖ box.
-        assert!(fs.has_data(EF_CRED));
-        let mut rec = [0u8; 1024];
-        let n = fs.read(EF_CRED, &mut rec).unwrap();
-        assert_eq!(&rec[..32], &rp_hash[..]);
-        assert_eq!(n, RECORD_PREFIX + len);
-        // EF_RP created with count 1.
-        let mut rp = [0u8; 256];
-        let m = fs.read(EF_RP, &mut rp).unwrap();
-        assert_eq!(rp[0], 1);
-        assert_eq!(&rp[1..33], &rp_hash[..]);
-        // The rpId domain tail is boxed under the seed: not cleartext on flash,
-        // but it un-boxes back to the original domain.
-        assert_ne!(&rp[RP_PREFIX..m], b"example.com");
-        let mut scratch = [0u8; 256];
-        let (domain, was_boxed) =
-            unseal_rp_id(&SEED, &rp_hash, &rp[RP_PREFIX..m], &mut scratch).unwrap();
-        assert_eq!(domain, "example.com");
-        assert!(was_boxed);
-
-        // Re-registering the SAME user reuses the slot (no new RP record / count bump).
-        let iv2 = [0x22u8; 12];
-        let len2 = credential_create(&SEED, &d, &input(), &rp_hash, &iv2, &mut out).unwrap();
-        credential_store(
-            &SEED,
-            &d,
-            &mut fs,
-            &out[..len2],
-            &rp_hash,
-            "example.com",
-            &[0xDE, 0xAD, 0xBE, 0xEF],
-        )
-        .unwrap();
-        assert!(!fs.has_data(EF_CRED + 1)); // still one credential slot used
-        let m2 = fs.read(EF_RP, &mut rp).unwrap();
-        assert_eq!(rp[0], 1, "same user must not bump the rp count");
-        assert_eq!(m2, m);
-    }
-}
+#[path = "credential_tests.rs"]
+mod tests;

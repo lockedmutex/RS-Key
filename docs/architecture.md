@@ -57,7 +57,27 @@ Three details make that work:
 Outside keygen, core1 parks in WFE, and embassy-rp pauses it around every flash
 erase/program, so its XIP fetches never collide with flash writes.
 
+## Boot sequence
+
+Getting to that runtime state has a strict order. The bootrom verifies the
+signed image, then the firmware provisions and recovers **all** persistent state
+— OTP keys, the KV store, the phy record, the TRNG, the seal migrations and the
+one-shot at-rest scrub — *before* it asserts the USB pull-up. That ordering is
+load-bearing: `builder.build()` starts host enumeration, and the task that
+answers control transfers must be spawned with no blocking work in between, or
+the host enumerates a mute device and times out — the "blink red / not
+recognised until several replugs" report that motivated attaching to the bus
+only after everything else is ready.
+
+![Boot sequence — bootrom secure-boot verify, then a provision-and-recover phase (OTP keys, KV mount, phy record, TRNG seed, seal migrations, at-rest scrub) that completes before the USB pull-up, then attach-and-serve (build, spawn usb_task, transports live, worker dispatches applets)](images/boot-flow.svg)
+
 ## Crates
+
+The workspace splits along a strict dependency gradient: the `firmware` binary
+is thin glue over the applet crates, which build on a handful of host-tested
+platform libraries. The per-crate detail is in the table; the shape is:
+
+![Crate dependency layers — the firmware binary on top, then the seven applet crates (fido, openpgp, piv, oath, otp, mgmt, rescue), then the platform libraries (sdk, fs, crypto, usb, rsa-asm, led); each tier depends on the one below, with piv→openpgp, otp→mgmt and openpgp→rsa-asm as the cross-edges](images/crate-graph.svg)
 
 | Crate | Contents |
 |---|---|
@@ -74,11 +94,15 @@ erase/program, so its XIP fetches never collide with flash writes.
 | `rsk-mgmt` | the YubiKey management applet (DeviceInfo, interface toggles) served over both CCID and CTAPHID |
 | `rsk-rescue` | recovery/provisioning applet: identity, phy config record, flash info, secure-boot status, attestation key, reboot, the one OTP-lock write |
 | `rsk-rsa-asm` | vendored C/ARM-asm modular exponentiation behind one FFI fn (host build uses a pure-Rust fallback) |
+| `rsk-led` | the `EF_LED_CONF` codec for the status-LED config block, shared by the firmware and the `rsk led` host tool |
+| `rsk-ui` | the trusted-display UI model (operation prompts, untrusted relying-party-string sanitizing, Allow/Deny button geometry); compiled only into the `display` build |
 
 Everything except `firmware` is hardware-agnostic and runs the full test
 suite on the host ([testing.md](testing.md)).
 
 ## Flash layout
+
+![RP2350-One flash map — a signed code region above two KV partitions (main store + counters) that survive a reflash](images/flash-map.svg)
 
 Two KV partitions at fixed offsets (`firmware/memory.x`): the main store, and
 a small separate partition for the per-operation counters so their churn
@@ -97,6 +121,26 @@ without losing data. Until that burn the root derives from on-chip state
 alone, which an attacker with full flash and chip access could reconstruct —
 [threat-model.md](threat-model.md) covers what at-rest sealing does and does
 not buy before provisioning.
+
+One sealed object worth spelling out is the FIDO credential box — it doubles as
+the opaque credential ID a relying party stores, so its size caps the reported
+`maxCredentialIdLength` (748):
+
+![FIDO credential box — proto(4) iv(12) then a variable CBOR body, poly1305 tag(16) and silent tag(16); the four framing pieces are 48 bytes and the whole box is at most 748. Below it, the 42-byte resident id returned to the relying party](images/cred-box.svg)
+
+## Capacity — why the flash is mostly empty
+
+The KV store is a fixed 1.5 MB whatever the `FLASH_SIZE` ([build.md](build.md));
+a larger flash only grows the code region, most of which no firmware writes. That
+is deliberate. A security key's maximum *logical* state is small and hard-capped:
+`MAX_RESIDENT_CREDENTIALS` (256 passkeys), `MAX_DYNAMIC_FILES` (256 files across
+all applets), `MAX_OATH_CRED` (255), plus a handful of OpenPGP/PIV slots — so a
+fully provisioned device fills only a few hundred KB, well under the 1408 KB main
+partition. Growing the store to "fill" a 16 MB board would buy nothing usable: it
+lengthens the `sequential-storage` scan behind every cold boot and absent-key
+probe (the present cache exists to dodge exactly that full-partition ~0.2 s cost),
+and forces the logical caps — and the RAM/stack buffers sized to them — up for
+capacity no one reaches. Empty flash here is headroom, not waste.
 
 ## Device identity
 

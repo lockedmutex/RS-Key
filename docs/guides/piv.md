@@ -43,6 +43,32 @@ The applet accepts AES-128/192/256 management keys; under the FIPS-style build
 it refuses to *set* a new 3DES key, though an existing 3DES key still
 authenticates so a reflashed device can migrate itself to AES.
 
+**On the panel (trusted-display builds).** The PIV PIN and PUK can be changed —
+and a blocked PIN unblocked with the PUK — on the device, no host needed:
+Settings → Security → **PIV PIN** → *Change PIN* / *Change PUK* / *Unblock PIN*.
+Each verifies the current PIN/PUK against the applet's own retry counter (shown
+on the pad) and stores the new value in the 8-byte `0xFF`-padded wire form, so a
+later `ykman` / `yubico-piv-tool` VERIFY accepts it.
+
+A 24-byte **management key** can't be typed on a numeric pad, so the panel sets a
+**random, PIN-protected** one instead — Settings → Security → **PIV PIN** →
+*Protect mgmt key*. The device generates a random AES-256 management key, seals
+it, and marks it PIN-protected (the ykman `--protect` scheme), so a host then
+uses it with just the PIV PIN — `ykman piv info` shows it as protected and
+`ykman piv` operations no longer need the hex key. **Security:** once protected,
+the PIV PIN **alone** grants management access (it unlocks the random key), so
+treat the PIN accordingly; the panel states this and gates the action behind the
+device PIN and a hold. (`ykman piv access change-management-key --generate
+--protect` does the same thing from the host.)
+
+The panel manages PINs/PUKs that follow the standard PIV convention — **6–8
+digits, padded to 8 bytes with `0xFF`** — which is what `ykman`, `yubico-piv-tool`
+and OpenSC all use. A PIN or PUK provisioned *outside* that convention (e.g.
+hand-crafted raw `CHANGE REFERENCE DATA` / `RESET RETRY` APDUs that store an
+unpadded or sub-6-digit value) can't be verified on the panel; re-set it with
+`ykman` first. The factory defaults follow the convention, so the panel works
+out of the box.
+
 > The defaults are public. Until you change the PIN, PUK and management key,
 > anyone with physical access can generate, import or delete keys. Treat a
 > default-credential card as unprovisioned.
@@ -66,11 +92,15 @@ non-signature slots it defaults to PIN **once per session**, so a default-policy
 9e key still needs one VERIFY before use. For true card-auth / contactless
 no-PIN behaviour, generate the 9e key with an explicit `--pin-policy NEVER`.
 
-**Algorithms.** On-card generation and import accept **RSA-2048**, **RSA-1024**
-(disabled under the FIPS-style build, SP 800-131A), and **ECC P-256 / P-384**.
-RSA-3072/4096 and Ed25519/X25519 — which the OpenPGP applet does offer
-([openpgp.md](openpgp.md)) — are **not** available on the PIV applet; pick
-P-256 or P-384 for elliptic-curve PIV keys.
+**Algorithms.** On-card generation and import accept **RSA-2048 / 3072 / 4096**,
+**RSA-1024** (disabled under the FIPS-style build, SP 800-131A), **ECC P-256 /
+P-384**, and the Curve25519 pair **Ed25519** (signing) and **X25519** (key
+agreement) — the Yubico 5.7 PIV algorithm ids `0xE0` / `0xE1`, so `ykman` drives
+them as `--algorithm ED25519` / `X25519`. An Ed25519 key generates with a
+self-signed certificate like the other curves; an X25519 key is key-agreement-only
+and can't self-sign, so generation writes **no** auto-certificate (provision one
+from a CA via `ykman piv certificates import`). RSA-3072/4096 keygen is slow on
+this hardware (tens of seconds to a minute-plus).
 
 ## Generate a key on-card
 
@@ -106,7 +136,8 @@ ykman piv keys import 9d existing.pem        # PEM with the private key
 ykman piv certificates import 9d existing-cert.pem
 ```
 
-Import is management-key gated and also accepts RSA-2048/1024 and P-256/P-384.
+Import is management-key gated and also accepts RSA-2048/1024, P-256/P-384 and
+Ed25519/X25519.
 An imported key keeps whatever copy you imported it from — your call which way
 the trade-off goes. Imported keys **cannot be attested** (see below): attestation
 proves on-card *generation*, which import didn't do.
@@ -200,9 +231,10 @@ The card shows up as a standard PIV token; nothing here is RS-Key-specific.
   it wants the opt-in `VIDPID=Yubikey5` build; on the default RS-Key build use any
   PKCS#11-aware `age` build against `opensc-pkcs11.so`.
 
-- **ECDH / key agreement** (`9d` and retired slots, P-256/P-384):
-  `ykman piv ... ` exposes it; at the wire level it is GENERAL AUTHENTICATE with
-  tag `0x85`, the operation `yubico-piv-tool` and OpenSC use for decryption.
+- **ECDH / key agreement** (`9d` and retired slots, P-256/P-384 and X25519):
+  `ykman piv ... ` exposes it (`ykman piv keys calculate-secret` for X25519); at
+  the wire level it is GENERAL AUTHENTICATE with tag `0x85`, the operation
+  `yubico-piv-tool` and OpenSC use for decryption.
 
 - **Windows / macOS native** smart-card stacks pick the PIV applet up as-is;
   macOS CryptoTokenKit binds its `pivtoken.appex` to the reader

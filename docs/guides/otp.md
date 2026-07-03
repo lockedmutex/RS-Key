@@ -96,10 +96,10 @@ Notes on the options:
   exist only on the device once programmed (see *Validation* below for the
   exception).
 - **Access code:** set one with `ykman otp settings <slot> --new-access-code`.
-  The firmware then refuses to overwrite, update, or delete that slot unless the
-  code is presented (`ykman otp --access-code <hex> …`, given *before* the
-  sub-command). Lose the code and the only way out is a factory reset of the OTP
-  applet.
+  The firmware then refuses to overwrite, update, delete, **or swap** that slot
+  unless the code is presented (`ykman otp --access-code <hex> …`, given *before*
+  the sub-command). Lose the code and the only way out is a factory reset of the
+  OTP applet.
 
 `ykman otp` reaches the device over the HID frame protocol on the keyboard
 interface (and over CCID); both work without any PIN — OTP slots are not

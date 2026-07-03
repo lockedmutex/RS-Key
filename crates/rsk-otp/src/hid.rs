@@ -15,6 +15,8 @@ pub const REPORT_DATA: usize = REPORT_SIZE - 1;
 pub const FRAME_SIZE: usize = 70;
 /// Command payload size.
 pub const PAYLOAD_SIZE: usize = 64;
+/// Offset of the frame CRC: payload ‖ slot ‖ CRC(2).
+const FRAME_CRC_OFF: usize = PAYLOAD_SIZE + 1;
 
 /// Host→device flag: a data frame (the low 5 bits are the sequence number).
 const FLAG_WRITE: u8 = 0x80;
@@ -86,7 +88,7 @@ impl FrameRx {
             return RxOutcome::None;
         }
         // Final slice: validate the frame CRC (plain CRC-16 over the payload).
-        let want = u16::from_le_bytes([self.buf[65], self.buf[66]]);
+        let want = u16::from_le_bytes([self.buf[FRAME_CRC_OFF], self.buf[FRAME_CRC_OFF + 1]]);
         if crc16(&self.buf[..PAYLOAD_SIZE]) != want {
             return RxOutcome::BadCrc;
         }
@@ -187,7 +189,7 @@ pub fn split_frame(payload: &[u8; PAYLOAD_SIZE], slot: u8) -> [[u8; REPORT_SIZE]
     frame[..PAYLOAD_SIZE].copy_from_slice(payload);
     frame[PAYLOAD_SIZE] = slot;
     let crc = crc16(payload);
-    frame[65..67].copy_from_slice(&crc.to_le_bytes());
+    frame[FRAME_CRC_OFF..FRAME_CRC_OFF + 2].copy_from_slice(&crc.to_le_bytes());
     let mut reports = [[0u8; REPORT_SIZE]; 10];
     for (seq, rep) in reports.iter_mut().enumerate() {
         rep[..REPORT_DATA]
@@ -198,84 +200,5 @@ pub fn split_frame(payload: &[u8; PAYLOAD_SIZE], slot: u8) -> [[u8; REPORT_SIZE]
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn reassembles_a_full_frame() {
-        let mut payload = [0u8; PAYLOAD_SIZE];
-        for (i, b) in payload.iter_mut().enumerate() {
-            *b = i as u8;
-        }
-        let reports = split_frame(&payload, 0x30);
-        let mut rx = FrameRx::new();
-        for r in &reports[..9] {
-            assert_eq!(rx.feed(r), RxOutcome::None);
-        }
-        match rx.feed(&reports[9]) {
-            RxOutcome::Frame { slot, payload: p } => {
-                assert_eq!(slot, 0x30);
-                assert_eq!(p, payload);
-            }
-            other => panic!("expected Frame, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn rejects_corrupted_crc() {
-        let payload = [0xAAu8; PAYLOAD_SIZE];
-        let mut reports = split_frame(&payload, 1);
-        reports[9][0] ^= 0xFF; // corrupt the last payload slice
-        let mut rx = FrameRx::new();
-        for r in &reports[..9] {
-            rx.feed(r);
-        }
-        assert_eq!(rx.feed(&reports[9]), RxOutcome::BadCrc);
-    }
-
-    #[test]
-    fn reset_byte_clears_state() {
-        let mut rx = FrameRx::new();
-        let mut reset = [0u8; REPORT_SIZE];
-        reset[REPORT_DATA] = FLAG_RESET;
-        assert_eq!(rx.feed(&reset), RxOutcome::Reset);
-    }
-
-    #[test]
-    fn out_of_range_sequence_ignored() {
-        let mut rx = FrameRx::new();
-        let mut bad = [0u8; REPORT_SIZE];
-        bad[REPORT_DATA] = FLAG_WRITE | 0x0A; // seq 10
-        assert_eq!(rx.feed(&bad), RxOutcome::None);
-    }
-
-    #[test]
-    fn tx_streams_body_then_end_marker_and_host_crc_checks() {
-        // A 20-byte response (an HMAC-SHA1 chal-resp) → 22 bytes with CRC → 4
-        // data frames (7+7+7+1) + an end marker.
-        let body: Vec<u8> = (0..20u8).collect();
-        let mut tx = FrameTx::new();
-        tx.load(&body);
-        let mut got = Vec::new();
-        let mut seqs = Vec::new();
-        let mut out = [0u8; REPORT_SIZE];
-        while tx.next(&mut out) {
-            if out[REPORT_DATA] & SEQ_MASK == 0 && got.len() >= 22 {
-                break; // end marker
-            }
-            got.extend_from_slice(&out[..REPORT_DATA]);
-            seqs.push(out[REPORT_DATA]);
-        }
-        assert_eq!(seqs, [0x40, 0x41, 0x42, 0x43]);
-        // The host validates payload ‖ CRC against the X.25 residual.
-        assert_eq!(&got[..20], &body[..]);
-        assert_eq!(crc16(&got[..22]), 0xF0B8);
-        assert!(!tx.active());
-    }
-
-    #[test]
-    fn status_frame_layout() {
-        let s = status_frame([5, 7, 4, 3, 0x01, 0, 0]);
-        assert_eq!(s, [0, 5, 7, 4, 3, 0x01, 0, 0]);
-    }
-}
+#[path = "hid_tests.rs"]
+mod tests;

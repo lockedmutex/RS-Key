@@ -21,11 +21,12 @@ import sys
 from datetime import datetime
 
 from . import ccid, ctaphid, openpgp
-from .audit import AUDIT_CHECKPOINT, CKPT_TAG, EVENTS, ENTRY_LEN, read_journal
-from .backup import _gated, _vendor, mse_handshake
+from .audit import (AUDIT_CHECKPOINT, EVENTS, ENTRY_LEN, EVT_RESET, _fingerprint,
+                    _fold, read_journal, verify_checkpoint)
+from .backup import ERR_NOT_ALLOWED, _gated, _vendor, mse_handshake
 from .common import confirm, connect_fido, die
 from .fido import ATT_CLEAR, ATT_STATE
-from .status import RESCUE_AID
+from .status import RESCUE_AID, rescue_serial
 
 OTP_AID = [0xA0, 0x00, 0x00, 0x05, 0x27, 0x20, 0x01]
 OATH_AID = [0xA0, 0x00, 0x00, 0x05, 0x27, 0x21, 0x01]
@@ -45,17 +46,18 @@ def register(sub):
 def _serial():
     """The device serial (RP2350 OTP chip id) from the rescue applet."""
     conn = ccid.connect()
-    d, s1, s2 = ccid.select(conn, RESCUE_AID)
-    if (s1, s2) != (0x90, 0x00) or len(d) < 12:
+    serial = rescue_serial(*ccid.select(conn, RESCUE_AID))
+    if serial is None:
         die("rescue applet did not answer — cannot identify the device")
-    return d[4:12].hex(), conn
+    return serial, conn
 
 
 def _wipe_otp(conn):
-    """Delete slots 1-4 (an all-zero config is the protocol's delete)."""
+    """Delete slots 1-4 (an all-zero config is the protocol's delete).
+    Returns (ok, detail) — detail is the receipt's step string."""
     _, s1, s2 = ccid.select(conn, OTP_AID)
-    if (s1, s2) != (0x90, 0x00):
-        return "applet absent"
+    if (s1, s2) != ccid.SW_OK:
+        return True, "applet absent"
     blocked = []
     for slot in range(1, 5):
         body = [0] * (OTP_CONFIG_SIZE + OTP_ACC_CODE_SIZE)
@@ -63,25 +65,28 @@ def _wipe_otp(conn):
             conn, [0x00, 0x01, 0x01, slot - 1, len(body)] + body)
         if (s1, s2) == (0x69, 0x82):
             blocked.append(slot)  # protected by an access code we don't have
-        elif (s1, s2) != (0x90, 0x00):
-            return f"slot {slot}: SW {s1:02X}{s2:02X}"
-    return f"slots {blocked} protected by access codes — NOT wiped" if blocked else "ok"
+        elif (s1, s2) != ccid.SW_OK:
+            return False, f"slot {slot}: SW {s1:02X}{s2:02X}"
+    if blocked:
+        return False, f"slots {blocked} protected by access codes — NOT wiped"
+    return True, "ok"
 
 
 def _wipe_oath(conn):
     _, s1, s2 = ccid.select(conn, OATH_AID)
-    if (s1, s2) != (0x90, 0x00):
-        return "applet absent"
+    if (s1, s2) != ccid.SW_OK:
+        return True, "applet absent"
     _, s1, s2 = ccid.transmit(conn, [0x00, 0x04, 0xDE, 0xAD])
-    return "ok" if (s1, s2) == (0x90, 0x00) else f"RESET: SW {s1:02X}{s2:02X}"
+    ok = (s1, s2) == ccid.SW_OK
+    return ok, "ok" if ok else f"RESET: SW {s1:02X}{s2:02X}"
 
 
 def _wipe_piv(conn):
     """Block PIN and PUK (two distinct wrong values, so even a matching first
     guess cannot keep the retry counter alive), then factory RESET."""
     _, s1, s2 = ccid.select(conn, PIV_AID)
-    if (s1, s2) != (0x90, 0x00):
-        return "applet absent"
+    if (s1, s2) != ccid.SW_OK:
+        return True, "applet absent"
     for bad in (b"00000000", b"11111111"):
         for _ in range(8):
             ccid.transmit(conn, [0x00, PIV_INS_VERIFY, 0x00, 0x80, 8] + list(bad))
@@ -89,15 +94,16 @@ def _wipe_piv(conn):
         for _ in range(8):
             ccid.transmit(conn, [0x00, PIV_INS_RESET_RETRY, 0x00, 0x80, 16] + list(bad))
     _, s1, s2 = ccid.transmit(conn, [0x00, PIV_INS_RESET, 0x00, 0x00])
-    return "ok" if (s1, s2) == (0x90, 0x00) else f"RESET: SW {s1:02X}{s2:02X}"
+    ok = (s1, s2) == ccid.SW_OK
+    return ok, "ok" if ok else f"RESET: SW {s1:02X}{s2:02X}"
 
 
 def _wipe_openpgp():
     try:
         openpgp.reset(None)
-        return "ok"
+        return True, "ok"
     except SystemExit as e:
-        return f"failed: {e}"
+        return False, f"failed: {e}"
 
 
 def _journal_entries(entries):
@@ -123,19 +129,25 @@ def run(args):
     print("attestation — and finishes with a signed wipe receipt.")
     confirm(f"OFFBOARD {serial}")
 
-    steps = {}
+    steps, failed = {}, {}
+
+    def record(name, ok, detail):
+        steps[name] = detail
+        if not ok:
+            failed[name] = detail
+
     print("\nwiping OTP slots…", end=" ")
-    steps["otp"] = _wipe_otp(conn)
+    record("otp", *_wipe_otp(conn))
     print(steps["otp"])
     print("wiping OATH…", end=" ")
-    steps["oath"] = _wipe_oath(conn)
+    record("oath", *_wipe_oath(conn))
     print(steps["oath"])
     print("wiping PIV (block PIN+PUK, then factory reset)…", end=" ")
-    steps["piv"] = _wipe_piv(conn)
+    record("piv", *_wipe_piv(conn))
     print(steps["piv"])
     conn.disconnect()  # openpgp.reset opens its own connection
     print("wiping OpenPGP…")
-    steps["openpgp"] = _wipe_openpgp()
+    record("openpgp", *_wipe_openpgp())
 
     dev, cid = connect_fido()
     print("\nFIDO factory reset — touch the device (BOOTSEL)…", file=sys.stderr)
@@ -150,7 +162,7 @@ def run(args):
         mse_handshake(dev, cid)
         print("removing the org attestation — touch the device (BOOTSEL)…", file=sys.stderr)
         st, _ = _vendor(dev, cid, _gated(ATT_CLEAR, None, dev, cid, None))
-        steps["org_attestation"] = "cleared" if st == 0 else f"clear failed: {st:#x}"
+        record("org_attestation", st == 0, "cleared" if st == 0 else f"clear failed: {st:#x}")
     else:
         steps["org_attestation"] = "none"
 
@@ -165,31 +177,27 @@ def run(args):
     report = {"device": serial,
               "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
               "steps": steps, "journal_window": window, "signed": False}
-    if st == 0x30:
+    if st == ERR_NOT_ALLOWED:
         print("warning: no OTP DEVK provisioned — receipt is UNSIGNED", file=sys.stderr)
     elif st != 0:
         print(f"warning: checkpoint failed ({st:#x}) — receipt is UNSIGNED", file=sys.stderr)
     else:
-        head, seq, sig, pubkey = m[1], m[2], m[3], m[4]
-        import hashlib
-
-        from cryptography.exceptions import InvalidSignature
-        from cryptography.hazmat.primitives import hashes
-        from cryptography.hazmat.primitives.asymmetric import ec
-
-        vk = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), pubkey)
-        try:
-            vk.verify(sig, CKPT_TAG + head + seq.to_bytes(4, "little") + challenge,
-                      ec.ECDSA(hashes.SHA256()))
-        except InvalidSignature:
-            die("receipt SIGNATURE INVALID — do not trust this device")
+        # The device is untrusted: validate every field before use so a
+        # malformed checkpoint fails closed instead of raising a traceback.
+        head, seq, sig, pubkey = verify_checkpoint(
+            m, challenge, "do not trust this device",
+            "receipt SIGNATURE INVALID — do not trust this device")
+        # Bind the signature to the window the receipt shows: recompute the head
+        # locally and require it match the signed head (as `rsk audit` does),
+        # then require the RESET event actually be present in that bound window.
+        if head != _fold(epoch, entries):
+            die("signed head differs from the exported window — TAMPER")
+        if not any(entries[off + 8] == EVT_RESET for off in range(0, len(entries), ENTRY_LEN)):
+            die("signed window does not contain the RESET event — refusing to certify")
         report.update({"signed": True, "challenge": challenge.hex(),
                        "signed_head": head.hex(), "seq": seq, "signature": sig.hex(),
                        "attestation_pubkey": pubkey.hex(),
-                       "fingerprint": hashlib.sha256(pubkey).hexdigest()[:16]})
-
-    if not any(e["event"] == "RESET" for e in window):
-        report["warning"] = "signed window does not contain the RESET event"
+                       "fingerprint": _fingerprint(pubkey)})
 
     path = args.report or f"offboard-{serial}-{datetime.now():%Y%m%d-%H%M%S}.json"
     with open(path, "w") as f:
@@ -199,8 +207,6 @@ def run(args):
     if report["signed"]:
         print(f"identity: fingerprint {report['fingerprint']} — match it against"
               " your inventory record")
-    failed = {k: v for k, v in steps.items()
-              if v not in ("ok", "cleared", "none", "applet absent")}
     if failed:
         die(f"offboard finished WITH FAILURES: {failed} — receipt saved")
     print("device offboarded ✓ — all applets at factory state")

@@ -1,0 +1,87 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 RS-Key contributors -->
+<svg viewBox="0 0 780 404" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="ttl dsc" font-family="'Segoe UI', system-ui, -apple-system, sans-serif">
+  <title id="ttl">CTAPHID transport framing</title>
+  <desc id="dsc">Two 64-byte HID report layouts. The init frame is CID(4) CMD(1) BCNT-hi(1) BCNT-lo(1) then 57 payload bytes; a continuation frame is CID(4) SEQ(1) then 59 payload bytes. Header fields shown in rust, payload in teal.</desc>
+  <defs>
+    <style>
+      .h1{font-size:23px;font-weight:700;fill:#2B2723}
+      .sub{font-size:12.5px;fill:#948A7F}
+      .lg{font-size:11.5px;fill:#6B645C}
+      .rowlab{font-size:12.5px;font-weight:700;fill:#2B2723}
+      .rowsub{font-size:11px;fill:#948A7F}
+      .cell{font-size:11.5px;font-weight:700;fill:#fff}
+      .cellsm{font-size:9.5px;font-weight:700;fill:#fff}
+      .blab{font-size:10.5px;fill:#948A7F;font-family:'SF Mono','Roboto Mono',ui-monospace,monospace}
+      .co{font-size:11.5px;fill:#5A534B}
+      .mono{font-family:'SF Mono','Roboto Mono',ui-monospace,monospace;fill:#A9764F;font-weight:700}
+      .foot{font-size:10.5px;fill:#ADA398}
+    </style>
+  </defs>
+  <rect x="6" y="6" width="768" height="392" rx="16" fill="#FBFAF8" stroke="#E4DED5" stroke-width="1.5"/>
+
+  <text class="h1" x="34" y="46">CTAPHID transport framing</text>
+  <text class="sub" x="34" y="68">64-byte HID reports · FIDO usage page 0xF1D0 · §1.2</text>
+
+  <!-- legend -->
+  <rect x="560" y="34" width="13" height="13" rx="3" fill="#C0562B"/>
+  <text class="lg" x="580" y="45">header</text>
+  <rect x="652" y="34" width="13" height="13" rx="3" fill="#2F7E75"/>
+  <text class="lg" x="672" y="45">payload</text>
+
+  <!-- INIT frame -->
+  <text class="rowlab" x="40" y="98">Init frame</text>
+  <text class="rowsub" x="120" y="98">first packet of a message</text>
+  <g>
+    <rect x="40"  y="108" width="120" height="46" fill="#C0562B"/>
+    <rect x="160" y="108" width="54"  height="46" fill="#C0562B"/>
+    <rect x="214" y="108" width="54"  height="46" fill="#C0562B"/>
+    <rect x="268" y="108" width="54"  height="46" fill="#C0562B"/>
+    <rect x="322" y="108" width="418" height="46" fill="#2F7E75"/>
+    <g stroke="#FBFAF8" stroke-width="1.5">
+      <line x1="160" y1="108" x2="160" y2="154"/>
+      <line x1="214" y1="108" x2="214" y2="154"/>
+      <line x1="268" y1="108" x2="268" y2="154"/>
+      <line x1="322" y1="108" x2="322" y2="154"/>
+    </g>
+    <text class="cell"   x="100" y="136" text-anchor="middle">CID</text>
+    <text class="cell"   x="187" y="136" text-anchor="middle">CMD</text>
+    <text class="cellsm" x="241" y="135" text-anchor="middle">BCNTH</text>
+    <text class="cellsm" x="295" y="135" text-anchor="middle">BCNTL</text>
+    <text class="cell"   x="531" y="136" text-anchor="middle">payload · data[0..57]</text>
+  </g>
+  <g text-anchor="middle">
+    <text class="blab" x="100" y="171">4 B</text>
+    <text class="blab" x="187" y="171">1</text>
+    <text class="blab" x="241" y="171">1</text>
+    <text class="blab" x="295" y="171">1</text>
+    <text class="blab" x="531" y="171">57 B</text>
+  </g>
+
+  <!-- CONTINUATION frame -->
+  <text class="rowlab" x="40" y="214">Continuation frame</text>
+  <text class="rowsub" x="196" y="214">SEQ = 0x00, 0x01, … when a payload exceeds 57 B</text>
+  <g>
+    <rect x="40"  y="224" width="120" height="46" fill="#C0562B"/>
+    <rect x="160" y="224" width="54"  height="46" fill="#C0562B"/>
+    <rect x="214" y="224" width="526" height="46" fill="#2F7E75"/>
+    <g stroke="#FBFAF8" stroke-width="1.5">
+      <line x1="160" y1="224" x2="160" y2="270"/>
+      <line x1="214" y1="224" x2="214" y2="270"/>
+    </g>
+    <text class="cell" x="100" y="252" text-anchor="middle">CID</text>
+    <text class="cell" x="187" y="252" text-anchor="middle">SEQ</text>
+    <text class="cell" x="477" y="252" text-anchor="middle">payload · data[0..59]</text>
+  </g>
+  <g text-anchor="middle">
+    <text class="blab" x="100" y="287">4 B</text>
+    <text class="blab" x="187" y="287">1</text>
+    <text class="blab" x="477" y="287">59 B</text>
+  </g>
+
+  <!-- notes -->
+  <text class="co" x="40" y="328">Init CMD: <tspan class="mono">0x86</tspan> INIT · <tspan class="mono">0x90</tspan> CBOR · <tspan class="mono">0xBB</tspan> KEEPALIVE.  BCNT = big-endian total payload length.</text>
+  <text class="co" x="40" y="348">A CTAP2 message is <tspan class="mono">command_byte ‖ CBOR</tspan> (vendor = <tspan class="mono">0x41</tspan>); frames reassemble up to maxMsgSize <tspan class="mono">7609</tspan>.</text>
+
+  <text class="foot" x="34" y="384">Reference transport: tools/rsk/ctaphid.py · CID assigned by the CTAPHID_INIT handshake</text>
+</svg>

@@ -6,11 +6,26 @@
 //! event panel drops away on small screens.
 
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
+};
 
 use crate::app::{App, AppMode, Modal, Search};
 use crate::model::*;
-use crate::theme::{ACCENT, Theme, bold, danger, dim, selection, warn};
+use crate::theme::{Theme, bold, dim};
+
+/// A rounded, muted-border panel — the shared frame for every box.
+fn frame(theme: Theme) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.border_style())
+}
+
+/// A framed panel with an accented title (surrounding spaces added).
+fn titled(theme: Theme, title: &str) -> Block<'static> {
+    frame(theme).title(Span::styled(format!(" {title} "), theme.title_style()))
+}
 
 pub fn render(f: &mut Frame, app: &App) {
     let area = f.area();
@@ -52,13 +67,7 @@ fn header(f: &mut Frame, app: &App, theme: Theme, area: Rect) {
     let snap = &app.snapshot;
     let health = snap.overall_health();
     let mut spans = vec![
-        Span::styled(
-            " rs-key ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(ACCENT)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(" rs-key ", theme.chip_style()),
         Span::raw(" cockpit  "),
         Span::styled(theme.dot(health), theme.health_style(health)),
         Span::raw(" "),
@@ -78,10 +87,7 @@ fn header(f: &mut Frame, app: &App, theme: Theme, area: Rect) {
         format!("   refreshed {}s ago", app.refreshed.elapsed().as_secs()),
         dim(),
     ));
-    f.render_widget(
-        Paragraph::new(Line::from(spans)).block(Block::default().borders(Borders::ALL)),
-        area,
-    );
+    f.render_widget(Paragraph::new(Line::from(spans)).block(frame(theme)), area);
 }
 
 fn body(f: &mut Frame, app: &App, theme: Theme, area: Rect) {
@@ -106,8 +112,8 @@ fn sidebar(f: &mut Frame, app: &App, theme: Theme, area: Rect) {
     st.select(Section::ALL.iter().position(|s| *s == app.section));
     f.render_stateful_widget(
         List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(" sections "))
-            .highlight_style(selection())
+            .block(titled(theme, "sections"))
+            .highlight_style(theme.selection())
             .highlight_symbol(theme.arrow()),
         area,
         &mut st,
@@ -115,9 +121,7 @@ fn sidebar(f: &mut Frame, app: &App, theme: Theme, area: Rect) {
 }
 
 fn panel(f: &mut Frame, app: &App, theme: Theme, area: Rect) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" {} ", app.section.title()));
+    let block = titled(theme, app.section.title());
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -162,8 +166,8 @@ fn panel(f: &mut Frame, app: &App, theme: Theme, area: Rect) {
     }
     f.render_stateful_widget(
         List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(" actions "))
-            .highlight_style(selection())
+            .block(titled(theme, "actions"))
+            .highlight_style(theme.selection())
             .highlight_symbol(theme.arrow()),
         split[1],
         &mut st,
@@ -174,8 +178,8 @@ fn panel(f: &mut Frame, app: &App, theme: Theme, area: Rect) {
 
 fn row(theme: Theme, h: Health, key: &str, value: impl Into<String>) -> Line<'static> {
     let vstyle = match h {
-        Health::Warn => warn(),
-        Health::Error => danger(),
+        Health::Warn => theme.warn(),
+        Health::Error => theme.danger(),
         _ => Style::default(),
     };
     Line::from(vec![
@@ -191,14 +195,6 @@ fn head(text: &str) -> Line<'static> {
 
 fn opt(s: &Option<String>) -> String {
     s.clone().unwrap_or_else(|| "—".into())
-}
-
-fn present_health(p: Option<bool>) -> (Health, &'static str) {
-    match p {
-        Some(true) => (Health::Ok, "present"),
-        Some(false) => (Health::Unknown, "absent"),
-        None => (Health::Unknown, "not probed"),
-    }
 }
 
 fn section_status_lines(app: &App, theme: Theme) -> Vec<Line<'static>> {
@@ -497,7 +493,7 @@ fn section_health(section: Section, s: &DeviceSnapshot) -> Health {
 // ---- event log + status bar ----
 
 fn event_log(f: &mut Frame, app: &App, theme: Theme, area: Rect) {
-    let block = Block::default().borders(Borders::ALL).title(" events ");
+    let block = titled(theme, "events");
     let inner = block.inner(area);
     f.render_widget(block, area);
     if app.log.is_empty() {
@@ -599,11 +595,7 @@ fn modal(f: &mut Frame, theme: Theme, m: &Modal) {
                     Line::from(""),
                     Line::from(format!("  {shown}_")),
                 ])
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(format!(" {title} ")),
-                )
+                .block(titled(theme, title))
                 .wrap(Wrap { trim: false }),
                 r,
             );
@@ -619,19 +611,14 @@ fn modal(f: &mut Frame, theme: Theme, m: &Modal) {
             f.render_widget(Clear, r);
             f.render_widget(
                 Paragraph::new(vec![
-                    Line::from(Span::styled(body.clone(), warn())),
+                    Line::from(Span::styled(body.clone(), theme.warn())),
                     Line::from(""),
                     Line::from(vec![
                         Span::styled(format!("  type {want} : "), bold()),
                         Span::raw(format!("{buf}_")),
                     ]),
                 ])
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(warn())
-                        .title(format!(" {title} ")),
-                )
+                .block(titled(theme, title).border_style(theme.warn()))
                 .wrap(Wrap { trim: true }),
                 r,
             );
@@ -645,23 +632,25 @@ fn modal(f: &mut Frame, theme: Theme, m: &Modal) {
                     Line::from(""),
                     Line::from(Span::styled("  [y] yes    [n] no", bold())),
                 ])
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(format!(" {title} ")),
-                )
+                .block(titled(theme, title))
                 .wrap(Wrap { trim: true }),
                 r,
             );
         }
         Modal::Reveal { title, body } => {
-            let r = centered(area, 88, 11);
+            // Grow to the body (SLIP-39 spans several shares) but never shrink
+            // below the single-line BIP-39 layout; clamp to the screen.
+            let lines = (body.lines().count() as u16 + 6)
+                .max(11)
+                .min(area.height.saturating_sub(2))
+                .max(3);
+            let r = centered(area, 88, lines);
             f.render_widget(Clear, r);
             f.render_widget(
                 Paragraph::new(vec![
                     Line::from(Span::styled(
                         "  WRITE THIS DOWN — the only backup of your FIDO seed.",
-                        warn(),
+                        theme.warn(),
                     )),
                     Line::from(Span::styled(
                         "  Not logged. Cleared from the screen on the next key.",
@@ -670,14 +659,10 @@ fn modal(f: &mut Frame, theme: Theme, m: &Modal) {
                     Line::from(""),
                     Line::from(Span::styled(
                         format!("  {}", body.as_str()),
-                        Style::default().fg(Color::Green),
+                        theme.health_style(Health::Ok),
                     )),
                 ])
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(format!(" {title} ")),
-                )
+                .block(titled(theme, title))
                 .wrap(Wrap { trim: true }),
                 r,
             );
@@ -697,11 +682,7 @@ fn modal(f: &mut Frame, theme: Theme, m: &Modal) {
                         .map(|l| Line::from(Span::styled(format!(" {l}"), style)))
                         .collect::<Vec<_>>(),
                 )
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(format!(" {title} ")),
-                )
+                .block(titled(theme, title))
                 .wrap(Wrap { trim: false }),
                 r,
             );
@@ -717,9 +698,7 @@ fn search_overlay(f: &mut Frame, theme: Theme, s: &Search) {
         .max(3);
     let r = centered(area, 70, h);
     f.render_widget(Clear, r);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" search actions ");
+    let block = titled(theme, "search actions");
     let inner = block.inner(r);
     f.render_widget(block, r);
     let rows = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(inner);
@@ -740,7 +719,7 @@ fn search_overlay(f: &mut Frame, theme: Theme, s: &Search) {
     }
     f.render_stateful_widget(
         List::new(items)
-            .highlight_style(selection())
+            .highlight_style(theme.selection())
             .highlight_symbol(theme.arrow()),
         rows[1],
         &mut st,
@@ -786,88 +765,5 @@ fn help_lines() -> Vec<Line<'static>> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::device::MockProvider;
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-
-    fn buffer_text(app: &App, w: u16, h: u16) -> String {
-        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-        term.draw(|f| render(f, app)).unwrap();
-        let buf = term.backend().buffer().clone();
-        buf.content().iter().map(|c| c.symbol()).collect()
-    }
-
-    fn demo_app() -> App {
-        App::new(Box::new(MockProvider::new()), Theme { ascii: true })
-    }
-
-    #[test]
-    fn renders_demo_overview() {
-        let app = demo_app();
-        let text = buffer_text(&app, 100, 40);
-        assert!(text.contains("rs-key"));
-        assert!(text.contains("Overview"));
-        assert!(text.contains("DEMO"));
-        assert!(text.contains("firmware"));
-    }
-
-    #[test]
-    fn renders_at_tiny_size_without_panicking() {
-        // Below the log / 2-line-status thresholds — must still paint.
-        let app = demo_app();
-        for (w, h) in [(40, 8), (24, 6), (10, 3), (80, 1)] {
-            let _ = buffer_text(&app, w, h);
-        }
-    }
-
-    #[test]
-    fn modal_and_search_paint_at_tiny_size() {
-        // A Message modal / Search overlay on a terminal shorter than the modal's
-        // preferred height must not panic (regression: clamp(min, max<min)).
-        let mut app = demo_app();
-        app.open_message("t".into(), "a\nb\nc\nd\ne\nf".into(), LogLevel::Warn);
-        for (w, h) in [(40, 4), (20, 3), (60, 2)] {
-            let _ = buffer_text(&app, w, h);
-        }
-        app.open_search();
-        for (w, h) in [(40, 4), (20, 3)] {
-            let _ = buffer_text(&app, w, h);
-        }
-    }
-
-    #[test]
-    fn reveal_modal_shows_seed_but_log_does_not() {
-        let mut app = demo_app();
-        // Drive export: confirm EXPORT, enter a PIN, run.
-        app.begin_action(Action::BackupExport);
-        if let AppMode::Modal(Modal::Confirm { buf, .. }) = &mut app.mode {
-            *buf = "EXPORT".into();
-        }
-        app.submit_modal();
-        if let AppMode::Modal(Modal::Input { buf, .. }) = &mut app.mode {
-            *buf = "1234".into();
-        }
-        let _ = app.submit_modal(); // returns Run(BackupExport)
-        let input = std::mem::take(&mut app.staging);
-        let result = app.provider.run(Action::BackupExport, &input);
-        drop(input);
-        if let ActionResult::Reveal { title, body } = result {
-            let words = body.to_string();
-            app.open_reveal(title, body);
-            app.log(LogLevel::Good, "seed exported — on screen, not logged");
-            // The reveal modal renders the mnemonic…
-            let screen = buffer_text(&app, 100, 40);
-            assert!(screen.contains(words.split(' ').next().unwrap()));
-            // …but no log entry ever contains any of it.
-            for w in words.split(' ') {
-                for entry in app.log.iter() {
-                    assert!(!entry.text.contains(w), "log leaked seed word {w}");
-                }
-            }
-        } else {
-            panic!("expected a reveal");
-        }
-    }
-}
+#[path = "ui_tests.rs"]
+mod tests;

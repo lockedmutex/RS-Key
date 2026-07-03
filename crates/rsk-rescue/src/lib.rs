@@ -17,6 +17,7 @@ use core::cell::RefCell;
 
 use rsk_crypto::Device;
 use rsk_fs::{Fs, Storage};
+pub use rsk_sdk::Confirm;
 use rsk_sdk::{Apdu, Applet, ResBuf, Sw};
 
 /// Rescue applet AID.
@@ -81,6 +82,24 @@ pub trait Rng {
     fn fill(&mut self, buf: &mut [u8]);
 }
 
+/// Outcome of a user-presence request for a privileged rescue operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presence {
+    Confirmed,
+    Timeout,
+    Declined,
+}
+
+/// Physical user presence, gating the runtime-reachable privileged rescue
+/// commands (attestation sign, cert write, phy/identity write, reboot-to-
+/// BOOTSEL) against a hostile USB host. On the trusted-display build the
+/// `confirm` names the operation for an on-screen Approve/Deny prompt; the
+/// BOOTSEL-button backend just waits for a press. Same shape as the sibling
+/// applets' `UserPresence`.
+pub trait UserPresence {
+    fn request(&mut self, confirm: Confirm<'_>) -> Presence;
+}
+
 pub struct RescueApplet<'a> {
     serial_id: [u8; 8],
     serial_hash: [u8; 32],
@@ -90,6 +109,8 @@ pub struct RescueApplet<'a> {
     devk: Option<[u8; 32]>,
     rng: &'a RefCell<dyn Rng>,
     platform: &'a RefCell<dyn Platform>,
+    /// Touch/approval gate for the runtime-reachable privileged commands.
+    presence: &'a RefCell<dyn UserPresence>,
     /// FLASH INFO `total`: the KV partition byte size.
     kv_total: u32,
     /// FLASH INFO `size`: the flash chip byte size.
@@ -105,6 +126,7 @@ impl<'a> RescueApplet<'a> {
         devk: Option<[u8; 32]>,
         rng: &'a RefCell<dyn Rng>,
         platform: &'a RefCell<dyn Platform>,
+        presence: &'a RefCell<dyn UserPresence>,
         kv_total: u32,
         flash_size: u32,
     ) -> Self {
@@ -115,6 +137,7 @@ impl<'a> RescueApplet<'a> {
             devk,
             rng,
             platform,
+            presence,
             kv_total,
             flash_size,
         }
@@ -128,11 +151,24 @@ impl<'a> RescueApplet<'a> {
         }
     }
 
+    /// Require a physical user-presence confirmation before a privileged
+    /// runtime operation. On the display build this renders a named Approve/Deny
+    /// prompt; the BOOTSEL backend waits for a press. `true` only on Confirmed —
+    /// a hostile USB host cannot drive these commands without the operator.
+    fn require_presence(&self, confirm: Confirm<'_>) -> bool {
+        self.presence.borrow_mut().request(confirm) == Presence::Confirmed
+    }
+
     fn keydev_sign<S: Storage>(&mut self, apdu: &Apdu, fs: &mut Fs<S>, res: &mut ResBuf) -> Sw {
         match apdu.p1 {
             0x01 => {
                 if apdu.nc != 32 {
                     return Sw::WRONG_LENGTH;
+                }
+                // Attestation signing over a host-chosen digest is an oracle over
+                // the device key; require the operator, not just the USB host.
+                if !self.require_presence(Confirm::titled("Attestation sign?")) {
+                    return Sw::CONDITIONS_NOT_SATISFIED;
                 }
                 let mut rng = self.rng.borrow_mut();
                 let Some(key) =
@@ -167,6 +203,11 @@ impl<'a> RescueApplet<'a> {
                 if apdu.nc == 0 {
                     return Sw::WRONG_LENGTH;
                 }
+                // Overwriting the device attestation certificate is device
+                // identity — gate it behind the operator.
+                if !self.require_presence(Confirm::titled("Write device cert?")) {
+                    return Sw::CONDITIONS_NOT_SATISFIED;
+                }
                 if fs.put(keydev::EF_DEVCERT, apdu.data).is_err() {
                     return Sw::MEMORY_FAILURE;
                 }
@@ -182,6 +223,11 @@ impl<'a> RescueApplet<'a> {
         }
         match apdu.p1 {
             0x01 => {
+                // The phy record is device identity (VID/PID, USB interfaces,
+                // LED); a hostile host must not rewrite it silently.
+                if !self.require_presence(Confirm::titled("Write device config?")) {
+                    return Sw::CONDITIONS_NOT_SATISFIED;
+                }
                 let parsed = phy::PhyData::parse(apdu.data);
                 if phy::save(fs, &parsed).is_err() {
                     return Sw::EXEC_ERROR;
@@ -288,7 +334,15 @@ impl<'a> RescueApplet<'a> {
             return Sw::WRONG_LENGTH;
         }
         match apdu.p1 {
-            0x01 => self.platform.borrow_mut().request_reboot(true),
+            0x01 => {
+                // Reboot-to-BOOTSEL drops the device into the mass-storage
+                // bootloader, aiding an at-rest flash/OTP dump — require the
+                // operator. A plain restart (P1=0x00) stays ungated.
+                if !self.require_presence(Confirm::titled("Reboot to BOOTSEL?")) {
+                    return Sw::CONDITIONS_NOT_SATISFIED;
+                }
+                self.platform.borrow_mut().request_reboot(true)
+            }
             0x00 => self.platform.borrow_mut().request_reboot(false),
             _ => return Sw::INCORRECT_P1P2,
         }
@@ -330,6 +384,12 @@ impl<'a> RescueApplet<'a> {
             otp_lock::LockDecision::AlreadyLocked => Sw::OK,
             otp_lock::LockDecision::Unexpected => Sw::CONDITIONS_NOT_SATISFIED,
             otp_lock::LockDecision::Write => {
+                // Irreversible fuse burn: gate on the operator like every other
+                // privileged rescue op — the magic payload is a source-visible
+                // constant, not authentication against a hostile USB host.
+                if !self.require_presence(Confirm::titled("Lock OTP page 58?")) {
+                    return Sw::CONDITIONS_NOT_SATISFIED;
+                }
                 if !self.platform.borrow_mut().lock_page58() {
                     return Sw::EXEC_ERROR;
                 }
@@ -363,6 +423,11 @@ impl<'a> RescueApplet<'a> {
         };
         if rollback::required(rollback::majority(raw.flags0)) {
             return Sw::OK;
+        }
+        // Irreversible fuse burn: gate on the operator like every other
+        // privileged rescue op (the magic payload is not authentication).
+        if !self.require_presence(Confirm::titled("Require anti-rollback?")) {
+            return Sw::CONDITIONS_NOT_SATISFIED;
         }
         if !self.platform.borrow_mut().set_rollback_required() {
             return Sw::EXEC_ERROR;
@@ -481,699 +546,4 @@ fn civil_from_epoch(t: u32) -> Civil {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use rsk_fs::storage::ram::RamStorage;
-
-    struct LcgRng(u64);
-    impl Rng for LcgRng {
-        fn fill(&mut self, buf: &mut [u8]) {
-            for b in buf {
-                self.0 = self
-                    .0
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                *b = (self.0 >> 33) as u8;
-            }
-        }
-    }
-
-    struct FakePlatform {
-        time: Option<u32>,
-        reboots: Vec<bool>,
-        status: (bool, bool, u8),
-        /// Simulated PAGE58_LOCK1 raw value; `None` models a read error.
-        lock_raw: Option<u32>,
-        lock_writes: u32,
-        /// Simulated anti-rollback rows; `None` models a read error.
-        rollback_raw: Option<rollback::RollbackRaw>,
-        rollback_writes: u32,
-    }
-    impl Default for FakePlatform {
-        fn default() -> Self {
-            FakePlatform {
-                time: None,
-                reboots: Vec::new(),
-                status: (false, false, 0xFF),
-                lock_raw: Some(0),
-                lock_writes: 0,
-                rollback_raw: Some(rollback::RollbackRaw {
-                    flags0: [0; 3],
-                    version0: [0; 3],
-                    version1: [0; 3],
-                }),
-                rollback_writes: 0,
-            }
-        }
-    }
-    impl Platform for FakePlatform {
-        fn secure_boot_status(&self) -> SecureBootStatus {
-            SecureBootStatus {
-                enabled: self.status.0,
-                locked: self.status.1,
-                bootkey: self.status.2,
-            }
-        }
-        fn now(&self) -> Option<u32> {
-            self.time
-        }
-        fn set_time(&mut self, epoch: u32) {
-            self.time = Some(epoch);
-        }
-        fn request_reboot(&mut self, bootsel: bool) {
-            self.reboots.push(bootsel);
-        }
-        fn read_page58_lock_raw(&self) -> Option<u32> {
-            self.lock_raw
-        }
-        fn lock_page58(&mut self) -> bool {
-            // OTP bits only go 0→1; model the fuse burning to our value.
-            self.lock_writes += 1;
-            self.lock_raw = Some(otp_lock::PAGE58_LOCK_VALUE);
-            true
-        }
-        fn read_rollback_raw(&self) -> Option<rollback::RollbackRaw> {
-            self.rollback_raw
-        }
-        fn set_rollback_required(&mut self) -> bool {
-            // OR the bit into every copy, like the firmware burn does.
-            self.rollback_writes += 1;
-            if let Some(raw) = self.rollback_raw.as_mut() {
-                for row in raw.flags0.iter_mut() {
-                    *row |= rollback::ROLLBACK_REQUIRED_BIT;
-                }
-            }
-            true
-        }
-    }
-
-    const SERIAL_ID: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
-    const SERIAL_HASH: [u8; 32] = [0xA5; 32];
-    const KV_TOTAL: u32 = 64 * 1024;
-    const FLASH_SIZE: u32 = 4 * 1024 * 1024;
-
-    fn apdu(cla: u8, ins: u8, p1: u8, p2: u8, data: &[u8]) -> Vec<u8> {
-        let mut a = vec![cla, ins, p1, p2];
-        if !data.is_empty() {
-            a.push(data.len() as u8);
-            a.extend_from_slice(data);
-        }
-        a.push(0); // Le
-        a
-    }
-
-    fn run(app: &mut RescueApplet, fs: &mut Fs<RamStorage>, raw: &[u8]) -> (Sw, Vec<u8>) {
-        let mut buf = [0u8; 512];
-        let parsed = Apdu::parse(raw).unwrap();
-        let mut res = ResBuf::new(&mut buf);
-        let sw = app.process(&parsed, fs, &mut res);
-        (sw, res.as_slice().to_vec())
-    }
-
-    #[test]
-    fn select_reports_identity() {
-        let rng = RefCell::new(LcgRng(7));
-        let platform = RefCell::new(FakePlatform::default());
-        let mut app = RescueApplet::new(
-            SERIAL_ID,
-            SERIAL_HASH,
-            None,
-            None,
-            &rng,
-            &platform,
-            KV_TOTAL,
-            FLASH_SIZE,
-        );
-        let mut fs = Fs::new(RamStorage::new(), &[]);
-        let mut buf = [0u8; 64];
-        let mut res = ResBuf::new(&mut buf);
-        let sw = Applet::<Fs<RamStorage>>::select(&mut app, false, &mut fs, &mut res);
-        assert_eq!(sw, Sw::OK);
-        let mut want = vec![1u8, 2, 8, 6]; // RP2350, FIDO product, SDK 8.6
-        want.extend_from_slice(&SERIAL_ID);
-        assert_eq!(res.as_slice(), &want[..]);
-    }
-
-    #[test]
-    fn cla_is_checked() {
-        let rng = RefCell::new(LcgRng(7));
-        let platform = RefCell::new(FakePlatform::default());
-        let mut app = RescueApplet::new(
-            SERIAL_ID,
-            SERIAL_HASH,
-            None,
-            None,
-            &rng,
-            &platform,
-            KV_TOTAL,
-            FLASH_SIZE,
-        );
-        let mut fs = Fs::new(RamStorage::new(), &[]);
-        let (sw, _) = run(&mut app, &mut fs, &apdu(0x00, INS_READ, 0x03, 0, &[]));
-        assert_eq!(sw, Sw::CLA_NOT_SUPPORTED);
-    }
-
-    fn lock_app<'a>(
-        rng: &'a RefCell<LcgRng>,
-        platform: &'a RefCell<FakePlatform>,
-        otp_key: Option<[u8; 32]>,
-    ) -> RescueApplet<'a> {
-        RescueApplet::new(
-            SERIAL_ID,
-            SERIAL_HASH,
-            otp_key,
-            None,
-            rng,
-            platform,
-            KV_TOTAL,
-            FLASH_SIZE,
-        )
-    }
-
-    fn lock_apdu() -> Vec<u8> {
-        apdu(0x80, INS_OTP_LOCK, 0x58, 0x00, OTP_LOCK_MAGIC)
-    }
-
-    #[test]
-    fn otp_lock_writes_once_then_idempotent() {
-        let rng = RefCell::new(LcgRng(7));
-        let platform = RefCell::new(FakePlatform::default()); // lock_raw = Some(0)
-        let mut app = lock_app(&rng, &platform, Some([0x11; 32]));
-        let mut fs = Fs::new(RamStorage::new(), &[]);
-
-        let (sw, _) = run(&mut app, &mut fs, &lock_apdu());
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(platform.borrow().lock_writes, 1);
-        assert_eq!(
-            platform.borrow().lock_raw,
-            Some(otp_lock::PAGE58_LOCK_VALUE)
-        );
-
-        // A second call finds the row already locked: OK, no further fuse write.
-        let (sw, _) = run(&mut app, &mut fs, &lock_apdu());
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(platform.borrow().lock_writes, 1, "must not re-burn");
-    }
-
-    #[test]
-    fn otp_lock_refused_without_provisioned_keys() {
-        let rng = RefCell::new(LcgRng(7));
-        let platform = RefCell::new(FakePlatform::default());
-        let mut app = lock_app(&rng, &platform, None); // no MKEK
-        let mut fs = Fs::new(RamStorage::new(), &[]);
-        let (sw, _) = run(&mut app, &mut fs, &lock_apdu());
-        assert_eq!(sw, Sw::CONDITIONS_NOT_SATISFIED);
-        assert_eq!(platform.borrow().lock_writes, 0);
-    }
-
-    #[test]
-    fn otp_lock_rejects_bad_guards() {
-        let rng = RefCell::new(LcgRng(7));
-        let platform = RefCell::new(FakePlatform::default());
-        let mut app = lock_app(&rng, &platform, Some([0x11; 32]));
-        let mut fs = Fs::new(RamStorage::new(), &[]);
-
-        // wrong P1 (not the page number)
-        let (sw, _) = run(
-            &mut app,
-            &mut fs,
-            &apdu(0x80, INS_OTP_LOCK, 0x00, 0x00, OTP_LOCK_MAGIC),
-        );
-        assert_eq!(sw, Sw::INCORRECT_P1P2);
-        // wrong magic payload
-        let (sw, _) = run(
-            &mut app,
-            &mut fs,
-            &apdu(0x80, INS_OTP_LOCK, 0x58, 0x00, b"nope"),
-        );
-        assert_eq!(sw, Sw::DATA_INVALID);
-        // wrong CLA never reaches the handler
-        let (sw, _) = run(
-            &mut app,
-            &mut fs,
-            &apdu(0x00, INS_OTP_LOCK, 0x58, 0x00, OTP_LOCK_MAGIC),
-        );
-        assert_eq!(sw, Sw::CLA_NOT_SUPPORTED);
-
-        assert_eq!(platform.borrow().lock_writes, 0, "no guard path may burn");
-    }
-
-    #[test]
-    fn otp_lock_refuses_foreign_lock_value() {
-        let rng = RefCell::new(LcgRng(7));
-        // a different, pre-existing lock config
-        let platform = RefCell::new(FakePlatform {
-            lock_raw: Some(0x14_14_14),
-            ..Default::default()
-        });
-        let mut app = lock_app(&rng, &platform, Some([0x11; 32]));
-        let mut fs = Fs::new(RamStorage::new(), &[]);
-        let (sw, _) = run(&mut app, &mut fs, &lock_apdu());
-        assert_eq!(sw, Sw::CONDITIONS_NOT_SATISFIED);
-        assert_eq!(
-            platform.borrow().lock_writes,
-            0,
-            "never clobber a non-blank row"
-        );
-    }
-
-    #[test]
-    fn otp_lock_read_error_is_exec_error() {
-        let rng = RefCell::new(LcgRng(7));
-        // model a read failure
-        let platform = RefCell::new(FakePlatform {
-            lock_raw: None,
-            ..Default::default()
-        });
-        let mut app = lock_app(&rng, &platform, Some([0x11; 32]));
-        let mut fs = Fs::new(RamStorage::new(), &[]);
-        let (sw, _) = run(&mut app, &mut fs, &lock_apdu());
-        assert_eq!(sw, Sw::EXEC_ERROR);
-        assert_eq!(platform.borrow().lock_writes, 0);
-    }
-
-    fn rollback_apdu() -> Vec<u8> {
-        apdu(0x80, INS_OTP_LOCK, 0x48, 0x00, ROLLBACK_MAGIC)
-    }
-
-    /// A platform with secure boot enabled (the rollback-require gate).
-    fn secure_platform() -> FakePlatform {
-        FakePlatform {
-            status: (true, true, 0),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn rollback_require_burns_once_then_idempotent() {
-        let rng = RefCell::new(LcgRng(7));
-        let platform = RefCell::new(secure_platform());
-        let mut app = lock_app(&rng, &platform, None); // no MKEK needed for this one
-        let mut fs = Fs::new(RamStorage::new(), &[]);
-
-        let (sw, _) = run(&mut app, &mut fs, &rollback_apdu());
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(platform.borrow().rollback_writes, 1);
-        let flags0 = platform.borrow().rollback_raw.unwrap().flags0;
-        assert!(
-            flags0
-                .iter()
-                .all(|r| r & rollback::ROLLBACK_REQUIRED_BIT != 0)
-        );
-
-        // A second call finds the bit already fused: OK, no further write.
-        let (sw, _) = run(&mut app, &mut fs, &rollback_apdu());
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(platform.borrow().rollback_writes, 1, "must not re-burn");
-    }
-
-    #[test]
-    fn rollback_require_needs_secure_boot() {
-        let rng = RefCell::new(LcgRng(7));
-        let platform = RefCell::new(FakePlatform::default()); // secure boot off
-        let mut app = lock_app(&rng, &platform, Some([0x11; 32]));
-        let mut fs = Fs::new(RamStorage::new(), &[]);
-        let (sw, _) = run(&mut app, &mut fs, &rollback_apdu());
-        assert_eq!(sw, Sw::CONDITIONS_NOT_SATISFIED);
-        assert_eq!(platform.borrow().rollback_writes, 0);
-    }
-
-    #[test]
-    fn rollback_require_rejects_bad_guards() {
-        let rng = RefCell::new(LcgRng(7));
-        let platform = RefCell::new(secure_platform());
-        let mut app = lock_app(&rng, &platform, Some([0x11; 32]));
-        let mut fs = Fs::new(RamStorage::new(), &[]);
-
-        // wrong magic (including the *other* P1's magic)
-        let (sw, _) = run(
-            &mut app,
-            &mut fs,
-            &apdu(0x80, INS_OTP_LOCK, 0x48, 0x00, b"nope"),
-        );
-        assert_eq!(sw, Sw::DATA_INVALID);
-        let (sw, _) = run(
-            &mut app,
-            &mut fs,
-            &apdu(0x80, INS_OTP_LOCK, 0x48, 0x00, OTP_LOCK_MAGIC),
-        );
-        assert_eq!(sw, Sw::DATA_INVALID);
-        // magics must not cross over to the page-58 arm either
-        let (sw, _) = run(
-            &mut app,
-            &mut fs,
-            &apdu(0x80, INS_OTP_LOCK, 0x58, 0x00, ROLLBACK_MAGIC),
-        );
-        assert_eq!(sw, Sw::DATA_INVALID);
-        // nonzero P2
-        let (sw, _) = run(
-            &mut app,
-            &mut fs,
-            &apdu(0x80, INS_OTP_LOCK, 0x48, 0x01, ROLLBACK_MAGIC),
-        );
-        assert_eq!(sw, Sw::INCORRECT_P1P2);
-
-        assert_eq!(
-            platform.borrow().rollback_writes,
-            0,
-            "no guard path may burn"
-        );
-        assert_eq!(platform.borrow().lock_writes, 0);
-    }
-
-    #[test]
-    fn rollback_require_read_error_is_exec_error() {
-        let rng = RefCell::new(LcgRng(7));
-        let platform = RefCell::new(FakePlatform {
-            rollback_raw: None,
-            ..secure_platform()
-        });
-        let mut app = lock_app(&rng, &platform, Some([0x11; 32]));
-        let mut fs = Fs::new(RamStorage::new(), &[]);
-        let (sw, _) = run(&mut app, &mut fs, &rollback_apdu());
-        assert_eq!(sw, Sw::EXEC_ERROR);
-        assert_eq!(platform.borrow().rollback_writes, 0);
-    }
-
-    #[test]
-    fn rollback_state_read() {
-        let rng = RefCell::new(LcgRng(7));
-        // Two of three flags copies fused (majority: required), thermometer at
-        // 3 + 1 across the two words — incl. one sparse single-copy bit that
-        // must NOT count (majority zero).
-        let platform = RefCell::new(FakePlatform {
-            rollback_raw: Some(rollback::RollbackRaw {
-                flags0: [
-                    rollback::ROLLBACK_REQUIRED_BIT,
-                    rollback::ROLLBACK_REQUIRED_BIT,
-                    0,
-                ],
-                version0: [0b111, 0b111, 0b011],
-                version1: [0b11, 0b01, 0b01],
-            }),
-            ..Default::default()
-        });
-        let mut app = lock_app(&rng, &platform, None);
-        let mut fs = Fs::new(RamStorage::new(), &[]);
-        let (sw, body) = run(&mut app, &mut fs, &apdu(0x80, INS_READ, 0x06, 0, &[]));
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(body, vec![1, 4, rollback::VERSION_CAPACITY]);
-
-        // Blank board: not required, version 0.
-        platform.borrow_mut().rollback_raw = Some(rollback::RollbackRaw {
-            flags0: [0; 3],
-            version0: [0; 3],
-            version1: [0; 3],
-        });
-        let (sw, body) = run(&mut app, &mut fs, &apdu(0x80, INS_READ, 0x06, 0, &[]));
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(body, vec![0, 0, rollback::VERSION_CAPACITY]);
-
-        // Read error.
-        platform.borrow_mut().rollback_raw = None;
-        let (sw, _) = run(&mut app, &mut fs, &apdu(0x80, INS_READ, 0x06, 0, &[]));
-        assert_eq!(sw, Sw::EXEC_ERROR);
-    }
-
-    #[test]
-    fn keydev_sign_verifies_and_key_persists() {
-        use k256::ecdsa::signature::hazmat::PrehashVerifier;
-        let rng = RefCell::new(LcgRng(7));
-        let platform = RefCell::new(FakePlatform::default());
-        let mut app = RescueApplet::new(
-            SERIAL_ID,
-            SERIAL_HASH,
-            None,
-            None,
-            &rng,
-            &platform,
-            KV_TOTAL,
-            FLASH_SIZE,
-        );
-        let mut fs = Fs::new(RamStorage::new(), &[]);
-
-        let (sw, pubkey) = run(
-            &mut app,
-            &mut fs,
-            &apdu(0x80, INS_KEYDEV_SIGN, 0x02, 0, &[]),
-        );
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(pubkey.len(), 65);
-        assert_eq!(pubkey[0], 0x04);
-
-        let digest = [0x42u8; 32];
-        let (sw, sig) = run(
-            &mut app,
-            &mut fs,
-            &apdu(0x80, INS_KEYDEV_SIGN, 0x01, 0, &digest),
-        );
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(sig.len(), 64);
-
-        let vk = k256::ecdsa::VerifyingKey::from_sec1_bytes(&pubkey).unwrap();
-        let sig = k256::ecdsa::Signature::from_slice(&sig).unwrap();
-        vk.verify_prehash(&digest, &sig).unwrap();
-
-        // Same key on re-load (sealed in EF_DEVCERT_KEY, not regenerated).
-        let (_, pubkey2) = run(
-            &mut app,
-            &mut fs,
-            &apdu(0x80, INS_KEYDEV_SIGN, 0x02, 0, &[]),
-        );
-        assert_eq!(pubkey, pubkey2);
-
-        // Wrong digest length.
-        let (sw, _) = run(
-            &mut app,
-            &mut fs,
-            &apdu(0x80, INS_KEYDEV_SIGN, 0x01, 0, &[0; 16]),
-        );
-        assert_eq!(sw, Sw::WRONG_LENGTH);
-    }
-
-    #[test]
-    fn keydev_cert_upload() {
-        let rng = RefCell::new(LcgRng(7));
-        let platform = RefCell::new(FakePlatform::default());
-        let mut app = RescueApplet::new(
-            SERIAL_ID,
-            SERIAL_HASH,
-            None,
-            None,
-            &rng,
-            &platform,
-            KV_TOTAL,
-            FLASH_SIZE,
-        );
-        let mut fs = Fs::new(RamStorage::new(), &[]);
-        let cert = [0x30u8, 0x82, 0x01, 0x00, 0xAA, 0xBB];
-        let (sw, _) = run(
-            &mut app,
-            &mut fs,
-            &apdu(0x80, INS_KEYDEV_SIGN, 0x03, 0, &cert),
-        );
-        assert_eq!(sw, Sw::OK);
-        let mut buf = [0u8; 16];
-        assert_eq!(fs.read(keydev::EF_DEVCERT, &mut buf), Some(cert.len()));
-        assert_eq!(&buf[..cert.len()], &cert);
-        // Empty upload is rejected.
-        let (sw, _) = run(
-            &mut app,
-            &mut fs,
-            &apdu(0x80, INS_KEYDEV_SIGN, 0x03, 0, &[]),
-        );
-        assert_eq!(sw, Sw::WRONG_LENGTH);
-    }
-
-    #[test]
-    fn phy_write_read_roundtrip() {
-        let rng = RefCell::new(LcgRng(7));
-        let platform = RefCell::new(FakePlatform::default());
-        let mut app = RescueApplet::new(
-            SERIAL_ID,
-            SERIAL_HASH,
-            None,
-            None,
-            &rng,
-            &platform,
-            KV_TOTAL,
-            FLASH_SIZE,
-        );
-        let mut fs = Fs::new(RamStorage::new(), &[]);
-
-        // Virgin device: READ phy returns just the zero OPTS TLV.
-        let (sw, body) = run(&mut app, &mut fs, &apdu(0x80, INS_READ, 0x01, 0, &[]));
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(body, vec![0x06, 0x02, 0x00, 0x00]);
-
-        // Write VIDPID + brightness; read back includes the ITF_ALL default.
-        let blob = [0x00, 4, 0x10, 0x50, 0x04, 0x07, 0x05, 1, 99];
-        let (sw, _) = run(&mut app, &mut fs, &apdu(0x80, INS_WRITE, 0x01, 0, &blob));
-        assert_eq!(sw, Sw::OK);
-        let (sw, body) = run(&mut app, &mut fs, &apdu(0x80, INS_READ, 0x01, 0, &[]));
-        assert_eq!(sw, Sw::OK);
-        let phy = phy::PhyData::parse(&body);
-        assert_eq!(phy.vid_pid, Some((0x1050, 0x0407)));
-        assert_eq!(phy.led_brightness, Some(99));
-        assert_eq!(phy.enabled_usb_itf, Some(phy::USB_ITF_ALL));
-    }
-
-    #[test]
-    fn flash_info_layout() {
-        let rng = RefCell::new(LcgRng(7));
-        let platform = RefCell::new(FakePlatform::default());
-        let mut app = RescueApplet::new(
-            SERIAL_ID,
-            SERIAL_HASH,
-            None,
-            None,
-            &rng,
-            &platform,
-            KV_TOTAL,
-            FLASH_SIZE,
-        );
-        let mut fs = Fs::new(RamStorage::new(), &[]);
-        fs.put(0x1111, &[0u8; 10]).unwrap();
-        fs.put(0x2222, &[0u8; 6]).unwrap();
-
-        let (sw, body) = run(&mut app, &mut fs, &apdu(0x80, INS_READ, 0x02, 0, &[]));
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(body.len(), 20);
-        let w = |i: usize| u32::from_be_bytes(body[i * 4..i * 4 + 4].try_into().unwrap());
-        assert_eq!(w(0), KV_TOTAL - 16); // free
-        assert_eq!(w(1), 16); // used
-        assert_eq!(w(2), KV_TOTAL);
-        assert_eq!(w(3), 2); // nfiles
-        assert_eq!(w(4), FLASH_SIZE);
-    }
-
-    #[test]
-    fn secure_boot_status() {
-        let rng = RefCell::new(LcgRng(7));
-        let platform = RefCell::new(FakePlatform {
-            status: (true, false, 2),
-            ..Default::default()
-        });
-        let mut app = RescueApplet::new(
-            SERIAL_ID,
-            SERIAL_HASH,
-            None,
-            None,
-            &rng,
-            &platform,
-            KV_TOTAL,
-            FLASH_SIZE,
-        );
-        let mut fs = Fs::new(RamStorage::new(), &[]);
-        let (sw, body) = run(&mut app, &mut fs, &apdu(0x80, INS_READ, 0x03, 0, &[]));
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(body, vec![1, 0, 2]);
-    }
-
-    #[test]
-    fn time_set_and_get_both_forms() {
-        let rng = RefCell::new(LcgRng(7));
-        let platform = RefCell::new(FakePlatform::default());
-        let mut app = RescueApplet::new(
-            SERIAL_ID,
-            SERIAL_HASH,
-            None,
-            None,
-            &rng,
-            &platform,
-            KV_TOTAL,
-            FLASH_SIZE,
-        );
-        let mut fs = Fs::new(RamStorage::new(), &[]);
-
-        // Before set: 6985.
-        let (sw, _) = run(&mut app, &mut fs, &apdu(0x80, INS_READ, 0x04, 0x02, &[]));
-        assert_eq!(sw, Sw::CONDITIONS_NOT_SATISFIED);
-
-        // Set 2026-06-11 00:00:00 UTC as a unix stamp; read back both forms.
-        let t: u32 = 1781136000;
-        let (sw, _) = run(
-            &mut app,
-            &mut fs,
-            &apdu(0x80, INS_WRITE, 0x02, 0x02, &t.to_be_bytes()),
-        );
-        assert_eq!(sw, Sw::OK);
-        let (sw, body) = run(&mut app, &mut fs, &apdu(0x80, INS_READ, 0x04, 0x02, &[]));
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(body, t.to_be_bytes());
-        let (sw, body) = run(&mut app, &mut fs, &apdu(0x80, INS_READ, 0x04, 0x01, &[]));
-        assert_eq!(sw, Sw::OK);
-        // year, mon0=5 (June), mday=11, wday=4 (Thursday), 00:00:00.
-        assert_eq!(body, vec![0x07, 0xEA, 5, 11, 4, 0, 0, 0]);
-
-        // Set via the calendar form; get the same stamp back.
-        let cal = [0x07, 0xEA, 5, 11, 0 /* wday ignored */, 12, 34, 56];
-        let (sw, _) = run(&mut app, &mut fs, &apdu(0x80, INS_WRITE, 0x02, 0x01, &cal));
-        assert_eq!(sw, Sw::OK);
-        let (_, body) = run(&mut app, &mut fs, &apdu(0x80, INS_READ, 0x04, 0x02, &[]));
-        assert_eq!(body, (t + 12 * 3600 + 34 * 60 + 56).to_be_bytes());
-
-        // Invalid month.
-        let bad = [0x07, 0xEA, 12, 11, 0, 0, 0, 0];
-        let (sw, _) = run(&mut app, &mut fs, &apdu(0x80, INS_WRITE, 0x02, 0x01, &bad));
-        assert_eq!(sw, Sw::DATA_INVALID);
-    }
-
-    #[test]
-    fn reboot_requests() {
-        let rng = RefCell::new(LcgRng(7));
-        let platform = RefCell::new(FakePlatform::default());
-        let mut app = RescueApplet::new(
-            SERIAL_ID,
-            SERIAL_HASH,
-            None,
-            None,
-            &rng,
-            &platform,
-            KV_TOTAL,
-            FLASH_SIZE,
-        );
-        let mut fs = Fs::new(RamStorage::new(), &[]);
-
-        let (sw, _) = run(
-            &mut app,
-            &mut fs,
-            &apdu(0x80, INS_REBOOT_BOOTSEL, 0x01, 0, &[]),
-        );
-        assert_eq!(sw, Sw::OK);
-        let (sw, _) = run(
-            &mut app,
-            &mut fs,
-            &apdu(0x80, INS_REBOOT_BOOTSEL, 0x00, 0, &[]),
-        );
-        assert_eq!(sw, Sw::OK);
-        let (sw, _) = run(
-            &mut app,
-            &mut fs,
-            &apdu(0x80, INS_REBOOT_BOOTSEL, 0x07, 0, &[]),
-        );
-        assert_eq!(sw, Sw::INCORRECT_P1P2);
-        assert_eq!(platform.borrow().reboots, vec![true, false]);
-    }
-
-    #[test]
-    fn secure_ins_is_not_supported() {
-        // 0x1D (enable secure boot) is deliberately unimplemented.
-        let rng = RefCell::new(LcgRng(7));
-        let platform = RefCell::new(FakePlatform::default());
-        let mut app = RescueApplet::new(
-            SERIAL_ID,
-            SERIAL_HASH,
-            None,
-            None,
-            &rng,
-            &platform,
-            KV_TOTAL,
-            FLASH_SIZE,
-        );
-        let mut fs = Fs::new(RamStorage::new(), &[]);
-        let (sw, _) = run(&mut app, &mut fs, &apdu(0x80, 0x1D, 0x00, 0, &[]));
-        assert_eq!(sw, Sw::INS_NOT_SUPPORTED);
-        assert!(platform.borrow().reboots.is_empty());
-    }
-}
+mod tests;

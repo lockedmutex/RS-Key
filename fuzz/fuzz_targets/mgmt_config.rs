@@ -13,16 +13,17 @@
 //! that hid the EF_DEV_CONF over-length panic — is explored directly against the
 //! persisted flash. Nothing may panic.
 
+use core::cell::RefCell;
 use libfuzzer_sys::fuzz_target;
 use rsk_fs::Fs;
 use rsk_fs::storage::ram::RamStorage;
-use rsk_mgmt::ManagementApplet;
+use rsk_mgmt::{AlwaysConfirm, ManagementApplet};
 use rsk_sdk::{Apdu, Applet, ResBuf};
 
 const INS_WRITE_CONFIG: u8 = 0x1C;
 const INS_READ_CONFIG: u8 = 0x1D;
 
-fn run(app: &mut ManagementApplet, fs: &mut Fs<RamStorage>, raw: &[u8]) {
+fn run(app: &mut ManagementApplet<'_>, fs: &mut Fs<RamStorage>, raw: &[u8]) {
     if let Ok(apdu) = Apdu::parse(raw) {
         let mut buf = [0u8; 256];
         let mut res = ResBuf::new(&mut buf);
@@ -33,7 +34,8 @@ fn run(app: &mut ManagementApplet, fs: &mut Fs<RamStorage>, raw: &[u8]) {
 fuzz_target!(|data: &[u8]| {
     let mut fs = Fs::new(RamStorage::new(), &[]);
     fs.scan();
-    let mut app = ManagementApplet::new([0x12, 0x34, 0x56, 0x78, 1, 2, 3, 4]);
+    let presence = RefCell::new(AlwaysConfirm);
+    let mut app = ManagementApplet::new([0x12, 0x34, 0x56, 0x78, 1, 2, 3, 4], &presence);
 
     // Consume the input as a sequence of `(len, blob)` writes; after each one,
     // read the config back. State persists in `fs` across the whole sequence.

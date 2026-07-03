@@ -19,8 +19,9 @@ import os
 import sys
 
 from . import ctaphid
-from .backup import (from_bip39, from_slip39, mse_handshake, to_bip39,
-                     to_slip39, _acfg_token, _vendor)
+from .backup import (PINUV_PREFIX, STATE as VENDOR_STATE, from_bip39,
+                     from_slip39, mse_handshake, to_bip39, to_slip39,
+                     _acfg_token, _vendor)
 from .common import add_pin_arg, connect_fido, device_has_pin, die, resolve_pin
 
 CTAP_CONFIG = 0x0D
@@ -28,7 +29,6 @@ CONFIG_VENDOR = 0xFF
 AUT_ENABLE = 0x03E43F56B34285E2
 AUT_DISABLE = 0x1831A40F04A25ED9
 VENDOR_UNLOCK = 6
-VENDOR_STATE = 5
 AUT_TOUCH_HINT = "touch the device (BOOTSEL) to authorise…"
 
 from cryptography.hazmat.primitives import hashes, hmac as chmac  # noqa: E402
@@ -87,7 +87,7 @@ def _config_vendor(dev, cid, pin, vendor_id, param=None):
     if param is not None:
         subpara[2] = param
     token = _acfg_token(dev, cid, pin)
-    vp = b"\xff" * 32 + bytes([CTAP_CONFIG, CONFIG_VENDOR]) + ctaphid.enc(subpara)
+    vp = PINUV_PREFIX + bytes([CTAP_CONFIG, CONFIG_VENDOR]) + ctaphid.enc(subpara)
     h = chmac.HMAC(token, hashes.SHA256())
     h.update(vp)
     req = {1: CONFIG_VENDOR, 2: subpara, 3: 2, 4: h.finalize()}

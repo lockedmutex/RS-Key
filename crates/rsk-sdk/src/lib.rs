@@ -9,12 +9,14 @@
 
 pub mod apdu;
 pub mod applet;
+pub mod confirm;
 pub mod error;
 pub mod sw;
 pub mod tlv;
 
 pub use apdu::Apdu;
 pub use applet::{Applet, Dispatcher, ResBuf};
+pub use confirm::{Confirm, ConfirmKind};
 pub use error::{Error, Result};
 pub use sw::Sw;
 
@@ -48,14 +50,5 @@ pub const FIRMWARE_VERSION_U32: u32 = ((FIRMWARE_VERSION.0 as u32) << 16)
     | (FIRMWARE_VERSION.2 as u32);
 
 #[cfg(test)]
-mod version_tests {
-    use super::*;
-
-    #[test]
-    fn default_firmware_version_is_5_7_4() {
-        // The default build must keep masquerading as a current YubiKey 5; an
-        // override (FW_VERSION=…) is the only thing that changes this.
-        assert_eq!(FIRMWARE_VERSION, (5, 7, 4));
-        assert_eq!(FIRMWARE_VERSION_U32, 0x05_07_04);
-    }
-}
+#[path = "tests.rs"]
+mod version_tests;

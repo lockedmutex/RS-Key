@@ -1,0 +1,73 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 RS-Key contributors -->
+<svg viewBox="0 0 780 316" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="ttl dsc" font-family="'Segoe UI', system-ui, -apple-system, sans-serif">
+  <title id="ttl">Seed-backup export window</title>
+  <desc id="dsc">The one-time seed-export window as a state machine. A device starts with No seed. First boot or a factory reset provisions a seed and Opens the export window, during which rsk backup export works given touch and the FIDO PIN/UV. rsk backup finalize moves it to Finalized, where export is refused. A factory reset regenerates a new seed and returns to No seed, reopening a fresh window.</desc>
+  <defs>
+    <style>
+      .h1{font-size:23px;font-weight:700;fill:#2B2723}
+      .sub{font-size:12.5px;fill:#948A7F}
+      .lg{font-size:11px;fill:#6B645C}
+      .sname{font-size:15px;font-weight:700;fill:#fff}
+      .sdesc{font-size:10.5px;fill:#F3ECE4}
+      .tk{font-size:11px;font-weight:700;fill:#A9764F;font-family:'SF Mono','Roboto Mono',ui-monospace,monospace}
+      .tc{font-size:10.5px;fill:#6B645C}
+      .call{font-size:10.5px;fill:#5A534B}
+      .callk{font-size:10.5px;font-weight:700;fill:#2F7E75;font-family:'SF Mono','Roboto Mono',ui-monospace,monospace}
+      .rk{font-size:11px;font-weight:700;fill:#6B645C;font-family:'SF Mono','Roboto Mono',ui-monospace,monospace}
+      .foot{font-size:10.5px;fill:#ADA398}
+    </style>
+    <marker id="af" viewBox="0 0 8 8" refX="6.5" refY="4" markerWidth="6.5" markerHeight="6.5" orient="auto"><path d="M0 0 L8 4 L0 8 z" fill="#A9764F"/></marker>
+    <marker id="ag" viewBox="0 0 8 8" refX="6.5" refY="4" markerWidth="6.5" markerHeight="6.5" orient="auto"><path d="M0 0 L8 4 L0 8 z" fill="#948A7F"/></marker>
+  </defs>
+  <rect x="6" y="6" width="768" height="304" rx="16" fill="#FBFAF8" stroke="#E4DED5" stroke-width="1.5"/>
+
+  <text class="h1" x="34" y="46">Seed-backup export window</text>
+  <text class="sub" x="34" y="68">the one-time window · malware cannot exfiltrate the seed silently or later</text>
+
+  <!-- legend -->
+  <rect x="486" y="34" width="13" height="13" rx="3" fill="#3E3A36"/>
+  <text class="lg" x="506" y="45">no seed</text>
+  <rect x="566" y="34" width="13" height="13" rx="3" fill="#2F7E75"/>
+  <text class="lg" x="586" y="45">export open</text>
+  <rect x="672" y="34" width="13" height="13" rx="3" fill="#C0562B"/>
+  <text class="lg" x="692" y="45">sealed</text>
+
+  <!-- initial marker -->
+  <circle cx="34" cy="140" r="5.5" fill="#3E3A36"/>
+  <line x1="40" y1="140" x2="56" y2="140" stroke="#948A7F" stroke-width="2" marker-end="url(#ag)"/>
+
+  <!-- states -->
+  <rect x="58"  y="112" width="152" height="58" rx="11" fill="#3E3A36"/>
+  <text class="sname" x="134" y="138" text-anchor="middle">No seed</text>
+  <text class="sdesc" x="134" y="156" text-anchor="middle">nothing to export</text>
+
+  <rect x="314" y="112" width="152" height="58" rx="11" fill="#2F7E75"/>
+  <text class="sname" x="390" y="138" text-anchor="middle">Open</text>
+  <text class="sdesc" x="390" y="156" text-anchor="middle">export window open</text>
+
+  <rect x="570" y="112" width="152" height="58" rx="11" fill="#C0562B"/>
+  <text class="sname" x="646" y="138" text-anchor="middle">Finalized</text>
+  <text class="sdesc" x="646" y="156" text-anchor="middle">window sealed</text>
+
+  <!-- forward transitions -->
+  <line x1="210" y1="140" x2="314" y2="140" stroke="#A9764F" stroke-width="2" marker-end="url(#af)"/>
+  <text class="tk" x="262" y="104" text-anchor="middle">first boot</text>
+  <text class="tc" x="262" y="128" text-anchor="middle">/ reset</text>
+
+  <line x1="466" y1="140" x2="570" y2="140" stroke="#A9764F" stroke-width="2" marker-end="url(#af)"/>
+  <text class="tk" x="518" y="104" text-anchor="middle">rsk backup</text>
+  <text class="tk" x="518" y="120" text-anchor="middle">finalize</text>
+
+  <!-- callouts under states -->
+  <text class="callk" x="390" y="192" text-anchor="middle">rsk backup export ✓</text>
+  <text class="call"  x="390" y="207" text-anchor="middle">touch + PIN/UV, one-time</text>
+  <text class="call"  x="646" y="192" text-anchor="middle">export refused</text>
+  <text class="call"  x="646" y="207" text-anchor="middle">until a full reset</text>
+
+  <!-- return: Finalized -> No seed -->
+  <path d="M646 170 C 646 250, 134 250, 134 170" fill="none" stroke="#948A7F" stroke-width="2" marker-end="url(#ag)"/>
+  <text class="rk" x="390" y="243" text-anchor="middle">factory reset · regenerates a new seed</text>
+
+  <text class="foot" x="34" y="292">Reference: guides/seed-backup.md · export moves the seed over an ephemeral P-256 ECDH → HKDF → ChaCha20-Poly1305 channel</text>
+</svg>

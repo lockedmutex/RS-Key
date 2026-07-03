@@ -21,11 +21,11 @@ use rsk_openpgp::Rng;
 use rsk_openpgp::keys::{Curve, PrivKey, rsa_sign};
 use rsk_sdk::Sw;
 
-use crate::files::{ALGO_ECCP384, SLOT_ATTESTATION};
+use crate::files::{ALGO_ECCP384, MAX_EC_POINT, SLOT_ATTESTATION};
 
-/// Largest certificate the builder emits (RSA-2048 SPKI + extensions, with
-/// margin).
-pub const MAX_CERT: usize = 1280;
+/// Largest certificate the builder emits (RSA-4096 SPKI + a 512-byte signature
+/// + extensions ≈ 1.4 KB, with margin).
+pub const MAX_CERT: usize = 1536;
 
 // OID content bytes.
 const OID_EC_PUBKEY: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01];
@@ -35,6 +35,11 @@ const OID_ECDSA_SHA256: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02
 const OID_ECDSA_SHA384: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03];
 const OID_RSA_ENC: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01];
 const OID_RSA_SHA256: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B];
+// RFC 8410 algorithm OIDs (id-Ed25519 1.3.101.112, id-X25519 1.3.101.110); each
+// is both the SPKI algorithm and, for Ed25519, the signatureAlgorithm — with
+// absent parameters in either role.
+const OID_ED25519: &[u8] = &[0x2B, 0x65, 0x70];
+const OID_X25519: &[u8] = &[0x2B, 0x65, 0x6E];
 const OID_AT_COUNTRY: &[u8] = &[0x55, 0x04, 0x06];
 const OID_AT_ORG: &[u8] = &[0x55, 0x04, 0x0A];
 const OID_AT_CN: &[u8] = &[0x55, 0x04, 0x03];
@@ -121,14 +126,28 @@ impl<'a> DerRev<'a> {
 
 /// The subject public key going into the certificate.
 pub enum Spki<'a> {
-    Ec { curve: Curve, point: &'a [u8] },
-    Rsa { n: &'a [u8], e: &'a [u8] },
+    Ec {
+        curve: Curve,
+        point: &'a [u8],
+    },
+    Rsa {
+        n: &'a [u8],
+        e: &'a [u8],
+    },
+    /// RFC 8410 raw key — Ed25519 (id-Ed25519) or X25519 (id-X25519). `point` is
+    /// the 32-byte public key; the algorithm carries no parameters.
+    Rfc8410 {
+        curve: Curve,
+        point: &'a [u8],
+    },
 }
 
 /// Who signs: the slot's own key (self-signed) or the F9 attestation key.
 pub enum Signer<'a> {
     Ec(&'a PrivKey),
     Rsa(&'a RsaPrivateKey),
+    /// A pure-Ed25519 signer (PureEdDSA over the whole TBS, never a digest).
+    Ed25519(&'a PrivKey),
 }
 
 /// Yubico attestation-statement extensions.
@@ -214,6 +233,17 @@ fn spki(w: &mut DerRev, key: &Spki) -> Result<(), Sw> {
             w.oid(OID_RSA_ENC)?;
             w.close(0x30, ma)?;
         }
+        Spki::Rfc8410 { curve, point } => {
+            // RFC 8410 §4: AlgorithmIdentifier is the bare OID (no parameters),
+            // subjectPublicKey is the raw 32-byte key.
+            let mb = w.mark();
+            w.raw(point)?;
+            w.byte(0x00)?;
+            w.close(0x03, mb)?;
+            let ma = w.mark();
+            w.oid(oid_8410(*curve)?)?;
+            w.close(0x30, ma)?;
+        }
     }
     w.close(0x30, m)
 }
@@ -226,11 +256,19 @@ fn curve_oid(c: Curve) -> Result<&'static [u8], Sw> {
     }
 }
 
+fn oid_8410(c: Curve) -> Result<&'static [u8], Sw> {
+    match c {
+        Curve::Ed25519 => Ok(OID_ED25519),
+        Curve::X25519 => Ok(OID_X25519),
+        _ => Err(Sw::EXEC_ERROR),
+    }
+}
+
 /// SHA-1 of the raw subject public key (point / RSAPublicKey DER) — the
 /// SKI/AKI input (RFC 5280 method 1).
 fn pub_hash(key: &Spki) -> Result<[u8; 20], Sw> {
     match key {
-        Spki::Ec { point, .. } => Ok(sha1(point)),
+        Spki::Ec { point, .. } | Spki::Rfc8410 { point, .. } => Ok(sha1(point)),
         Spki::Rsa { n, e } => {
             let mut tmp = [0u8; 600];
             let mut w = DerRev::new(&mut tmp);
@@ -270,9 +308,21 @@ fn extensions(
     let m_outer = w.mark();
     // DER order: [Yubico…,] BC, SKI, AKI, KU — written backward.
     {
-        // keyUsage = digitalSignature | keyCertSign, critical.
+        // keyUsage, critical: a key-agreement key (X25519) advertises keyAgreement
+        // (bit 4); a signing key advertises digitalSignature | keyCertSign.
         let m = w.mark();
-        w.raw(&[0x03, 0x02, 0x02, 0x84])?;
+        let ku: &[u8] = if matches!(
+            p.spki,
+            Spki::Rfc8410 {
+                curve: Curve::X25519,
+                ..
+            }
+        ) {
+            &[0x03, 0x02, 0x03, 0x08]
+        } else {
+            &[0x03, 0x02, 0x02, 0x84]
+        };
+        w.raw(ku)?;
         finish_ext(w, OID_KEY_USAGE, true, m)?;
     }
     {
@@ -327,6 +377,10 @@ fn sigalg(w: &mut DerRev, signer: &Signer, sha384sig: bool) -> Result<(), Sw> {
             w.raw(&[0x05, 0x00])?;
             w.oid(OID_RSA_SHA256)?;
         }
+        // RFC 8410 §6: Ed25519 signatures carry id-Ed25519 with absent parameters.
+        Signer::Ed25519(_) => {
+            w.oid(OID_ED25519)?;
+        }
     }
     w.close(0x30, m)
 }
@@ -348,8 +402,8 @@ pub fn build_cert(
 
     let subject_hash = pub_hash(&p.spki)?;
     let issuer_hash = match signer {
-        Signer::Ec(k) => {
-            let mut pt = [0u8; 97];
+        Signer::Ec(k) | Signer::Ed25519(k) => {
+            let mut pt = [0u8; MAX_EC_POINT];
             let n = k.public_point(&mut pt)?;
             sha1(&pt[..n])
         }
@@ -407,7 +461,7 @@ pub fn build_cert(
         digest[..32].copy_from_slice(&sha256(tbs_bytes));
         &digest[..32]
     };
-    let mut sig = [0u8; 280];
+    let mut sig = [0u8; 512];
     let sig_len = match signer {
         Signer::Ec(k) => {
             let mut raw = [0u8; 96];
@@ -415,6 +469,9 @@ pub fn build_cert(
             ecdsa_der(&raw[..rn], &mut sig)?
         }
         Signer::Rsa(k) => rsa_sign(k, digest, rng, &mut sig)?,
+        // PureEdDSA signs the whole TBS, not a digest; the 64-byte signature
+        // goes straight into the BIT STRING (no ASN.1 wrapping).
+        Signer::Ed25519(k) => k.sign(tbs_bytes, rng, &mut sig)?,
     };
 
     // --- Certificate = SEQ { tbs, sigalg, BIT STRING sig }.

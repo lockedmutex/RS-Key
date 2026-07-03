@@ -30,6 +30,7 @@ pub mod journal;
 pub mod keyderiv;
 pub mod largeblobs;
 pub mod makecredential;
+pub mod passkeys;
 pub mod reset;
 pub mod seed;
 pub mod selection;
@@ -38,9 +39,11 @@ pub mod u2f;
 pub mod vendor;
 
 pub use error::{CTAP2_OK, CtapError, CtapResult};
+pub use reset::survives_factory_reset;
 
 use rsk_crypto::Device;
 use rsk_fs::{Fs, Storage};
+pub use rsk_sdk::{Confirm, ConfirmKind};
 
 pub use state::FidoState;
 
@@ -65,11 +68,49 @@ pub enum Presence {
     Cancelled,
 }
 
+/// Outcome of collecting a built-in-UV PIN on the device's own UI (the
+/// trusted-display PIN pad). Built-in UV proves *user verification* without the
+/// PIN ever crossing the host — the anti-keylogger counterpart to the on-screen
+/// Approve/Deny that proves *user presence*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinEntry {
+    /// The user committed a PIN of this many ASCII-digit bytes, in `out[..len]`.
+    Entered(usize),
+    /// The user tapped Cancel on the pad — a deliberate decline.
+    Declined,
+    /// No completed entry within the presence timeout.
+    Timeout,
+    /// The platform sent `CTAPHID_CANCEL` while the pad was up.
+    Cancelled,
+    /// The backend has no on-device UI to collect a PIN (the default).
+    Unsupported,
+}
+
 /// Obtains physical user presence. The firmware polls the BOOTSEL button; with
 /// no button configured it confirms immediately, which is also what host tests
 /// use via [`AlwaysConfirm`].
 pub trait UserPresence {
-    fn request(&mut self) -> Presence;
+    /// Ask for presence. `confirm` describes the pending operation for a trusted
+    /// on-screen Approve/Deny prompt; the BOOTSEL-button backend ignores it.
+    fn request(&mut self, confirm: Confirm<'_>) -> Presence;
+
+    /// Whether this backend can collect built-in user verification — a PIN entered
+    /// on the authenticator's own UI, so it never reaches the host. Only the
+    /// trusted-display backend overrides this; the BOOTSEL button and the host-test
+    /// stand-in have no UI to type a PIN, so built-in UV is absent and `options.uv`
+    /// stays unadvertised (and `clientPIN` 0x06/0x07 answer `UnsupportedOption`).
+    fn uv_available(&self) -> bool {
+        false
+    }
+
+    /// Collect a built-in-UV PIN on the device's own UI as ASCII digits into `out`,
+    /// refusing to *commit* below `min_len` characters so a fat-fingered short entry
+    /// can't burn a retry. Returns how the entry ended. The default — no on-device
+    /// UI — reports [`PinEntry::Unsupported`]; this is only reached on a backend
+    /// that also overrides [`uv_available`](Self::uv_available).
+    fn collect_pin(&mut self, _min_len: usize, _out: &mut [u8]) -> PinEntry {
+        PinEntry::Unsupported
+    }
 }
 
 /// A [`UserPresence`] that confirms instantly — the no-button default and the
@@ -77,7 +118,7 @@ pub trait UserPresence {
 pub struct AlwaysConfirm;
 
 impl UserPresence for AlwaysConfirm {
-    fn request(&mut self) -> Presence {
+    fn request(&mut self, _confirm: Confirm<'_>) -> Presence {
         Presence::Confirmed
     }
 }
@@ -101,15 +142,15 @@ impl<S: Storage, R: Rng> Ctx<'_, S, R> {
     /// Request a touch, mapping any non-confirmation (timeout, decline or
     /// cancel) to `false`. Callers that must distinguish a `CTAPHID_CANCEL`
     /// (→ `KEEPALIVE_CANCEL`) use [`require_presence`](Self::require_presence).
-    pub fn check_user_presence(&mut self) -> bool {
-        self.presence.request() == Presence::Confirmed
+    pub fn check_user_presence(&mut self, confirm: Confirm<'_>) -> bool {
+        self.presence.request(confirm) == Presence::Confirmed
     }
 
     /// Obtain user presence for a CTAP2 command, mapping the outcome to its
     /// status code: a `CTAPHID_CANCEL` aborts with `KEEPALIVE_CANCEL`, any
     /// other non-confirmation (timeout, decline) with `OPERATION_DENIED`.
-    pub fn require_presence(&mut self) -> Result<(), CtapError> {
-        match self.presence.request() {
+    pub fn require_presence(&mut self, confirm: Confirm<'_>) -> Result<(), CtapError> {
+        match self.presence.request(confirm) {
             Presence::Confirmed => Ok(()),
             Presence::Cancelled => Err(CtapError::KeepAliveCancel),
             Presence::Timeout | Presence::Declined => Err(CtapError::OperationDenied),
@@ -155,6 +196,7 @@ pub fn process_cbor<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, data: &[u8], out: &
                 force,
                 ctx.fs.has_data(consts::EF_EA_ENABLED),
                 ctx.fs.has_data(consts::EF_ALWAYS_UV),
+                ctx.presence.uv_available(),
                 remaining_rk,
                 &mut out[1..],
             )
@@ -185,74 +227,4 @@ pub fn process_cbor<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, data: &[u8], out: &
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use rsk_fs::storage::ram::RamStorage;
-
-    struct SeqRng(u64);
-    impl Rng for SeqRng {
-        fn fill(&mut self, buf: &mut [u8]) {
-            for b in buf.iter_mut() {
-                self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
-                *b = (self.0 >> 33) as u8;
-            }
-        }
-    }
-
-    // Run process_cbor with a fresh context (empty flash).
-    fn dispatch(data: &[u8], out: &mut [u8]) -> usize {
-        let mut fs = Fs::new(RamStorage::new(), &[]);
-        let dev = Device {
-            serial_hash: &[0xAB; 32],
-            serial_id: &[1, 2, 3, 4, 5, 6, 7, 8],
-            otp_key: None,
-        };
-        let mut rng = SeqRng(1);
-        let mut state = FidoState::new();
-        let mut presence = AlwaysConfirm;
-        let mut ctx = Ctx {
-            dev,
-            fs: &mut fs,
-            rng: &mut rng,
-            state: &mut state,
-            now_ms: 0,
-            presence: &mut presence,
-        };
-        process_cbor(&mut ctx, data, out)
-    }
-
-    #[test]
-    fn dispatch_get_info_ok() {
-        let mut out = [0u8; 512];
-        let n = dispatch(&[consts::CTAP_GET_INFO], &mut out);
-        assert!(n > 1);
-        assert_eq!(out[0], CTAP2_OK);
-        // The payload is the getInfo map (CBOR map header 0xB4 = map(20)).
-        assert_eq!(out[1], 0xB4);
-    }
-
-    #[test]
-    fn dispatch_unknown_command() {
-        let mut out = [0u8; 64];
-        let n = dispatch(&[0xEE], &mut out);
-        assert_eq!(n, 1);
-        assert_eq!(out[0], CtapError::InvalidCommand.as_u8());
-    }
-
-    #[test]
-    fn dispatch_empty_is_invalid_length() {
-        let mut out = [0u8; 64];
-        let n = dispatch(&[], &mut out);
-        assert_eq!(n, 1);
-        assert_eq!(out[0], CtapError::InvalidLength.as_u8());
-    }
-
-    #[test]
-    fn dispatch_get_assertion_routes_to_handler() {
-        // getAssertion with empty params is malformed CBOR.
-        let mut out = [0u8; 64];
-        let n = dispatch(&[consts::CTAP_GET_ASSERTION], &mut out);
-        assert_eq!(n, 1);
-        assert_eq!(out[0], CtapError::InvalidCbor.as_u8());
-    }
-}
+mod tests;

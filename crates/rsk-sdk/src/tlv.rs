@@ -98,84 +98,9 @@ pub const fn len_tag(tag: u16, len: u16) -> usize {
 /// Kani proof harnesses (`cargo kani -p rsk-sdk`): exhaustive over every input
 /// up to the stated bound, where the unit tests above only sample.
 #[cfg(kani)]
-mod proofs {
-    use super::*;
-
-    /// Walking ANY byte sequence (up to 16 bytes — past every tag/length form
-    /// with room for several nested objects) never panics, never overflows, and
-    /// always terminates; every yielded value lies inside the input.
-    #[kani::proof]
-    #[kani::unwind(18)]
-    fn walk_any_input() {
-        const N: usize = 16;
-        let data: [u8; N] = kani::any();
-        let n: usize = kani::any();
-        kani::assume(n <= N);
-        for (_tag, value) in Tlv::new(&data[..n]) {
-            assert!(value.len() <= n);
-        }
-    }
-
-    /// `format_len` writes exactly `format_len_size` bytes, and the encoding
-    /// decodes back to `len` under the same rules `Tlv::next` uses — for EVERY
-    /// `u16` length.
-    #[kani::proof]
-    fn format_len_roundtrip() {
-        let len: u16 = kani::any();
-        let mut buf = [0u8; 3];
-        let n = format_len(len, &mut buf);
-        assert_eq!(n, format_len_size(len));
-        let (decoded, consumed) = match buf[0] {
-            0x82 => (((buf[1] as usize) << 8) | buf[2] as usize, 3),
-            0x81 => (buf[1] as usize, 2),
-            b => (b as usize, 1),
-        };
-        assert_eq!(consumed, n);
-        assert_eq!(decoded, len as usize);
-    }
-}
+#[path = "tlv_kani.rs"]
+mod proofs;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn walk_two_objects() {
-        // 0x5A len2 [aa bb], 0x9F1F (2-byte tag) len1 [cc]
-        let data = [0x5A, 0x02, 0xAA, 0xBB, 0x9F, 0x1F, 0x01, 0xCC];
-        let items: Vec<_> = Tlv::new(&data).collect();
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[0], (0x5A, &[0xAA, 0xBB][..]));
-        assert_eq!(items[1], (0x9F1F, &[0xCC][..]));
-    }
-
-    #[test]
-    fn find_and_long_len() {
-        // tag 0x70, length 0x81 0x80 (128 bytes)
-        let mut data = [0u8; 3 + 128];
-        data[0] = 0x70;
-        data[1] = 0x81;
-        data[2] = 0x80;
-        let v = find_tag(&data, 0x70).unwrap();
-        assert_eq!(v.len(), 128);
-        assert!(find_tag(&data, 0x71).is_none());
-    }
-
-    #[test]
-    fn truncated_is_none() {
-        // claims 5 bytes but only 2 present
-        let data = [0x5A, 0x05, 0x01, 0x02];
-        assert_eq!(Tlv::new(&data).count(), 0);
-    }
-
-    #[test]
-    fn format_len_roundtrip() {
-        let mut buf = [0u8; 3];
-        assert_eq!(format_len(10, &mut buf), 1);
-        assert_eq!(buf[0], 10);
-        assert_eq!(format_len(200, &mut buf), 2);
-        assert_eq!(&buf[..2], &[0x81, 200]);
-        assert_eq!(format_len(0x1234, &mut buf), 3);
-        assert_eq!(&buf[..3], &[0x82, 0x12, 0x34]);
-    }
-}
+#[path = "tlv_tests.rs"]
+mod tests;

@@ -22,6 +22,8 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 REPORT_LEN = 64
 CTAPHID_INIT = 0x86
 CTAPHID_CBOR = 0x90
+CTAP_GET_INFO = 0x04  # CTAP2 authenticatorGetInfo
+FIDO_USAGE_PAGE = 0xF1D0  # FIDO HID usage page (CTAPHID spec)
 
 
 def _hdr(major, n):
@@ -100,7 +102,7 @@ def decode(b):
 
 def find():
     for d in hid.enumerate():
-        if d.get("usage_page") == 0xF1D0:
+        if d.get("usage_page") == FIDO_USAGE_PAGE:
             return d
     return None
 

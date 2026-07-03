@@ -30,6 +30,7 @@ flowchart TD
 | `advertise-pqc` | off | Prepends ML-DSA-44 (COSE −48) to the getInfo `algorithms` list. Off by default because released Firefox versions abort the *entire* getInfo parse on an unknown COSE id and report the authenticator broken. **PQC capability is on regardless of this flag** — makeCredential negotiates −48 from the request's `pubKeyCredParams`; the flag only controls advertising. |
 | `fips-profile` | off | Bakes a locked FIPS-style policy into the image: ES256K (secp256k1) leaves the FIDO menu, the minimum PIN rises to 6, the vendor seed *export* is refused, and PIV refuses new 3DES management keys and RSA-1024. The default build is unchanged; with secure boot the policy is sealed by your signature. A profile, **not** a FIPS validation — details and rationale: [guides/fips.md](guides/fips.md). |
 | `strict-up` | off | Require a touch on **every** `getAssertion`. By default RS-Key honors the platform's silent pre-flight probe (`up:false`): it returns the discovery assertion with no touch and the UP flag clear, so a WebAuthn login with an `allowCredentials` (non-resident) credential is a **single** touch — matching the CTAP2 spec and YubiKey. With `strict-up` the button is polled even for that probe, so such a login asks for **two** touches (one for the probe, one for the real assertion). A deliberately stricter "every assertion needs an explicit gesture" stance for those who want it; it is **not** spec-conformant for `up:false`. Resident-credential / passkey logins are a single touch either way. `fido-conformance` enables this implicitly (the conformance pass was validated with it). |
+| `display` | off | **Experimental** trusted-display build for a screen + touch board (Waveshare RP2350-Touch-LCD-2.8). Adds an on-screen **Approve / Deny** that paints the real relying party for every touch (Deny refuses with `OPERATION_DENIED`), an on-device **PIN pad** — built-in user verification (`options.uv`), plus a CCID **pinpad** so GnuPG / OpenSC collect the OpenPGP / PIV PIN on the panel, never over USB — a read-only **Apps** browser (OpenPGP / PIV / OATH state, no PIN), a **Passkeys** manager (delete / rename on-device), and **Settings** (device & FIDO PINs, on-screen BIP-39 / SLIP-39 recovery export, audit log, factory reset). Entirely `dep:`-gated — a standard key compiles **none** of it, so its image is unaffected. Build it `LED_KIND=none FLASH_SIZE=16M … --features display` (the panel takes GPIO16 for its backlight; a compile-time guard enforces `LED_KIND=none`). Full walkthrough with screenshots: [guides/display.md](guides/display.md). |
 
 ## Environment variables
 
@@ -42,10 +43,13 @@ flowchart TD
 | `XOSC_DELAY_MULT` | `128` | `1..=1024` | Crystal-oscillator startup-delay multiplier ("delayed boot"). A longer settle wait is intended to harden the early-boot clock-switch window against glitch/fault injection. 128 is the embassy default. |
 | `FLASH_SIZE` | `4M` | bytes, `0xHEX`, or `<n>K`/`<n>M` | External QSPI flash size. build.rs regenerates `memory.x` from it — the KV store stays a fixed 1.5 MB at the top, the code region is the rest. `4M` reproduces the checked-in layout byte-for-byte. Use this for boards with a different flash chip (e.g. `8M`); must be ≥ ~2 MB and ≤ 16 MB. |
 | `LED_PIN` | `16` | `0..=29` | The status-LED GPIO for the `ws2812` and `gpio` backends (RP2350A). Default GPIO16 is the Waveshare RP2350-One. Point it at a free GPIO on boards that use 16 for something else; the indicator simply drives whatever pin you pick. (Unused by `pimoroni`, which has fixed PWM pins, and by `none`.) |
-| `PRESENCE_PIN` | `bootsel` | `bootsel` or `0..=29` | User-presence input source. Default `bootsel` keeps the BOOTSEL hardware-button path. Set a GPIO number for a dedicated button (active-low with internal pull-up). Example: `PRESENCE_PIN=0` for a button to ground on GPIO0. |
+| `PRESENCE_PIN` | `bootsel` | `bootsel` or `0..=29` | User-presence input source. Default `bootsel` keeps the BOOTSEL hardware-button path. Set a GPIO number for a dedicated button (active-low with an internal pull-up by default — flip with `PRESENCE_ACTIVE_HIGH`). Example: `PRESENCE_PIN=0` for a button to ground on GPIO0. |
+| `PRESENCE_ACTIVE_HIGH` | `0` | `0` / `1` | GPIO presence-button polarity — only meaningful with a GPIO `PRESENCE_PIN`. `0` (default) = active-low: button to ground, internal pull-up, a press reads **low**. `1` = active-high: internal pull-down, a press reads **high** — for a capacitive touch sensor or a button to VCC. Ignored for the BOOTSEL default. |
+| `WAKE_PIN` | `25` | `none` or `0..=29` | **`display` builds only.** The button that wakes the panel from display sleep. Default `25` is the Waveshare RP2350-Touch-LCD-2.8's **BAT_PWR** button. `none` makes wake touch-only (no button); any other GPIO selects a different button. A value in the LCD/touch range (`10..=18`) is rejected at compile time. The display-sleep timeout itself is set on-device (Settings → Display sleep). |
+| `WAKE_ACTIVE_HIGH` | `0` | `0` / `1` | Wake-button polarity (`display` builds, with a GPIO `WAKE_PIN`). `0` (default) = active-low (internal pull-up, press reads **low**, e.g. BAT_PWR to ground); `1` = active-high (internal pull-down). |
 | `LED_KIND` | `ws2812` | `ws2812` / `gpio` / `pimoroni` / `none` | The LED driver backend, and the **boot default** — a non-`none` build compiles all three so the driver/pin/order are runtime-switchable via `rsk hw` / PicoForge (see below). `ws2812` = a single addressable RGB on `LED_PIN` (the Waveshare default). `gpio` = a plain on/off LED on `LED_PIN` — hue/brightness collapse to lit/unlit, but the blink *pattern* still distinguishes statuses. `pimoroni` = a 3-pin PWM RGB (Pimoroni Tiny 2350: R=GPIO18, G=GPIO19, B=GPIO20, common-anode). `none` = no indicator (the status engine still runs; nothing renders it, and the phy LED fields are ignored). |
 | `LED_ORDER` | `rgb` | `rgb` / `grb` | WS2812 wire byte order (`ws2812` backend only). The Waveshare RP2350-One is unusually `rgb` (the default); standard WS2812B parts (e.g. the TenStar RP2350-USB) are `grb`. If a `ws2812` board comes up with red and green swapped (blue fine), flip this to `grb`. |
-| `MAX_LEDS` | `8` | `1`–`64` | PIO state-machine and frame-buffer ceiling for addressable LEDs. The **actual** connected count is set at runtime via `rsk hw --led-num` and must be ≤ `MAX_LEDS`. Default 8 covers the common 1–8 range; boards with more (up to 64) override this.|
+| `MAX_LEDS` | `1` | `1`–`64` | PIO state-machine and frame-buffer ceiling for addressable LEDs. The **actual** connected count is set at runtime via `rsk hw --led-num` and must be ≤ `MAX_LEDS`. Default 1 is a single onboard LED; a board with a chain of N builds with `MAX_LEDS=N` (up to 64).|
 | `FAKE_MKEK` / `FAKE_DEVK` | unset | 64 hex chars | **Test builds only.** Bakes a fake OTP master key / device key into the image instead of reading the OTP fuses, so the whole OTP migration path can be exercised with zero fuse writes. The build prints a loud warning and the key is greppable in the binary. Flashing a FAKE build onto a provisioned device migrates its data under the fake key — going back orphans that data (recovery = per-applet resets). Never flash one on a device you care about. |
 
 The `LED_PIN` / `LED_KIND` / `LED_ORDER` / `MAX_LEDS` values are **boot defaults**
@@ -67,6 +71,15 @@ rg PK_XOSC_DELAY_MULT target/thumbv8m.main-none-eabihf/release/build/firmware-*/
 The `firmware-*` glob matches one build dir per feature combination you have
 built, so a stale entry can show an old value. Read the freshest one (or
 `cargo clean -p firmware` first) if the output looks doubled.
+
+## Flash size and the memory map
+
+`FLASH_SIZE` regenerates `memory.x`: the 1.5 MB KV store stays pinned to the top
+of flash and only the code region grows. A 16 MB board just gets more (unused)
+code headroom — the credential capacity is unchanged (why the flash is mostly
+empty by design: [architecture.md](architecture.md)).
+
+![4 MB vs 16 MB flash layout — the KV store is identical on both; only the code region and the KV origin move with FLASH_SIZE](images/flash-map-sizes.svg)
 
 ## Examples
 
@@ -121,6 +134,7 @@ check the seal with `picotool`. The flavors mirror the
 | `.#firmware-no-touch` | `--features no-touch` (the test build) |
 | `.#firmware-fips` | `--features fips-profile` |
 | `.#firmware-pqc` | `--features advertise-pqc` |
+| `.#firmware-display` | `--features display`, `FLASH_SIZE=16M`, `LED_KIND=none` (experimental, Waveshare RP2350-Touch-LCD-2.8) |
 
 Two caveats:
 

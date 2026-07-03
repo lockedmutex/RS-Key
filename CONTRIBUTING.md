@@ -8,6 +8,21 @@ fix for this file too.
 One thing before anything else: **exploitable bugs go through
 [private reporting](SECURITY.md), not a public issue or PR.**
 
+## AI-assisted contributions
+
+Using an AI agent (Claude Code, Cursor, Codex, …) to write a patch is fine —
+several already have. Two expectations. **You own the diff:** you understand it
+and can defend it in review; the agent is a tool (a `Co-Authored-By:` trailer is
+welcome), you are the contributor. And **the bar doesn't move:**
+`./scripts/check.sh` green, `bcdDevice` bumped if firmware behaviour changed,
+tests where the change is visible, docs in sync. A PR that compiles but skips the
+gate is more work to review than no PR.
+
+Point your agent at [AGENTS.md](AGENTS.md) — the condensed rules plus the gotchas
+agents reliably trip on (the `no_std` host-test split, the bcdDevice bump, keeping
+`docs/protocol.md` in sync). Disclosing that a change was AI-assisted is welcome,
+not required.
+
 ## Setup
 
 ```sh
@@ -72,8 +87,10 @@ Every file starts with the SPDX header:
 ```
 
 Comments explain constraints, not mechanics — the reader can see *what* the
-line does. Flash-layout decisions, spec-section references (`// CTAP 2.1
-§6.5.5.7`), power-cut ordering, those are worth words.
+line does. Keep them short: three lines is the ceiling, and if a comment needs
+more, the code or the design is the thing to fix. Flash-layout decisions,
+spec-section references (`// CTAP 2.1 §6.5.5.7`), power-cut ordering, those are
+worth words.
 
 New dependencies are a conversation, not a default. cargo-deny enforces
 licenses and advisories mechanically, but the real bar is: does this belong
@@ -89,7 +106,14 @@ Any change to device behavior bumps `config.device_release` in
 `firmware/src/main.rs` by one (hex). It's the build counter: `rsk inventory
 list` reports it, fleet records key on it, and "which build is this key
 actually running" stops being archaeology. Host-only changes (CLI, docs, CI)
-don't bump it.
+don't bump it — but a user-facing change to `tools/rsk` (the Python CLI) or
+`tools/tui` (the Rust TUI) **does** bump that package's own version
+(`tools/rsk/__init__.py`'s `__version__` / `tools/tui/Cargo.toml`'s `version`):
+`pipx` / `pip` / a published `uvx` install key off it, so an unbumped tool change
+leaves those users on a stale build — e.g. an old `rsk led` silently mis-parsing
+a new device's config block. (For local dev, run current source with `uv run
+--project tools rsk …` or `nix develop` → `rsk`; `uvx --from tools/` caches the
+built env regardless of version — `uv cache clean` busts it.)
 
 Don't confuse it with the **anti-rollback epoch** — a separate, much coarser
 number that is *not* in `main.rs`. The epoch is a `picotool seal --rollback N`

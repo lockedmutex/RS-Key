@@ -49,10 +49,9 @@ use crate::journal;
 use crate::seed::{
     LOCK_BLOB_LEN, encrypt_keydev_f1, ensure_seed, lock_engaged, open_seed_locked, store_att_key,
 };
-use crate::state::PERM_ACFG;
+use crate::state::{PERM_ACFG, puat_subcommand_msg};
 use crate::{Ctx, Rng};
 
-const BLOB_LEN: usize = 12 + 32 + 16; // nonce ‖ ciphertext(seed) ‖ tag
 // Sized for ATT_IMPORT's wrapped key + a full cert chain (≤ 2048 B); every
 // other subcommand stays tiny. The pinUvAuth MAC covers these bytes verbatim.
 const MAX_RAW_SUBPARA: usize = 2200;
@@ -173,7 +172,7 @@ pub fn vendor<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, data: &[u8], out: &mut [u
 /// move (MSE + PIN + touch). Survives authenticatorReset — it is
 /// org-provisioned *device* identity; ATT_CLEAR removes it.
 fn att_import<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req) -> CtapResult {
-    let mut packed = [0u8; cert::ATT_CHAIN_MAX + 1 + 2 * cert::ATT_CHAIN_MAX_CERTS];
+    let mut packed = [0u8; cert::ATT_CHAIN_REC_MAX];
     let plen = cert::att_chain_pack(req.chain, &mut packed).ok_or(CtapError::InvalidParameter)?;
     gate(ctx, req)?;
     let mut scalar = open_channel_key(ctx, req.blob)?;
@@ -203,7 +202,7 @@ fn att_clear<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req) -> CtapResult {
 /// `ATT_STATE`: `{1: present, 2: sha256(packed chain)}` — ungated, like
 /// BACKUP_STATE; the chain itself is public.
 fn att_state<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, out: &mut [u8]) -> CtapResult {
-    let mut chain = [0u8; cert::ATT_CHAIN_MAX + 1 + 2 * cert::ATT_CHAIN_MAX_CERTS];
+    let mut chain = [0u8; cert::ATT_CHAIN_REC_MAX];
     let present = ctx.fs.has_key(EF_ATT_KEY);
     let n = ctx.fs.read(EF_ATT_CHAIN, &mut chain).unwrap_or(0);
     encode(out, |e| {
@@ -234,7 +233,7 @@ fn audit_checkpoint<S: Storage, R: Rng>(
     out: &mut [u8],
 ) -> CtapResult {
     pin_gate(ctx, req)?;
-    if !ctx.check_user_presence() {
+    if !ctx.check_user_presence(crate::Confirm::titled("Sign audit log?")) {
         return Err(CtapError::OperationDenied);
     }
     journal::vendor_checkpoint(ctx, req.blob, out)
@@ -287,7 +286,7 @@ fn unlock<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req) -> CtapResult {
     }
     let mut blob = [0u8; LOCK_BLOB_LEN];
     let n = ctx.fs.read_key(EF_KEY_DEV_ENC, &mut blob);
-    let seed = n.and_then(|n| open_seed_locked(&lock_key, &blob[..n]));
+    let seed = n.and_then(|n| open_seed_locked(&lock_key, &blob[..n.min(blob.len())]));
     lock_key.zeroize();
     match seed {
         Some(seed) => {
@@ -417,7 +416,7 @@ fn gate<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req) -> Result<(), CtapEr
         return Err(CtapError::NotAllowed);
     }
     pin_gate(ctx, req)?;
-    if !ctx.check_user_presence() {
+    if !ctx.check_user_presence(crate::Confirm::titled("Vendor config?")) {
         return Err(CtapError::OperationDenied);
     }
     Ok(())
@@ -434,11 +433,8 @@ fn pin_gate<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req) -> Result<(), Ct
             return Err(CtapError::RequestTooLarge);
         }
         let mut vp = [0u8; 32 + 2 + MAX_RAW_SUBPARA];
-        vp[..32].fill(0xff);
-        vp[32] = CTAP_VENDOR;
-        vp[33] = req.subcommand as u8;
-        vp[34..34 + req.raw_subpara.len()].copy_from_slice(req.raw_subpara);
-        let vp_len = 34 + req.raw_subpara.len();
+        let vp_len =
+            puat_subcommand_msg(&mut vp, CTAP_VENDOR, req.subcommand as u8, req.raw_subpara);
         if !ctx.state.verify_token(proto, &vp[..vp_len], param)
             || ctx.state.paut.permissions & PERM_ACFG == 0
         {
@@ -449,7 +445,9 @@ fn pin_gate<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req) -> Result<(), Ct
 }
 
 /// `BACKUP_EXPORT`: encrypt the 32-byte seed under the MSE channel and return it.
-/// Refused once the export window is sealed (finalize or a prior backup).
+/// Refused once the export window is sealed by `BACKUP_FINALIZE` (a reset reopens
+/// it). Export itself does not seal the window; each call re-encrypts under a
+/// fresh nonce, so a repeat export before finalize is safe (no keystream reuse).
 fn backup_export<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [u8]) -> CtapResult {
     // The FIPS-style profile seals the seed in entirely (non-exportable key
     // material; the MSE channel is ChaCha20-Poly1305 — not approved transport).
@@ -468,7 +466,7 @@ fn backup_export<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [
     ct.copy_from_slice(&seed);
     seed.zeroize();
     let tag = chacha20poly1305_encrypt(&ctx.state.mse_key, &nonce, &ctx.state.mse_pub, &mut ct);
-    let mut blob = [0u8; BLOB_LEN];
+    let mut blob = [0u8; LOCK_BLOB_LEN]; // nonce ‖ ciphertext(seed) ‖ tag
     blob[..12].copy_from_slice(&nonce);
     blob[12..44].copy_from_slice(&ct);
     blob[44..].copy_from_slice(&tag);
@@ -490,7 +488,7 @@ fn backup_export<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [
 /// live wrapped blob would leave two competing seeds; disable the lock (or
 /// reset) first.
 fn backup_load<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req) -> CtapResult {
-    if req.blob.len() != BLOB_LEN {
+    if req.blob.len() != LOCK_BLOB_LEN {
         return Err(CtapError::MissingParameter);
     }
     if lock_engaged(ctx.fs) {
@@ -529,7 +527,7 @@ fn backup_load<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req) -> CtapResult
 
 /// `BACKUP_FINALIZE`: seal the one-time export window (a reset reopens it).
 fn backup_finalize<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>) -> CtapResult {
-    if !ctx.check_user_presence() {
+    if !ctx.check_user_presence(crate::Confirm::titled("Finish backup?")) {
         return Err(CtapError::OperationDenied);
     }
     ctx.fs
@@ -562,1032 +560,53 @@ fn backup_state<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, out: &mut [u8]) -> Ctap
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::seed::{ensure_seed, load_keydev};
-    use crate::{AlwaysConfirm, FidoState, Presence, UserPresence};
-    use rsk_crypto::Device;
-    use rsk_crypto::MlKem768Pair;
-    use rsk_crypto::mlkem::MLKEM768_SEED_LEN;
-    use rsk_fs::Fs;
-    use rsk_fs::storage::ram::RamStorage;
-
-    struct SeqRng(u64);
-    impl Rng for SeqRng {
-        fn fill(&mut self, buf: &mut [u8]) {
-            for b in buf.iter_mut() {
-                self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
-                *b = (self.0 >> 33) as u8;
-            }
-        }
-    }
-
-    struct Decline;
-    impl UserPresence for Decline {
-        fn request(&mut self) -> Presence {
-            Presence::Timeout
-        }
-    }
-
-    fn dev() -> Device<'static> {
-        Device {
-            serial_hash: &[0xAB; 32],
-            serial_id: &[1, 2, 3, 4, 5, 6, 7, 8],
-            otp_key: None,
-        }
-    }
-
-    /// The full host channel: the 32-byte key and 65-byte device pubkey (AAD), so
-    /// tests can encrypt/decrypt blobs exactly as the real host tool does.
-    struct Host {
-        key: [u8; 32],
-        aad: [u8; 65],
-    }
-
-    fn call(
-        fs: &mut Fs<RamStorage>,
-        rng: &mut SeqRng,
-        state: &mut FidoState,
-        presence: &mut dyn UserPresence,
-        req: &[u8],
-        out: &mut [u8],
-    ) -> CtapResult {
-        let mut ctx = Ctx {
-            dev: dev(),
-            fs,
-            rng,
-            state,
-            now_ms: 0,
-            presence,
-        };
-        vendor(&mut ctx, req, out)
-    }
-
-    fn build_mse(buf: &mut [u8], hx: &[u8; 32], hy: &[u8; 32]) -> usize {
-        let mut e = Encoder::new(Cursor::new(buf));
-        e.map(2)
-            .unwrap()
-            .u8(1)
-            .unwrap()
-            .u64(VENDOR_MSE)
-            .unwrap()
-            .u8(2)
-            .unwrap()
-            .map(1)
-            .unwrap()
-            .u8(1)
-            .unwrap()
-            .map(5)
-            .unwrap()
-            .u8(1)
-            .unwrap()
-            .u8(2)
-            .unwrap()
-            .u8(3)
-            .unwrap()
-            .i64(-25)
-            .unwrap()
-            .i8(-1)
-            .unwrap()
-            .u8(1)
-            .unwrap()
-            .i8(-2)
-            .unwrap()
-            .bytes(hx)
-            .unwrap()
-            .i8(-3)
-            .unwrap()
-            .bytes(hy)
-            .unwrap();
-        e.writer().position()
-    }
-
-    /// Run the MSE handshake host-side and return the derived channel.
-    fn handshake(fs: &mut Fs<RamStorage>, rng: &mut SeqRng, state: &mut FidoState) -> Host {
-        let host_scalar = [0x42u8; 32];
-        let (hx, hy) = P256Key::from_scalar(&host_scalar).unwrap().public_xy();
-        let mut req = [0u8; 200];
-        let n = build_mse(&mut req, &hx, &hy);
-        let mut out = [0u8; 200];
-        let r = call(fs, rng, state, &mut AlwaysConfirm, &req[..n], &mut out).unwrap();
-
-        // parse {1: COSE_Key{...,-2:dx,-3:dy}}
-        let mut d = Decoder::new(&out[..r]);
-        assert_eq!(d.map().unwrap(), Some(1));
-        assert_eq!(d.u8().unwrap(), 1);
-        let c = d.map().unwrap().unwrap();
-        let (mut dx, mut dy) = ([0u8; 32], [0u8; 32]);
-        for _ in 0..c {
-            match d.i32().unwrap() {
-                -2 => dx.copy_from_slice(d.bytes().unwrap()),
-                -3 => dy.copy_from_slice(d.bytes().unwrap()),
-                _ => {
-                    d.skip().unwrap();
-                }
-            }
-        }
-        let z = ecdh_raw(&host_scalar, &dx, &dy).unwrap();
-        let mut aad = [0u8; 65];
-        aad[0] = 0x04;
-        aad[1..33].copy_from_slice(&dx);
-        aad[33..].copy_from_slice(&dy);
-        let mut key = [0u8; 32];
-        hkdf_sha256(&[], &z, &aad, &mut key).unwrap();
-        Host { key, aad }
-    }
-
-    /// MSE request with the optional ML-KEM-768 encapsulation key in
-    /// subCommandParams key 2 — `{1: MSE, 2: {1: COSE_Key, 2: ek}}`.
-    fn build_mse_hybrid(buf: &mut [u8], hx: &[u8; 32], hy: &[u8; 32], ek: &[u8]) -> usize {
-        let mut e = Encoder::new(Cursor::new(buf));
-        e.map(2)
-            .unwrap()
-            .u8(1)
-            .unwrap()
-            .u64(VENDOR_MSE)
-            .unwrap()
-            .u8(2)
-            .unwrap()
-            .map(2)
-            .unwrap()
-            .u8(1)
-            .unwrap()
-            .map(5)
-            .unwrap()
-            .u8(1)
-            .unwrap()
-            .u8(2)
-            .unwrap()
-            .u8(3)
-            .unwrap()
-            .i64(-25)
-            .unwrap()
-            .i8(-1)
-            .unwrap()
-            .u8(1)
-            .unwrap()
-            .i8(-2)
-            .unwrap()
-            .bytes(hx)
-            .unwrap()
-            .i8(-3)
-            .unwrap()
-            .bytes(hy)
-            .unwrap()
-            .u8(2)
-            .unwrap()
-            .bytes(ek)
-            .unwrap();
-        e.writer().position()
-    }
-
-    /// Run the hybrid MSE handshake host-side: send a P-256 pubkey plus a fresh
-    /// ML-KEM-768 encapsulation key, then recompute the channel key from the ECDH
-    /// secret and the decapsulated ML-KEM secret exactly as [`mlkem_leg`] does.
-    fn handshake_pq(fs: &mut Fs<RamStorage>, rng: &mut SeqRng, state: &mut FidoState) -> Host {
-        let host_scalar = [0x42u8; 32];
-        let (hx, hy) = P256Key::from_scalar(&host_scalar).unwrap().public_xy();
-
-        // The host is the decapsulator: it keeps the ML-KEM keypair and ships ek.
-        let pair = MlKem768Pair::from_seed(&[0x55u8; MLKEM768_SEED_LEN]);
-        let ek = pair.encapsulation_key();
-
-        let mut req = [0u8; 1400];
-        let n = build_mse_hybrid(&mut req, &hx, &hy, &ek);
-        let mut out = [0u8; 1400];
-        let r = call(fs, rng, state, &mut AlwaysConfirm, &req[..n], &mut out).unwrap();
-
-        // parse {1: COSE_Key{...,-2:dx,-3:dy}, 2: ct}
-        let mut d = Decoder::new(&out[..r]);
-        assert_eq!(d.map().unwrap(), Some(2));
-        assert_eq!(d.u8().unwrap(), 1);
-        let c = d.map().unwrap().unwrap();
-        let (mut dx, mut dy) = ([0u8; 32], [0u8; 32]);
-        for _ in 0..c {
-            match d.i32().unwrap() {
-                -2 => dx.copy_from_slice(d.bytes().unwrap()),
-                -3 => dy.copy_from_slice(d.bytes().unwrap()),
-                _ => {
-                    d.skip().unwrap();
-                }
-            }
-        }
-        assert_eq!(d.u8().unwrap(), 2);
-        let mut ct = [0u8; MLKEM768_CT_LEN];
-        ct.copy_from_slice(d.bytes().unwrap());
-
-        let z = ecdh_raw(&host_scalar, &dx, &dy).unwrap();
-        let ss = pair.decapsulate(&ct);
-        let mut aad = [0u8; 65];
-        aad[0] = 0x04;
-        aad[1..33].copy_from_slice(&dx);
-        aad[33..].copy_from_slice(&dy);
-
-        let mut ikm = [0u8; 64];
-        ikm[..32].copy_from_slice(&z);
-        ikm[32..].copy_from_slice(&ss);
-        let mut info = [0u8; 65 + MLKEM768_CT_LEN];
-        info[..65].copy_from_slice(&aad);
-        info[65..].copy_from_slice(&ct);
-        let mut key = [0u8; 32];
-        hkdf_sha256(MSE_PQ_SALT, &ikm, &info, &mut key).unwrap();
-        Host { key, aad }
-    }
-
-    fn one_byte_req(buf: &mut [u8], subcmd: u64) -> usize {
-        let mut e = Encoder::new(Cursor::new(buf));
-        e.map(1).unwrap().u8(1).unwrap().u64(subcmd).unwrap();
-        e.writer().position()
-    }
-
-    fn load_req(buf: &mut [u8], blob: &[u8]) -> usize {
-        let mut e = Encoder::new(Cursor::new(buf));
-        e.map(2)
-            .unwrap()
-            .u8(1)
-            .unwrap()
-            .u64(VENDOR_BACKUP_LOAD)
-            .unwrap()
-            .u8(2)
-            .unwrap()
-            .map(1)
-            .unwrap()
-            .u8(1)
-            .unwrap()
-            .bytes(blob)
-            .unwrap();
-        e.writer().position()
-    }
-
-    fn setup() -> (Fs<RamStorage>, SeqRng, FidoState) {
-        let mut fs = Fs::new(RamStorage::new(), &[]);
-        let mut rng = SeqRng(1);
-        ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
-        (fs, rng, FidoState::new())
-    }
-
-    #[cfg(feature = "fips-profile")]
-    #[test]
-    fn fips_backup_export_refused() {
-        let (mut fs, mut rng, mut st) = setup();
-        st.mse_active = true; // even over a live channel the seed is sealed in
-        let mut req = [0u8; 16];
-        let n = one_byte_req(&mut req, VENDOR_BACKUP_EXPORT);
-        let mut out = [0u8; 64];
-        assert_eq!(
-            call(
-                &mut fs,
-                &mut rng,
-                &mut st,
-                &mut AlwaysConfirm,
-                &req[..n],
-                &mut out
-            ),
-            Err(CtapError::NotAllowed)
-        );
-    }
-
-    /// ChaCha-wrap a 32-byte value for the channel (the ATT_IMPORT/LOAD shape).
-    fn wrap32(host: &Host, value: &[u8; 32]) -> [u8; 60] {
-        let nonce = [0x24u8; 12];
-        let mut ct = *value;
-        let tag = chacha20poly1305_encrypt(&host.key, &nonce, &host.aad, &mut ct);
-        let mut blob = [0u8; 60];
-        blob[..12].copy_from_slice(&nonce);
-        blob[12..44].copy_from_slice(&ct);
-        blob[44..].copy_from_slice(&tag);
-        blob
-    }
-
-    fn att_import_req(buf: &mut [u8], blob: &[u8; 60], chain: &[u8]) -> usize {
-        let mut e = Encoder::new(Cursor::new(buf));
-        e.map(2)
-            .unwrap()
-            .u8(1)
-            .unwrap()
-            .u64(VENDOR_ATT_IMPORT)
-            .unwrap();
-        e.u8(2).unwrap().map(2).unwrap();
-        e.u8(1).unwrap().bytes(blob).unwrap();
-        e.u8(2).unwrap().bytes(chain).unwrap();
-        e.writer().position()
-    }
-
-    #[test]
-    fn att_import_state_clear_roundtrip() {
-        let (mut fs, mut rng, mut st) = setup();
-        let host = handshake(&mut fs, &mut rng, &mut st);
-
-        // Import an org key + two fake-TLV certs over the channel.
-        let org_scalar = [0x21u8; 32];
-        let blob = wrap32(&host, &org_scalar);
-        let chain: &[u8] = &[0x30, 0x03, 1, 2, 3, 0x30, 0x02, 7, 7];
-        let mut req = [0u8; 256];
-        let n = att_import_req(&mut req, &blob, chain);
-        let mut out = [0u8; 128];
-        call(
-            &mut fs,
-            &mut rng,
-            &mut st,
-            &mut AlwaysConfirm,
-            &req[..n],
-            &mut out,
-        )
-        .unwrap();
-
-        // The stored key decrypts back to the imported scalar; STATE says so.
-        assert_eq!(
-            crate::seed::load_att_key(&dev(), &mut fs).unwrap(),
-            org_scalar
-        );
-        let n = one_byte_req(&mut req, VENDOR_ATT_STATE);
-        let r = call(
-            &mut fs,
-            &mut rng,
-            &mut st,
-            &mut AlwaysConfirm,
-            &req[..n],
-            &mut out,
-        )
-        .unwrap();
-        let mut d = Decoder::new(&out[..r]);
-        assert_eq!(d.map().unwrap(), Some(2));
-        assert_eq!(d.u8().unwrap(), 1);
-        assert!(d.bool().unwrap());
-
-        // CLEAR drops both and STATE flips back.
-        let n = one_byte_req(&mut req, VENDOR_ATT_CLEAR);
-        call(
-            &mut fs,
-            &mut rng,
-            &mut st,
-            &mut AlwaysConfirm,
-            &req[..n],
-            &mut out,
-        )
-        .unwrap();
-        assert!(crate::seed::load_att_key(&dev(), &mut fs).is_none());
-        let n = one_byte_req(&mut req, VENDOR_ATT_STATE);
-        let r = call(
-            &mut fs,
-            &mut rng,
-            &mut st,
-            &mut AlwaysConfirm,
-            &req[..n],
-            &mut out,
-        )
-        .unwrap();
-        let mut d = Decoder::new(&out[..r]);
-        assert_eq!(d.map().unwrap(), Some(1));
-        assert_eq!(d.u8().unwrap(), 1);
-        assert!(!d.bool().unwrap());
-
-        // A malformed chain is refused before any gate is consumed.
-        let n = att_import_req(&mut req, &blob, &[0xFF, 0x01]);
-        assert_eq!(
-            call(
-                &mut fs,
-                &mut rng,
-                &mut st,
-                &mut AlwaysConfirm,
-                &req[..n],
-                &mut out
-            ),
-            Err(CtapError::InvalidParameter)
-        );
-    }
-
-    #[test]
-    fn mse_then_export_roundtrips_seed() {
-        let (mut fs, mut rng, mut st) = setup();
-        let seed = load_keydev(&dev(), &mut fs).unwrap();
-        let host = handshake(&mut fs, &mut rng, &mut st);
-
-        let mut req = [0u8; 32];
-        let n = one_byte_req(&mut req, VENDOR_BACKUP_EXPORT);
-        let mut out = [0u8; 128];
-        let r = call(
-            &mut fs,
-            &mut rng,
-            &mut st,
-            &mut AlwaysConfirm,
-            &req[..n],
-            &mut out,
-        )
-        .unwrap();
-
-        // {1: blob(60)} — decrypt it host-side.
-        let mut d = Decoder::new(&out[..r]);
-        assert_eq!(d.map().unwrap(), Some(1));
-        assert_eq!(d.u8().unwrap(), 1);
-        let blob = d.bytes().unwrap();
-        assert_eq!(blob.len(), BLOB_LEN);
-        let mut nonce = [0u8; 12];
-        nonce.copy_from_slice(&blob[..12]);
-        let mut buf = [0u8; 32];
-        buf.copy_from_slice(&blob[12..44]);
-        let mut tag = [0u8; 16];
-        tag.copy_from_slice(&blob[44..]);
-        chacha20poly1305_decrypt(&host.key, &nonce, &host.aad, &mut buf, &tag).unwrap();
-        assert_eq!(buf, seed);
-    }
-
-    #[test]
-    fn mse_hybrid_then_export_roundtrips_seed() {
-        // End-to-end proof of the hybrid channel: if the device-side ML-KEM
-        // encapsulate + HKDF agrees with the host-side decapsulate + HKDF, the
-        // seed exported over the channel decrypts to the real seed.
-        let (mut fs, mut rng, mut st) = setup();
-        let seed = load_keydev(&dev(), &mut fs).unwrap();
-        let host = handshake_pq(&mut fs, &mut rng, &mut st);
-
-        let mut req = [0u8; 32];
-        let n = one_byte_req(&mut req, VENDOR_BACKUP_EXPORT);
-        let mut out = [0u8; 128];
-        let r = call(
-            &mut fs,
-            &mut rng,
-            &mut st,
-            &mut AlwaysConfirm,
-            &req[..n],
-            &mut out,
-        )
-        .unwrap();
-
-        let mut d = Decoder::new(&out[..r]);
-        assert_eq!(d.map().unwrap(), Some(1));
-        assert_eq!(d.u8().unwrap(), 1);
-        let blob = d.bytes().unwrap();
-        assert_eq!(blob.len(), BLOB_LEN);
-        let mut nonce = [0u8; 12];
-        nonce.copy_from_slice(&blob[..12]);
-        let mut buf = [0u8; 32];
-        buf.copy_from_slice(&blob[12..44]);
-        let mut tag = [0u8; 16];
-        tag.copy_from_slice(&blob[44..]);
-        chacha20poly1305_decrypt(&host.key, &nonce, &host.aad, &mut buf, &tag).unwrap();
-        assert_eq!(buf, seed);
-    }
-
-    #[test]
-    fn hybrid_channel_key_differs_from_classical() {
-        // Same fresh device (same RNG seed → same P-256 ephemeral and ECDH
-        // secret): the PQ leg must still derive a different channel key, proving
-        // the ML-KEM secret and the domain salt actually participate.
-        let (mut fs1, mut rng1, mut st1) = setup();
-        let classical = handshake(&mut fs1, &mut rng1, &mut st1);
-        let (mut fs2, mut rng2, mut st2) = setup();
-        let hybrid = handshake_pq(&mut fs2, &mut rng2, &mut st2);
-        assert_ne!(classical.key, hybrid.key);
-    }
-
-    #[test]
-    fn mse_rejects_short_mlkem_ek() {
-        // An encapsulation key one byte short is rejected before any channel
-        // forms — no half-open hybrid state.
-        let (mut fs, mut rng, mut st) = setup();
-        let (hx, hy) = P256Key::from_scalar(&[0x42u8; 32]).unwrap().public_xy();
-        let short_ek = [0u8; MLKEM768_EK_LEN - 1];
-        let mut req = [0u8; 1400];
-        let n = build_mse_hybrid(&mut req, &hx, &hy, &short_ek);
-        let mut out = [0u8; 1400];
-        let e = call(
-            &mut fs,
-            &mut rng,
-            &mut st,
-            &mut AlwaysConfirm,
-            &req[..n],
-            &mut out,
-        );
-        assert_eq!(e, Err(CtapError::InvalidParameter));
-        assert!(!st.mse_active);
-    }
-
-    #[test]
-    fn mse_rejects_unreduced_mlkem_ek() {
-        // Right length, non-reduced coefficients → ML-KEM encapsulate fails; the
-        // vendor layer maps that to InvalidParameter, no channel established.
-        let (mut fs, mut rng, mut st) = setup();
-        let (hx, hy) = P256Key::from_scalar(&[0x42u8; 32]).unwrap().public_xy();
-        let bad_ek = [0xFFu8; MLKEM768_EK_LEN];
-        let mut req = [0u8; 1400];
-        let n = build_mse_hybrid(&mut req, &hx, &hy, &bad_ek);
-        let mut out = [0u8; 1400];
-        let e = call(
-            &mut fs,
-            &mut rng,
-            &mut st,
-            &mut AlwaysConfirm,
-            &req[..n],
-            &mut out,
-        );
-        assert_eq!(e, Err(CtapError::InvalidParameter));
-        assert!(!st.mse_active);
-    }
-
-    #[test]
-    fn load_installs_seed_and_rebuilds_attestation() {
-        let (mut fs, mut rng, mut st) = setup();
-        let old = load_keydev(&dev(), &mut fs).unwrap();
-        let host = handshake(&mut fs, &mut rng, &mut st);
-
-        // Encrypt a fresh seed host-side into a blob.
-        let new_seed = [0x33u8; 32];
-        let nonce = [0x07u8; 12];
-        let mut buf = new_seed;
-        let tag = chacha20poly1305_encrypt(&host.key, &nonce, &host.aad, &mut buf);
-        let mut blob = [0u8; BLOB_LEN];
-        blob[..12].copy_from_slice(&nonce);
-        blob[12..44].copy_from_slice(&buf);
-        blob[44..].copy_from_slice(&tag);
-
-        let mut req = [0u8; 128];
-        let n = load_req(&mut req, &blob);
-        let mut out = [0u8; 16];
-        call(
-            &mut fs,
-            &mut rng,
-            &mut st,
-            &mut AlwaysConfirm,
-            &req[..n],
-            &mut out,
-        )
-        .unwrap();
-
-        assert_ne!(new_seed, old);
-        assert_eq!(load_keydev(&dev(), &mut fs), Some(new_seed));
-        assert!(fs.has_data(EF_EE_DEV)); // attestation rebuilt over the new seed
-    }
-
-    #[test]
-    fn export_refused_after_finalize() {
-        let (mut fs, mut rng, mut st) = setup();
-        let _ = handshake(&mut fs, &mut rng, &mut st);
-        let mut req = [0u8; 32];
-        let mut out = [0u8; 128];
-
-        let n = one_byte_req(&mut req, VENDOR_BACKUP_FINALIZE);
-        call(
-            &mut fs,
-            &mut rng,
-            &mut st,
-            &mut AlwaysConfirm,
-            &req[..n],
-            &mut out,
-        )
-        .unwrap();
-
-        let n = one_byte_req(&mut req, VENDOR_BACKUP_EXPORT);
-        let e = call(
-            &mut fs,
-            &mut rng,
-            &mut st,
-            &mut AlwaysConfirm,
-            &req[..n],
-            &mut out,
-        );
-        assert_eq!(e, Err(CtapError::NotAllowed));
-    }
-
-    #[test]
-    fn export_refused_without_touch() {
-        let (mut fs, mut rng, mut st) = setup();
-        let _ = handshake(&mut fs, &mut rng, &mut st);
-        let mut req = [0u8; 32];
-        let n = one_byte_req(&mut req, VENDOR_BACKUP_EXPORT);
-        let mut out = [0u8; 128];
-        let e = call(
-            &mut fs,
-            &mut rng,
-            &mut st,
-            &mut Decline,
-            &req[..n],
-            &mut out,
-        );
-        assert_eq!(e, Err(CtapError::OperationDenied));
-    }
-
-    #[test]
-    fn export_without_mse_is_not_allowed() {
-        let (mut fs, mut rng, mut st) = setup();
-        let mut req = [0u8; 32];
-        let n = one_byte_req(&mut req, VENDOR_BACKUP_EXPORT);
-        let mut out = [0u8; 128];
-        let e = call(
-            &mut fs,
-            &mut rng,
-            &mut st,
-            &mut AlwaysConfirm,
-            &req[..n],
-            &mut out,
-        );
-        assert_eq!(e, Err(CtapError::NotAllowed));
-    }
-
-    #[test]
-    fn load_rejects_tampered_blob() {
-        let (mut fs, mut rng, mut st) = setup();
-        let host = handshake(&mut fs, &mut rng, &mut st);
-        let nonce = [0x07u8; 12];
-        let mut buf = [0x33u8; 32];
-        let tag = chacha20poly1305_encrypt(&host.key, &nonce, &host.aad, &mut buf);
-        let mut blob = [0u8; BLOB_LEN];
-        blob[..12].copy_from_slice(&nonce);
-        blob[12..44].copy_from_slice(&buf);
-        blob[44..].copy_from_slice(&tag);
-        blob[20] ^= 0xFF; // flip a ciphertext byte
-
-        let mut req = [0u8; 128];
-        let n = load_req(&mut req, &blob);
-        let mut out = [0u8; 16];
-        let e = call(
-            &mut fs,
-            &mut rng,
-            &mut st,
-            &mut AlwaysConfirm,
-            &req[..n],
-            &mut out,
-        );
-        assert_eq!(e, Err(CtapError::IntegrityFailure));
-    }
-
-    #[test]
-    fn export_with_pin_requires_token() {
-        let (mut fs, mut rng, mut st) = setup();
-        fs.put(EF_PIN, &[8, 4, 1]).unwrap(); // PIN present → token required
-        let _ = handshake(&mut fs, &mut rng, &mut st);
-        let mut req = [0u8; 32];
-        let n = one_byte_req(&mut req, VENDOR_BACKUP_EXPORT);
-        let mut out = [0u8; 128];
-        let e = call(
-            &mut fs,
-            &mut rng,
-            &mut st,
-            &mut AlwaysConfirm,
-            &req[..n],
-            &mut out,
-        );
-        assert_eq!(e, Err(CtapError::PuatRequired));
-    }
-
-    #[test]
-    fn backup_state_reports_flags() {
-        let (mut fs, mut rng, mut st) = setup();
-        assert_eq!(
-            state_flags(&mut fs, &mut rng, &mut st),
-            (false, true, false, false) // not sealed, has seed, not locked, not unlocked
-        );
-    }
-
-    // ---- soft-lock ----
-
-    /// Read BACKUP_STATE and return `(sealed, has_seed, locked, unlocked)`.
-    fn state_flags(
-        fs: &mut Fs<RamStorage>,
-        rng: &mut SeqRng,
-        st: &mut FidoState,
-    ) -> (bool, bool, bool, bool) {
-        let mut req = [0u8; 16];
-        let n = one_byte_req(&mut req, VENDOR_BACKUP_STATE);
-        let mut out = [0u8; 64];
-        let r = call(fs, rng, st, &mut AlwaysConfirm, &req[..n], &mut out).unwrap();
-        let mut d = Decoder::new(&out[..r]);
-        assert_eq!(d.map().unwrap(), Some(4));
-        let mut flags = [false; 4];
-        for f in flags.iter_mut() {
-            d.u8().unwrap();
-            *f = d.bool().unwrap();
-        }
-        (flags[0], flags[1], flags[2], flags[3])
-    }
-
-    /// Host side of the channel: wrap 32 bytes as nonce ‖ ct ‖ tag.
-    fn host_wrap(host: &Host, key: &[u8; 32], nonce: &[u8; 12]) -> [u8; LOCK_BLOB_LEN] {
-        let mut ct = *key;
-        let tag = chacha20poly1305_encrypt(&host.key, nonce, &host.aad, &mut ct);
-        let mut blob = [0u8; LOCK_BLOB_LEN];
-        blob[..12].copy_from_slice(nonce);
-        blob[12..44].copy_from_slice(&ct);
-        blob[44..].copy_from_slice(&tag);
-        blob
-    }
-
-    const ACFG_TOKEN: [u8; 32] = [0x77; 32];
-
-    /// Arm an acfg-permission pinUvAuthToken on `st` (authenticatorConfig always
-    /// demands one) without disturbing the MSE channel fields.
-    fn arm_acfg(st: &mut FidoState) {
-        st.paut.token = ACFG_TOKEN;
-        st.paut.permissions = PERM_ACFG;
-        st.begin_using_token(false);
-    }
-
-    /// Build a MAC'd `authenticatorConfig` vendor request
-    /// `{1: 0xFF, 2: {1: vendor_id, 2: param?}, 3: 2, 4: mac}`.
-    fn config_vendor_req(vendor_id: u64, param: Option<&[u8]>, buf: &mut [u8]) -> usize {
-        use rsk_crypto::pinproto;
-
-        let mut sub = [0u8; 128];
-        let sub_len = {
-            let mut e = Encoder::new(Cursor::new(&mut sub[..]));
-            match param {
-                Some(p) => {
-                    e.map(2).unwrap();
-                    e.u8(1).unwrap().u64(vendor_id).unwrap();
-                    e.u8(2).unwrap().bytes(p).unwrap();
-                }
-                None => {
-                    e.map(1).unwrap();
-                    e.u8(1).unwrap().u64(vendor_id).unwrap();
-                }
-            }
-            e.writer().position()
-        };
-
-        let mut vp = [0u8; 32 + 2 + 128];
-        vp[..32].fill(0xff);
-        vp[32] = crate::consts::CTAP_CONFIG;
-        vp[33] = 0xFF;
-        vp[34..34 + sub_len].copy_from_slice(&sub[..sub_len]);
-        let mut mac = [0u8; 32];
-        let mlen =
-            pinproto::authenticate(PinProto::Two, &ACFG_TOKEN, &vp[..34 + sub_len], &mut mac)
-                .unwrap();
-
-        // Assemble by hand — the raw subCommandParams bytes are spliced verbatim.
-        let mut n = 0;
-        buf[n] = 0xA4; // map(4)
-        n += 1;
-        buf[n..n + 3].copy_from_slice(&[0x01, 0x18, 0xFF]); // 1: 0xFF
-        n += 3;
-        buf[n] = 0x02; // 2: subCommandParams
-        n += 1;
-        buf[n..n + sub_len].copy_from_slice(&sub[..sub_len]);
-        n += sub_len;
-        buf[n..n + 2].copy_from_slice(&[0x03, 0x02]); // 3: protocol 2
-        n += 2;
-        buf[n..n + 3].copy_from_slice(&[0x04, 0x58, mlen as u8]); // 4: mac
-        n += 3;
-        buf[n..n + mlen].copy_from_slice(&mac[..mlen]);
-        n + mlen
-    }
-
-    fn run_config(
-        fs: &mut Fs<RamStorage>,
-        rng: &mut SeqRng,
-        st: &mut FidoState,
-        presence: &mut dyn UserPresence,
-        req: &[u8],
-    ) -> CtapResult {
-        let mut out = [0u8; 64];
-        let mut ctx = Ctx {
-            dev: dev(),
-            fs,
-            rng,
-            state: st,
-            now_ms: 0,
-            presence,
-        };
-        crate::config::authenticator_config(&mut ctx, req, &mut out)
-    }
-
-    /// Drive a vendor UNLOCK with `lock_key` wrapped for the current channel.
-    fn run_unlock(
-        fs: &mut Fs<RamStorage>,
-        rng: &mut SeqRng,
-        st: &mut FidoState,
-        lock_key: &[u8; 32],
-        host: &Host,
-        nonce_seed: u8,
-    ) -> CtapResult {
-        let blob = host_wrap(host, lock_key, &[nonce_seed; 12]);
-        let mut req = [0u8; 128];
-        let n = {
-            let mut e = Encoder::new(Cursor::new(&mut req[..]));
-            e.map(2).unwrap();
-            e.u8(1).unwrap().u64(VENDOR_UNLOCK).unwrap();
-            e.u8(2).unwrap().map(1).unwrap().u8(1).unwrap();
-            e.bytes(&blob).unwrap();
-            e.writer().position()
-        };
-        let mut out = [0u8; 16];
-        call(fs, rng, st, &mut AlwaysConfirm, &req[..n], &mut out)
-    }
-
-    const LOCK_KEY: [u8; 32] = [0xA7; 32];
-
-    /// setup + handshake + armed token + AUT_ENABLE; returns the original seed
-    /// and the live channel.
-    fn locked_setup() -> (Fs<RamStorage>, SeqRng, FidoState, Host, [u8; 32]) {
-        let (mut fs, mut rng, mut st) = setup();
-        let seed = load_keydev(&dev(), &mut fs).unwrap();
-        let host = handshake(&mut fs, &mut rng, &mut st);
-        arm_acfg(&mut st);
-        let blob = host_wrap(&host, &LOCK_KEY, &[0x11; 12]);
-        let mut req = [0u8; 192];
-        let n = config_vendor_req(crate::consts::CONFIG_AUT_ENABLE, Some(&blob), &mut req);
-        run_config(&mut fs, &mut rng, &mut st, &mut AlwaysConfirm, &req[..n]).unwrap();
-        (fs, rng, st, host, seed)
-    }
-
-    #[test]
-    fn lock_enable_wraps_seed_and_drops_plain() {
-        let (mut fs, mut rng, mut st, _host, _seed) = locked_setup();
-        assert!(!fs.has_data(EF_KEY_DEV.get()));
-        assert_eq!(fs.size(EF_KEY_DEV_ENC.get()), Some(LOCK_BLOB_LEN));
-        // No RAM copy after enable — operations are locked out immediately.
-        assert!(st.keydev_dec.is_none());
-        assert_eq!(load_keydev(&dev(), &mut fs), None);
-        assert_eq!(
-            state_flags(&mut fs, &mut rng, &mut st),
-            (false, false, true, false)
-        );
-    }
-
-    #[test]
-    fn unlock_restores_operations_for_the_session() {
-        let (mut fs, mut rng, mut st, host, seed) = locked_setup();
-        run_unlock(&mut fs, &mut rng, &mut st, &LOCK_KEY, &host, 0x22).unwrap();
-        assert_eq!(st.keydev_dec, Some(seed));
-        // The op-level loader sees the RAM copy; flash stays wrapped.
-        let mut presence = AlwaysConfirm;
-        let mut ctx = Ctx {
-            dev: dev(),
-            fs: &mut fs,
-            rng: &mut rng,
-            state: &mut st,
-            now_ms: 0,
-            presence: &mut presence,
-        };
-        assert_eq!(ctx.load_keydev(), Some(seed));
-        assert!(!fs.has_data(EF_KEY_DEV.get()));
-        assert_eq!(
-            state_flags(&mut fs, &mut rng, &mut st),
-            (false, false, true, true)
-        );
-    }
-
-    #[test]
-    fn unlock_with_wrong_key_fails() {
-        let (mut fs, mut rng, mut st, host, _seed) = locked_setup();
-        let e = run_unlock(&mut fs, &mut rng, &mut st, &[0x5C; 32], &host, 0x23);
-        assert_eq!(e, Err(CtapError::InvalidParameter));
-        assert!(st.keydev_dec.is_none());
-    }
-
-    #[test]
-    fn unlock_when_not_locked_is_integrity_failure() {
-        let (mut fs, mut rng, mut st) = setup();
-        let host = handshake(&mut fs, &mut rng, &mut st);
-        let e = run_unlock(&mut fs, &mut rng, &mut st, &LOCK_KEY, &host, 0x24);
-        assert_eq!(e, Err(CtapError::IntegrityFailure));
-    }
-
-    #[test]
-    fn disable_restores_plain_seed() {
-        let (mut fs, mut rng, mut st, host, seed) = locked_setup();
-        run_unlock(&mut fs, &mut rng, &mut st, &LOCK_KEY, &host, 0x25).unwrap();
-        let mut req = [0u8; 192];
-        let n = config_vendor_req(crate::consts::CONFIG_AUT_DISABLE, None, &mut req);
-        run_config(&mut fs, &mut rng, &mut st, &mut AlwaysConfirm, &req[..n]).unwrap();
-        assert!(!fs.has_data(EF_KEY_DEV_ENC.get()));
-        assert!(st.keydev_dec.is_none()); // no stale RAM copy
-        assert_eq!(load_keydev(&dev(), &mut fs), Some(seed));
-        assert_eq!(
-            state_flags(&mut fs, &mut rng, &mut st),
-            (false, true, false, false)
-        );
-    }
-
-    #[test]
-    fn disable_without_unlock_is_pin_auth_invalid() {
-        let (mut fs, mut rng, mut st, _host, _seed) = locked_setup();
-        let mut req = [0u8; 192];
-        let n = config_vendor_req(crate::consts::CONFIG_AUT_DISABLE, None, &mut req);
-        let e = run_config(&mut fs, &mut rng, &mut st, &mut AlwaysConfirm, &req[..n]);
-        assert_eq!(e, Err(CtapError::PinAuthInvalid));
-        assert!(fs.has_data(EF_KEY_DEV_ENC.get()));
-    }
-
-    #[test]
-    fn enable_twice_is_not_allowed() {
-        let (mut fs, mut rng, mut st, host, _seed) = locked_setup();
-        let blob = host_wrap(&host, &LOCK_KEY, &[0x33; 12]);
-        let mut req = [0u8; 192];
-        let n = config_vendor_req(crate::consts::CONFIG_AUT_ENABLE, Some(&blob), &mut req);
-        let e = run_config(&mut fs, &mut rng, &mut st, &mut AlwaysConfirm, &req[..n]);
-        assert_eq!(e, Err(CtapError::NotAllowed));
-    }
-
-    #[test]
-    fn enable_without_mse_is_not_allowed() {
-        let (mut fs, mut rng, mut st) = setup();
-        arm_acfg(&mut st);
-        let blob = [0u8; LOCK_BLOB_LEN];
-        let mut req = [0u8; 192];
-        let n = config_vendor_req(crate::consts::CONFIG_AUT_ENABLE, Some(&blob), &mut req);
-        let e = run_config(&mut fs, &mut rng, &mut st, &mut AlwaysConfirm, &req[..n]);
-        assert_eq!(e, Err(CtapError::NotAllowed));
-        assert!(fs.has_data(EF_KEY_DEV.get()));
-    }
-
-    #[test]
-    fn enable_without_touch_changes_nothing() {
-        let (mut fs, mut rng, mut st) = setup();
-        let host = handshake(&mut fs, &mut rng, &mut st);
-        arm_acfg(&mut st);
-        let blob = host_wrap(&host, &LOCK_KEY, &[0x44; 12]);
-        let mut req = [0u8; 192];
-        let n = config_vendor_req(crate::consts::CONFIG_AUT_ENABLE, Some(&blob), &mut req);
-        let e = run_config(&mut fs, &mut rng, &mut st, &mut Decline, &req[..n]);
-        assert_eq!(e, Err(CtapError::OperationDenied));
-        assert!(fs.has_data(EF_KEY_DEV.get()));
-        assert!(!fs.has_data(EF_KEY_DEV_ENC.get()));
-    }
-
-    #[test]
-    fn unknown_vendor_id_is_invalid_subcommand() {
-        let (mut fs, mut rng, mut st) = setup();
-        arm_acfg(&mut st);
-        let mut req = [0u8; 192];
-        let n = config_vendor_req(0xDEAD_BEEF, None, &mut req);
-        let e = run_config(&mut fs, &mut rng, &mut st, &mut AlwaysConfirm, &req[..n]);
-        assert_eq!(e, Err(CtapError::InvalidSubcommand));
-    }
-
-    #[test]
-    fn backup_load_refused_while_locked() {
-        let (mut fs, mut rng, mut st, host, _seed) = locked_setup();
-        let blob = host_wrap(&host, &[0x66; 32], &[0x55; 12]);
-        let mut req = [0u8; 128];
-        let n = load_req(&mut req, &blob);
-        let mut out = [0u8; 16];
-        let e = call(
-            &mut fs,
-            &mut rng,
-            &mut st,
-            &mut AlwaysConfirm,
-            &req[..n],
-            &mut out,
-        );
-        assert_eq!(e, Err(CtapError::NotAllowed));
-    }
-
-    #[test]
-    fn backup_export_serves_the_unlocked_ram_copy() {
-        let (mut fs, mut rng, mut st, host, seed) = locked_setup();
-        run_unlock(&mut fs, &mut rng, &mut st, &LOCK_KEY, &host, 0x26).unwrap();
-        let mut req = [0u8; 32];
-        let n = one_byte_req(&mut req, VENDOR_BACKUP_EXPORT);
-        let mut out = [0u8; 128];
-        let r = call(
-            &mut fs,
-            &mut rng,
-            &mut st,
-            &mut AlwaysConfirm,
-            &req[..n],
-            &mut out,
-        )
-        .unwrap();
-        let mut d = Decoder::new(&out[..r]);
-        assert_eq!(d.map().unwrap(), Some(1));
-        assert_eq!(d.u8().unwrap(), 1);
-        let blob = d.bytes().unwrap();
-        let mut nonce = [0u8; 12];
-        nonce.copy_from_slice(&blob[..12]);
-        let mut buf = [0u8; 32];
-        buf.copy_from_slice(&blob[12..44]);
-        let mut tag = [0u8; 16];
-        tag.copy_from_slice(&blob[44..]);
-        chacha20poly1305_decrypt(&host.key, &nonce, &host.aad, &mut buf, &tag).unwrap();
-        assert_eq!(buf, seed);
-    }
-
-    #[test]
-    fn reset_clears_the_lock_and_regenerates() {
-        let (mut fs, mut rng, mut st, _host, old_seed) = locked_setup();
-        let mut presence = AlwaysConfirm;
-        let mut ctx = Ctx {
-            dev: dev(),
-            fs: &mut fs,
-            rng: &mut rng,
-            state: &mut st,
-            now_ms: 0,
-            presence: &mut presence,
-        };
-        crate::reset::reset(&mut ctx).unwrap();
-        assert!(!fs.has_data(EF_KEY_DEV_ENC.get()));
-        let new_seed = load_keydev(&dev(), &mut fs).unwrap();
-        assert_ne!(new_seed, old_seed); // fresh identity — the recovery path
-    }
-
-    #[test]
-    fn ensure_seed_does_not_regenerate_under_lock() {
-        let (mut fs, mut rng, mut st, host, seed) = locked_setup();
-        ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
-        assert!(!fs.has_data(EF_KEY_DEV.get())); // boot on a locked device: no regen
-        run_unlock(&mut fs, &mut rng, &mut st, &LOCK_KEY, &host, 0x27).unwrap();
-        assert_eq!(st.keydev_dec, Some(seed)); // blob untouched, same seed
+/// The seed-backup status for the trusted-display Backup screen — the same
+/// `sealed` / `has_seed` bits [`backup_state`] reports to the host, plus whether
+/// this build can export at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BackupStatus {
+    /// The one-time export window is sealed: the seed has been backed up (or a
+    /// `BACKUP_FINALIZE` closed the window). A factory reset / authenticatorReset
+    /// reopens it.
+    pub sealed: bool,
+    /// A device master seed (`EF_KEY_DEV`) is present.
+    pub has_seed: bool,
+    /// The MSE export channel exists on this build — `false` under `fips-profile`,
+    /// where the seed is non-exportable and recovery is restore-only.
+    pub exportable: bool,
+    /// The seed is soft-locked (the stored copy is wrapped) — it can't be read for an
+    /// on-device recovery-phrase reveal until a host vendor `UNLOCK` this power cycle.
+    pub locked: bool,
+}
+
+/// Read the seed-backup status from the store for the on-device Backup screen
+/// (Settings → Security → Backup). A lean, `Ctx`-free mirror of [`backup_state`]'s
+/// flags — no CBOR — so the display task can read it directly while the worker is parked.
+pub fn backup_status<S: Storage>(fs: &mut rsk_fs::Fs<S>) -> BackupStatus {
+    BackupStatus {
+        sealed: fs.has_data(EF_BACKUP_SEALED),
+        has_seed: fs.has_key(EF_KEY_DEV),
+        exportable: !cfg!(feature = "fips-profile"),
+        locked: lock_engaged(fs),
     }
 }
+
+/// Seal the one-time backup window on-device (Settings → Security → Backup → Seal),
+/// mirroring host [`BACKUP_FINALIZE`](backup_finalize) without the `Ctx` / journal:
+/// write the `EF_BACKUP_SEALED` marker so the seed can no longer be exported **or**
+/// shown as a recovery phrase until a factory reset reopens the window. The display
+/// task gates this behind the device PIN and a deliberate hold.
+pub fn mark_backup_sealed<S: Storage>(fs: &mut rsk_fs::Fs<S>) -> bool {
+    fs.put(EF_BACKUP_SEALED, &[1]).is_ok()
+}
+
+/// Whether the seed-backup export window is sealed — the cheap `has_data` probe the
+/// Security list row uses for its "Sealed / Review" status, without the `has_seed`
+/// key lookup [`backup_status`] also does.
+pub fn backup_sealed<S: Storage>(fs: &mut rsk_fs::Fs<S>) -> bool {
+    fs.has_data(EF_BACKUP_SEALED)
+}
+
+#[cfg(test)]
+#[path = "vendor_tests.rs"]
+mod tests;

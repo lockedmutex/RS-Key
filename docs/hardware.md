@@ -9,6 +9,23 @@ the short version.
 
 ## Supported boards
 
+<table>
+<tr>
+<td align="center"><img src="images/board-one.jpg" width="160" alt="Waveshare RP2350-One — a blue USB-A stick board"></td>
+<td align="center"><img src="images/board-zero.jpg" width="160" alt="Waveshare RP2350-Zero — a small blue USB-C stick board"></td>
+<td align="center"><img src="images/board-tenstar.jpg" width="160" alt="TenStar RP2350-USB — a black USB-A stick board"></td>
+<td align="center"><img src="images/board-display.jpg" width="160" alt="Waveshare RP2350-Touch-LCD-2.8 — a board with a 2.8-inch touch screen"></td>
+</tr>
+<tr>
+<td align="center"><b>RP2350-One</b><br>reference · USB-A<br>WS2812 on GPIO16</td>
+<td align="center"><b>RP2350-Zero</b><br>mini stick · USB-C</td>
+<td align="center"><b>TenStar RP2350-USB</b><br>USB-A stick<br>WS2812 on GP22</td>
+<td align="center"><b>RP2350-Touch-LCD-2.8</b><br>trusted display · 2.8″ LCD</td>
+</tr>
+</table>
+
+<sub>Board photos: Waveshare (RP2350-One / Zero / Touch-LCD-2.8).</sub>
+
 Any RP2350 board with a USB connector should work. Development and on-device
 testing happen on the **Waveshare RP2350-One**, where the WS2812 status LED on
 GPIO16 works out of the box. Boards without an addressable LED run fine — the
@@ -29,7 +46,8 @@ three compile-time knobs usually cover it:
 |---|---|---|
 | `FLASH_SIZE` | `4M` | A board with a different QSPI flash chip (e.g. `8M`). `build.rs` regenerates `memory.x` from it. Must be ≥ ~2 MB and ≤ 16 MB. |
 | `LED_PIN` | `16` | A board that uses GPIO16 for something else, or wires its addressable LED elsewhere (RP2350A: GPIO `0..=29`). |
-| `PRESENCE_PIN` | `bootsel` | A board with a dedicated user-presence button on a GPIO. Set a pin number (`0..=29`) for an active-low button with pull-up (e.g. `0` for GPIO0-to-GND). |
+| `PRESENCE_PIN` | `bootsel` | A board with a dedicated user-presence button on a GPIO. Set a pin number (`0..=29`); active-low with a pull-up by default (e.g. `0` for GPIO0-to-GND). |
+| `PRESENCE_ACTIVE_HIGH` | `0` | A presence button/sensor that reads **high** when pressed (a capacitive touch sensor, or a button to VCC). `1` flips the GPIO to pull-down + active-high. Only with a GPIO `PRESENCE_PIN`. |
 | `LED_KIND` | `ws2812` | `ws2812` (addressable RGB, default), `gpio` (plain on/off), `pimoroni` (3-pin PWM RGB), or `none` (no indicator). See [build.md](build.md). |
 | `LED_ORDER` | `rgb` | A `ws2812` board whose red and green come out swapped (blue fine): set `grb` (the WS2812B standard). The Waveshare RP2350-One is `rgb`; most other parts are `grb`. |
 | `MAX_LEDS` | `8` | A board with **more than 8** daisy-chained addressable LEDs. The buffer ceiling; the actual connected count is set at runtime ([guides/led.md](guides/led.md)). |
@@ -41,8 +59,11 @@ env FLASH_SIZE=8M LED_KIND=gpio LED_PIN=25 cargo build --release -p firmware
 # example: a 16 MB TenStar RP2350-USB — WS2812 on GP22, standard GRB order
 env FLASH_SIZE=16M LED_PIN=22 LED_ORDER=grb cargo build --release -p firmware
 
-# example: WS2812 on GP22 and a dedicated touch button on GP0
+# example: WS2812 on GP22 and a button-to-GND on GP0 (active-low)
 env LED_PIN=22 PRESENCE_PIN=0 cargo build --release -p firmware
+
+# example: an active-high capacitive touch sensor on GP0
+env PRESENCE_PIN=0 PRESENCE_ACTIVE_HIGH=1 cargo build --release -p firmware
 ```
 
 The four LED knobs (`LED_PIN` / `LED_KIND` / `LED_ORDER` / `MAX_LEDS`) set only the

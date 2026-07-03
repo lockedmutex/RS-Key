@@ -40,13 +40,13 @@ def reset(args):
         for _ in range(5):
             ccid.transmit(conn, _apdu(INS_VERIFY, 0x00, mode, b"00000000"))
     _, s1, s2 = ccid.transmit(conn, _apdu(INS_TERMINATE, 0x00, 0x00))
-    if (s1, s2) != (0x90, 0x00):
+    if (s1, s2) != ccid.SW_OK:
         raise SystemExit(f"TERMINATE not accepted ({s1:02X}{s2:02X}) — PINs may not both be blocked")
     ccid.transmit(conn, _apdu(INS_ACTIVATE, 0x00, 0x00))
     ccid.select(conn, OPENPGP_AID)
     _, p1, p2 = ccid.transmit(conn, _apdu(INS_VERIFY, 0x00, MODE_PW3, PW3_DEFAULT))
     _, q1, q2 = ccid.transmit(conn, _apdu(INS_VERIFY, 0x00, MODE_PW1, PW1_DEFAULT))
-    if (p1, p2) == (0x90, 0x00) and (q1, q2) == (0x90, 0x00):
+    if (p1, p2) == ccid.SW_OK and (q1, q2) == ccid.SW_OK:
         print("OpenPGP reset to factory defaults (PW1=123456, PW3=12345678).")
     else:
         raise SystemExit("reset finished but default PINs do not verify — try rsk-wipe")

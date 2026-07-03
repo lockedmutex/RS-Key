@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 RS-Key contributors
+
+[package]
+name = "rsk-ui"
+version = "0.1.0"
+license = "AGPL-3.0-only"
+edition = "2024"
+publish = false
+
+# `cfg(kani)` guards the proof harnesses (set by `cargo kani`, unknown to rustc).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
+[dependencies]
+# The renderer is generic over `embedded_graphics::DrawTarget<Color = Rgb565>`, so
+# the *what to draw* (layout, fonts, the security-critical Allow/Deny geometry)
+# lives here, host-tested against a recording target — exactly like `rsk-led`'s
+# codec. The firmware's `display.rs` only supplies the real ST7789 draw target.
+embedded-graphics = { workspace = true }
+# Proportional 1-bit fonts for the high-fidelity redesign (see `font.rs`). Same
+# `DrawTarget` vocabulary as embedded-graphics; only ever linked into the display flavor.
+u8g2-fonts = { workspace = true }

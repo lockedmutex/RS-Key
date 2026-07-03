@@ -14,6 +14,7 @@ extern crate alloc;
 
 mod auth;
 pub mod files;
+pub mod info;
 mod keygen;
 mod seal;
 mod x509;
@@ -23,9 +24,9 @@ use core::cell::RefCell;
 use rsk_crypto::Device;
 use rsk_fs::{Fs, Sealed, Storage};
 pub use rsk_openpgp::Rng;
-use rsk_openpgp::keys::make_rsa_response;
+use rsk_openpgp::keys::{MAX_RSA_PUBDO, make_rsa_response};
 // PIV reuses the OpenPGP user-presence trait, so the firmware's existing
-// `impl rsk_openpgp::UserPresence for BootselPresence` already drives PIV touch.
+// `impl rsk_openpgp::UserPresence for ButtonPresence` already drives PIV touch.
 use rsa::RsaPrivateKey;
 use rsa::traits::PublicKeyParts;
 pub use rsk_openpgp::{AlwaysConfirm, Presence, UserPresence};
@@ -65,13 +66,61 @@ const INS_VERSION: u8 = 0xFD;
 const INS_IMPORT_ASYM: u8 = 0xFE;
 const INS_SET_MGMKEY: u8 = 0xFF;
 
+/// YubiKey "PRINTED INFORMATION" object — repurposed to hold the PIN-protected
+/// management key (readable only after a PIN VERIFY, and only once protection is
+/// enabled). The key itself is synthesized from the sealed 0x9B auth slot, never
+/// stored a second time.
+const PRINTED_ID: u32 = 0x5FC109;
+/// PivmanData (ADMIN DATA) TLV: outer `0x80 { 0x81 = flags, 0x82 = derived-key
+/// salt, 0x83 = PIN-change timestamp }`; flag bit `0x02` means the management key
+/// is PIN-protected (a host reads it back from PRINTED). ykman writes the salt
+/// only for the deprecated PIN-*derived* management key; the timestamp is the
+/// last-PIN-change record it displays.
+const PIVMAN_TAG: u8 = 0x80;
+const PIVMAN_FLAGS_TAG: u8 = 0x81;
+// Salt (0x82) is only ever *read* to be dropped, never re-emitted, so it needs no
+// named constant in the encoder; tests spell the raw tag with a `// salt` note.
+const PIVMAN_TS_TAG: u8 = 0x83;
+const PIVMAN_FLAG_MGM_PROTECTED: u8 = 0x02;
+/// Upper bound for a PivmanData record we re-emit: outer tag+len, the 3-byte
+/// flags TLV, and a preserved timestamp TLV whose value we cap at 16 bytes (a
+/// real one is 4). The salt is never re-emitted, so it is not budgeted.
+const PIVMAN_TS_MAX: usize = 16;
+const PIVMAN_MAX: usize = 2 + 3 + 2 + PIVMAN_TS_MAX;
+/// PivmanProtectedData TLV: outer `0x88 { 0x89 = raw management key }`.
+const PROTECTED_TAG: u8 = 0x88;
+const PROTECTED_MGM_TAG: u8 = 0x89;
+// GET/PUT DATA (SP 800-73-4): 5C = the object-id path, 53 = the data object.
+const TAG_DATA_PATH: u8 = 0x5C;
+const TAG_DATA_OBJECT: u8 = 0x53;
+
+/// Which GENERAL AUTHENTICATE handshake issued the pending `challenge`. The two
+/// flows attach opposite confidentiality to that field — mutual auth returns the
+/// witness *encrypted* (proof = decrypt it), single auth returns the challenge in
+/// *plaintext* (proof = encrypt it) — so a challenge issued by one flow must never
+/// be consumed by the other. Without this tag the plaintext single-auth challenge
+/// could be replayed as the mutual-auth witness, authenticating with no key.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ChallengeKind {
+    #[default]
+    None,
+    MutualWitness,
+    SingleChallenge,
+}
+
 /// Volatile per-selection security state.
 #[derive(Default)]
 pub(crate) struct Session {
     pub(crate) has_pin: bool,
     pub(crate) has_mgm: bool,
     pub(crate) has_challenge: bool,
+    pub(crate) chal_kind: ChallengeKind,
     pub(crate) challenge: [u8; 16],
+    /// The 9B algorithm the outstanding challenge/witness was issued under. A
+    /// step-2 presented under a different algorithm is refused, so an AES-192
+    /// witness cannot be answered as 3DES (both are 24-byte keys, so the
+    /// length gate alone does not separate them).
+    pub(crate) chal_algo: u8,
 }
 
 impl Session {
@@ -79,6 +128,8 @@ impl Session {
         self.has_pin = false;
         self.has_mgm = false;
         self.has_challenge = false;
+        self.chal_kind = ChallengeKind::None;
+        self.chal_algo = 0;
         self.challenge.zeroize();
     }
 }
@@ -135,11 +186,7 @@ impl<'a> PivApplet<'a> {
             return None;
         }
         let req = keygen::parse_gen_template(data).ok()?;
-        let nbits = match req.algo {
-            ALGO_RSA1024 => 1024,
-            ALGO_RSA2048 => 2048,
-            _ => return None,
-        };
+        let nbits = keygen::rsa_size_from_algo(req.algo)? * 8;
         let pol = keygen::resolved_policies(p2, req.pin_policy, req.touch_policy);
         Some((p2, nbits, pol))
     }
@@ -155,10 +202,8 @@ impl<'a> PivApplet<'a> {
         key: &RsaPrivateKey,
         resp: &mut [u8],
     ) -> (usize, Sw) {
-        let algo = if key.size() == 128 {
-            ALGO_RSA1024
-        } else {
-            ALGO_RSA2048
+        let Some(algo) = keygen::rsa_algo_from_size(key.size()) else {
+            return (0, Sw::EXEC_ERROR);
         };
         let dev = Device {
             serial_hash: &self.serial_hash,
@@ -306,7 +351,7 @@ impl PivApplet<'_> {
         if apdu.p1 != 0x00 && apdu.p1 != 0xFF {
             return Sw::INCORRECT_P1P2;
         }
-        if apdu.p2 != 0x80 {
+        if apdu.p2 != REF_PIN {
             return Sw::REFERENCE_NOT_FOUND;
         }
         if !fs.has_data(EF_PIN) {
@@ -331,7 +376,7 @@ impl PivApplet<'_> {
             if self.sess.has_pin {
                 return Sw::OK;
             }
-            return Sw::new(0x63, 0xC0 | left);
+            return Sw::retries(left);
         }
         match check_ref(dev, fs, EF_PIN, RETRY_PIN, apdu.data) {
             Sw::OK => {
@@ -348,11 +393,12 @@ impl PivApplet<'_> {
         if apdu.p1 != 0x00 {
             return Sw::INCORRECT_P1P2;
         }
-        let (fid, retry) = match apdu.p2 {
-            0x80 => (EF_PIN, RETRY_PIN),
-            0x81 => (EF_PUK, RETRY_PUK),
+        let which = match apdu.p2 {
+            REF_PIN => PinRef::Pin,
+            REF_PUK => PinRef::Puk,
             _ => return Sw::INCORRECT_P1P2,
         };
+        let (fid, _) = which.fid_retry();
         let old_len = match stored_pin_len(fs, fid) {
             Ok(n) => n,
             Err(sw) => return sw,
@@ -360,23 +406,12 @@ impl PivApplet<'_> {
         if apdu.nc <= old_len {
             return Sw::WRONG_LENGTH;
         }
-        let new = &apdu.data[old_len..];
-        if new.len() > 8 {
-            return Sw::WRONG_LENGTH;
-        }
-        match check_ref(dev, fs, fid, retry, &apdu.data[..old_len]) {
-            Sw::OK => {}
-            sw => return sw,
-        }
-        if put_pin_verifier(dev, fs, fid, new).is_err() {
-            return Sw::MEMORY_FAILURE;
-        }
-        Sw::OK
+        change_reference(dev, fs, which, &apdu.data[..old_len], &apdu.data[old_len..])
     }
 
     /// RESET RETRY COUNTER (INS 0x2C): unblock/replace the PIN with the PUK.
     fn reset_retry<S: Storage>(&mut self, dev: &Device, fs: &mut Fs<S>, apdu: &Apdu) -> Sw {
-        if apdu.p1 != 0x00 || apdu.p2 != 0x80 {
+        if apdu.p1 != 0x00 || apdu.p2 != REF_PIN {
             return Sw::INCORRECT_P1P2;
         }
         let puk_len = match stored_pin_len(fs, EF_PUK) {
@@ -386,18 +421,7 @@ impl PivApplet<'_> {
         if apdu.nc <= puk_len {
             return Sw::WRONG_LENGTH;
         }
-        let new = &apdu.data[puk_len..];
-        if new.len() > 8 {
-            return Sw::WRONG_LENGTH;
-        }
-        match check_ref(dev, fs, EF_PUK, RETRY_PUK, &apdu.data[..puk_len]) {
-            Sw::OK => {}
-            sw => return sw,
-        }
-        if put_pin_verifier(dev, fs, EF_PIN, new).is_err() {
-            return Sw::MEMORY_FAILURE;
-        }
-        reset_counter(fs, RETRY_PIN)
+        unblock_pin_with_puk(dev, fs, &apdu.data[..puk_len], &apdu.data[puk_len..])
     }
 
     /// SET RETRIES (INS 0xFA, management-gated): resets both references to
@@ -460,7 +484,7 @@ impl PivApplet<'_> {
         if apdu.nc == 0 {
             return Sw::WRONG_LENGTH;
         }
-        if apdu.data[0] != 0xAC {
+        if apdu.data[0] != TAG_GEN_TEMPLATE {
             return WRONG_DATA;
         }
         if !self.sess.has_mgm {
@@ -475,13 +499,12 @@ impl PivApplet<'_> {
         };
         let mut rng = self.rng.borrow_mut();
         match req.algo {
-            ALGO_ECCP256 | ALGO_ECCP384 => {
+            ALGO_ECCP256 | ALGO_ECCP384 | ALGO_ED25519 | ALGO_X25519 => {
                 keygen::generate_ec(dev, fs, &mut *rng, apdu.p2, &req, res)
             }
-            ALGO_RSA1024 | ALGO_RSA2048 => {
+            ALGO_RSA1024 | ALGO_RSA2048 | ALGO_RSA3072 | ALGO_RSA4096 => {
                 keygen::generate_rsa_blocking(dev, fs, &mut *rng, apdu.p2, &req, res)
             }
-            // X25519 generation is unsupported: fail rather than store nothing.
             _ => WRONG_DATA,
         }
     }
@@ -492,7 +515,7 @@ impl PivApplet<'_> {
             return Sw::INCORRECT_P1P2;
         }
         let d = apdu.data;
-        if d.len() < 3 || d[0] != 0x5C {
+        if d.len() < 3 || d[0] != TAG_DATA_PATH {
             return WRONG_DATA;
         }
         let l = d[1] as usize;
@@ -507,18 +530,64 @@ impl PivApplet<'_> {
             res.extend(DISCOVERY);
             return Sw::OK;
         }
+        if id == PRINTED_ID {
+            return self.get_protected_mgm(fs, res);
+        }
         let Some(fid) = object_fid(id) else {
             return Sw::FILE_NOT_FOUND;
         };
         let mut obj = [0u8; MAX_OBJECT];
+        // `Storage::read` returns the value's FULL stored length; clamp to the
+        // bytes we actually hold. Host writers cap at MAX_OBJECT (put_data), so
+        // this only bites a flash-corrupted over-length record — returning its
+        // prefix instead of panicking on the slice.
         let n = match fs.read(fid, &mut obj) {
-            Some(n) if n > 0 => n,
+            Some(n) if n > 0 => n.min(obj.len()),
             _ => return Sw::FILE_NOT_FOUND,
         };
-        if push_tlv(res, 0x53, &obj[..n]).is_err() {
+        if push_tlv(res, TAG_DATA_OBJECT, &obj[..n]).is_err() {
             return Sw::WRONG_LENGTH;
         }
         Sw::OK
+    }
+
+    /// GET DATA for the PRINTED object (`5FC109`) — the PIN-protected management
+    /// key. Returns it only when protection is enabled (the ADMIN-DATA flag) AND
+    /// the PIN is verified; a default or plain mgmt key reads as absent, so the
+    /// key is never PIN-disclosed unless the user opted in. The key is synthesized
+    /// from the sealed 0x9B auth slot — there is no second copy at rest.
+    fn get_protected_mgm<S: Storage>(&mut self, fs: &mut Fs<S>, res: &mut ResBuf) -> Sw {
+        if !mgm_is_protected(fs) {
+            return Sw::FILE_NOT_FOUND;
+        }
+        if !self.sess.has_pin {
+            return Sw::SECURITY_STATUS_NOT_SATISFIED;
+        }
+        let dev = Device {
+            serial_hash: &self.serial_hash,
+            serial_id: &self.serial_id,
+            otp_key: self.otp_key.as_ref(),
+        };
+        let mut key = [0u8; 32];
+        let klen = match seal::seal_read(&dev, fs, key_fid(SLOT_CARDMGM), &mut key) {
+            Ok(n) => n,
+            Err(sw) => return sw,
+        };
+        // PivmanProtectedData: 88 { 89 <key> }, wrapped in the 53 response object.
+        let mut body = [0u8; 4 + 32];
+        body[0] = PROTECTED_TAG;
+        body[1] = (2 + klen) as u8;
+        body[2] = PROTECTED_MGM_TAG;
+        body[3] = klen as u8;
+        body[4..4 + klen].copy_from_slice(&key[..klen]);
+        key.zeroize();
+        let r = if push_tlv(res, TAG_DATA_OBJECT, &body[..4 + klen]).is_err() {
+            Sw::WRONG_LENGTH
+        } else {
+            Sw::OK
+        };
+        body.zeroize();
+        r
     }
 
     /// PUT DATA (INS 0xDB, management-gated).
@@ -533,13 +602,29 @@ impl PivApplet<'_> {
         if !apdu.data.is_empty() && (apdu.data[0] == 0x7E || apdu.data[0] == 0x7F) {
             return Sw::OK;
         }
-        let (Some(path), Some(obj)) = (find_tag(apdu.data, 0x5C), find_tag(apdu.data, 0x53)) else {
+        let (Some(path), Some(obj)) = (
+            find_tag(apdu.data, TAG_DATA_PATH as u16),
+            find_tag(apdu.data, TAG_DATA_OBJECT as u16),
+        ) else {
             return WRONG_DATA;
         };
-        if path.len() != 3 || path[0] != 0x5F || path[1] != 0xC1 {
+        if path.len() != 3 {
             return WRONG_DATA;
         }
-        let fid = 0xD200 | path[2] as u16;
+        let fid = match (path[0], path[1], path[2]) {
+            // ADMIN DATA (5FFF00): the protection flags. Plaintext (non-secret).
+            (0x5F, 0xFF, 0x00) => EF_PIVMAN_DATA,
+            // PRINTED (5FC109): the PIN-protected mgmt key is virtual — backed by
+            // the sealed 0x9B auth slot (set via SET MANAGEMENT KEY); the host's
+            // copy isn't persisted (GET DATA synthesizes it), so acknowledge the
+            // write without storing the key plaintext at rest.
+            (0x5F, 0xC1, 0x09) => return Sw::OK,
+            (0x5F, 0xC1, b) => match data_object_fid(b) {
+                Some(fid) => fid,
+                None => return WRONG_DATA,
+            },
+            _ => return WRONG_DATA,
+        };
         if obj.is_empty() {
             let _ = fs.delete(fid);
             return Sw::OK;
@@ -566,17 +651,17 @@ impl PivApplet<'_> {
         }
         let key_ref = apdu.p2;
         match key_ref {
-            0x80 | 0x81 => {
-                let (fid, retry, default) = if key_ref == 0x80 {
+            REF_PIN | REF_PUK => {
+                let (fid, retry, default) = if key_ref == REF_PIN {
                     (EF_PIN, RETRY_PIN, &DEFAULT_PIN)
                 } else {
                     (EF_PUK, RETRY_PUK, &DEFAULT_PUK)
                 };
-                let mut rec = [0u8; 34];
-                let Some(34) = fs.read(fid, &mut rec) else {
+                let mut rec = [0u8; PIN_REC_LEN];
+                let Some(PIN_REC_LEN) = fs.read(fid, &mut rec) else {
                     return Sw::REFERENCE_NOT_FOUND;
                 };
-                let is_default = ct_eq(&rec[2..34], &dev.pin_derive_verifier(default));
+                let is_default = ct_eq(&rec[2..PIN_REC_LEN], &dev.pin_derive_verifier(default));
                 let (total, left) = match retries(fs, retry) {
                     Ok(t) => t,
                     Err(sw) => return sw,
@@ -635,9 +720,9 @@ impl PivApplet<'_> {
         algo: u8,
         res: &mut ResBuf,
     ) -> Sw {
-        let mut body = [0u8; 5 + 4 + 256 + 2 + 8];
+        let mut body = [0u8; MAX_RSA_PUBDO];
         let n = match algo {
-            ALGO_RSA1024 | ALGO_RSA2048 => {
+            ALGO_RSA1024 | ALGO_RSA2048 | ALGO_RSA3072 | ALGO_RSA4096 => {
                 let key = match seal::load_rsa_key(dev, fs, key_fid(slot)) {
                     Ok(k) => k,
                     Err(_) => return Sw::EXEC_ERROR,
@@ -648,12 +733,12 @@ impl PivApplet<'_> {
                 body.copy_within(5..full, 0);
                 full - 5
             }
-            ALGO_ECCP256 | ALGO_ECCP384 => {
+            ALGO_ECCP256 | ALGO_ECCP384 | ALGO_ED25519 | ALGO_X25519 => {
                 let key = match seal::load_ec_key(dev, fs, key_fid(slot)) {
                     Ok(k) => k,
                     Err(_) => return Sw::EXEC_ERROR,
                 };
-                let mut point = [0u8; 97];
+                let mut point = [0u8; MAX_EC_POINT];
                 let plen = match key.public_point(&mut point) {
                     Ok(p) => p,
                     Err(e) => return e,
@@ -692,10 +777,7 @@ impl PivApplet<'_> {
         // (SP 800-131A); an existing 3DES key still authenticates, so a
         // reflashed device can migrate itself to AES.
         let tdes = cfg!(not(feature = "fips-profile"));
-        let len_ok = matches!(
-            (algo, klen),
-            (ALGO_AES128, 16) | (ALGO_AES192, 24) | (ALGO_AES256, 32)
-        ) || (tdes && (algo, klen) == (ALGO_3DES, 24));
+        let len_ok = mgm_key_len(algo) == Some(klen) && (tdes || algo != ALGO_3DES);
         if key_ref != SLOT_CARDMGM || !len_ok {
             return WRONG_DATA;
         }
@@ -747,8 +829,9 @@ impl PivApplet<'_> {
             return Sw::INCORRECT_P1P2;
         }
         // The sealed blob is bound to the device, not the fid, so it moves
-        // verbatim.
-        let mut blob = [0u8; 300];
+        // verbatim. Sized to the largest sealed record (RSA-4096 `P ‖ Q`); a
+        // smaller buffer would truncate/overrun-slice a 3072/4096 key's blob.
+        let mut blob = [0u8; seal::MAX_BLOB];
         let Some(blob_n) = fs.read_key(key_fid(from), &mut blob) else {
             return Sw::FILE_NOT_FOUND;
         };
@@ -763,8 +846,10 @@ impl PivApplet<'_> {
             }
             let mut obj = [0u8; MAX_OBJECT];
             let cert = cert_from.and_then(|f| fs.read(f, &mut obj));
+            // Clamp the full stored length to the buffer (flash-corruption guard,
+            // as in get_data); host-written certs are already <= MAX_OBJECT.
             if let (Some(n), Some(tofid)) = (cert, cert_to) {
-                if fs.put(tofid, &obj[..n]).is_err() {
+                if fs.put(tofid, &obj[..n.min(obj.len())]).is_err() {
                     blob.zeroize();
                     return Sw::MEMORY_FAILURE;
                 }
@@ -833,8 +918,8 @@ fn reset_counter<S: Storage>(fs: &mut Fs<S>, idx: usize) -> Sw {
 }
 
 fn stored_pin_len<S: Storage>(fs: &mut Fs<S>, fid: u16) -> Result<usize, Sw> {
-    let mut rec = [0u8; 34];
-    let Some(34) = fs.read(fid, &mut rec) else {
+    let mut rec = [0u8; PIN_REC_LEN];
+    let Some(PIN_REC_LEN) = fs.read(fid, &mut rec) else {
         return Err(Sw::MEMORY_FAILURE);
     };
     Ok(rec[0] as usize)
@@ -857,15 +942,18 @@ fn check_ref<S: Storage>(dev: &Device, fs: &mut Fs<S>, fid: u16, retry: usize, p
     if left == 0 {
         return Sw::PIN_BLOCKED;
     }
-    let mut rec = [0u8; 34];
-    let Some(34) = fs.read(fid, &mut rec) else {
+    let mut rec = [0u8; PIN_REC_LEN];
+    let Some(PIN_REC_LEN) = fs.read(fid, &mut rec) else {
         return Sw::MEMORY_FAILURE;
     };
     let ver = dev.pin_derive_verifier(pin);
-    let mut matched = ct_eq(&ver, &rec[2..34]);
+    let mut matched = ct_eq(&ver, &rec[2..PIN_REC_LEN]);
     if !matched
         && dev.otp_key.is_some()
-        && ct_eq(&dev.without_otp().pin_derive_verifier(pin), &rec[2..34])
+        && ct_eq(
+            &dev.without_otp().pin_derive_verifier(pin),
+            &rec[2..PIN_REC_LEN],
+        )
     {
         // kbase-migration fallback: the correct PIN against a verifier stored
         // before the OTP key was provisioned — re-store it under the OTP arm
@@ -888,8 +976,221 @@ fn check_ref<S: Storage>(dev: &Device, fs: &mut Fs<S>, fid: u16, retry: usize, p
     if left == 0 {
         Sw::PIN_BLOCKED
     } else {
-        Sw::new(0x63, 0xC0 | left)
+        Sw::retries(left)
     }
+}
+
+/// Which PIV reference a change/verify targets — the application PIN or the PUK.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PinRef {
+    Pin,
+    Puk,
+}
+
+impl PinRef {
+    fn fid_retry(self) -> (u16, usize) {
+        match self {
+            PinRef::Pin => (EF_PIN, RETRY_PIN),
+            PinRef::Puk => (EF_PUK, RETRY_PUK),
+        }
+    }
+}
+
+/// Pad a collected numeric PIN/PUK (`1..=8` bytes) to the 8-byte PIV wire form
+/// (trailing `0xFF`), matching ykman / yubico-piv-tool. On-device (panel) entry
+/// MUST store the verifier over this padded form, or a host `VERIFY` — which
+/// always pads — will not match. `None` for empty / over-long input.
+pub fn pad_pin(entered: &[u8]) -> Option<[u8; PIN_WIRE_LEN]> {
+    if entered.is_empty() || entered.len() > PIN_WIRE_LEN {
+        return None;
+    }
+    let mut out = [0xFFu8; PIN_WIRE_LEN];
+    out[..entered.len()].copy_from_slice(entered);
+    Some(out)
+}
+
+/// Change a PIN or PUK: verify `old` (burns a retry on mismatch, exactly like the
+/// CHANGE REFERENCE DATA APDU), then store `new`. Shared by that handler and the
+/// on-device panel flow; panel callers pad both via [`pad_pin`] first so the
+/// stored verifier matches the host's padded wire form.
+pub fn change_reference<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    which: PinRef,
+    old: &[u8],
+    new: &[u8],
+) -> Sw {
+    if new.is_empty() || new.len() > PIN_WIRE_LEN {
+        return Sw::WRONG_LENGTH;
+    }
+    let (fid, retry) = which.fid_retry();
+    match check_ref(dev, fs, fid, retry, old) {
+        Sw::OK => {}
+        sw => return sw,
+    }
+    if put_pin_verifier(dev, fs, fid, new).is_err() {
+        return Sw::MEMORY_FAILURE;
+    }
+    Sw::OK
+}
+
+/// Unblock the PIN with the PUK (RESET RETRY COUNTER): verify `puk`, set the PIN to
+/// `new`, and reset the PIN retry counter. Shared by the APDU handler and the panel.
+pub fn unblock_pin_with_puk<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    puk: &[u8],
+    new: &[u8],
+) -> Sw {
+    if new.is_empty() || new.len() > PIN_WIRE_LEN {
+        return Sw::WRONG_LENGTH;
+    }
+    match check_ref(dev, fs, EF_PUK, RETRY_PUK, puk) {
+        Sw::OK => {}
+        sw => return sw,
+    }
+    if put_pin_verifier(dev, fs, EF_PIN, new).is_err() {
+        return Sw::MEMORY_FAILURE;
+    }
+    reset_counter(fs, RETRY_PIN)
+}
+
+/// Remaining verify attempts for the PIN or PUK — for on-panel status display.
+pub fn reference_retries_left<S: Storage>(fs: &mut Fs<S>, which: PinRef) -> Option<u8> {
+    let (_, retry) = which.fid_retry();
+    retries_left(fs, retry).ok()
+}
+
+/// Verify the PIN or PUK against its stored verifier — the retry dance (burns an attempt on
+/// mismatch → `63Cx` / `6983`, resets on success). For the on-panel change/unblock flows to
+/// gate on the *current* secret before collecting the new one; the host VERIFY APDU stays
+/// its own path. Callers mirroring the host wire pad via [`pad_pin`] first.
+pub fn verify_reference<S: Storage>(dev: &Device, fs: &mut Fs<S>, which: PinRef, pin: &[u8]) -> Sw {
+    let (fid, retry) = which.fid_retry();
+    check_ref(dev, fs, fid, retry, pin)
+}
+
+/// Whether the management key is marked PIN-protected (the ADMIN-DATA `0x02`
+/// flag). The PRINTED object only yields the key when this is set, so a default
+/// or plain management key is never PIN-readable.
+fn mgm_is_protected<S: Storage>(fs: &mut Fs<S>) -> bool {
+    // Sized to hold a real ykman PivmanData (flags + 16-byte salt + 4-byte timestamp ≈ 29B);
+    // `Storage::read` returns the value's FULL stored length, so clamp to the bytes we hold
+    // before slicing — a larger record must not panic, and an unparsable one fails closed
+    // (read as not protected), the safe direction.
+    let mut obj = [0u8; 64];
+    let Some(n) = fs.read(EF_PIVMAN_DATA, &mut obj) else {
+        return false;
+    };
+    let body = &obj[..n.min(obj.len())];
+    if body.len() < 2 || body[0] != PIVMAN_TAG {
+        return false;
+    }
+    let inner_len = (body[1] as usize).min(body.len() - 2);
+    matches!(
+        find_tag(&body[2..2 + inner_len], PIVMAN_FLAGS_TAG as u16),
+        Some(f) if !f.is_empty() && f[0] & PIVMAN_FLAG_MGM_PROTECTED != 0
+    )
+}
+
+/// Replace the PIV management key with a fresh random AES-256 key and mark it
+/// PIN-protected (the ykman `--protect` model): the key is sealed in the 0x9B
+/// auth slot and the ADMIN-DATA flag is set, so a host reads it back from the
+/// PRINTED object (`5FC109`) after a PIN VERIFY. The user never sees the key.
+/// Shared by the on-panel "Protect management key" action — physical presence at
+/// the trusted panel is the authorisation (no prior management-key auth).
+///
+/// SECURITY: after this, the PIV PIN **alone** grants management access (it
+/// unlocks the random mgmt key), exactly as YubiKey's `--protect`. Caller-gated
+/// behind the device PIN + a deliberate hold on the panel.
+///
+/// Power-cut ordering: the key+meta are written before the ADMIN flag, so a torn
+/// write leaves the flag clear → PRINTED reads absent (fail-closed, no half-key
+/// disclosure). Re-running this (or a PIV factory reset) recovers — it depends on
+/// no prior state, just overwriting the slot.
+///
+/// The ADMIN-DATA record is rebuilt from any prior host-written one
+/// ([`pivman_set_protected`]): the PIN-change timestamp and unrelated flag bits
+/// survive, so on-panel protect no longer discards a host's PivmanData.
+pub fn protect_mgm_key<S: Storage>(dev: &Device, fs: &mut Fs<S>, rng: &mut dyn Rng) -> Sw {
+    // Read any existing PivmanData up front (before the writes below), so the new
+    // record can carry its timestamp / flags forward.
+    let mut prior_buf = [0u8; 64];
+    let prior = match fs.read(EF_PIVMAN_DATA, &mut prior_buf) {
+        Some(n) => &prior_buf[..n.min(prior_buf.len())],
+        None => &[][..],
+    };
+    let mut admin = [0u8; PIVMAN_MAX];
+    let admin_len = pivman_set_protected(prior, &mut admin);
+
+    let mut key = [0u8; 32];
+    rng.fill(&mut key);
+    let sealed = seal::seal_put(dev, fs, rng, key_fid(SLOT_CARDMGM), &key);
+    key.zeroize();
+    if sealed.is_err() {
+        return Sw::MEMORY_FAILURE;
+    }
+    // pin-policy NEVER matches a real YubiKey's protected mgmt key (9B is not
+    // PIN-gated at the APDU level; `is_key(0x9B)` is false so auth ignores it).
+    if fs
+        .meta_add(
+            key_fid(SLOT_CARDMGM).get(),
+            &[ALGO_AES256, PINPOLICY_NEVER, TOUCHPOLICY_NEVER],
+        )
+        .is_err()
+    {
+        return Sw::MEMORY_FAILURE;
+    }
+    if fs.put(EF_PIVMAN_DATA, &admin[..admin_len]).is_err() {
+        return Sw::MEMORY_FAILURE;
+    }
+    Sw::OK
+}
+
+/// Rebuild the PivmanData (ADMIN DATA) record for the PIN-protected-mgmt state
+/// from an arbitrary `prior` record, writing the encoded object into `out` and
+/// returning its length. The MGM_PROTECTED flag is forced on; any other flag bits
+/// and the PIN-change timestamp (`0x83`) in `prior` are carried forward; the
+/// derived-key salt (`0x82`) is deliberately dropped.
+///
+/// Dropping the salt mirrors ykman's `--protect`: once the management key is a
+/// fresh random device-sealed key it is no longer derived from PIN+salt, so a
+/// left-over salt would only mislead a host into the derivation path. A malformed
+/// `prior` contributes nothing (flags default to 0, no timestamp) and never
+/// panics — the record is always a well-formed `80 { 81 .. }`, protected.
+pub(crate) fn pivman_set_protected(prior: &[u8], out: &mut [u8; PIVMAN_MAX]) -> usize {
+    // Parse the prior record's inner TLV run, if it is a `80 <len> { .. }`.
+    let inner = if prior.len() >= 2 && prior[0] == PIVMAN_TAG {
+        let l = (prior[1] as usize).min(prior.len() - 2);
+        &prior[2..2 + l]
+    } else {
+        &[][..]
+    };
+    let flags = find_tag(inner, PIVMAN_FLAGS_TAG as u16)
+        .and_then(|f| f.first().copied())
+        .unwrap_or(0)
+        | PIVMAN_FLAG_MGM_PROTECTED;
+    let ts = find_tag(inner, PIVMAN_TS_TAG as u16)
+        .map(|t| &t[..t.len().min(PIVMAN_TS_MAX)])
+        .unwrap_or(&[]);
+
+    // Body = 81 01 <flags> [83 <len> <ts>]; outer = 80 <body_len> <body>.
+    let mut body = [0u8; 3 + 2 + PIVMAN_TS_MAX];
+    let mut n = 0;
+    body[n] = PIVMAN_FLAGS_TAG;
+    body[n + 1] = 0x01;
+    body[n + 2] = flags;
+    n += 3;
+    if !ts.is_empty() {
+        body[n] = PIVMAN_TS_TAG;
+        body[n + 1] = ts.len() as u8;
+        body[n + 2..n + 2 + ts.len()].copy_from_slice(ts);
+        n += 2 + ts.len();
+    }
+    out[0] = PIVMAN_TAG;
+    out[1] = n as u8;
+    out[2..2 + n].copy_from_slice(&body[..n]);
+    2 + n
 }
 
 /// Constant-time slice equality (length public).
@@ -913,7 +1214,7 @@ pub(crate) fn dyn_auth_resp(res: &mut ResBuf, tag: u8, payload: &[u8]) -> Result
     let inner = 1 + format_len(payload.len() as u16, &mut ll) as u16 + payload.len() as u16;
     let mut oll = [0u8; 3];
     let on = format_len(inner, &mut oll);
-    if !res.push(0x7C) || !res.extend(&oll[..on]) {
+    if !res.push(TAG_DYN_AUTH) || !res.extend(&oll[..on]) {
         return Err(Sw::WRONG_LENGTH);
     }
     push_tlv(res, tag, payload)
@@ -959,1197 +1260,11 @@ impl rsa::rand_core::RngCore for RngAdapter<'_> {
 }
 impl rsa::rand_core::CryptoRng for RngAdapter<'_> {}
 
+/// Kani proof harnesses (`cargo kani -p rsk-piv`): exhaustive over every input up
+/// to the stated bound, where the unit tests only sample.
+#[cfg(kani)]
+#[path = "kani.rs"]
+mod proofs;
+
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use rsk_fs::storage::ram::RamStorage;
-
-    use p256::ecdsa::signature::hazmat::PrehashVerifier;
-    use sha2::Digest;
-
-    const SERIAL: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
-    const HASH: [u8; 32] = [0x22; 32];
-
-    /// Deterministic LCG randomness — good enough for nonces and prime search.
-    struct TestRng(u64);
-    impl Rng for TestRng {
-        fn fill(&mut self, b: &mut [u8]) {
-            for x in b.iter_mut() {
-                self.0 = self
-                    .0
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                *x = (self.0 >> 33) as u8;
-            }
-        }
-    }
-
-    fn new_fs() -> Fs<RamStorage> {
-        let mut fs = Fs::new(RamStorage::new(), &[]);
-        fs.scan();
-        fs
-    }
-
-    fn select(app: &mut PivApplet, fs: &mut Fs<RamStorage>) -> Vec<u8> {
-        let mut out = [0u8; 256];
-        let mut res = ResBuf::new(&mut out);
-        let sw = Applet::select(app, false, fs, &mut res);
-        assert_eq!(sw, Sw::OK);
-        res.as_slice().to_vec()
-    }
-
-    fn apdu_bytes(ins: u8, p1: u8, p2: u8, data: &[u8]) -> Vec<u8> {
-        let mut raw = vec![0x00, ins, p1, p2];
-        if data.is_empty() {
-        } else if data.len() <= 255 {
-            raw.push(data.len() as u8);
-            raw.extend_from_slice(data);
-        } else {
-            raw.push(0);
-            raw.extend_from_slice(&(data.len() as u16).to_be_bytes());
-            raw.extend_from_slice(data);
-        }
-        raw
-    }
-
-    fn run(
-        app: &mut PivApplet,
-        fs: &mut Fs<RamStorage>,
-        ins: u8,
-        p1: u8,
-        p2: u8,
-        data: &[u8],
-    ) -> (Sw, Vec<u8>) {
-        let raw = apdu_bytes(ins, p1, p2, data);
-        let apdu = Apdu::parse(&raw).unwrap();
-        let mut out = [0u8; 2048];
-        let mut res = ResBuf::new(&mut out);
-        let sw = Applet::process(app, &apdu, fs, &mut res);
-        (sw, res.as_slice().to_vec())
-    }
-
-    /// Mutual-auth against the default AES-192 management key.
-    fn auth_mgm(app: &mut PivApplet, fs: &mut Fs<RamStorage>) {
-        let (sw, wit) = run(
-            app,
-            fs,
-            INS_AUTHENTICATE,
-            ALGO_AES192,
-            0x9B,
-            &[0x7C, 0x02, 0x80, 0x00],
-        );
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(&wit[..4], &[0x7C, 0x12, 0x80, 0x10]);
-        let mut w: [u8; 16] = wit[4..20].try_into().unwrap();
-        rsk_crypto::aes_ecb_decrypt_block(&DEFAULT_MGM, &mut w).unwrap();
-        let host_chal = [0xA5u8; 16];
-        let mut msg = vec![0x7C, 0x24, 0x80, 0x10];
-        msg.extend_from_slice(&w);
-        msg.push(0x81);
-        msg.push(0x10);
-        msg.extend_from_slice(&host_chal);
-        let (sw, resp) = run(app, fs, INS_AUTHENTICATE, ALGO_AES192, 0x9B, &msg);
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(&resp[..4], &[0x7C, 0x12, 0x82, 0x10]);
-        let mut expect = host_chal;
-        rsk_crypto::aes_ecb_encrypt_block(&DEFAULT_MGM, &mut expect).unwrap();
-        assert_eq!(&resp[4..20], &expect);
-    }
-
-    fn verify_pin(app: &mut PivApplet, fs: &mut Fs<RamStorage>) {
-        let (sw, _) = run(app, fs, INS_VERIFY, 0, 0x80, &DEFAULT_PIN);
-        assert_eq!(sw, Sw::OK);
-    }
-
-    fn gen_template(algo: u8) -> Vec<u8> {
-        vec![0xAC, 0x03, 0x80, 0x01, algo]
-    }
-
-    /// Presence stand-in whose answer the test flips between calls.
-    struct Scripted {
-        confirm: bool,
-    }
-    impl UserPresence for Scripted {
-        fn request(&mut self) -> Presence {
-            if self.confirm {
-                Presence::Confirmed
-            } else {
-                Presence::Declined
-            }
-        }
-    }
-
-    /// Extract `point` from the keygen response `7F49 { 86 point }` (P-256 and
-    /// P-384 bodies use short-form lengths).
-    fn ec_point_of(resp: &[u8]) -> Vec<u8> {
-        assert_eq!(&resp[..2], &[0x7F, 0x49]);
-        let body = &resp[3..];
-        assert_eq!(body[0], 0x86);
-        let plen = body[1] as usize;
-        body[2..2 + plen].to_vec()
-    }
-
-    #[test]
-    fn touch_policy_enforced_on_slot_sign() {
-        let rng = RefCell::new(TestRng(7));
-        let pres = RefCell::new(Scripted { confirm: true });
-        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
-        let mut fs = new_fs();
-        select(&mut app, &mut fs);
-        // Management auth: default mgm touch is NEVER, so no touch is consulted.
-        auth_mgm(&mut app, &mut fs);
-        verify_pin(&mut app, &mut fs);
-        // Generate a P-256 key in 9A — default touch policy ALWAYS.
-        let (sw, _) = run(
-            &mut app,
-            &mut fs,
-            INS_ASYM_KEYGEN,
-            0,
-            0x9A,
-            &gen_template(ALGO_ECCP256),
-        );
-        assert_eq!(sw, Sw::OK);
-        let (sw, md) = run(&mut app, &mut fs, INS_GET_METADATA, 0, 0x9A, &[]);
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(find_tag(&md, 0x02).unwrap()[1], TOUCHPOLICY_ALWAYS);
-        let digest = [0x42u8; 32];
-        let mut msg = vec![0x7C, 0x24, 0x82, 0x00, 0x81, 0x20];
-        msg.extend_from_slice(&digest);
-        // Touch declined → the sign is refused.
-        pres.borrow_mut().confirm = false;
-        let (sw, _) = run(
-            &mut app,
-            &mut fs,
-            INS_AUTHENTICATE,
-            ALGO_ECCP256,
-            0x9A,
-            &msg,
-        );
-        assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
-        // Touch confirmed → it proceeds.
-        pres.borrow_mut().confirm = true;
-        let (sw, _) = run(
-            &mut app,
-            &mut fs,
-            INS_AUTHENTICATE,
-            ALGO_ECCP256,
-            0x9A,
-            &msg,
-        );
-        assert_eq!(sw, Sw::OK);
-    }
-
-    #[test]
-    fn touch_policy_never_skips_presence() {
-        // A slot generated with an explicit touch policy NEVER must not consult
-        // presence — a declining button still lets the sign through.
-        let rng = RefCell::new(TestRng(7));
-        let pres = RefCell::new(Scripted { confirm: false });
-        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
-        let mut fs = new_fs();
-        select(&mut app, &mut fs);
-        auth_mgm(&mut app, &mut fs);
-        verify_pin(&mut app, &mut fs);
-        // AC template with touch policy tag 0xAB = NEVER.
-        let tmpl = vec![
-            0xAC,
-            0x06,
-            0x80,
-            0x01,
-            ALGO_ECCP256,
-            0xAB,
-            0x01,
-            TOUCHPOLICY_NEVER,
-        ];
-        let (sw, _) = run(&mut app, &mut fs, INS_ASYM_KEYGEN, 0, 0x9E, &tmpl);
-        assert_eq!(sw, Sw::OK);
-        let digest = [0x42u8; 32];
-        let mut msg = vec![0x7C, 0x24, 0x82, 0x00, 0x81, 0x20];
-        msg.extend_from_slice(&digest);
-        let (sw, _) = run(
-            &mut app,
-            &mut fs,
-            INS_AUTHENTICATE,
-            ALGO_ECCP256,
-            0x9E,
-            &msg,
-        );
-        assert_eq!(sw, Sw::OK);
-    }
-
-    #[test]
-    fn select_returns_apt() {
-        let rng = RefCell::new(TestRng(7));
-        let pres = RefCell::new(AlwaysConfirm);
-        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
-        let mut fs = new_fs();
-        let apt = select(&mut app, &mut fs);
-        assert_eq!(apt[0], 0x61);
-        assert_eq!(apt[1] as usize, apt.len() - 2, "APT length backpatched");
-        let body = &apt[2..];
-        assert!(find_tag(body, 0x4F).is_some());
-        assert_eq!(find_tag(body, 0x50).unwrap(), b"RS-Key PIV");
-        assert!(find_tag(body, 0xAC).is_some());
-    }
-
-    #[test]
-    fn version_and_serial() {
-        let rng = RefCell::new(TestRng(7));
-        let pres = RefCell::new(AlwaysConfirm);
-        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
-        let mut fs = new_fs();
-        select(&mut app, &mut fs);
-        let (sw, v) = run(&mut app, &mut fs, INS_VERSION, 0, 0, &[]);
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(v, vec![5, 7, 4]);
-        let (sw, s) = run(&mut app, &mut fs, INS_YK_SERIAL, 0, 0, &[]);
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(s, rsk_mgmt::serial4(SERIAL).to_vec());
-    }
-
-    #[test]
-    fn pin_verify_retry_and_unblock() {
-        let rng = RefCell::new(TestRng(7));
-        let pres = RefCell::new(AlwaysConfirm);
-        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
-        let mut fs = new_fs();
-        select(&mut app, &mut fs);
-        // Retry query on a fresh card.
-        let (sw, _) = run(&mut app, &mut fs, INS_VERIFY, 0, 0x80, &[]);
-        assert_eq!(sw, Sw::new(0x63, 0xC3));
-        // Wrong PIN decrements.
-        let wrong = [0x39u8; 8];
-        let (sw, _) = run(&mut app, &mut fs, INS_VERIFY, 0, 0x80, &wrong);
-        assert_eq!(sw, Sw::new(0x63, 0xC2));
-        verify_pin(&mut app, &mut fs);
-        // Success resets the counter and satisfies the empty-data query.
-        let (sw, _) = run(&mut app, &mut fs, INS_VERIFY, 0, 0x80, &[]);
-        assert_eq!(sw, Sw::OK);
-        // P1=FF drops the security state.
-        let (sw, _) = run(&mut app, &mut fs, INS_VERIFY, 0xFF, 0x80, &[]);
-        assert_eq!(sw, Sw::OK);
-        let (sw, _) = run(&mut app, &mut fs, INS_VERIFY, 0, 0x80, &[]);
-        assert_eq!(sw, Sw::new(0x63, 0xC3));
-        // Block the PIN, then unblock with the PUK.
-        for left in [2, 1] {
-            let (sw, _) = run(&mut app, &mut fs, INS_VERIFY, 0, 0x80, &wrong);
-            assert_eq!(sw, Sw::new(0x63, 0xC0 | left));
-        }
-        let (sw, _) = run(&mut app, &mut fs, INS_VERIFY, 0, 0x80, &wrong);
-        assert_eq!(sw, Sw::PIN_BLOCKED);
-        let (sw, _) = run(&mut app, &mut fs, INS_VERIFY, 0, 0x80, &DEFAULT_PIN);
-        assert_eq!(sw, Sw::PIN_BLOCKED);
-        let mut unblock = DEFAULT_PUK.to_vec();
-        let newpin = *b"654321\xff\xff";
-        unblock.extend_from_slice(&newpin);
-        let (sw, _) = run(&mut app, &mut fs, INS_RESET_RETRY, 0, 0x80, &unblock);
-        assert_eq!(sw, Sw::OK);
-        let (sw, _) = run(&mut app, &mut fs, INS_VERIFY, 0, 0x80, &newpin);
-        assert_eq!(sw, Sw::OK);
-    }
-
-    #[test]
-    fn change_pin_and_puk() {
-        let rng = RefCell::new(TestRng(7));
-        let pres = RefCell::new(AlwaysConfirm);
-        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
-        let mut fs = new_fs();
-        select(&mut app, &mut fs);
-        let newpin = *b"00112233";
-        let mut msg = DEFAULT_PIN.to_vec();
-        msg.extend_from_slice(&newpin);
-        let (sw, _) = run(&mut app, &mut fs, INS_CHANGE_PIN, 0, 0x80, &msg);
-        assert_eq!(sw, Sw::OK);
-        let (sw, _) = run(&mut app, &mut fs, INS_VERIFY, 0, 0x80, &newpin);
-        assert_eq!(sw, Sw::OK);
-        // Wrong old PIN burns a retry and reports it.
-        let mut bad = DEFAULT_PIN.to_vec();
-        bad.extend_from_slice(b"99999999");
-        let (sw, _) = run(&mut app, &mut fs, INS_CHANGE_PIN, 0, 0x80, &bad);
-        assert_eq!(sw, Sw::new(0x63, 0xC2));
-        // PUK change.
-        let mut msg = DEFAULT_PUK.to_vec();
-        msg.extend_from_slice(b"87654321");
-        let (sw, _) = run(&mut app, &mut fs, INS_CHANGE_PIN, 0, 0x81, &msg);
-        assert_eq!(sw, Sw::OK);
-    }
-
-    #[test]
-    fn mgm_mutual_auth_gates_keygen() {
-        let rng = RefCell::new(TestRng(7));
-        let pres = RefCell::new(AlwaysConfirm);
-        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
-        let mut fs = new_fs();
-        select(&mut app, &mut fs);
-        let (sw, _) = run(
-            &mut app,
-            &mut fs,
-            INS_ASYM_KEYGEN,
-            0,
-            0x9A,
-            &gen_template(ALGO_ECCP256),
-        );
-        assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
-        auth_mgm(&mut app, &mut fs);
-        verify_pin(&mut app, &mut fs);
-        let (sw, resp) = run(
-            &mut app,
-            &mut fs,
-            INS_ASYM_KEYGEN,
-            0,
-            0x9A,
-            &gen_template(ALGO_ECCP256),
-        );
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(&resp[..2], &[0x7F, 0x49]);
-    }
-
-    #[test]
-    fn mgm_single_auth() {
-        let rng = RefCell::new(TestRng(7));
-        let pres = RefCell::new(AlwaysConfirm);
-        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
-        let mut fs = new_fs();
-        select(&mut app, &mut fs);
-        let (sw, chal) = run(
-            &mut app,
-            &mut fs,
-            INS_AUTHENTICATE,
-            ALGO_AES192,
-            0x9B,
-            &[0x7C, 0x02, 0x81, 0x00],
-        );
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(&chal[..4], &[0x7C, 0x12, 0x81, 0x10]);
-        let mut enc: [u8; 16] = chal[4..20].try_into().unwrap();
-        rsk_crypto::aes_ecb_encrypt_block(&DEFAULT_MGM, &mut enc).unwrap();
-        let mut msg = vec![0x7C, 0x12, 0x82, 0x10];
-        msg.extend_from_slice(&enc);
-        let (sw, _) = run(&mut app, &mut fs, INS_AUTHENTICATE, ALGO_AES192, 0x9B, &msg);
-        assert_eq!(sw, Sw::OK);
-        // The gate is open now.
-        verify_pin(&mut app, &mut fs);
-        let (sw, _) = run(
-            &mut app,
-            &mut fs,
-            INS_ASYM_KEYGEN,
-            0,
-            0x9D,
-            &gen_template(ALGO_ECCP256),
-        );
-        assert_eq!(sw, Sw::OK);
-    }
-
-    #[test]
-    fn mgm_single_auth_wrong_response_fails() {
-        let rng = RefCell::new(TestRng(7));
-        let pres = RefCell::new(AlwaysConfirm);
-        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
-        let mut fs = new_fs();
-        select(&mut app, &mut fs);
-        let (sw, _) = run(
-            &mut app,
-            &mut fs,
-            INS_AUTHENTICATE,
-            ALGO_AES192,
-            0x9B,
-            &[0x7C, 0x02, 0x81, 0x00],
-        );
-        assert_eq!(sw, Sw::OK);
-        let mut msg = vec![0x7C, 0x12, 0x82, 0x10];
-        msg.extend_from_slice(&[0u8; 16]);
-        let (sw, _) = run(&mut app, &mut fs, INS_AUTHENTICATE, ALGO_AES192, 0x9B, &msg);
-        assert_eq!(sw, Sw::DATA_INVALID);
-        let (sw, _) = run(&mut app, &mut fs, INS_SET_RETRIES, 5, 5, &[]);
-        assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
-    }
-
-    #[cfg(feature = "fips-profile")]
-    #[test]
-    fn fips_refuses_3des_mgm_and_rsa1024() {
-        let rng = RefCell::new(TestRng(7));
-        let pres = RefCell::new(AlwaysConfirm);
-        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
-        let mut fs = new_fs();
-        select(&mut app, &mut fs);
-        auth_mgm(&mut app, &mut fs);
-        // A new 3DES management key is refused (SP 800-131A)…
-        let mut msg = vec![ALGO_3DES, 0x9B, 24];
-        msg.extend_from_slice(&DEFAULT_MGM);
-        let (sw, _) = run(&mut app, &mut fs, INS_SET_MGMKEY, 0xFF, 0xFF, &msg);
-        assert_eq!(sw, WRONG_DATA);
-        // …and so is RSA-1024 generation.
-        let tmpl = [0xAC, 0x03, 0x80, 0x01, ALGO_RSA1024];
-        let (sw, _) = run(&mut app, &mut fs, INS_ASYM_KEYGEN, 0x00, 0x9A, &tmpl);
-        assert_eq!(sw, WRONG_DATA);
-        // AES management keys are unaffected.
-        let mut msg = vec![ALGO_AES256, 0x9B, 32];
-        msg.extend_from_slice(&[0x11; 32]);
-        let (sw, _) = run(&mut app, &mut fs, INS_SET_MGMKEY, 0xFF, 0xFF, &msg);
-        assert_eq!(sw, Sw::OK);
-    }
-
-    #[test]
-    fn mgm_3des_roundtrip() {
-        let rng = RefCell::new(TestRng(7));
-        let pres = RefCell::new(AlwaysConfirm);
-        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
-        let mut fs = new_fs();
-        select(&mut app, &mut fs);
-        auth_mgm(&mut app, &mut fs);
-        // Switch the management key to 3DES (same bytes, new type).
-        let mut msg = vec![ALGO_3DES, 0x9B, 24];
-        msg.extend_from_slice(&DEFAULT_MGM);
-        let (sw, _) = run(&mut app, &mut fs, INS_SET_MGMKEY, 0xFF, 0xFF, &msg);
-        assert_eq!(sw, Sw::OK);
-        // Metadata reports the new type and no longer claims default…
-        let (sw, md) = run(&mut app, &mut fs, INS_GET_METADATA, 0, 0x9B, &[]);
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(find_tag(&md, 0x01).unwrap(), &[ALGO_3DES]);
-        // …well, the bytes ARE the default key, just typed 3DES.
-        assert_eq!(find_tag(&md, 0x05).unwrap(), &[1]);
-        // Mutual auth over 8-byte 3DES blocks with well-formed TLVs.
-        let (sw, wit) = run(
-            &mut app,
-            &mut fs,
-            INS_AUTHENTICATE,
-            ALGO_3DES,
-            0x9B,
-            &[0x7C, 0x02, 0x80, 0x00],
-        );
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(&wit[..4], &[0x7C, 0x0A, 0x80, 0x08]);
-        let mut w: [u8; 8] = wit[4..12].try_into().unwrap();
-        let key24: [u8; 24] = DEFAULT_MGM;
-        rsk_crypto::des3_decrypt_block(&key24, &mut w);
-        let host_chal = [0x5Au8; 8];
-        let mut msg = vec![0x7C, 0x14, 0x80, 0x08];
-        msg.extend_from_slice(&w);
-        msg.push(0x81);
-        msg.push(0x08);
-        msg.extend_from_slice(&host_chal);
-        let (sw, resp) = run(&mut app, &mut fs, INS_AUTHENTICATE, ALGO_3DES, 0x9B, &msg);
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(&resp[..4], &[0x7C, 0x0A, 0x82, 0x08]);
-        let mut expect = host_chal;
-        rsk_crypto::des3_encrypt_block(&key24, &mut expect);
-        assert_eq!(&resp[4..12], &expect);
-    }
-
-    #[test]
-    fn keygen_p256_sign_and_verify() {
-        let rng = RefCell::new(TestRng(7));
-        let pres = RefCell::new(AlwaysConfirm);
-        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
-        let mut fs = new_fs();
-        select(&mut app, &mut fs);
-        auth_mgm(&mut app, &mut fs);
-        verify_pin(&mut app, &mut fs);
-        let (sw, resp) = run(
-            &mut app,
-            &mut fs,
-            INS_ASYM_KEYGEN,
-            0,
-            0x9A,
-            &gen_template(ALGO_ECCP256),
-        );
-        assert_eq!(sw, Sw::OK);
-        let point = ec_point_of(&resp);
-        assert_eq!(point.len(), 65);
-        // Slot metadata.
-        let (sw, md) = run(&mut app, &mut fs, INS_GET_METADATA, 0, 0x9A, &[]);
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(find_tag(&md, 0x01).unwrap(), &[ALGO_ECCP256]);
-        assert_eq!(
-            find_tag(&md, 0x02).unwrap(),
-            &[PINPOLICY_ONCE, TOUCHPOLICY_ALWAYS]
-        );
-        assert_eq!(find_tag(&md, 0x03).unwrap(), &[ORIGIN_GENERATED]);
-        let pk = find_tag(&md, 0x04).unwrap();
-        assert_eq!(find_tag(pk, 0x86).unwrap(), &point[..]);
-        // Sign a digest, verify with the returned point.
-        let digest: [u8; 32] = sha2::Sha256::digest(b"piv test message").into();
-        let mut msg = vec![0x7C, 0x24, 0x82, 0x00, 0x81, 0x20];
-        msg.extend_from_slice(&digest);
-        let (sw, sig) = run(
-            &mut app,
-            &mut fs,
-            INS_AUTHENTICATE,
-            ALGO_ECCP256,
-            0x9A,
-            &msg,
-        );
-        assert_eq!(sw, Sw::OK);
-        let dyn_auth = find_tag(&sig, 0x7C).unwrap();
-        let der = find_tag(dyn_auth, 0x82).unwrap().to_vec();
-        let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(&point).unwrap();
-        let psig = p256::ecdsa::Signature::from_der(&der).unwrap();
-        vk.verify_prehash(&digest, &psig).unwrap();
-    }
-
-    #[test]
-    fn pin_policy_always_on_signature_slot() {
-        let rng = RefCell::new(TestRng(7));
-        let pres = RefCell::new(AlwaysConfirm);
-        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
-        let mut fs = new_fs();
-        select(&mut app, &mut fs);
-        auth_mgm(&mut app, &mut fs);
-        verify_pin(&mut app, &mut fs);
-        let (sw, _) = run(
-            &mut app,
-            &mut fs,
-            INS_ASYM_KEYGEN,
-            0,
-            0x9C,
-            &gen_template(ALGO_ECCP256),
-        );
-        assert_eq!(sw, Sw::OK);
-        let digest = [0x42u8; 32];
-        let mut msg = vec![0x7C, 0x24, 0x82, 0x00, 0x81, 0x20];
-        msg.extend_from_slice(&digest);
-        let (sw, _) = run(
-            &mut app,
-            &mut fs,
-            INS_AUTHENTICATE,
-            ALGO_ECCP256,
-            0x9C,
-            &msg,
-        );
-        assert_eq!(sw, Sw::OK);
-        // PIN-always: the second signature needs a fresh VERIFY.
-        let (sw, _) = run(
-            &mut app,
-            &mut fs,
-            INS_AUTHENTICATE,
-            ALGO_ECCP256,
-            0x9C,
-            &msg,
-        );
-        assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
-        verify_pin(&mut app, &mut fs);
-        let (sw, _) = run(
-            &mut app,
-            &mut fs,
-            INS_AUTHENTICATE,
-            ALGO_ECCP256,
-            0x9C,
-            &msg,
-        );
-        assert_eq!(sw, Sw::OK);
-    }
-
-    #[test]
-    fn cert_object_is_wrapped_and_parses() {
-        let rng = RefCell::new(TestRng(7));
-        let pres = RefCell::new(AlwaysConfirm);
-        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
-        let mut fs = new_fs();
-        select(&mut app, &mut fs);
-        auth_mgm(&mut app, &mut fs);
-        verify_pin(&mut app, &mut fs);
-        let (sw, resp) = run(
-            &mut app,
-            &mut fs,
-            INS_ASYM_KEYGEN,
-            0,
-            0x9A,
-            &gen_template(ALGO_ECCP256),
-        );
-        assert_eq!(sw, Sw::OK);
-        let point = ec_point_of(&resp);
-        let (sw, obj) = run(
-            &mut app,
-            &mut fs,
-            INS_GET_DATA,
-            0x3F,
-            0xFF,
-            &[0x5C, 0x03, 0x5F, 0xC1, 0x05],
-        );
-        assert_eq!(sw, Sw::OK);
-        let body = find_tag(&obj, 0x53).unwrap();
-        let cert = find_tag(body, 0x70).unwrap();
-        assert_eq!(find_tag(body, 0x71).unwrap(), &[0x00]);
-        let (_, parsed) = x509_parser::parse_x509_certificate(cert).unwrap();
-        assert!(
-            parsed
-                .subject()
-                .to_string()
-                .contains("CN=RS-Key PIV Slot 9A")
-        );
-        // Self-signature verifies against the slot public key.
-        let digest: [u8; 32] = sha2::Sha256::digest(parsed.tbs_certificate.as_ref()).into();
-        let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(&point).unwrap();
-        let sig = p256::ecdsa::Signature::from_der(&parsed.signature_value.data).unwrap();
-        vk.verify_prehash(&digest, &sig).unwrap();
-    }
-
-    #[test]
-    fn attestation_chains_to_f9() {
-        let rng = RefCell::new(TestRng(7));
-        let pres = RefCell::new(AlwaysConfirm);
-        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
-        let mut fs = new_fs();
-        select(&mut app, &mut fs);
-        auth_mgm(&mut app, &mut fs);
-        verify_pin(&mut app, &mut fs);
-        let (sw, _) = run(
-            &mut app,
-            &mut fs,
-            INS_ASYM_KEYGEN,
-            0,
-            0x9A,
-            &gen_template(ALGO_ECCP256),
-        );
-        assert_eq!(sw, Sw::OK);
-        let (sw, att) = run(&mut app, &mut fs, INS_ATTESTATION, 0x9A, 0, &[]);
-        assert_eq!(sw, Sw::OK);
-        let (_, att_cert) = x509_parser::parse_x509_certificate(&att).unwrap();
-        assert!(
-            att_cert
-                .subject()
-                .to_string()
-                .contains("CN=RS-Key PIV Attestation 9A")
-        );
-        assert!(
-            att_cert
-                .issuer()
-                .to_string()
-                .contains("CN=RS-Key PIV Slot F9")
-        );
-        // The Yubico statement extensions are present.
-        let oids: Vec<String> = att_cert
-            .extensions()
-            .iter()
-            .map(|e| e.oid.to_id_string())
-            .collect();
-        for oid in [
-            "1.3.6.1.4.1.41482.3.3",
-            "1.3.6.1.4.1.41482.3.7",
-            "1.3.6.1.4.1.41482.3.8",
-            "1.3.6.1.4.1.41482.3.9",
-        ] {
-            assert!(oids.iter().any(|o| o == oid), "{oid} missing");
-        }
-        // The F9 certificate object verifies the attestation signature.
-        let (sw, f9obj) = run(
-            &mut app,
-            &mut fs,
-            INS_GET_DATA,
-            0x3F,
-            0xFF,
-            &[0x5C, 0x03, 0x5F, 0xFF, 0x01],
-        );
-        assert_eq!(sw, Sw::OK);
-        let f9cert = find_tag(find_tag(&f9obj, 0x53).unwrap(), 0x70).unwrap();
-        let (_, f9) = x509_parser::parse_x509_certificate(f9cert).unwrap();
-        let spk = &f9.tbs_certificate.subject_pki.subject_public_key.data;
-        let vk = p384::ecdsa::VerifyingKey::from_sec1_bytes(spk).unwrap();
-        let digest: [u8; 32] = sha2::Sha256::digest(att_cert.tbs_certificate.as_ref()).into();
-        let sig = p384::ecdsa::Signature::from_der(&att_cert.signature_value.data).unwrap();
-        use p384::ecdsa::signature::hazmat::PrehashVerifier as _;
-        vk.verify_prehash(&digest, &sig).unwrap();
-        // An imported key must not attest.
-        let scalar = [0x11u8; 32];
-        let mut imp = vec![0x06, 32];
-        imp.extend_from_slice(&scalar);
-        let (sw, _) = run(&mut app, &mut fs, INS_IMPORT_ASYM, ALGO_ECCP256, 0x9D, &imp);
-        assert_eq!(sw, Sw::OK);
-        let (sw, _) = run(&mut app, &mut fs, INS_ATTESTATION, 0x9D, 0, &[]);
-        assert_eq!(sw, Sw::INCORRECT_PARAMS);
-    }
-
-    #[test]
-    fn ecdh_on_key_management_slot() {
-        let rng = RefCell::new(TestRng(7));
-        let pres = RefCell::new(AlwaysConfirm);
-        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
-        let mut fs = new_fs();
-        select(&mut app, &mut fs);
-        auth_mgm(&mut app, &mut fs);
-        verify_pin(&mut app, &mut fs);
-        let (sw, resp) = run(
-            &mut app,
-            &mut fs,
-            INS_ASYM_KEYGEN,
-            0,
-            0x9D,
-            &gen_template(ALGO_ECCP256),
-        );
-        assert_eq!(sw, Sw::OK);
-        let card_point = ec_point_of(&resp);
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
-        let host_sk = p256::SecretKey::from_slice(&[7u8; 32]).unwrap();
-        let host_pub_unc = host_sk.public_key().to_encoded_point(false);
-        let mut msg = vec![0x7C, 0x45, 0x82, 0x00, 0x85, 0x41];
-        msg.extend_from_slice(host_pub_unc.as_bytes());
-        let (sw, out) = run(
-            &mut app,
-            &mut fs,
-            INS_AUTHENTICATE,
-            ALGO_ECCP256,
-            0x9D,
-            &msg,
-        );
-        assert_eq!(sw, Sw::OK);
-        let dyn_auth = find_tag(&out, 0x7C).unwrap();
-        let shared = find_tag(dyn_auth, 0x82).unwrap().to_vec();
-        // Host-side ECDH against the card's public point.
-        let card_pub = p256::PublicKey::from_sec1_bytes(&card_point).unwrap();
-        let host_shared =
-            p256::ecdh::diffie_hellman(host_sk.to_nonzero_scalar(), card_pub.as_affine());
-        assert_eq!(shared, host_shared.raw_secret_bytes().as_slice());
-    }
-
-    #[test]
-    fn rsa1024_keygen_sign_verify_and_metadata() {
-        let rng = RefCell::new(TestRng(7));
-        let pres = RefCell::new(AlwaysConfirm);
-        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
-        let mut fs = new_fs();
-        select(&mut app, &mut fs);
-        auth_mgm(&mut app, &mut fs);
-        verify_pin(&mut app, &mut fs);
-        let (sw, resp) = run(
-            &mut app,
-            &mut fs,
-            INS_ASYM_KEYGEN,
-            0,
-            0x9A,
-            &gen_template(ALGO_RSA1024),
-        );
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(&resp[..2], &[0x7F, 0x49]);
-        let body = &resp[5..];
-        assert_eq!(body[0], 0x81);
-        assert_eq!(body[1], 0x82);
-        let nlen = u16::from_be_bytes([body[2], body[3]]) as usize;
-        let n_bytes = &body[4..4 + nlen];
-        assert_eq!(nlen, 128);
-        // Build a PKCS#1 v1.5 EM for SHA-256 and have the card run the raw op.
-        let digest: [u8; 32] = sha2::Sha256::digest(b"rsa piv").into();
-        let mut em = vec![0x00, 0x01];
-        let di = [
-            0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
-            0x01, 0x05, 0x00, 0x04, 0x20,
-        ];
-        let pad = 128 - 3 - di.len() - digest.len();
-        em.extend(core::iter::repeat_n(0xFF, pad));
-        em.push(0x00);
-        em.extend_from_slice(&di);
-        em.extend_from_slice(&digest);
-        assert_eq!(em.len(), 128);
-        let mut msg = vec![0x7C, 0x81, 0x85, 0x82, 0x00, 0x81, 0x81, 0x80];
-        msg.extend_from_slice(&em);
-        let (sw, out) = run(
-            &mut app,
-            &mut fs,
-            INS_AUTHENTICATE,
-            ALGO_RSA1024,
-            0x9A,
-            &msg,
-        );
-        assert_eq!(sw, Sw::OK);
-        let dyn_auth = find_tag(&out, 0x7C).unwrap();
-        let sig = find_tag(dyn_auth, 0x82).unwrap().to_vec();
-        assert_eq!(sig.len(), 128);
-        // Verify the raw op: sig^e mod n must reproduce the EM (the leading
-        // 0x00 is dropped by to_bytes_be).
-        let n = rsa::BigUint::from_bytes_be(n_bytes);
-        let m = rsa::BigUint::from_bytes_be(&sig).modpow(&rsa::BigUint::from(65537u32), &n);
-        assert_eq!(m.to_bytes_be(), em[1..]);
-        // Metadata exposes the same modulus.
-        let (sw, md) = run(&mut app, &mut fs, INS_GET_METADATA, 0, 0x9A, &[]);
-        assert_eq!(sw, Sw::OK);
-        let pk = find_tag(&md, 0x04).unwrap();
-        assert_eq!(find_tag(pk, 0x81).unwrap(), n_bytes);
-        // The self-signed RSA certificate parses, names the slot and is signed
-        // sha256WithRSAEncryption.
-        let (sw, obj) = run(
-            &mut app,
-            &mut fs,
-            INS_GET_DATA,
-            0x3F,
-            0xFF,
-            &[0x5C, 0x03, 0x5F, 0xC1, 0x05],
-        );
-        assert_eq!(sw, Sw::OK);
-        let cert = find_tag(find_tag(&obj, 0x53).unwrap(), 0x70).unwrap();
-        let (_, parsed) = x509_parser::parse_x509_certificate(cert).unwrap();
-        assert!(
-            parsed
-                .subject()
-                .to_string()
-                .contains("CN=RS-Key PIV Slot 9A")
-        );
-        assert_eq!(
-            parsed.signature_algorithm.algorithm.to_id_string(),
-            "1.2.840.113549.1.1.11"
-        );
-        // RSA-slot attestation: the P-384 F9 key signs with ecdsa-with-SHA256.
-        let (sw, att) = run(&mut app, &mut fs, INS_ATTESTATION, 0x9A, 0, &[]);
-        assert_eq!(sw, Sw::OK);
-        let (_, att_cert) = x509_parser::parse_x509_certificate(&att).unwrap();
-        assert_eq!(
-            att_cert.signature_algorithm.algorithm.to_id_string(),
-            "1.2.840.10045.4.3.2"
-        );
-    }
-
-    #[test]
-    fn rsa_import_and_sign() {
-        let rng = RefCell::new(TestRng(7));
-        let pres = RefCell::new(AlwaysConfirm);
-        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
-        let mut fs = new_fs();
-        select(&mut app, &mut fs);
-        auth_mgm(&mut app, &mut fs);
-        verify_pin(&mut app, &mut fs);
-        let key = {
-            let mut krng = TestRng(99);
-            rsk_openpgp::keys::generate_rsa(&mut krng, 1024).unwrap()
-        };
-        use rsa::traits::PrivateKeyParts as _;
-        let primes = key.primes();
-        let p = primes[0].to_bytes_be();
-        let q = primes[1].to_bytes_be();
-        let mut imp = vec![0x01, p.len() as u8];
-        imp.extend_from_slice(&p);
-        imp.push(0x02);
-        imp.push(q.len() as u8);
-        imp.extend_from_slice(&q);
-        let (sw, _) = run(&mut app, &mut fs, INS_IMPORT_ASYM, ALGO_RSA1024, 0x9E, &imp);
-        assert_eq!(sw, Sw::OK);
-        let (sw, md) = run(&mut app, &mut fs, INS_GET_METADATA, 0, 0x9E, &[]);
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(find_tag(&md, 0x03).unwrap(), &[ORIGIN_IMPORTED]);
-        use rsa::traits::PublicKeyParts as _;
-        assert_eq!(
-            find_tag(find_tag(&md, 0x04).unwrap(), 0x81).unwrap(),
-            key.n().to_bytes_be()
-        );
-    }
-
-    #[test]
-    fn objects_roundtrip_and_discovery() {
-        let rng = RefCell::new(TestRng(7));
-        let pres = RefCell::new(AlwaysConfirm);
-        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
-        let mut fs = new_fs();
-        select(&mut app, &mut fs);
-        // Discovery needs no auth and is served raw.
-        let (sw, disc) = run(
-            &mut app,
-            &mut fs,
-            INS_GET_DATA,
-            0x3F,
-            0xFF,
-            &[0x5C, 0x01, 0x7E],
-        );
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(disc, DISCOVERY);
-        // PUT is management-gated.
-        let chuid = [0x30, 0x19, 0xD4, 0xE7, 0x39, 0xDA];
-        let mut put = vec![0x5C, 0x03, 0x5F, 0xC1, 0x02, 0x53, chuid.len() as u8];
-        put.extend_from_slice(&chuid);
-        let (sw, _) = run(&mut app, &mut fs, INS_PUT_DATA, 0x3F, 0xFF, &put);
-        assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
-        auth_mgm(&mut app, &mut fs);
-        let (sw, _) = run(&mut app, &mut fs, INS_PUT_DATA, 0x3F, 0xFF, &put);
-        assert_eq!(sw, Sw::OK);
-        let (sw, obj) = run(
-            &mut app,
-            &mut fs,
-            INS_GET_DATA,
-            0x3F,
-            0xFF,
-            &[0x5C, 0x03, 0x5F, 0xC1, 0x02],
-        );
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(find_tag(&obj, 0x53).unwrap(), &chuid);
-        // Empty 53 deletes; reads then 6A82.
-        let (sw, _) = run(
-            &mut app,
-            &mut fs,
-            INS_PUT_DATA,
-            0x3F,
-            0xFF,
-            &[0x5C, 0x03, 0x5F, 0xC1, 0x02, 0x53, 0x00],
-        );
-        assert_eq!(sw, Sw::OK);
-        let (sw, _) = run(
-            &mut app,
-            &mut fs,
-            INS_GET_DATA,
-            0x3F,
-            0xFF,
-            &[0x5C, 0x03, 0x5F, 0xC1, 0x02],
-        );
-        assert_eq!(sw, Sw::FILE_NOT_FOUND);
-        // Unknown object id.
-        let (sw, _) = run(
-            &mut app,
-            &mut fs,
-            INS_GET_DATA,
-            0x3F,
-            0xFF,
-            &[0x5C, 0x03, 0x5F, 0x00, 0x01],
-        );
-        assert_eq!(sw, Sw::FILE_NOT_FOUND);
-    }
-
-    #[test]
-    fn pin_metadata_shapes() {
-        let rng = RefCell::new(TestRng(7));
-        let pres = RefCell::new(AlwaysConfirm);
-        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
-        let mut fs = new_fs();
-        select(&mut app, &mut fs);
-        let (sw, md) = run(&mut app, &mut fs, INS_GET_METADATA, 0, 0x80, &[]);
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(find_tag(&md, 0x05).unwrap(), &[1]);
-        assert_eq!(find_tag(&md, 0x06).unwrap(), &[3, 3]);
-        // Change the PIN: no longer default, and a burnt retry shows up.
-        let mut msg = DEFAULT_PIN.to_vec();
-        msg.extend_from_slice(b"violets8");
-        let (sw, _) = run(&mut app, &mut fs, INS_CHANGE_PIN, 0, 0x80, &msg);
-        assert_eq!(sw, Sw::OK);
-        let (sw, _) = run(&mut app, &mut fs, INS_VERIFY, 0, 0x80, &DEFAULT_PIN);
-        assert_eq!(sw, Sw::new(0x63, 0xC2));
-        let (sw, md) = run(&mut app, &mut fs, INS_GET_METADATA, 0, 0x80, &[]);
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(find_tag(&md, 0x05).unwrap(), &[0]);
-        assert_eq!(find_tag(&md, 0x06).unwrap(), &[3, 2]);
-        // Management-key metadata shape.
-        let (sw, md) = run(&mut app, &mut fs, INS_GET_METADATA, 0, 0x9B, &[]);
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(find_tag(&md, 0x01).unwrap(), &[ALGO_AES192]);
-        // Default management key ships touch-OFF (real-YubiKey behaviour).
-        assert_eq!(
-            find_tag(&md, 0x02).unwrap(),
-            &[PINPOLICY_ALWAYS, TOUCHPOLICY_NEVER]
-        );
-        assert_eq!(find_tag(&md, 0x05).unwrap(), &[1]);
-    }
-
-    #[test]
-    fn move_and_delete_key() {
-        let rng = RefCell::new(TestRng(7));
-        let pres = RefCell::new(AlwaysConfirm);
-        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
-        let mut fs = new_fs();
-        select(&mut app, &mut fs);
-        auth_mgm(&mut app, &mut fs);
-        verify_pin(&mut app, &mut fs);
-        let (sw, _) = run(
-            &mut app,
-            &mut fs,
-            INS_ASYM_KEYGEN,
-            0,
-            0x9A,
-            &gen_template(ALGO_ECCP256),
-        );
-        assert_eq!(sw, Sw::OK);
-        // Move 9A → retired 0x82.
-        let (sw, _) = run(&mut app, &mut fs, INS_MOVE_KEY, 0x82, 0x9A, &[]);
-        assert_eq!(sw, Sw::OK);
-        let (sw, _) = run(&mut app, &mut fs, INS_GET_METADATA, 0, 0x9A, &[]);
-        assert_eq!(sw, Sw::REFERENCE_NOT_FOUND);
-        let (sw, md) = run(&mut app, &mut fs, INS_GET_METADATA, 0, 0x82, &[]);
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(find_tag(&md, 0x01).unwrap(), &[ALGO_ECCP256]);
-        // The certificate object moved with it.
-        let (sw, _) = run(
-            &mut app,
-            &mut fs,
-            INS_GET_DATA,
-            0x3F,
-            0xFF,
-            &[0x5C, 0x03, 0x5F, 0xC1, 0x05],
-        );
-        assert_eq!(sw, Sw::FILE_NOT_FOUND);
-        let (sw, _) = run(
-            &mut app,
-            &mut fs,
-            INS_GET_DATA,
-            0x3F,
-            0xFF,
-            &[0x5C, 0x03, 0x5F, 0xC1, 0x0D],
-        );
-        assert_eq!(sw, Sw::OK);
-        // Retired → active is rejected; delete works.
-        let (sw, _) = run(&mut app, &mut fs, INS_MOVE_KEY, 0x9A, 0x82, &[]);
-        assert_eq!(sw, Sw::INCORRECT_P1P2);
-        let (sw, _) = run(&mut app, &mut fs, INS_MOVE_KEY, 0xFF, 0x82, &[]);
-        assert_eq!(sw, Sw::OK);
-        let (sw, _) = run(&mut app, &mut fs, INS_GET_METADATA, 0, 0x82, &[]);
-        assert_eq!(sw, Sw::REFERENCE_NOT_FOUND);
-    }
-
-    #[test]
-    fn set_retries_and_reset_card() {
-        let rng = RefCell::new(TestRng(7));
-        let pres = RefCell::new(AlwaysConfirm);
-        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
-        let mut fs = new_fs();
-        select(&mut app, &mut fs);
-        auth_mgm(&mut app, &mut fs);
-        verify_pin(&mut app, &mut fs);
-        let (sw, _) = run(
-            &mut app,
-            &mut fs,
-            INS_ASYM_KEYGEN,
-            0,
-            0x9A,
-            &gen_template(ALGO_ECCP256),
-        );
-        assert_eq!(sw, Sw::OK);
-        let (sw, _) = run(&mut app, &mut fs, INS_SET_RETRIES, 5, 4, &[]);
-        assert_eq!(sw, Sw::OK);
-        let (sw, md) = run(&mut app, &mut fs, INS_GET_METADATA, 0, 0x80, &[]);
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(find_tag(&md, 0x06).unwrap(), &[5, 5]);
-        // Reset requires both references blocked.
-        let (sw, _) = run(&mut app, &mut fs, INS_RESET, 0, 0, &[]);
-        assert_eq!(sw, Sw::INCORRECT_PARAMS);
-        let wrong = [0x39u8; 8];
-        for _ in 0..5 {
-            let _ = run(&mut app, &mut fs, INS_VERIFY, 0, 0x80, &wrong);
-        }
-        let mut bad_unblock = wrong.to_vec();
-        bad_unblock.extend_from_slice(&wrong);
-        for _ in 0..4 {
-            let _ = run(&mut app, &mut fs, INS_RESET_RETRY, 0, 0x80, &bad_unblock);
-        }
-        let (sw, _) = run(&mut app, &mut fs, INS_RESET, 0, 0, &[]);
-        assert_eq!(sw, Sw::OK);
-        // Factory state: default PIN verifies, the generated key is gone.
-        let (sw, _) = run(&mut app, &mut fs, INS_VERIFY, 0, 0x80, &DEFAULT_PIN);
-        assert_eq!(sw, Sw::OK);
-        let (sw, _) = run(&mut app, &mut fs, INS_GET_METADATA, 0, 0x9A, &[]);
-        assert_eq!(sw, Sw::REFERENCE_NOT_FOUND);
-        let (sw, md) = run(&mut app, &mut fs, INS_GET_METADATA, 0, 0x9B, &[]);
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(find_tag(&md, 0x05).unwrap(), &[1]);
-    }
-
-    #[test]
-    fn management_gates() {
-        let rng = RefCell::new(TestRng(7));
-        let pres = RefCell::new(AlwaysConfirm);
-        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
-        let mut fs = new_fs();
-        select(&mut app, &mut fs);
-        let scalar = [0x11u8; 32];
-        let mut imp = vec![0x06, 32];
-        imp.extend_from_slice(&scalar);
-        let (sw, _) = run(&mut app, &mut fs, INS_IMPORT_ASYM, ALGO_ECCP256, 0x9D, &imp);
-        assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
-        let mut setkey = vec![ALGO_AES192, 0x9B, 24];
-        setkey.extend_from_slice(&DEFAULT_MGM);
-        let (sw, _) = run(&mut app, &mut fs, INS_SET_MGMKEY, 0xFF, 0xFF, &setkey);
-        assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
-        let (sw, _) = run(&mut app, &mut fs, INS_MOVE_KEY, 0x82, 0x9A, &[]);
-        assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
-        // X25519 generation is rejected, not silently OK.
-        auth_mgm(&mut app, &mut fs);
-        let (sw, _) = run(
-            &mut app,
-            &mut fs,
-            INS_ASYM_KEYGEN,
-            0,
-            0x9A,
-            &gen_template(ALGO_X25519),
-        );
-        assert_eq!(sw, WRONG_DATA);
-        // Unknown INS.
-        let (sw, _) = run(&mut app, &mut fs, 0x01, 0, 0, &[]);
-        assert_eq!(sw, Sw::INS_NOT_SUPPORTED);
-    }
-
-    #[test]
-    fn keys_at_rest_are_sealed() {
-        let rng = RefCell::new(TestRng(7));
-        let pres = RefCell::new(AlwaysConfirm);
-        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
-        let mut fs = new_fs();
-        select(&mut app, &mut fs);
-        auth_mgm(&mut app, &mut fs);
-        verify_pin(&mut app, &mut fs);
-        let scalar = [0x11u8; 32];
-        let mut imp = vec![0x06, 32];
-        imp.extend_from_slice(&scalar);
-        let (sw, _) = run(&mut app, &mut fs, INS_IMPORT_ASYM, ALGO_ECCP256, 0x9D, &imp);
-        assert_eq!(sw, Sw::OK);
-        // The raw file must not contain the scalar (GCM-sealed).
-        let mut blob = [0u8; 300];
-        let n = fs.read_key(key_fid(0x9D), &mut blob).unwrap();
-        assert!(n > 32);
-        assert!(!blob[..n].windows(32).any(|w| w == scalar));
-    }
-
-    #[test]
-    fn kbase_migration_reseals_slots_and_pin_falls_back() {
-        const OTP: [u8; 32] = [0x44; 32];
-        // Provision under a pre-OTP device: defaults + a generated 9A key.
-        let rng = RefCell::new(TestRng(7));
-        let pres = RefCell::new(AlwaysConfirm);
-        let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
-        let mut fs = new_fs();
-        select(&mut app, &mut fs);
-        auth_mgm(&mut app, &mut fs);
-        verify_pin(&mut app, &mut fs);
-        let (sw, resp) = run(
-            &mut app,
-            &mut fs,
-            INS_ASYM_KEYGEN,
-            0,
-            0x9A,
-            &gen_template(ALGO_ECCP256),
-        );
-        assert_eq!(sw, Sw::OK);
-        let point = ec_point_of(&resp);
-
-        // The boot pass re-seals the key slots; a second run is a no-op.
-        let dev_new = Device {
-            serial_hash: &HASH,
-            serial_id: &SERIAL,
-            otp_key: Some(&OTP),
-        };
-        migrate_kbase(&dev_new, &mut fs, &mut TestRng(9));
-        migrate_kbase(&dev_new, &mut fs, &mut TestRng(11));
-
-        // An OTP-build applet on the migrated state: the sealed management key
-        // authenticates, the default PIN verifies via the fallback (and once
-        // more directly against the re-stored verifier), and slot 9A signs with
-        // the SAME key it had before the migration.
-        let mut app2 = PivApplet::new(SERIAL, HASH, Some(OTP), &rng, &pres);
-        select(&mut app2, &mut fs);
-        auth_mgm(&mut app2, &mut fs);
-        verify_pin(&mut app2, &mut fs);
-        verify_pin(&mut app2, &mut fs);
-        let digest: [u8; 32] = sha2::Sha256::digest(b"kbase migration").into();
-        let mut msg = vec![0x7C, 0x24, 0x82, 0x00, 0x81, 0x20];
-        msg.extend_from_slice(&digest);
-        let (sw, sig) = run(
-            &mut app2,
-            &mut fs,
-            INS_AUTHENTICATE,
-            ALGO_ECCP256,
-            0x9A,
-            &msg,
-        );
-        assert_eq!(sw, Sw::OK);
-        let dyn_auth = find_tag(&sig, 0x7C).unwrap();
-        let der = find_tag(dyn_auth, 0x82).unwrap().to_vec();
-        let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(&point).unwrap();
-        let psig = p256::ecdsa::Signature::from_der(&der).unwrap();
-        vk.verify_prehash(&digest, &psig).unwrap();
-
-        // A pre-OTP applet no longer accepts the migrated PIN verifier.
-        let mut app3 = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
-        select(&mut app3, &mut fs);
-        let (sw, _) = run(&mut app3, &mut fs, INS_VERIFY, 0, 0x80, &DEFAULT_PIN);
-        assert_eq!(sw, Sw::new(0x63, 0xC2));
-    }
-}
+mod tests;

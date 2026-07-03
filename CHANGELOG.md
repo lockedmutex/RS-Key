@@ -13,6 +13,405 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-07-03
+
+### Added
+
+- **Trusted-display build (experimental, opt-in).** A screen-and-touch RS-Key
+  variant for the Waveshare RP2350-Touch-LCD-2.8, behind the `display` cargo
+  feature (`firmware-display` nix flavor). The screen turns the key into a
+  *trusted display* — the operations that matter happen on the device's own glass,
+  not on the host:
+  - **Approve / Deny** paints the *real* relying party for every touch-gated
+    operation, so a signature can't be produced without a physical tap on a screen
+    showing the true `rpId` (refuse → `OPERATION_DENIED`); a registration shows a
+    *Save new passkey?* card. A look-alike id too long for the box is clipped with
+    a truncation marker so its prefix can't masquerade.
+  - **On-screen PIN entry** — built-in user verification (getInfo `options.uv`; a
+    `pinUvAuthToken` minted from the on-screen pad against the same `EF_PIN`), and
+    a CCID **pinpad** (`bPINSupport` / `PC_to_RDR_Secure`) so GnuPG and OpenSC
+    collect the OpenPGP / PIV PIN on the panel — the PIN never crosses USB. Every
+    PIN screen names which credential it collects, an eye toggle reveals the
+    digits, and "N tries remaining" is shown up front.
+  - A dedicated **device PIN** (separate from the FIDO clientPIN) gating the
+    on-device UI, with **lock / unlock**, display **sleep** (image-retention
+    guard + wake button), and set / change PIN on the panel.
+  - **Passkeys** — browse resident credentials, **rename** (a device-local
+    nickname that never re-seals the box) and **delete** on-device.
+  - **Apps** — a read-only browser of OpenPGP / PIV / OATH state (no PIN, no
+    secret, no OATH code — the device has no clock), plus on-device **PIV key
+    generation** (EC P-256/P-384, Ed25519, X25519, RSA 2048/3072/4096) into empty
+    retired slots.
+  - **Settings** — device & FIDO PINs; a PIV PIN / PUK / unblock / **protect
+    management key** (ykman `--protect`) sub-menu; on-screen **BIP-39 / SLIP-39
+    recovery** export (derived on-device, never over USB) and backup-window status;
+    an **audit log**; **factory reset**; a **Firmware** screen that reboots to
+    BOOTSEL for an over-USB update; and live brightness / display-sleep /
+    touch-timeout that persist across reboots.
+  - A standard **screenless key compiles none of it** — the whole UI stack
+    (`rsk-ui`, `embedded-graphics`, `u8g2-fonts`) is `dep:`-gated and the build
+    asserts it absent from the default image, so an ordinary build is
+    byte-for-byte unaffected. The UI model, geometry and glyphs live in the
+    host-tested + Kani-proved `rsk-ui` crate. See
+    [`docs/guides/display.md`](docs/guides/display.md). Built up across bcdDevice
+    `0x0784`–`0x07D5`.
+
+- **PIV: RSA-3072 and RSA-4096 keys.** Generate, import, sign / decrypt,
+  attestation and metadata gained RSA-3072/4096 (the applet buffers were lifted
+  off their RSA-2048 ceiling); on a display build the on-device **Generate key**
+  chooser offers RSA via a 2048 / 3072 / 4096 sub-picker. RSA-1024 stays disabled.
+  bcdDevice `0x07C4` → `0x07C6`.
+
+- **PIV: Ed25519 and X25519 keys** (algorithm ids `0xE0` / `0xE1`, Yubico 5.7
+  PIV). Generate (Ed25519 with an RFC 8410 self-signed cert; X25519 is
+  key-agreement-only), import (raw seed / scalar, yubikit tags `0x07` / `0x08`),
+  sign / key-agree, metadata and attestation — interoperating with `ykman` /
+  `yubico-piv-tool` (an imported X25519 scalar is byte-flipped to the little-endian
+  form standard tooling sends, so the slot's public key matches). bcdDevice
+  `0x07C3` → `0x07C4`.
+
+- **Configurable multi-LED effects engine.** Boards with a chain of addressable
+  WS2812 LEDs light the whole strip with per-status animated effects (`vapor`,
+  `bounce`, `flow`, `sparkle`, `legacy`) via `rsk led --effect/--speed`; the
+  connected count is a runtime phy setting (`rsk hw --led-num`, TLV tag `0x0E`)
+  bounded by the `MAX_LEDS` build ceiling (a value over it saturates, never
+  panics). `EF_LED_CONF` grows to 17 bytes; older blocks still load. Thanks to
+  @Curious-r. bcdDevice `0x0780` → `0x0783`.
+
+- **Configurable GPIO presence button (`PRESENCE_PIN`).** The user-presence input
+  can move from BOOTSEL to a dedicated GPIO at compile time (`PRESENCE_PIN=<0..=29>`,
+  active-low with a pull-up by default, or `PRESENCE_ACTIVE_HIGH=1` for a touch
+  sensor / button-to-VCC); the pin is guarded against colliding with the LED and is
+  rejected on a `display` build. One new documented `unsafe`. Thanks to @lpiob
+  ([#17](https://github.com/TheMaxMur/RS-Key/pull/17)). bcdDevice `0x0791` → `0x0793`.
+
+- **`rsk-tui` can export the seed as SLIP-39 shares** (tools/tui 0.2.4). The Backup
+  section gains "Export seed (SLIP-39)" beside the BIP-39 export, revealing the seed
+  as a 2-of-3 Shamir share set (via the in-tree `rsk-slip39` crate) that recombines
+  with `rsk backup restore --scheme slip39`.
+
+### Changed
+
+- **Touch timeout is configurable; phy tag `0x08` now follows pico-fido.** Tag
+  `0x08` (previously an unused presence-button GPIO) now means `PresenceTimeout` —
+  the touch-wait in seconds — matching pico-fido / PicoForge, so a PicoForge config
+  or `rsk hw --touch-timeout <secs>` sets it (absent / `0` keeps the 30 s default).
+  bcdDevice `0x0783` → `0x0784`.
+
+- **`rsk-tui` gets a curated colour theme** (tools/tui 0.2.3). On truecolor / 256-
+  colour terminals the cockpit uses a fixed brand palette with rounded borders and
+  an explicit selection bar; a 16-colour terminal keeps the adaptive named-ANSI
+  colours. Override with `RSK_TUI_TRUECOLOR=1|0`. No `--once` / `--json` change.
+
+- **`rsk-tui` status labels are single-sourced** (tools/tui 0.2.2). The `--once`
+  printer and the cockpit now share the model's label mappings, which changes three
+  `--once` labels (seed lock "… disabled until unlock", secure boot "ENABLED (not
+  locked)", un-probed applets "not probed").
+
+### Fixed
+
+- **Maximal credential requests now fit the credential box.** A registration
+  within every advertised limit (a 253-byte `rpId`, a 64-byte user.id, 64-byte
+  name / displayName and a 127-byte credBlob) could overflow the sealed credential
+  box or its resident bookkeeping and be rejected (`CTAP2_ERR_OTHER` /
+  `KEY_STORE_FULL` / `REQUEST_TOO_LARGE`), and a large credential that did register
+  could then never assert. The three ceilings are now **derived** from the field
+  maxima so they can't drift below what the device advertises: `CRED_BOX_MAX` (748)
+  sizes create / assert / reseal, `RP_REC_MAX` (314) the resident `EF_RP` record,
+  and `MAX_RAW_SUBPARA` (384) a maximal `updateUserInformation`; getInfo's
+  `maxCredentialIdLength` and the published metadata report the real 748, and
+  over-maximum inputs are rejected explicitly with `INVALID_LENGTH`. Older records
+  load unchanged. bcdDevice `0x07E7` → `0x07EC`.
+
+### Security
+
+- **Additional defense-in-depth hardening** (four items, none independently
+  exploitable; bcdDevice `0x07DD` → `0x07DE`):
+  - **credProtect is now range-checked.** makeCredential rejected nothing for a
+    credProtect value outside `{1,2,3}` and stored it verbatim; `getAssertion`
+    enforces protection by exact match, so an out-of-range value silently meant
+    *no* protection. It now returns `CTAP2_ERR_INVALID_OPTION` (§12.1).
+  - **hmac-secret-mc empty-salt parity.** makeCredential now rejects an
+    hmac-secret-mc request with an empty salt up front (`MissingParameter`),
+    matching the existing `getAssertion` hmac-secret guard (previously this was
+    only caught later by the length check in `hmacsecret::eval`).
+  - **credentialManagement enumeration counters widened to `u16`.** The `skip` /
+    `total` / begin-next counters were `u8` and saturated at 255, so on a fully
+    provisioned store (`MAX_RESIDENT_CREDENTIALS = 256`) the 256th RP/credential
+    was invisible to (and undeletable via) enumeration. The wire encoding is
+    unchanged for ≤255 (canonical CBOR).
+  - **RSA-keygen fast path resets the incoming command chain.** The CCID keygen
+    fast path already dropped a stale GET RESPONSE tail (`clear_pending`); it now
+    also resets a half-accumulated CLA-`0x10` command chain (`clear_chaining`,
+    scrubbing it) so an interrupted chain cannot prepend onto a later command.
+- **Missing-authorization fixes in the Yubico-management and rescue applets**
+  (two defects in never-before-audited utility applets; bcdDevice `0x07DC` →
+  `0x07DD`):
+  - **Rescue OTP-fuse writes now require an on-device user-presence confirmation.**
+    The two irreversible fuse burns — page-58 access lock (`INS 0x1B` `P1=0x58`,
+    `"LOCK58"`) and `ROLLBACK_REQUIRED` (`P1=0x48`, `"ROLLBK"`) — were the only
+    privileged rescue commands without the `require_presence` gate every sibling
+    op (attestation sign, cert/phy write, reboot-to-BOOTSEL) enforces. Their magic
+    payload is a source-visible constant, not authentication, so an unauthenticated
+    USB host could permanently burn a fuse with no operator consent. Both now
+    prompt (`6985` if declined); idempotent no-ops still return `OK` without a
+    prompt. (`crates/rsk-rescue/src/lib.rs`.)
+  - **Management WRITE CONFIG (`INS 0x1C`) now requires user presence.** It was
+    entirely unauthenticated and the `CONFIG_LOCK` byte it stores was never
+    enforced, so a USB host could persistently spoof the reported DeviceInfo. The
+    write now prompts for on-device confirmation (`6985` if declined), matching
+    every sibling applet's write path. (`crates/rsk-mgmt/src/lib.rs`.)
+- **PIV and CCID defense-in-depth hardening** (no exploitable vulnerability
+  found; three items; bcdDevice `0x07DB` → `0x07DC`):
+  - **PIV `GENERAL AUTHENTICATE` challenge is now bound to its issuing
+    algorithm.** A 9B mutual/single-auth challenge issued under one algorithm
+    (3DES `chal_len` 8 vs AES `chal_len` 16) could structurally be answered under
+    the other; AES-192 and 3DES share a 24-byte key, so the key-length gate alone
+    did not separate them. This was **not** exploitable (the witness always
+    requires knowledge of the management key, and every replay failed closed with
+    `has_mgm` staying false), but the `Session` now records `chal_algo` at issue
+    and refuses a step-2 whose algorithm differs.
+  - **PIV GET DATA / MOVE KEY clamp the stored object length.** `get_data` and
+    `move_key` sliced a `MAX_OBJECT` (1900-byte) buffer by the full length
+    `Storage::read` returns, which would panic on a stored value longer than the
+    buffer. Every host writer already caps at `MAX_OBJECT` (so this was reachable
+    only by a raw flash write — a stronger attacker than the USB host), but the
+    readers now clamp with `n.min(MAX_OBJECT)`, returning the prefix instead of
+    panicking. Matches the existing `EF_PIVMAN_DATA` clamp pattern.
+  - **CCID RSA-keygen fast path clears the GET RESPONSE remainder.** The dual-core
+    `try_rsa_keygen` / `try_piv_rsa_keygen` fast paths bypass
+    `Dispatcher::process`, which is what normally drops a stale chained-response
+    tail, so a host interleaving `chained-response → GENERATE → GET RESPONSE` was
+    re-served its own prior tail. This crossed no trust boundary (same principal;
+    a SELECT to another applet clears the buffer first), but the fast paths now
+    call `Dispatcher::clear_pending()` to match ordinary dispatch.
+
+- **PIV and OATH authentication fixes** (bcdDevice `0x07DA` → `0x07DB`):
+  - **PIV management-key authentication bypass via an encryption oracle
+    (critical).** `GENERAL AUTHENTICATE` had a symmetric-algorithm tag-`0x81`
+    ("internal authenticate") branch for slot `9B` that returned
+    `E(mgm_key, caller_bytes)` with no `has_mgm`, no PIN (`9B` is not a key slot,
+    so the PIN gate was skipped) and no touch (default `9B` policy is
+    `TOUCHPOLICY_NEVER`). Because the management-key cipher is deterministic ECB,
+    an unauthenticated USB host could chain it with the applet's own single-auth
+    challenge — request a plaintext challenge `R`, ask the oracle for `E(mgm,R)`,
+    submit that as the response — and the card's `D(mgm,·)==R` check would pass,
+    setting `has_mgm` with **zero knowledge of the management key**. That grants
+    full, persistent PIV takeover (generate/import/overwrite slot keys, `PUT DATA`,
+    rotate the management key, reset PIN/PUK counters). It is a distinct-mechanism
+    sibling of the earlier mgmt-key bypass, whose `ChallengeKind` binding did not
+    cover it. **Fix:** the symmetric tag-`0x81` branch (which has no legitimate PIV
+    client) is removed, so the only sanctioned `9B` flows are mutual-witness
+    (tag `0x80`) and single-auth (tag `0x81`-empty challenge → tag `0x82` verify).
+    A class-invariant test asserts no `GENERAL AUTHENTICATE` path reachable without
+    prior auth can set `has_mgm`.
+  - **OATH `CHANGE PIN` unlimited OTP-PIN guessing at the retry floor (medium).**
+    `cmd_change_otp_pin` decremented the OTP-PIN retry counter with a saturating
+    subtraction but, unlike `cmd_verify_otp_pin`, did not refuse at the floor —
+    once the counter reached 0 it stayed 0 and the PIN comparison kept running on
+    every request, an unlimited online brute-force of the store-unlocking OTP-PIN
+    (a residual sibling of the earlier `CHANGE PIN` finding). **Fix:** both `VERIFY`
+    and `CHANGE` now go through a single `spend_and_match_otp_pin` chokepoint that
+    refuses at `rec[0]==0`; legitimate recovery after lock-out is `RESET` (which
+    wipes the store), not more guesses. **Behavior change:** a correct old-PIN no
+    longer recovers a locked-out OTP-PIN via `CHANGE`; use `RESET`.
+- **OTP, OpenPGP, U2F and audit-journal hardening** (bcdDevice `0x07D9` →
+  `0x07DA`):
+  - **OTP `SLOT_SWAP` access-code bypass (high).** `cmd_swap` was the only
+    slot-mutating OTP command that did not check the per-slot access code that
+    `cmd_configure`/`cmd_update` enforce: it unsealed both target slots (the seal
+    read never compares the access code) and relocated/deleted them unconditionally.
+    An unauthenticated USB host (CCID or the HID keyboard frame, no PIN/code/touch)
+    could `SLOT_SWAP` a programmed, access-code-protected slot to **silently delete
+    or relocate** it — persistently breaking a challenge-response credential used
+    for LUKS / KeePassXC / pam_yubico. An unbounded swap offset could also orphan
+    the slot at an FID outside the addressable 1..=4 range. `cmd_swap` now requires
+    the access code of every non-empty slot it touches (an unprotected slot's code
+    is all-zero, so a plain `ykman otp swap` of unprotected slots is unchanged) and
+    rejects out-of-range offsets; the same offset bound is applied to
+    `cmd_configure`/`cmd_update`/`cmd_calculate`. Integrity/availability only — the
+    config stays GCM-sealed (no secret exfiltration).
+  - **OpenPGP `read_public` unclamped stored length (hardening).** `read_public`
+    returned the value's full `Fs::read` length without `n.min(out.len())` — the
+    6th member of the OpenPGP stored-length family. Latent only (`EF_PB_*` is not
+    host-writable beyond its bound), now clamped like every other reader.
+  - **U2F attestation-chain read (hardening).** The org-attestation branch sliced
+    `cert[..n]` on the full stored length with only a size margin; now clamps
+    `n.min(cert.len())`, matching the sibling `EF_EE_DEV` branch.
+  - **Audit-journal meta window (hardening).** `load_meta` now fails closed to
+    genesis when a persisted `EF_AUDIT_META` claims a window wider than
+    `AUDIT_RING_SLOTS`, so a flash-corrupted meta can't overrun the export buffer.
+  - **`BACKUP_EXPORT` docstring corrected** to match behavior (only
+    `BACKUP_FINALIZE` seals the window; repeat export before finalize is safe).
+- **FIDO, OpenPGP and OATH fixes** (bcdDevice `0x07D8` → `0x07D9`):
+  - **FIDO `getNextAssertion` user-presence bypass (high).** `getAssertion` armed
+    the multi-credential `getNextAssertion` queue during resident discovery
+    *before* its user-presence gate, and no path tore the queue down when that gate
+    failed; `getNextAssertion` performs no presence check of its own. So on a
+    device holding ≥2 discoverable credentials for one RP, after the user
+    **declined or ignored** the touch, a host could still pull valid `UP=1`
+    assertions for credentials #2..N with no touch — defeating the test of user
+    presence. `get_assertion` now calls `gna.reset()` on any error return (CTAP 2.1
+    §6.3: getNextAssertion only continues a *successful* getAssertion).
+  - **OpenPGP `GENERATE` OOB panic on a short algorithm attribute (medium).** A
+    PW3-written 1–2 byte `C1/C2/C3` DO (`PUT DATA` caps no minimum length) made
+    `GENERATE ASYMMETRIC KEY PAIR` index the RSA modulus-size bytes past the slice
+    → panic/reset on every `GENERATE` for that slot. The earlier clamp only bounded
+    the *over*-long case; both `generate` and `rsa_generate_params` now reject an
+    attribute shorter than 3 bytes, matching the guarded sibling `info::slot_algo`.
+  - **OATH OTP-PIN counter glitch-hardening (defense-in-depth).** `VERIFY PIN` /
+    `CHANGE PIN` now persist and read back the retry-counter decrement *before* the
+    PIN compare (mirroring the FIDO clientPIN gate), so a fault-injected or failed
+    flash program can't widen the 3-try OTP-PIN limiter.
+  - **FIDO `verify_pin_hash` self-guards the retry decrement (defense-in-depth).**
+    Added an in-function `retry == 0` check before `pin_data[0] -= 1` (matching
+    `verify_pin_at`), so no future caller can underflow the PIN retry budget in a
+    release build without overflow-checks.
+- **OpenPGP, OATH and FIDO fixes; `rsk` receipt binding** (bcdDevice `0x07D8`;
+  `rsk` 0.3.1; `rsk-tui` 0.2.1):
+  - **OpenPGP `GET DATA` unclamped length → OOB brick (high, ×2 sites).** Both the
+    generic top-level Flash DO (`login`/`url`/private DOs) and the `C1/C2/C3`
+    algorithm-attribute path returned the value's full stored length, so an
+    over-long PW3-written object panicked the device on every read (persistent
+    DoS reached by `gpg --card-status`). `get_data` now clamps `data_len` to the
+    scratch buffer at the single chokepoint, plus a defensive clamp at the extend.
+  - **OATH access-code / OTP-PIN bypasses (high, ×2).** `SET PIN` now requires a
+    validated session (an unauthenticated host could mint the unlock secret on a
+    locked applet); `CHANGE PIN` now spends a retry on a wrong old-PIN (it was an
+    unlimited brute-force oracle that recovered the OTP-PIN and unlocked the store).
+  - **FIDO `setMinPINLength` truncation (medium).** A `newMinPINLength` above the
+    max PIN length is now rejected before the `as u8` store, which otherwise
+    truncated (e.g. 256 → 0) and silently defeated the monotonic enterprise floor.
+  - **`rsk offboard` receipt binding (medium).** The signed wipe receipt is now
+    bound to the journal window it presents (recompute + compare the head, hard-fail
+    a missing RESET), matching `rsk audit`; the verify ceremonies also validate
+    device-supplied checkpoint fields instead of raising a traceback.
+  - **Defense-in-depth (low).** Clamped five remaining `Fs::read` readers
+    (`phy`/`largeblobs`/vendor `unlock`/`makeCredential` att-chain/OpenPGP DEK) to
+    their buffers; fixed the OpenPGP `GET DATA 0x7A` stale-scratch over-read;
+    rejected the 2-byte TLV tag form in OATH `PUT`; hardened the `rsk-tui` audit
+    view and `rsk led` against malformed device responses.
+
+- **Full-tree audit fixes.** Found and fixed:
+  - **PIV management-key authentication bypass (critical).** `GENERAL
+    AUTHENTICATE` shared one session challenge field between the single-auth
+    (plaintext challenge) and mutual-auth (encrypted witness) handshakes, so a
+    host could read the plaintext single-auth challenge and replay it as the
+    mutual-auth witness to authenticate as the card administrator with no
+    knowledge of the management key — no PIN, no touch. The challenge is now
+    tagged with the flow that issued it and can only be consumed by that same
+    flow.
+  - **OpenPGP `GET DATA` over-long-DO brick (two more sites).** The cardholder
+    certificate (`7F21`) read-out and the generic `DoWriter` flash-DO builder
+    sliced/advanced a fixed 1024-byte buffer by the value's *full* stored length;
+    a PW3 host can `PUT DATA` an over-long cardholder cert/name, so a later `GET
+    DATA 65/6E/7F21` (issued by `gpg --card-status`) panicked — a persistent
+    brick. Both are now clamped to the buffer, matching the earlier `info.rs` fix.
+  - **OATH `VERIFY CODE` (INS `0xB1`) now honours the access code.** It lacked the
+    `validated` gate every other stored-data command has, so a locked applet
+    answered it — a replayable oracle on the primary credential's current OTP
+    across the access-code boundary. Now gated.
+  - **Trusted-display delete-confirmation clips the identity.** The
+    delete-passkey confirmation drew the untrusted rpId/account unclipped with no
+    truncation marker, unlike the approve/add ceremonies; a padded look-alike
+    rpId could overflow the card silently. Now ellipsized + marked to the card.
+  - **OpenPGP private keys are AES-256-GCM-sealed with a fresh nonce.** The DEK
+    seal used one fixed (key, IV) AES-CFB across every key slot, so the block-0
+    keystream repeated and a flash-dump attacker could recover the XOR of two
+    same-format scalars' first bytes; CFB was also unauthenticated. Sealing now
+    uses AES-256-GCM under a synthetic per-record nonce (`HMAC(dek, fid ‖ key)`),
+    adding authentication and eliminating the reuse. Keys in the old CFB format
+    still load (trial-decrypt fallback) and are re-sealed to the new format the
+    first time they are used — no reprovisioning needed.
+  - **The release pipeline no longer ships the `no-touch` firmware.** The release
+    workflow built and published four `no-touch` flavors (user-presence bypass,
+    marked "never ship") as signed, SLSA-provenanced public assets. It now builds
+    and publishes only the four touch-required flavors, with a guard that fails
+    the release if any `no-touch` asset is present.
+
+- **FIDO master seed sealed with authenticated ChaCha20-Poly1305.** The device
+  master seed and the org attestation scalar (`EF_KEY_DEV` / `EF_ATT_KEY`) were
+  sealed with AES-256-CBC under one fixed serial-hash IV shared across both
+  slots, and carried no MAC — the same fixed-IV / no-authentication class as the
+  OpenPGP DEK above, but at the root of the FIDO identity. They are now
+  ChaCha20-Poly1305-sealed (new tags `0x02` pre-OTP / `0x12` OTP-arm) under a
+  synthetic per-record nonce (`HMAC(HMAC(nonce_key, fid), value)`), so the seed
+  and the attestation key never share a nonce and a flash fault or tamper is
+  detected rather than silently decrypting to a corrupted seed. Records in the
+  legacy CBC (`0x01`/`0x11`) and PIN-wrapped (`0x03`/`0x13`) formats still load
+  and are re-sealed forward at boot / the first PIN verify — no reprovisioning,
+  and every passkey survives the upgrade.
+
+- **Pre-release cross-review hardening.** An adversarial re-review of the two
+  unreleased hardening commits (the trusted-display arc and the pico-keys
+  carry-over below) — the ones that had not yet been cross-reviewed before a
+  release tag — found and fixed:
+  - **OpenPGP over-long-DO brick, two remaining sites.** `GENERATE`,
+    `rsa_generate_params` and key `IMPORT` read the algorithm-attribute DO into a
+    fixed 16-byte buffer and sliced it by the value's *full* stored length; a
+    PW3 host can `PUT DATA` an over-16-byte `C1/C2/C3`, so the slice panicked
+    (device brick). Clamped to the buffer, matching the earlier `info.rs` fix.
+  - **OTP slots and OATH credentials now survive a later OTP-MKEK burn.** Both
+    seal under the device root key, which changes when the fuse MKEK is burned;
+    neither had the pre-OTP recovery arm the FIDO seed / PIV / attestation key
+    already use, so a secret provisioned *before* a burn became unreadable (OTP)
+    or was double-encrypted and destroyed (OATH) on the first post-burn boot. The
+    boot migrations now trial-decrypt under the pre-OTP arm and re-seal under the
+    OTP arm.
+  - **OATH OTP-PIN survives an OTP-MKEK burn.** The new OTP-rooted verifier gained
+    the same `without_otp()` match-and-re-store fallback the PIV / OpenPGP / FIDO
+    PINs use, so a PIN set before a burn still verifies afterwards — restoring the
+    burn-immunity the legacy serial-only hash happened to have.
+  - **The reboot-to-BOOTSEL user-presence gate can no longer be bypassed.** The
+    vendor applet exposes the same reboot verb as the (gated) rescue applet, over
+    both the CCID and CTAPHID transports; its `1F/01` (BOOTSEL) is now gated
+    identically. A warm restart (`1F/00`) stays ungated.
+  - **Trusted-display: the Add-passkey (enrollment) screen marks a truncated
+    relying-party id.** The makeCredential screen dropped the truncation marker
+    for a clamped look-alike id whose prefix fit the box — the phishing vector the
+    Approve screen already closed. It now forces the marker like the Approve path.
+  - **`rsk-wipe` rejects a degenerate `FLASH_SIZE`.** `FLASH_SIZE=0` passed the
+    remaining build asserts and made the erase a silent no-op that still signalled
+    success; a lower bound now rejects it.
+
+  bcdDevice 0x07D3 → 0x07D4. Host CLI (`tools/rsk`) 0.2.0 → 0.3.0: `rsk hw` and
+  `rsk reboot bootsel` now prompt for the on-device approval the firmware requires
+  and explain a `6985` decline instead of failing cryptically.
+
+- **Carry-over hardening from a pico-keys upstream audit.** A review of the upstream
+  pico-keys C firmware surfaced design flaws; each was re-verified against the RS-Key
+  Rust source. The overwhelming majority were already handled by the port (OATH gate,
+  PIV key sealing + admin-auth gates, parser totality, HMAC-DRBG, constant-time
+  compares), and this wave closes the remaining gaps:
+  - **Yubico OTP slot secrets are now sealed at rest.** The 52-byte slot config —
+    which carries the AES-128 key, private UID and the HMAC-SHA1 / OATH-HOTP secret —
+    was the one applet still written to flash in the clear. It now goes through the same
+    `KeyFid` AES-256-GCM chokepoint as FIDO / PIV / OpenPGP / OATH; a boot pass re-seals
+    any pre-existing plaintext slot, so a flash-dump thief no longer recovers the token
+    secrets.
+  - **The OATH OTP-PIN verifier is OTP-rooted, not a fast serial-only hash.** The
+    Nitrokey-style OTP PIN now stores `pin_derive_verifier` (rooted in the OTP MKEK,
+    exactly like the OpenPGP / PIV PINs) instead of the legacy `double_hash_pin`; a
+    legacy record still verifies and is upgraded on the next successful use.
+  - **The device attestation key is AEAD-sealed.** `EF_DEVCERT_KEY` moved from raw
+    AES-256-CBC under a public fixed IV with no MAC to AES-256-GCM (random nonce, auth
+    tag); a bit-flip in the sealed scalar is now detected rather than silently accepted,
+    and legacy CBC records are re-sealed at boot.
+  - **Privileged rescue commands require user presence.** Attestation signing over a
+    host-chosen digest, attestation-cert overwrite, phy/identity write and
+    reboot-to-BOOTSEL now need an on-device confirmation (a touch, or an on-screen
+    Approve on the trusted-display build), so a hostile USB host can no longer drive
+    them silently. Read-only status and a plain restart stay ungated.
+  - **OpenPGP MSE touch policy follows the repointed slot.** The UIF (touch) check for
+    PSO:DECIPHER / INTERNAL AUTHENTICATE now follows an MSE key-reference repoint, so a
+    cross-wired DEC↔AUT key can no longer be used under the wrong slot's touch policy.
+  - **FIDO credMgmt `updateUserInformation` requires an exact userId match** (CTAP 2.1
+    §6.8.3), closing a min-length-prefix compare where a prefix (or empty id) matched.
+  - **`rsk-wipe` erases the whole target flash.** It reads the same `FLASH_SIZE` build
+    knob as the firmware instead of assuming 4 MB, so a 16 MiB board is fully wiped.
+
+  bcdDevice 0x07D2 → 0x07D3. (`rsk-wipe` is a separate binary and carries no bcdDevice.)
+
 ## [0.2.8] — 2026-06-21
 
 ### Changed
@@ -591,5 +990,6 @@ family that keeps the "enterprise" features in the open tree.
   signature of it, and a CycloneDX SBOM. See
   [docs/releases.md](docs/releases.md) to verify a download.
 
-[Unreleased]: https://github.com/TheMaxMur/RS-Key/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/TheMaxMur/RS-Key/compare/v0.2.8...v0.3.0
 [0.1.0]: https://github.com/TheMaxMur/RS-Key/releases/tag/v0.1.0

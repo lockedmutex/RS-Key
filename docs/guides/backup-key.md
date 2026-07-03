@@ -33,12 +33,7 @@ copied onto two sticks. That independence is the point:
 
 ## The model
 
-```mermaid
-flowchart TD
-    P["Primary key<br/>seed A · everyday carry"] -->|enrolled| ACC["Each account<br/>(GitHub, Google, …)"]
-    B["Backup key<br/>seed B · stored offsite"] -->|enrolled| ACC
-    ACC -.->|"lost the primary?<br/>sign in with the backup"| B
-```
+![Primary and backup key redundancy — the primary key (seed A, everyday carry) and the backup key (seed B, stored offsite) are each enrolled as separate credentials at every account (GitHub, Google, …); if the primary is lost you sign in with the backup, so no single lost device locks you out](../images/backup-key-redundancy.svg)
 
 Both keys are enrolled on every account. Day to day you use the primary; the
 backup sits in a drawer or a safe. If the primary is gone, the backup logs you in

@@ -140,7 +140,8 @@ straight after:
 picotool seal --sign --hash firmware.uf2 firmware-signed.uf2 \
     /tmp/sk.pem ~/.rs-key-secrets/otp_secureboot.json --major 1 --minor 0
 rm -P /tmp/sk.pem        # overwrite + delete (Linux: shred -u /tmp/sk.pem)
-# flash firmware-signed.uf2 over BOOTSEL
+# BOOTSEL, then:
+picotool load -v firmware-signed.uf2 && picotool reboot   # or drag it onto the RP2350 drive
 ```
 
 If your key has **no** passphrase, pass `~/.rs-key-secrets/secure_boot_key.pem`

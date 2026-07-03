@@ -23,13 +23,16 @@ pub enum Error {
     Crypto,
 }
 
-const FORMAT_V3: u8 = 0x03;
-const PIN_FORMAT_V1: u8 = 0x01;
 const KDF_DEFAULT: &[u8] = &[0x81, 0x01, 0x00];
 const UIF_DEFAULT: &[u8] = &[0x00, 0x20];
 const SEX_DEFAULT: &[u8] = &[0x30];
 const SIG_COUNT_ZERO: &[u8] = &[0x00, 0x00, 0x00];
-const PW_RETRIES_INIT: &[u8] = &[0x01, 3, 3, 3];
+const PW_RETRIES_INIT: &[u8] = &[
+    0x01,
+    PW_RETRIES_DEFAULT,
+    PW_RETRIES_DEFAULT,
+    PW_RETRIES_DEFAULT,
+];
 
 fn put<S: Storage>(fs: &mut Fs<S>, fid: u16, data: &[u8]) -> Result<(), Error> {
     fs.put(fid, data).map_err(|_| Error::Storage)
@@ -42,13 +45,7 @@ fn put_pin_verifier<S: Storage>(
     fid: u16,
     pin: &[u8],
 ) -> Result<(), Error> {
-    let mut rec = [0u8; 34];
-    rec[0] = pin.len() as u8;
-    rec[1] = PIN_FORMAT_V1;
-    rec[2..].copy_from_slice(&dev.pin_derive_verifier(pin));
-    let r = put(fs, fid, &rec);
-    rec.zeroize();
-    r
+    crate::pin::put_verifier(dev, fs, fid, pin).map_err(|_| Error::Storage)
 }
 
 /// Initialise the OpenPGP EFs: the DEK (sealed under the default PINs), the PIN
@@ -70,7 +67,7 @@ pub fn scan_files<S: Storage>(
         let mut session_pw1 = dev.pin_derive_session(PW1_DEFAULT);
         let mut session_pw3 = dev.pin_derive_session(PW3_DEFAULT);
         let mut def = [0u8; DEK_FILE_SIZE];
-        def[0] = FORMAT_V3;
+        def[0] = DEK_FORMAT_V3;
         let mut nonce = [0u8; 12];
 
         rng.fill(&mut nonce);
@@ -129,101 +126,5 @@ pub fn scan_files<S: Storage>(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use rsk_fs::storage::ram::RamStorage;
-
-    /// Deterministic counter RNG for tests.
-    struct CountRng(u8);
-    impl Rng for CountRng {
-        fn fill(&mut self, buf: &mut [u8]) {
-            for b in buf.iter_mut() {
-                *b = self.0;
-                self.0 = self.0.wrapping_add(1);
-            }
-        }
-    }
-
-    fn dev() -> Device<'static> {
-        Device {
-            serial_hash: &[0x11; 32],
-            serial_id: &[1, 2, 3, 4, 5, 6, 7, 8],
-            otp_key: None,
-        }
-    }
-
-    fn fresh() -> Fs<RamStorage> {
-        let mut fs = Fs::new(RamStorage::new(), &[]);
-        fs.scan();
-        fs
-    }
-
-    #[test]
-    fn creates_all_default_files() {
-        let mut fs = fresh();
-        scan_files(&dev(), &mut fs, &mut CountRng(0)).unwrap();
-
-        // DEK files are 77 bytes, format byte 0x03.
-        for fid in [EF_DEK_PW1, EF_DEK_RC, EF_DEK_PW3] {
-            assert_eq!(fs.size(fid.get()), Some(DEK_FILE_SIZE));
-            let mut b = [0u8; 1];
-            fs.read(fid.get(), &mut b);
-            assert_eq!(b[0], FORMAT_V3);
-        }
-        // PIN verifiers: [len, 1, verifier(32)].
-        let mut rec = [0u8; 34];
-        fs.read(EF_PW1, &mut rec);
-        assert_eq!(rec[0], 6);
-        assert_eq!(rec[1], PIN_FORMAT_V1);
-        let mut rec3 = [0u8; 34];
-        fs.read(EF_PW3, &mut rec3);
-        assert_eq!(rec3[0], 8);
-
-        assert_eq!(fs.size(EF_SIG_COUNT), Some(3));
-        let mut pw = [0u8; 7];
-        fs.read(EF_PW_PRIV, &mut pw);
-        assert_eq!(&pw, &[0x01, 127, 127, 127, 3, 3, 3]);
-        assert!(fs.has_data(EF_KDF));
-        assert!(fs.has_data(EF_SEX));
-        assert!(fs.has_data(EF_PW_RETRIES));
-    }
-
-    #[test]
-    fn dek_decrypts_under_default_pin() {
-        let mut fs = fresh();
-        let d = dev();
-        scan_files(&d, &mut fs, &mut CountRng(0)).unwrap();
-
-        // The wrapped DEK is recoverable with the default PW1 session key.
-        let mut blob = [0u8; DEK_FILE_SIZE];
-        let n = fs.read(EF_DEK_PW1.get(), &mut blob).unwrap();
-        assert_eq!(blob[0], FORMAT_V3);
-        let session = d.pin_derive_session(PW1_DEFAULT);
-        let mut dek = [0u8; DEK_SIZE];
-        let m = d
-            .decrypt_with_aad(&session, &blob[1..n], PinKdf::V2, &mut dek)
-            .unwrap();
-        assert_eq!(m, DEK_SIZE);
-        // RC and PW3 are the same blob sealed under PW3 and decrypt to the same DEK.
-        let mut blob3 = [0u8; DEK_FILE_SIZE];
-        fs.read(EF_DEK_PW3.get(), &mut blob3);
-        let session3 = d.pin_derive_session(PW3_DEFAULT);
-        let mut dek3 = [0u8; DEK_SIZE];
-        d.decrypt_with_aad(&session3, &blob3[1..], PinKdf::V2, &mut dek3)
-            .unwrap();
-        assert_eq!(dek, dek3);
-    }
-
-    #[test]
-    fn is_idempotent() {
-        let mut fs = fresh();
-        scan_files(&dev(), &mut fs, &mut CountRng(0)).unwrap();
-        let mut first = [0u8; DEK_FILE_SIZE];
-        fs.read(EF_DEK_PW1.get(), &mut first);
-        // A second run with a different RNG must not rewrite existing files.
-        scan_files(&dev(), &mut fs, &mut CountRng(200)).unwrap();
-        let mut second = [0u8; DEK_FILE_SIZE];
-        fs.read(EF_DEK_PW1.get(), &mut second);
-        assert_eq!(first, second);
-    }
-}
+#[path = "init_tests.rs"]
+mod tests;

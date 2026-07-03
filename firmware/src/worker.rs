@@ -17,13 +17,13 @@ use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant};
 use zeroize::Zeroize;
 
-use rsk_usb::ccid::ApduHandler;
+use rsk_usb::ccid::{ApduHandler, SecureResult};
 use rsk_usb::ctaphid::{CTAP_MAX_MESSAGE, MsgHandler};
 
 use crate::ccid_handler::CcidApplets;
 use crate::handler::{AppletHandler, FidoRng, Store};
 use crate::otp_kbd;
-use crate::presence::BootselPresence;
+use crate::presence::Presence;
 
 /// A worker request carries a full CTAPHID message at most; responses match —
 /// an ML-DSA-44 makeCredential response runs ~4 KB, and getInfo advertises
@@ -36,6 +36,10 @@ enum Kind {
     Cbor,
     Msg,
     Apdu,
+    /// A CCID `PC_to_RDR_Secure` (pinpad VERIFY): the PIN is collected on the
+    /// device's screen, the VERIFY runs internally, only the status word returns.
+    /// `Exchange::sec_status`/`sec_error` carry the CCID `bStatus`/`bError` back.
+    Secure,
     /// A CTAPHID vendor command (YubiKey Management read) — `Exchange::vcmd` holds
     /// the logical command number.
     Vendor,
@@ -48,6 +52,9 @@ struct Exchange {
     vcmd: u8,
     /// Worker → transport: whether the vendor command was supported (`Vendor` only).
     vendor_ok: bool,
+    /// Worker → transport: CCID `bStatus`/`bError` for the reply (`Secure` only).
+    sec_status: u8,
+    sec_error: u8,
     req_len: usize,
     req: [u8; REQ_CAP],
     resp_len: usize,
@@ -60,6 +67,8 @@ static EXCHANGE: Mutex<Cs, Exchange> = Mutex::new(Exchange {
     kind: Kind::Cbor,
     vcmd: 0,
     vendor_ok: false,
+    sec_status: 0,
+    sec_error: 0,
     req_len: 0,
     req: [0; REQ_CAP],
     resp_len: 0,
@@ -77,6 +86,16 @@ static DONE: Signal<Cs, ()> = Signal::new();
 /// Set on the high-priority transport, consumed by the worker; the INIT→next-MSG
 /// ordering (the client waits for the INIT reply) makes Relaxed sufficient.
 static MSG_DESELECT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether a transport request is queued for the worker but not yet picked up. The
+/// trusted-display browse modals (Passkeys / Settings) poll this: while one is open
+/// the worker is parked on the single thread executor, so a host command would wait
+/// behind it — yielding back to idle the instant one arrives lets the worker run,
+/// which is a precise alternative to capping the wait with a blind inactivity timeout.
+#[cfg(feature = "display")]
+pub(crate) fn host_request_pending() -> bool {
+    REQ.signaled()
+}
 
 /// Hand `data` to the worker as `kind`, await its response, copy it into `out`,
 /// return the length. The caller (a transport on the high-priority executor) wraps
@@ -133,6 +152,36 @@ async fn roundtrip_vendor(cmd: u8, data: &[u8], out: &mut [u8]) -> Option<usize>
     Some(n)
 }
 
+/// Hand a CCID `PC_to_RDR_Secure` payload to the worker and await its response.
+/// Like [`roundtrip`] but returns the [`SecureResult`] (the CCID `bStatus`/`bError`
+/// the worker chose for a card result vs. a pad cancel/timeout) alongside the body.
+async fn roundtrip_secure(data: &[u8], out: &mut [u8]) -> SecureResult {
+    let _serialize = WORKER_LOCK.lock().await;
+    {
+        let mut ex = EXCHANGE.lock().await;
+        let n = data.len().min(REQ_CAP);
+        ex.kind = Kind::Secure;
+        ex.req_len = n;
+        ex.req[..n].copy_from_slice(&data[..n]);
+    }
+    REQ.signal(());
+    DONE.wait().await;
+    let mut ex = EXCHANGE.lock().await;
+    let n = ex.resp_len.min(out.len());
+    out[..n].copy_from_slice(&ex.resp[..n]);
+    let (status, error) = (ex.sec_status, ex.sec_error);
+    // The response holds only a status word, but wipe it from the static buffer
+    // along with the rest of the roundtrip discipline.
+    let m = ex.resp_len;
+    ex.resp[..m].zeroize();
+    ex.resp_len = 0;
+    SecureResult {
+        len: n,
+        status,
+        error,
+    }
+}
+
 /// CTAPHID client handler (runs on the high-priority executor) — forwards to the
 /// worker. Holds no state; the applet layer + flash live in the [`Worker`].
 pub struct ClientCtap;
@@ -159,6 +208,28 @@ impl ApduHandler for ClientCcid {
     async fn handle_apdu(&mut self, apdu: &[u8], out: &mut [u8]) -> usize {
         roundtrip(Kind::Apdu, apdu, out).await
     }
+    async fn handle_secure(&mut self, data: &[u8], out: &mut [u8]) -> SecureResult {
+        roundtrip_secure(data, out).await
+    }
+}
+
+/// The on-screen title + the policy minimum PIN length for a pinpad VERIFY,
+/// chosen from the template's `P2` (which PIN the host is verifying). The minimum
+/// is the universal floor of 6 for every reference — never higher than the
+/// shortest PIN a user could have set, so the pad can't lock out a valid PIN; the
+/// applet enforces its own real minimum and reports a wrong/blocked status word.
+#[cfg(feature = "display")]
+fn secure_pin_meta(template: &[u8]) -> (&'static str, usize) {
+    let title = match template.get(3).copied() {
+        Some(rsk_openpgp::consts::PW1_MODE81) => "OpenPGP Sign PIN",
+        Some(rsk_openpgp::consts::PW1_MODE82) => "OpenPGP PIN",
+        Some(rsk_openpgp::consts::PW3_MODE83) => "OpenPGP Admin PIN",
+        Some(rsk_usb::secure_pin::PIV_PIN_P2) => {
+            crate::display::piv_ref_title(rsk_piv::PinRef::Pin)
+        }
+        _ => "Enter PIN",
+    };
+    (title, 6)
 }
 
 /// The compute worker (low-priority thread executor): owns the applet layer and
@@ -171,9 +242,10 @@ pub struct Worker<'a> {
     /// The TRNG/DRBG, kept for the secure-reboot wipe (the DRBG state is the one
     /// long-lived RAM secret outside the applet layer).
     rng: &'a RefCell<FidoRng>,
-    /// The BOOTSEL button, for the typed-ticket press watcher (the same button the
-    /// applets borrow for touch confirmation, behind the shared `RefCell`).
-    presence: &'a RefCell<BootselPresence>,
+    /// The presence backend (BOOTSEL button, or the screen on a `display` build),
+    /// for the typed-ticket press watcher and the same backend the applets borrow
+    /// for touch confirmation, behind the shared `RefCell`.
+    presence: &'a RefCell<Presence>,
     /// Click-counter state: last sampled level, click count, and the
     /// ms of the last release.
     btn_state: bool,
@@ -191,13 +263,13 @@ impl<'a> Worker<'a> {
     /// `presence` is the one BOOTSEL button, shared (through its `RefCell`) by the
     /// FIDO handler (CTAP user presence), the OpenPGP applet (the UIF DOs), the
     /// OTP applet (CHAL_BTN_TRIG) and the OATH applet (PROP_TOUCH credentials) —
-    /// the `&RefCell<BootselPresence>` coerces to each applet's `UserPresence`
+    /// the `&RefCell<ButtonPresence>` coerces to each applet's `UserPresence`
     /// trait.
     #[allow(clippy::too_many_arguments)] // one-time wiring from main
     pub fn new(
         fs: &'a RefCell<Store>,
         rng: &'a RefCell<FidoRng>,
-        presence: &'a RefCell<BootselPresence>,
+        presence: &'a RefCell<Presence>,
         platform: &'a RefCell<crate::rescue_platform::RescuePlatform>,
         serial_id: [u8; 8],
         serial_hash: [u8; 32],
@@ -206,10 +278,21 @@ impl<'a> Worker<'a> {
         kv_total: u32,
     ) -> Self {
         Self {
-            ctap: AppletHandler::new(fs, rng, presence, serial_id, serial_hash, otp_key, devk),
+            ctap: AppletHandler::new(
+                fs,
+                rng,
+                presence,
+                presence,
+                serial_id,
+                serial_hash,
+                otp_key,
+                devk,
+            ),
             ccid: CcidApplets::new(
                 fs,
                 rng,
+                presence,
+                presence,
                 presence,
                 presence,
                 presence,
@@ -253,7 +336,17 @@ impl<'a> Worker<'a> {
                     }
                 }
                 Either3::Second(_) => self.handle_otp_hid(),
-                Either3::Third(_) => self.button_tick(),
+                Either3::Third(_) => {
+                    self.button_tick();
+                    // A reboot queued off-transport — the display's Settings → Firmware
+                    // "Verify & install" — is serviced on this idle tick so it lands within a
+                    // button-poll period instead of waiting on the next host APDU. The
+                    // worker owns the live RAM secrets, so the scrub-then-reset in `reboot`
+                    // runs here, not from the display task.
+                    if let Some(mode) = crate::vendor::take_reboot() {
+                        self.reboot(mode).await;
+                    }
+                }
             }
         }
     }
@@ -269,16 +362,22 @@ impl<'a> Worker<'a> {
         crate::led::set_status(crate::led::STATUS_PROCESSING);
         {
             let mut ex = EXCHANGE.lock().await;
-            let Exchange {
-                kind,
-                vcmd,
-                vendor_ok,
-                req_len,
-                req,
-                resp,
-                resp_len,
-            } = &mut *ex;
-            {
+            // A CCID pinpad VERIFY collects the PIN on the screen and runs the
+            // VERIFY itself, so it needs both `self.presence` and `self.ccid`; keep
+            // it out of the borrow-the-whole-Exchange match below.
+            if ex.kind == Kind::Secure {
+                self.handle_secure_req(&mut ex);
+            } else {
+                let Exchange {
+                    kind,
+                    vcmd,
+                    vendor_ok,
+                    req_len,
+                    req,
+                    resp,
+                    resp_len,
+                    ..
+                } = &mut *ex;
                 let r: &[u8] = match *kind {
                     Kind::Cbor => self.ctap.handle_cbor(&req[..*req_len]),
                     Kind::Msg => {
@@ -300,6 +399,7 @@ impl<'a> Worker<'a> {
                             }
                         }
                     }
+                    Kind::Secure => &[], // handled above
                 };
                 let n = r.len().min(resp.len());
                 resp[..n].copy_from_slice(&r[..n]);
@@ -308,8 +408,9 @@ impl<'a> Worker<'a> {
             // The request can carry secrets (a VERIFY PIN, an imported
             // private key); wipe it as soon as the dispatch is done. The
             // handlers' own response buffers held the same bytes as `resp`.
-            req[..*req_len].zeroize();
-            *req_len = 0;
+            let rl = ex.req_len;
+            ex.req[..rl].zeroize();
+            ex.req_len = 0;
             self.ctap.scrub();
             self.ccid.scrub();
         }
@@ -320,6 +421,75 @@ impl<'a> Worker<'a> {
         self.btn_time = 0;
         crate::led::set_status(crate::led::STATUS_IDLE);
         DONE.signal(());
+    }
+
+    /// Handle a CCID `PC_to_RDR_Secure` (pinpad VERIFY). Parse the request, collect
+    /// the PIN on the trusted screen, assemble the real VERIFY APDU on-device, run it
+    /// through the normal applet dispatch, and report the card's status word — the PIN
+    /// never leaves the device. Writes the reply body into `ex.resp` and the CCID
+    /// `bStatus`/`bError` into `ex.sec_status`/`ex.sec_error`.
+    ///
+    /// Ordering matters: the worker holds the shared `fs` borrowed for the whole
+    /// dispatch, and `collect_pin` runs on the same thread executor, so anything the
+    /// pad needs from `fs` (here: nothing — the per-PIN minimum is a fixed policy by
+    /// `P2`) must be read into locals *before* `collect_pin`, never inside it — a
+    /// re-borrow would panic. `collect_pin` touches only the panel's own `RefCell`,
+    /// so it is borrow-disjoint from `self.ccid`/`fs`.
+    #[cfg(feature = "display")]
+    fn handle_secure_req(&mut self, ex: &mut Exchange) {
+        use rsk_usb::ccid::{SECURE_ERR_CANCELLED, SECURE_ERR_TIMEOUT, SECURE_STATUS_FAILED};
+        let failed = |ex: &mut Exchange, err: u8| {
+            ex.resp_len = 0;
+            ex.sec_status = SECURE_STATUS_FAILED;
+            ex.sec_error = err;
+        };
+        let Some(req) = rsk_usb::secure_pin::parse_secure(&ex.req[..ex.req_len]) else {
+            return failed(ex, 0);
+        };
+        // Only VERIFY (bPINOperation 0x00) is advertised (bPINSupport=0x01); refuse
+        // a MODIFY or anything else rather than feed it to the pad.
+        if req.operation != 0x00 {
+            return failed(ex, 0);
+        }
+        let (title, min_len) = secure_pin_meta(req.apdu_template);
+        let mut pin = [0u8; rsk_usb::secure_pin::MAX_PIN];
+        let entry = self
+            .presence
+            .borrow_mut()
+            .collect_pin_titled(title, min_len, &mut pin);
+        match entry {
+            rsk_fido::PinEntry::Entered(n) => {
+                let mut apdu = [0u8; 5 + rsk_usb::secure_pin::MAX_PIN];
+                if let Some(len) =
+                    rsk_usb::secure_pin::assemble_verify(req.apdu_template, &pin[..n], &mut apdu)
+                {
+                    let body = self.ccid.handle_apdu(&apdu[..len]);
+                    let m = body.len().min(ex.resp.len());
+                    ex.resp[..m].copy_from_slice(&body[..m]);
+                    ex.resp_len = m;
+                    ex.sec_status = rsk_usb::ccid::SECURE_STATUS_OK;
+                    ex.sec_error = 0;
+                } else {
+                    failed(ex, 0);
+                }
+                apdu.zeroize();
+            }
+            rsk_fido::PinEntry::Cancelled | rsk_fido::PinEntry::Declined => {
+                failed(ex, SECURE_ERR_CANCELLED)
+            }
+            rsk_fido::PinEntry::Timeout => failed(ex, SECURE_ERR_TIMEOUT),
+            rsk_fido::PinEntry::Unsupported => failed(ex, 0),
+        }
+        pin.zeroize();
+    }
+
+    /// No on-device pad on a button build — `bPINSupport` is 0, so the host never
+    /// sends `PC_to_RDR_Secure`; a stray one is reported as a failed command.
+    #[cfg(not(feature = "display"))]
+    fn handle_secure_req(&mut self, ex: &mut Exchange) {
+        ex.resp_len = 0;
+        ex.sec_status = rsk_usb::ccid::SECURE_STATUS_FAILED;
+        ex.sec_error = 0;
     }
 
     /// One keyboard-interface OTP frame command: run it against flash and stash

@@ -49,15 +49,7 @@ cannot quietly re-export your seed. Corollary: lost words cannot be
 re-exported either — pick a SLIP-39 share count with margin (2-of-3 minimum,
 3-of-5 for the paranoid).
 
-```mermaid
-stateDiagram-v2
-    [*] --> NoSeed
-    NoSeed --> Open: first boot / factory reset
-    Open --> Finalized: rsk backup finalize
-    Finalized --> NoSeed: factory reset (new seed)
-    note right of Open: rsk backup export (while open)
-    note right of Finalized: export refused until reset
-```
+![Seed-backup export window — a device starts with No seed; first boot or a factory reset provisions a seed and Opens the export window, during which rsk backup export works given touch and the FIDO PIN/UV; rsk backup finalize moves it to Finalized, where export is refused; a factory reset regenerates a new seed and reopens a fresh window](../images/seed-backup-window.svg)
 
 ## Restore (onto any RS-Key board)
 

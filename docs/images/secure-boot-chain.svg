@@ -1,0 +1,82 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 RS-Key contributors -->
+<svg viewBox="0 0 780 336" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="ttl dsc" font-family="'Segoe UI', system-ui, -apple-system, sans-serif">
+  <title id="ttl">Secure-boot signing chain</title>
+  <desc id="dsc">On the host, with the signing key: build produces firmware.uf2, picotool seal --sign produces firmware-signed.uf2, which is flashed over BOOTSEL. On the device, the RP2350 bootrom verifies the ECDSA signature against the fingerprint fused in OTP; a verified image runs, a rejected one falls back to BOOTSEL for re-flashing a signed image.</desc>
+  <defs>
+    <style>
+      .h1{font-size:23px;font-weight:700;fill:#2B2723}
+      .sub{font-size:12px;fill:#948A7F}
+      .lg{font-size:11px;fill:#6B645C}
+      .lane{font-size:10.5px;font-weight:700;fill:#948A7F;letter-spacing:.5px}
+      .box{font-size:11.5px;font-weight:700;fill:#fff}
+      .boxs{font-size:9.5px;fill:#F6EBE3}
+      .gate{font-size:11px;font-weight:700;fill:#fff}
+      .rej{font-size:11px;font-weight:700;fill:#6B645C}
+      .note{font-size:10.5px;fill:#5A534B}
+      .notek{font-weight:700;fill:#C0562B}
+      .foot{font-size:10.5px;fill:#ADA398}
+    </style>
+    <marker id="a1" viewBox="0 0 8 8" refX="6.5" refY="4" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M0 0 L8 4 L0 8 z" fill="#B9AEA2"/>
+    </marker>
+  </defs>
+  <rect x="6" y="6" width="768" height="324" rx="16" fill="#FBFAF8" stroke="#E4DED5" stroke-width="1.5"/>
+
+  <text class="h1" x="34" y="46">Secure-boot signing chain</text>
+  <text class="sub" x="34" y="66">ECDSA secp256k1 + SHA-256 · verified by the RP2350 bootrom · unsigned images fall to BOOTSEL</text>
+
+  <!-- legend -->
+  <rect x="470" y="34" width="13" height="13" rx="3" fill="#C0562B"/>
+  <text class="lg" x="490" y="45">host</text>
+  <rect x="546" y="34" width="13" height="13" rx="3" fill="#2F7E75"/>
+  <text class="lg" x="566" y="45">device</text>
+  <rect x="632" y="34" width="13" height="13" rx="3" fill="#3E3A36"/>
+  <text class="lg" x="652" y="45">bootrom gate</text>
+
+  <!-- HOST lane -->
+  <text class="lane" x="44" y="90">HOST · WITH YOUR SIGNING KEY</text>
+  <g fill="#C0562B">
+    <rect x="44"  y="96" width="150" height="36" rx="8"/>
+    <rect x="210" y="96" width="150" height="36" rx="8"/>
+    <rect x="376" y="96" width="150" height="36" rx="8"/>
+    <rect x="542" y="96" width="150" height="36" rx="8"/>
+  </g>
+  <g class="box" text-anchor="middle">
+    <text x="119" y="118">cargo / nix build</text>
+    <text x="285" y="118">firmware.uf2</text>
+    <text x="451" y="112">picotool seal --sign</text>
+    <text x="617" y="118">firmware-signed.uf2</text>
+  </g>
+  <text class="boxs" x="451" y="125" text-anchor="middle">signing key · host-only</text>
+  <g stroke="#B9AEA2" stroke-width="2" marker-end="url(#a1)">
+    <line x1="194" y1="114" x2="208" y2="114"/>
+    <line x1="360" y1="114" x2="374" y2="114"/>
+    <line x1="526" y1="114" x2="540" y2="114"/>
+  </g>
+
+  <!-- connector host -> device -->
+  <path d="M617 132 V150 H300 V166" fill="none" stroke="#B9AEA2" stroke-width="2" marker-end="url(#a1)"/>
+
+  <!-- DEVICE lane -->
+  <text class="lane" x="44" y="184">DEVICE · RP2350 BOOTROM</text>
+  <rect x="225" y="190" width="150" height="40" rx="8" fill="#2F7E75"/>
+  <text class="box" x="300" y="214" text-anchor="middle">BOOTSEL flash</text>
+  <rect x="400" y="190" width="250" height="40" rx="8" fill="#3E3A36"/>
+  <text class="gate" x="525" y="207" text-anchor="middle">bootrom — verify ECDSA signature</text>
+  <text class="gate" x="525" y="222" text-anchor="middle" font-weight="400" font-size="10">vs the fingerprint fused in OTP (page 2)</text>
+  <line x1="375" y1="210" x2="398" y2="210" stroke="#B9AEA2" stroke-width="2" marker-end="url(#a1)"/>
+
+  <!-- outcomes -->
+  <rect x="666" y="196" width="96" height="28" rx="8" fill="#2F7E75"/>
+  <text class="box" x="714" y="214" text-anchor="middle">✓ run app</text>
+  <line x1="650" y1="210" x2="664" y2="210" stroke="#2F7E75" stroke-width="2" marker-end="url(#a1)"/>
+
+  <rect x="400" y="248" width="250" height="28" rx="8" fill="#EDE6DD" stroke="#D9D2C8"/>
+  <text class="rej" x="525" y="266" text-anchor="middle">✗ fall back to BOOTSEL — re-flash signed</text>
+  <line x1="525" y1="230" x2="525" y2="246" stroke="#B9AEA2" stroke-width="2" marker-end="url(#a1)"/>
+
+  <!-- notes -->
+  <text class="note" x="34" y="298">Fingerprint = <tspan class="notek">SHA-256(pubkey)</tspan> fused at OTP page 2 (0x80). Lose the signing key → the board takes no new firmware, but the last signed image keeps booting.</text>
+  <text class="foot" x="34" y="318">Source: docs/production.md · picotool seal --sign · the RP2350 bootrom (not RS-Key firmware) does the verify.</text>
+</svg>

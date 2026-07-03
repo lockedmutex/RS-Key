@@ -117,16 +117,7 @@ signature on every image against a fingerprint fused into OTP. Unsigned or
 foreign-signed images do not boot — the chip falls back to BOOTSEL, where you
 can always drag a correctly-signed UF2 (recovery path).
 
-```mermaid
-flowchart TD
-    build["cargo / nix build"] --> uf2["firmware.uf2"]
-    uf2 --> seal["picotool seal --sign<br/>signing key (host-only)"]
-    seal --> signed["firmware-signed.uf2"]
-    signed --> flash["BOOTSEL flash"]
-    flash --> rom{"bootrom: signature<br/>vs fused fingerprint"}
-    rom -->|verified| run["run the app"]
-    rom -->|rejected| bootsel["fall back to BOOTSEL<br/>(re-flash a signed image)"]
-```
+![Secure-boot signing chain — on the host, build then picotool seal --sign produce a signed UF2; on the device the RP2350 bootrom verifies the ECDSA signature against the fingerprint fused in OTP, running a verified image and falling back to BOOTSEL for a rejected one](images/secure-boot-chain.svg)
 
 **The permanent consequences:**
 
@@ -163,7 +154,8 @@ picotool seal --sign --hash firmware.uf2 firmware-signed.uf2 \
     ~/.rs-key-secrets/secure_boot_key.pem ~/.rs-key-secrets/otp_secureboot.json \
     --major 1 --minor 0 --rollback 1
 picotool info firmware-signed.uf2        # must say "signature: verified"
-# flash firmware-signed.uf2 over BOOTSEL and confirm the device works
+# BOOTSEL, then flash + confirm the device works:
+picotool load -v firmware-signed.uf2 && picotool reboot   # or drag it onto the RP2350 drive
 ```
 
 The arguments:
@@ -223,7 +215,8 @@ picotool uf2 convert target/thumbv8m.main-none-eabihf/release/firmware -t elf fi
 picotool seal --sign --hash firmware.uf2 firmware-signed.uf2 \
     ~/.rs-key-secrets/secure_boot_key.pem ~/.rs-key-secrets/otp_secureboot.json \
     --major 1 --minor 0 --rollback 1
-# flash firmware-signed.uf2 (BOOTSEL, or: rsk reboot bootsel && cp)
+# BOOTSEL (hands-free: rsk reboot bootsel), then:
+picotool load -v firmware-signed.uf2 && picotool reboot   # or drag it onto the RP2350 drive
 ```
 
 The `--rollback` value is your board's current floor (see

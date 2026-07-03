@@ -2,35 +2,42 @@
 // Copyright (C) 2026 RS-Key contributors
 
 //! Physical user presence over either the BOOTSEL button (default) or a dedicated
-//! GPIO button. BOOTSEL samples use the QSPI-CS-to-Hi-Z trick in a RAM function;
-//! a GPIO button is polled as active-low with an internal pull-up. The wait blocks
-//! the worker while the high-priority transports stream keepalives reporting
-//! `UPNEEDED` ([`up_pending`]). One [`BootselPresence`] serves every applet's
-//! `UserPresence` trait; a touch is required by default, and the opt-in `no-touch`
-//! feature makes `request` confirm instantly (for the automated suites, which
-//! cannot press a button).
+//! GPIO button (`PRESENCE_PIN`). BOOTSEL samples use the QSPI-CS-to-Hi-Z trick in a
+//! RAM function; a GPIO button is polled active-low with an internal pull-up by
+//! default, or active-high with a pull-down when `PRESENCE_ACTIVE_HIGH` is set. The
+//! wait blocks the worker while the high-priority transports stream keepalives
+//! reporting `UPNEEDED` ([`up_pending`]). One [`ButtonPresence`] serves every
+//! applet's `UserPresence` trait; a touch is required by default, and the opt-in
+//! `no-touch` feature makes `request` confirm instantly (for the automated suites,
+//! which cannot press a button). The `display` build takes presence from the
+//! touchscreen ([`crate::display::TouchPresence`]) instead, so this whole module is
+//! compiled out there.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+#[cfg(not(feature = "display"))]
 use embassy_rp::Peri;
+#[cfg(not(feature = "display"))]
 use embassy_rp::gpio::{AnyPin, Input, Pull};
+#[cfg(not(feature = "display"))]
 use embassy_rp::peripherals::BOOTSEL;
 
-#[cfg(not(feature = "no-touch"))]
+#[cfg(all(not(feature = "no-touch"), not(feature = "display")))]
 use embassy_rp::bootsel::is_bootsel_pressed;
-#[cfg(not(feature = "no-touch"))]
+#[cfg(all(not(feature = "no-touch"), not(feature = "display")))]
 use embassy_time::{Duration, Instant, block_for};
 
-/// Set while the worker is blocked in a button wait — read by the CTAPHID keepalive
-/// to report `UPNEEDED` (0x02) instead of `PROCESSING` (0x01).
-static UP_PENDING: AtomicBool = AtomicBool::new(false);
+/// Set while the worker is blocked in a presence wait — read by the CTAPHID
+/// keepalive to report `UPNEEDED` (0x02) instead of `PROCESSING` (0x01). Shared
+/// with the `display` build's `TouchPresence`.
+pub(crate) static UP_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// Set by the CTAPHID transport (high-priority executor) when a `CTAPHID_CANCEL`
 /// arrives for the request the worker is processing. The button wait — running on
 /// the worker executor — polls it each iteration and abandons with `Cancelled`, so
 /// the in-flight CTAP2 command answers `CTAP2_ERR_KEEPALIVE_CANCEL`. Cross-executor
 /// (transport sets, worker reads), mirroring `UP_PENDING` in the other direction.
-static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
+pub(crate) static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// The CTAPHID keepalive hook passed to `CtapHid::new`: is a touch being awaited?
 /// Always `false` on the `no-touch` build, so the status stays `PROCESSING`.
@@ -45,18 +52,32 @@ pub fn request_cancel() {
     CANCEL_REQUESTED.store(true, Ordering::Relaxed);
 }
 
-// Poll cadence and the press timeout. `block_for` keeps interrupts enabled, so the
+/// Built-in touch-wait timeout (ms) used when the phy record carries none.
+const DEFAULT_TIMEOUT_MS: u32 = 30_000;
+/// Touch-wait timeout in ms, seeded at boot from the phy record's
+/// `PRESENCE_TIMEOUT` tag (pico-fido `0x08`, seconds). Read live by the wait.
+pub(crate) static PRESENCE_TIMEOUT_MS: AtomicU32 = AtomicU32::new(DEFAULT_TIMEOUT_MS);
+
+/// Override the touch-wait timeout from the phy record — value in **seconds**,
+/// matching pico-fido / PicoForge's tag `0x08`. `0` (or an absent tag) keeps the
+/// built-in 30 s default. Call once at boot, before any applet runs.
+pub fn set_timeout_secs(secs: u8) {
+    if secs != 0 {
+        PRESENCE_TIMEOUT_MS.store(secs as u32 * 1000, Ordering::Relaxed);
+    }
+}
+
+// Poll cadence for the press wait. `block_for` keeps interrupts enabled, so the
 // high-priority executor (USB + keepalives) runs between polls; only the ~4000-cycle
-// `is_bootsel_pressed` read briefly masks interrupts.
-#[cfg(not(feature = "no-touch"))]
+// `is_bootsel_pressed` read briefly masks interrupts. The timeout is runtime
+// (`PRESENCE_TIMEOUT_MS`).
+#[cfg(all(not(feature = "no-touch"), not(feature = "display")))]
 const POLL_MS: u64 = 16;
-#[cfg(not(feature = "no-touch"))]
-const TIMEOUT_MS: u64 = 30_000;
 
 /// Neutral wait result, mapped to each applet's own `Presence` enum. The button
 /// has no "declined" gesture; `Cancelled` comes from a `CTAPHID_CANCEL` (FIDO
 /// only) observed via [`CANCEL_REQUESTED`].
-#[cfg(not(feature = "no-touch"))]
+#[cfg(all(not(feature = "no-touch"), not(feature = "display")))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Outcome {
     Confirmed,
@@ -65,18 +86,34 @@ enum Outcome {
 }
 
 /// User presence via BOOTSEL (default) or a dedicated GPIO button.
-pub struct BootselPresence {
+#[cfg(not(feature = "display"))]
+pub struct ButtonPresence {
     #[cfg_attr(feature = "no-touch", allow(dead_code))]
     button: Button,
 }
 
+/// The presence source: the BOOTSEL hardware button, or a GPIO button (the bool is
+/// `active_high` — `true` reads a press as logic high, `false` as logic low).
+#[cfg(not(feature = "display"))]
 #[cfg_attr(feature = "no-touch", allow(dead_code))]
 enum Button {
     Bootsel(Peri<'static, BOOTSEL>),
-    Gpio(Input<'static>),
+    Gpio(Input<'static>, bool),
 }
 
-impl BootselPresence {
+/// The presence backend the [`crate::worker::Worker`] owns, selected at build
+/// time so the worker wiring stays backend-agnostic. The standard key confirms
+/// with the BOOTSEL button (or a `PRESENCE_PIN` GPIO); the `display` build swaps
+/// this alias to the [`crate::display::TouchPresence`] that renders on-screen
+/// Approve/Deny and returns a real `Declined` — every applet's `UserPresence`
+/// trait is satisfied by whichever backend this names, so only this alias changes.
+#[cfg(not(feature = "display"))]
+pub type Presence = ButtonPresence;
+#[cfg(feature = "display")]
+pub type Presence = crate::display::TouchPresence;
+
+#[cfg(not(feature = "display"))]
+impl ButtonPresence {
     /// Build the default BOOTSEL-backed presence source.
     pub fn new_bootsel(bootsel: Peri<'static, BOOTSEL>) -> Self {
         Self {
@@ -84,21 +121,24 @@ impl BootselPresence {
         }
     }
 
-    /// Build a GPIO-backed presence source on `pin` (active-low, pull-up).
+    /// Build a GPIO-backed presence source on `pin`. `active_high` picks the polarity:
+    /// `false` = active-low (button to ground, internal pull-up, a press reads low);
+    /// `true` = active-high (pull-down, a press reads high — e.g. a touch sensor).
     ///
     /// # Panics
     ///
     /// Panics if `pin` is out of the RP2350A range `0..=29`.
-    pub fn new_gpio(pin: u8) -> Self {
+    pub fn new_gpio(pin: u8, active_high: bool) -> Self {
         assert!(
             pin <= 29,
             "PRESENCE_PIN={pin} out of range 0..=29 (RP2350A GPIOs)"
         );
         // Safety: `main` guarantees this pin is not handed to another driver.
         let any = unsafe { AnyPin::steal(pin) };
-        let input = Input::new(any, Pull::Up);
+        let pull = if active_high { Pull::Down } else { Pull::Up };
+        let input = Input::new(any, pull);
         Self {
-            button: Button::Gpio(input),
+            button: Button::Gpio(input, active_high),
         }
     }
 
@@ -106,7 +146,13 @@ impl BootselPresence {
     fn pressed(&mut self) -> bool {
         match &mut self.button {
             Button::Bootsel(bootsel) => is_bootsel_pressed(bootsel.reborrow()),
-            Button::Gpio(button) => button.is_low(),
+            Button::Gpio(button, active_high) => {
+                if *active_high {
+                    button.is_high()
+                } else {
+                    button.is_low()
+                }
+            }
         }
     }
 
@@ -133,8 +179,9 @@ impl BootselPresence {
         CANCEL_REQUESTED.store(false, Ordering::Relaxed);
         UP_PENDING.store(true, Ordering::Relaxed);
         let start = Instant::now();
-        // Wait for a press; a CTAPHID_CANCEL aborts it, and with neither in
-        // TIMEOUT_MS it times out.
+        let timeout = Duration::from_millis(PRESENCE_TIMEOUT_MS.load(Ordering::Relaxed) as u64);
+        // Wait for a press; a CTAPHID_CANCEL aborts it, and with neither before
+        // the timeout it times out.
         let result = loop {
             if self.pressed() {
                 break Outcome::Confirmed;
@@ -142,7 +189,7 @@ impl BootselPresence {
             if CANCEL_REQUESTED.load(Ordering::Relaxed) {
                 break Outcome::Cancelled;
             }
-            if start.elapsed() >= Duration::from_millis(TIMEOUT_MS) {
+            if start.elapsed() >= timeout {
                 break Outcome::Timeout;
             }
             block_for(Duration::from_millis(POLL_MS));
@@ -152,7 +199,7 @@ impl BootselPresence {
         if result == Outcome::Confirmed {
             let release = Instant::now();
             while self.pressed() {
-                if release.elapsed() >= Duration::from_millis(TIMEOUT_MS) {
+                if release.elapsed() >= timeout {
                     break;
                 }
                 block_for(Duration::from_millis(POLL_MS));
@@ -167,8 +214,9 @@ impl BootselPresence {
     }
 }
 
-impl rsk_fido::UserPresence for BootselPresence {
-    fn request(&mut self) -> rsk_fido::Presence {
+#[cfg(not(feature = "display"))]
+impl rsk_fido::UserPresence for ButtonPresence {
+    fn request(&mut self, _confirm: rsk_fido::Confirm<'_>) -> rsk_fido::Presence {
         #[cfg(not(feature = "no-touch"))]
         {
             match self.wait() {
@@ -184,8 +232,9 @@ impl rsk_fido::UserPresence for BootselPresence {
     }
 }
 
-impl rsk_openpgp::UserPresence for BootselPresence {
-    fn request(&mut self) -> rsk_openpgp::Presence {
+#[cfg(not(feature = "display"))]
+impl rsk_openpgp::UserPresence for ButtonPresence {
+    fn request(&mut self, _confirm: rsk_openpgp::Confirm<'_>) -> rsk_openpgp::Presence {
         #[cfg(not(feature = "no-touch"))]
         {
             match self.wait() {
@@ -202,8 +251,9 @@ impl rsk_openpgp::UserPresence for BootselPresence {
     }
 }
 
-impl rsk_otp::UserPresence for BootselPresence {
-    fn request(&mut self) -> rsk_otp::Presence {
+#[cfg(not(feature = "display"))]
+impl rsk_otp::UserPresence for ButtonPresence {
+    fn request(&mut self, _confirm: rsk_otp::Confirm<'_>) -> rsk_otp::Presence {
         #[cfg(not(feature = "no-touch"))]
         {
             match self.wait() {
@@ -219,8 +269,9 @@ impl rsk_otp::UserPresence for BootselPresence {
     }
 }
 
-impl rsk_oath::UserPresence for BootselPresence {
-    fn request(&mut self) -> rsk_oath::Presence {
+#[cfg(not(feature = "display"))]
+impl rsk_oath::UserPresence for ButtonPresence {
+    fn request(&mut self, _confirm: rsk_oath::Confirm<'_>) -> rsk_oath::Presence {
         #[cfg(not(feature = "no-touch"))]
         {
             match self.wait() {
@@ -232,6 +283,42 @@ impl rsk_oath::UserPresence for BootselPresence {
         #[cfg(feature = "no-touch")]
         {
             rsk_oath::Presence::Confirmed
+        }
+    }
+}
+
+#[cfg(not(feature = "display"))]
+impl rsk_rescue::UserPresence for ButtonPresence {
+    fn request(&mut self, _confirm: rsk_rescue::Confirm<'_>) -> rsk_rescue::Presence {
+        #[cfg(not(feature = "no-touch"))]
+        {
+            match self.wait() {
+                Outcome::Confirmed => rsk_rescue::Presence::Confirmed,
+                // CCID-only applet: no CTAPHID_CANCEL reaches it.
+                Outcome::Timeout | Outcome::Cancelled => rsk_rescue::Presence::Timeout,
+            }
+        }
+        #[cfg(feature = "no-touch")]
+        {
+            rsk_rescue::Presence::Confirmed
+        }
+    }
+}
+
+#[cfg(not(feature = "display"))]
+impl rsk_mgmt::UserPresence for ButtonPresence {
+    fn request(&mut self, _confirm: rsk_mgmt::Confirm<'_>) -> rsk_mgmt::Presence {
+        #[cfg(not(feature = "no-touch"))]
+        {
+            match self.wait() {
+                Outcome::Confirmed => rsk_mgmt::Presence::Confirmed,
+                // CCID-only applet: no CTAPHID_CANCEL reaches it.
+                Outcome::Timeout | Outcome::Cancelled => rsk_mgmt::Presence::Timeout,
+            }
+        }
+        #[cfg(feature = "no-touch")]
+        {
+            rsk_mgmt::Presence::Confirmed
         }
     }
 }

@@ -309,5 +309,26 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "otp_slot_seal"
+path = "fuzz_targets/otp_slot_seal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "keydev_seal"
+path = "fuzz_targets/keydev_seal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "oath_otp_pin"
+path = "fuzz_targets/oath_otp_pin.rs"
+test = false
+doc = false
+bench = false
+
 # Standalone workspace so the parent (thumbv8m) build never pulls these in.
 [workspace]

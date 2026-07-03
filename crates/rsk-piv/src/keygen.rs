@@ -12,7 +12,7 @@ use rsk_crypto::Device;
 use rsk_fs::{Fs, Storage};
 use rsk_openpgp::Rng;
 use rsk_openpgp::keys::{
-    Curve, PrivKey, generate_rsa, make_ec_pubkey_do, make_rsa_response, rsa_from_pqe,
+    Curve, MAX_RSA_PUBDO, PrivKey, generate_rsa, make_ec_pubkey_do, make_rsa_response, rsa_from_pqe,
 };
 use rsk_sdk::tlv::find_tag;
 use rsk_sdk::{ResBuf, Sw};
@@ -22,6 +22,10 @@ use crate::files::*;
 use crate::seal;
 use crate::x509;
 use crate::{Session, WRONG_DATA, wrap_cert_object};
+
+// Yubico generation/import template policy tags.
+const TAG_PIN_POLICY: u16 = 0xAA;
+const TAG_TOUCH_POLICY: u16 = 0xAB;
 
 /// Parsed `AC` generation template: algorithm + optional policy tags.
 pub(crate) struct GenReq {
@@ -34,10 +38,10 @@ pub(crate) fn parse_gen_template(data: &[u8]) -> Result<GenReq, Sw> {
     if data.is_empty() {
         return Err(Sw::WRONG_LENGTH);
     }
-    if data[0] != 0xAC {
+    if data[0] != TAG_GEN_TEMPLATE {
         return Err(WRONG_DATA);
     }
-    let ac = find_tag(data, 0xAC)
+    let ac = find_tag(data, TAG_GEN_TEMPLATE as u16)
         .filter(|v| !v.is_empty())
         .ok_or(WRONG_DATA)?;
     let algo = find_tag(ac, 0x80)
@@ -48,12 +52,38 @@ pub(crate) fn parse_gen_template(data: &[u8]) -> Result<GenReq, Sw> {
     if cfg!(feature = "fips-profile") && algo == ALGO_RSA1024 {
         return Err(WRONG_DATA);
     }
-    let pin_policy = find_tag(ac, 0xAA).and_then(|v| v.first().copied());
-    let touch_policy = find_tag(ac, 0xAB).and_then(|v| v.first().copied());
+    let pin_policy = find_tag(ac, TAG_PIN_POLICY).and_then(|v| v.first().copied());
+    let touch_policy = find_tag(ac, TAG_TOUCH_POLICY).and_then(|v| v.first().copied());
     Ok(GenReq {
         algo,
         pin_policy,
         touch_policy,
+    })
+}
+
+/// The PIV algorithm id for an RSA key, keyed off its modulus length in bytes
+/// (`RsaPrivateKey::size()`): 128→1024, 256→2048, 384→3072, 512→4096. The single
+/// source of truth for size→algo, shared by the firmware fast-path and the
+/// display retired-slot store so they cannot drift.
+pub(crate) fn rsa_algo_from_size(modulus_bytes: usize) -> Option<u8> {
+    Some(match modulus_bytes {
+        128 => ALGO_RSA1024,
+        256 => ALGO_RSA2048,
+        384 => ALGO_RSA3072,
+        512 => ALGO_RSA4096,
+        _ => return None,
+    })
+}
+
+/// Inverse of [`rsa_algo_from_size`]: modulus length in bytes for a PIV RSA
+/// algorithm id.
+pub(crate) fn rsa_size_from_algo(algo: u8) -> Option<usize> {
+    Some(match algo {
+        ALGO_RSA1024 => 128,
+        ALGO_RSA2048 => 256,
+        ALGO_RSA3072 => 384,
+        ALGO_RSA4096 => 512,
+        _ => return None,
     })
 }
 
@@ -100,7 +130,42 @@ fn store_slot_cert<S: Storage>(
     fs.put(fid, &obj[..on]).map_err(|_| Sw::MEMORY_FAILURE)
 }
 
-/// The EC arm of GENERATE; RSA goes through
+/// The EC/EdDSA curve a non-RSA GENERATE algorithm produces.
+pub(crate) fn curve_for_algo(algo: u8) -> Option<Curve> {
+    Some(match algo {
+        ALGO_ECCP256 => Curve::P256,
+        ALGO_ECCP384 => Curve::P384,
+        ALGO_ED25519 => Curve::Ed25519,
+        ALGO_X25519 => Curve::X25519,
+        _ => return None,
+    })
+}
+
+/// Build + store the slot's self-signed certificate for a freshly minted EC or
+/// Ed25519 key. X25519 is key-agreement-only and cannot self-sign, so — by
+/// design — no certificate is written; a host/CA provisions one later via PUT
+/// DATA (GET DATA then returns 6A82 until it does).
+fn store_generated_cert<S: Storage>(
+    fs: &mut Fs<S>,
+    rng: &mut dyn Rng,
+    slot: u8,
+    algo: u8,
+    curve: Curve,
+    point: &[u8],
+    key: &PrivKey,
+) -> Result<(), Sw> {
+    let (spki, signer) = match algo {
+        ALGO_X25519 => return Ok(()),
+        ALGO_ED25519 => (
+            x509::Spki::Rfc8410 { curve, point },
+            x509::Signer::Ed25519(key),
+        ),
+        _ => (x509::Spki::Ec { curve, point }, x509::Signer::Ec(key)),
+    };
+    store_slot_cert(fs, rng, slot, algo, spki, signer)
+}
+
+/// The EC / Ed25519 / X25519 arm of GENERATE; RSA goes through
 /// [`crate::PivApplet::rsa_generate_finish`] (the firmware runs the dual-core
 /// prime search, CCID keepalives flowing meanwhile) or the blocking fallback
 /// below.
@@ -112,30 +177,18 @@ pub(crate) fn generate_ec<S: Storage>(
     req: &GenReq,
     res: &mut ResBuf,
 ) -> Sw {
-    let curve = match req.algo {
-        ALGO_ECCP256 => Curve::P256,
-        ALGO_ECCP384 => Curve::P384,
-        _ => return WRONG_DATA,
+    let Some(curve) = curve_for_algo(req.algo) else {
+        return WRONG_DATA;
     };
     let Some(key) = PrivKey::generate(curve, rng) else {
         return Sw::EXEC_ERROR;
     };
-    let mut point = [0u8; 97];
+    let mut point = [0u8; MAX_EC_POINT];
     let plen = match key.public_point(&mut point) {
         Ok(n) => n,
         Err(e) => return e,
     };
-    if let Err(e) = store_slot_cert(
-        fs,
-        rng,
-        slot,
-        req.algo,
-        x509::Spki::Ec {
-            curve,
-            point: &point[..plen],
-        },
-        x509::Signer::Ec(&key),
-    ) {
+    if let Err(e) = store_generated_cert(fs, rng, slot, req.algo, curve, &point[..plen], &key) {
         return e;
     }
     if let Err(e) = seal::store_ec_key(dev, fs, rng, key_fid(slot), &key) {
@@ -197,7 +250,7 @@ pub(crate) fn finish_rsa<S: Storage>(
     {
         return Sw::MEMORY_FAILURE;
     }
-    let mut out = [0u8; 5 + 4 + 256 + 2 + 8];
+    let mut out = [0u8; MAX_RSA_PUBDO];
     let dn = make_rsa_response(key, &mut out);
     if !res.extend(&out[..dn]) {
         return Sw::WRONG_LENGTH;
@@ -215,17 +268,92 @@ pub(crate) fn generate_rsa_blocking<S: Storage>(
     req: &GenReq,
     res: &mut ResBuf,
 ) -> Sw {
-    let nbits = match req.algo {
-        ALGO_RSA1024 => 1024,
-        ALGO_RSA2048 => 2048,
-        _ => return WRONG_DATA,
+    let Some(nbytes) = rsa_size_from_algo(req.algo) else {
+        return WRONG_DATA;
     };
-    let key = match generate_rsa(rng, nbits) {
+    let key = match generate_rsa(rng, nbytes * 8) {
         Ok(k) => k,
         Err(e) => return e,
     };
     let pol = resolved_policies(slot, req.pin_policy, req.touch_policy);
     finish_rsa(dev, fs, rng, slot, req.algo, pol, &key, res)
+}
+
+/// On-device EC / EdDSA key generation into an empty retired slot (82–95), driven by
+/// the trusted display. There is no management-key auth — physical presence at the panel
+/// is the authorisation — so it is deliberately fenced to retired slots that hold no
+/// key: it can only *add* a key, never overwrite one (the four primary slots and F9
+/// stay USB-managed). EC P-256/P-384, Ed25519 and X25519 only — these are instant; RSA
+/// runs its slow dual-core prime search in the firmware and persists via
+/// [`store_retired_rsa`]. Stores the sealed key, the self-signed cert (none for X25519,
+/// which can't self-sign) and the metadata, the same writes the host GENERATE makes, so
+/// `ykman` / GET DATA see a normal slot after.
+pub(crate) fn generate_retired_ec<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    rng: &mut dyn Rng,
+    slot: u8,
+    algo: u8,
+) -> Result<(), Sw> {
+    if !is_retired(slot) {
+        return Err(Sw::INCORRECT_P1P2);
+    }
+    // Never clobber a key on-device: overwriting a retired slot needs USB + mgmt-key.
+    if fs.has_key(key_fid(slot)) {
+        return Err(Sw::SECURITY_STATUS_NOT_SATISFIED);
+    }
+    let curve = curve_for_algo(algo).ok_or(WRONG_DATA)?;
+    let Some(key) = PrivKey::generate(curve, rng) else {
+        return Err(Sw::EXEC_ERROR);
+    };
+    let mut point = [0u8; MAX_EC_POINT];
+    let plen = key.public_point(&mut point)?;
+    store_generated_cert(fs, rng, slot, algo, curve, &point[..plen], &key)?;
+    seal::store_ec_key(dev, fs, rng, key_fid(slot), &key)?;
+    let pol = resolved_policies(slot, None, None);
+    fs.meta_add(
+        key_fid(slot).get(),
+        &[algo, pol[0], pol[1], ORIGIN_GENERATED],
+    )
+    .map_err(|_| Sw::MEMORY_FAILURE)
+}
+
+/// Persist a display-generated RSA key into an empty retired slot — the RSA companion
+/// to [`generate_retired_ec`]. The slow prime search runs in the firmware (dual-core,
+/// off this function), so this only writes the result: the self-signed cert, the sealed
+/// key and the metadata, with the same empty-retired-slot fence (it can only *add* a
+/// key, never overwrite one; the four primary slots and F9 stay USB-managed).
+pub(crate) fn store_retired_rsa<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    rng: &mut dyn Rng,
+    slot: u8,
+    key: &RsaPrivateKey,
+) -> Result<(), Sw> {
+    if !is_retired(slot) {
+        return Err(Sw::INCORRECT_P1P2);
+    }
+    if fs.has_key(key_fid(slot)) {
+        return Err(Sw::SECURITY_STATUS_NOT_SATISFIED);
+    }
+    let algo = rsa_algo_from_size(key.size()).ok_or(Sw::EXEC_ERROR)?;
+    let n = key.n().to_bytes_be();
+    let e = key.e().to_bytes_be();
+    store_slot_cert(
+        fs,
+        rng,
+        slot,
+        algo,
+        x509::Spki::Rsa { n: &n, e: &e },
+        x509::Signer::Rsa(key),
+    )?;
+    seal::store_rsa_key(dev, fs, rng, key_fid(slot), key)?;
+    let pol = resolved_policies(slot, None, None);
+    fs.meta_add(
+        key_fid(slot).get(),
+        &[algo, pol[0], pol[1], ORIGIN_GENERATED],
+    )
+    .map_err(|_| Sw::MEMORY_FAILURE)
 }
 
 /// IMPORT ASYMMETRIC KEY; gated on management-key auth.
@@ -248,10 +376,10 @@ pub(crate) fn import<S: Storage>(
     if cfg!(feature = "fips-profile") && algo == ALGO_RSA1024 {
         return WRONG_DATA;
     }
-    let pin_policy = find_tag(data, 0xAA).and_then(|v| v.first().copied());
-    let touch_policy = find_tag(data, 0xAB).and_then(|v| v.first().copied());
+    let pin_policy = find_tag(data, TAG_PIN_POLICY).and_then(|v| v.first().copied());
+    let touch_policy = find_tag(data, TAG_TOUCH_POLICY).and_then(|v| v.first().copied());
     match algo {
-        ALGO_RSA1024 | ALGO_RSA2048 => {
+        ALGO_RSA1024 | ALGO_RSA2048 | ALGO_RSA3072 | ALGO_RSA4096 => {
             let p = find_tag(data, 0x01).filter(|v| !v.is_empty());
             let q = find_tag(data, 0x02).filter(|v| !v.is_empty());
             let (Some(p), Some(q)) = (p, q) else {
@@ -260,7 +388,9 @@ pub(crate) fn import<S: Storage>(
             let Some(key) = rsa_from_pqe(&[0x01, 0x00, 0x01], p, q) else {
                 return Sw::EXEC_ERROR;
             };
-            let want = if algo == ALGO_RSA1024 { 128 } else { 256 };
+            let Some(want) = rsa_size_from_algo(algo) else {
+                return WRONG_DATA;
+            };
             if key.size() != want {
                 return WRONG_DATA;
             }
@@ -272,10 +402,8 @@ pub(crate) fn import<S: Storage>(
             let Some(scalar) = find_tag(data, 0x06).filter(|v| !v.is_empty()) else {
                 return WRONG_DATA;
             };
-            let curve = if algo == ALGO_ECCP256 {
-                Curve::P256
-            } else {
-                Curve::P384
+            let Some(curve) = curve_for_algo(algo) else {
+                return WRONG_DATA;
             };
             let field = if algo == ALGO_ECCP256 { 32 } else { 48 };
             if scalar.len() > field {
@@ -286,10 +414,48 @@ pub(crate) fn import<S: Storage>(
             };
             // Reject the zero/invalid scalar early: deriving the public point
             // fails for out-of-range keys.
-            let mut pt = [0u8; 97];
+            let mut pt = [0u8; MAX_EC_POINT];
             if key.public_point(&mut pt).is_err() {
                 return WRONG_DATA;
             }
+            if let Err(sw) = seal::store_ec_key(dev, fs, rng, key_fid(slot), &key) {
+                return sw;
+            }
+        }
+        ALGO_ED25519 | ALGO_X25519 => {
+            // yubikit tags the raw 32-byte seed/scalar 0x07 (Ed25519) / 0x08 (X25519).
+            let (tag, curve) = if algo == ALGO_ED25519 {
+                (0x07u16, Curve::Ed25519)
+            } else {
+                (0x08u16, Curve::X25519)
+            };
+            let Some(scalar) = find_tag(data, tag).filter(|v| !v.is_empty()) else {
+                return WRONG_DATA;
+            };
+            if scalar.len() > 32 {
+                return WRONG_DATA;
+            }
+            // ykman / yubico-piv-tool import the X25519 private key little-endian
+            // (RFC 8410 / RFC 7748); `PrivKey` keeps the scalar as a big-endian MPI
+            // (keys.rs reverses it for the curve op), so flip the imported bytes —
+            // else the slot's public key disagrees with the key's real identity and
+            // ciphertext bound to it can't be decrypted. Ed25519's tag 0x07 is a
+            // hash seed, not an integer, so it is imported verbatim.
+            let mut flipped = [0u8; 32];
+            let scalar = if algo == ALGO_X25519 {
+                let n = scalar.len();
+                for (i, &b) in scalar.iter().enumerate() {
+                    flipped[n - 1 - i] = b;
+                }
+                &flipped[..n]
+            } else {
+                scalar
+            };
+            let key = PrivKey::from_scalar(curve, scalar);
+            flipped.zeroize();
+            let Some(key) = key else {
+                return WRONG_DATA;
+            };
             if let Err(sw) = seal::store_ec_key(dev, fs, rng, key_fid(slot), &key) {
                 return sw;
             }
@@ -345,7 +511,7 @@ pub(crate) fn attest<S: Storage>(
     };
     let mut cert = [0u8; x509::MAX_CERT];
     let built = match meta[0] {
-        ALGO_RSA1024 | ALGO_RSA2048 => {
+        ALGO_RSA1024 | ALGO_RSA2048 | ALGO_RSA3072 | ALGO_RSA4096 => {
             let key = match seal::load_rsa_key(dev, fs, key_fid(slot)) {
                 Ok(k) => k,
                 Err(e) => return e,
@@ -370,7 +536,7 @@ pub(crate) fn attest<S: Storage>(
                 Ok(k) => k,
                 Err(e) => return e,
             };
-            let mut point = [0u8; 97];
+            let mut point = [0u8; MAX_EC_POINT];
             let plen = match key.public_point(&mut point) {
                 Ok(n) => n,
                 Err(e) => return e,
@@ -380,6 +546,32 @@ pub(crate) fn attest<S: Storage>(
                     subject_slot: slot,
                     algo: meta[0],
                     spki: x509::Spki::Ec {
+                        curve: key.curve(),
+                        point: &point[..plen],
+                    },
+                    attestation: Some(att),
+                    ca_pathlen: None,
+                },
+                &x509::Signer::Ec(&f9),
+                rng,
+                &mut cert,
+            )
+        }
+        ALGO_ED25519 | ALGO_X25519 => {
+            let key = match seal::load_ec_key(dev, fs, key_fid(slot)) {
+                Ok(k) => k,
+                Err(e) => return e,
+            };
+            let mut point = [0u8; MAX_EC_POINT];
+            let plen = match key.public_point(&mut point) {
+                Ok(n) => n,
+                Err(e) => return e,
+            };
+            x509::build_cert(
+                &x509::CertParams {
+                    subject_slot: slot,
+                    algo: meta[0],
+                    spki: x509::Spki::Rfc8410 {
                         curve: key.curve(),
                         point: &point[..plen],
                     },

@@ -99,23 +99,7 @@ A few notes that matter:
   remain secure-writable, which is how the firmware applies `ROLLBACK_REQUIRED`
   after the pages are otherwise locked down.
 
-```mermaid
-flowchart TD
-    subgraph keys["Device keys — page 58"]
-      mkek["MKEK / DEVK + chaff<br/>(random, forgotten)"]
-      lock58["page-58 lock<br/>BOOTSEL-unreadable, secure r/w"]
-    end
-    subgraph sb["Secure boot"]
-      bootkey["boot-key fingerprint<br/>SHA-256(pubkey)"]
-      crit["SECURE_BOOT_ENABLE<br/>DEBUG_DISABLE · glitch"]
-      keyvalid["KEY_VALID / KEY_INVALID"]
-    end
-    subgraph rb["Anti-rollback"]
-      flag["ROLLBACK_REQUIRED"]
-      therm["48-bit thermometer"]
-    end
-    keys ~~~ sb ~~~ rb
-```
+![OTP fuse map — the rows RS-Key provisions grouped by page: page 1 boot-policy flags (CRIT1, BOOT_FLAGS0/1, the 48-bit rollback thermometer), page 2 boot-key fingerprint, page 58 DEVK and MKEK with high-half complement chaff, and the lock rows; each row coloured by whether picotool over BOOTSEL, the secure firmware, or the bootrom writes it](images/otp-fuse-map.svg)
 
 ### Anti-imaging chaff
 

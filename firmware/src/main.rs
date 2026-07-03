@@ -46,6 +46,8 @@ use rsk_usb::ctaphid::{CtapHid, FIDO_REPORT_DESCRIPTOR};
 
 mod ccid_handler;
 mod core1;
+#[cfg(feature = "display")]
+mod display;
 mod flash_storage;
 mod handler;
 mod led;
@@ -56,9 +58,21 @@ mod rescue_platform;
 mod vendor;
 mod worker;
 
+// The `display` build turns the ST7789 panel into the status indicator, and its
+// backlight sits on GPIO16 — the default addressable-LED pin. So the panel and the
+// LED can't coexist: the flavor must be built `LED_KIND=none` (which also frees
+// GPIO16). Fail loudly at compile time rather than silently double-claim the pin.
+#[cfg(all(feature = "display", not(led_kind = "none")))]
+compile_error!(
+    "the `display` build requires LED_KIND=none (the ST7789 panel replaces the LED \
+     and its backlight uses GPIO16); build with `LED_KIND=none ... --features \
+     display` — the `firmware-display` nix flavor sets this for you"
+);
+
 use flash_storage::{FLASH_SIZE, FlashStorage};
 use handler::{FidoRng, Store};
-use presence::BootselPresence;
+#[cfg(not(feature = "display"))]
+use presence::ButtonPresence;
 use worker::{ClientCcid, ClientCtap, Worker};
 
 use panic_halt as _;
@@ -117,7 +131,47 @@ const XOSC_DELAY_MULT: u32 = env_u32(env!("PK_XOSC_DELAY_MULT"));
 #[cfg(not(led_kind = "none"))]
 const BUILD_LED_PIN: u8 = env_u16(env!("PK_LED_PIN")) as u8;
 const BUILD_PRESENCE_IS_GPIO: bool = env_u16(env!("PK_PRESENCE_IS_GPIO")) != 0;
+#[cfg(not(feature = "display"))]
 const BUILD_PRESENCE_PIN: u8 = env_u16(env!("PK_PRESENCE_PIN")) as u8;
+#[cfg(not(feature = "display"))]
+const BUILD_PRESENCE_ACTIVE_HIGH: bool = env_u16(env!("PK_PRESENCE_ACTIVE_HIGH")) != 0;
+
+// Active-high polarity only applies to a GPIO presence button (BOOTSEL has a fixed
+// sense); flag a stray `PRESENCE_ACTIVE_HIGH` set without a GPIO `PRESENCE_PIN`.
+#[cfg(not(feature = "display"))]
+const _: () = assert!(
+    !BUILD_PRESENCE_ACTIVE_HIGH || BUILD_PRESENCE_IS_GPIO,
+    "PRESENCE_ACTIVE_HIGH only applies with a GPIO PRESENCE_PIN"
+);
+
+// A `display` build takes user presence from the touchscreen, not a GPIO button, so a
+// `PRESENCE_PIN` would be silently ignored — fail the build loudly instead (mirrors
+// the LED_KIND guard above). The non-display path consumes both consts directly.
+#[cfg(feature = "display")]
+const _: () = assert!(
+    !BUILD_PRESENCE_IS_GPIO,
+    "PRESENCE_PIN has no effect on a `display` build (presence is the touchscreen); \
+     drop PRESENCE_PIN, or build without --features display"
+);
+
+// Display-sleep wake button (the `display` build only): build.rs bakes the GPIO
+// (default 25 = the BAT_PWR / KEY_BAT button on the Waveshare RP2350-Touch-LCD-2.8),
+// whether it is enabled (`WAKE_PIN=none` disables it for touch-only wake) and its
+// polarity. `main` claims the pin and hands an `Input` to `display::Ui::build`.
+#[cfg(feature = "display")]
+const BUILD_WAKE_ENABLED: bool = env_u16(env!("PK_WAKE_ENABLED")) != 0;
+#[cfg(feature = "display")]
+const BUILD_WAKE_PIN: u8 = env_u16(env!("PK_WAKE_PIN")) as u8;
+#[cfg(feature = "display")]
+const BUILD_WAKE_ACTIVE_HIGH: bool = env_u16(env!("PK_WAKE_ACTIVE_HIGH")) != 0;
+
+// The wake button must not collide with the LCD/touch GPIOs (10..=18) the display build
+// already drives — catch a bad `WAKE_PIN` at compile time rather than double-claim a pad.
+#[cfg(feature = "display")]
+const _: () = assert!(
+    !BUILD_WAKE_ENABLED || BUILD_WAKE_PIN < 10 || BUILD_WAKE_PIN > 18,
+    "WAKE_PIN collides with an LCD/touch GPIO (10..=18) owned by the display build"
+);
 #[cfg(led_kind = "ws2812")]
 const BUILD_DRIVER: u8 = 3;
 #[cfg(led_kind = "gpio")]
@@ -145,9 +199,19 @@ static USB_HANDLER: StaticCell<led::StatusHandler> = StaticCell::new();
 static FS: StaticCell<RefCell<Store>> = StaticCell::new();
 static FLASH_CELL: StaticCell<RefCell<flash_storage::AsyncFlash>> = StaticCell::new();
 static RNG_CELL: StaticCell<RefCell<FidoRng>> = StaticCell::new();
-static PRESENCE: StaticCell<RefCell<BootselPresence>> = StaticCell::new();
+static PRESENCE: StaticCell<RefCell<presence::Presence>> = StaticCell::new();
 static RESCUE_PLATFORM: StaticCell<RefCell<rescue_platform::RescuePlatform>> = StaticCell::new();
 static PHY_PRODUCT: StaticCell<[u8; 32]> = StaticCell::new();
+// The mipidsi SPI pixel-batch buffer for the `display` build: bigger = fewer SPI
+// transactions per fill. 4 KiB ≈ 8 full panel rows per chunk.
+#[cfg(feature = "display")]
+const DISPLAY_BUF_LEN: usize = 4096;
+#[cfg(feature = "display")]
+static DISPLAY_BUF: StaticCell<[u8; DISPLAY_BUF_LEN]> = StaticCell::new();
+/// The trusted-display panel + touch, shared by `status_task` (ambient status) and
+/// the `TouchPresence` backend (the confirm prompt) on the thread executor.
+#[cfg(feature = "display")]
+static UI: StaticCell<RefCell<display::Ui>> = StaticCell::new();
 
 struct SendUsb(UsbDevice<'static, Drv>);
 unsafe impl Send for SendUsb {}
@@ -187,7 +251,7 @@ fn kvcnt_range() -> core::ops::Range<u32> {
 }
 
 #[embassy_executor::main]
-async fn main(_spawner: Spawner) {
+async fn main(spawner: Spawner) {
     let mut config = embassy_rp::config::Config::default();
     if let Some(xosc) = config.clocks.xosc.as_mut() {
         xosc.delay_multiplier = XOSC_DELAY_MULT;
@@ -231,6 +295,8 @@ async fn main(_spawner: Spawner) {
             }
         }
         usb_itf = rsk_rescue::phy::effective_usb_itf(phy);
+        // Touch-wait timeout (pico-fido phy tag 0x08, seconds; 0/absent = default).
+        presence::set_timeout_secs(phy.presence_timeout.unwrap_or(0));
     }
 
     // Provision/recover all persistent state BEFORE attaching to USB. `builder.build()`
@@ -259,9 +325,10 @@ async fn main(_spawner: Spawner) {
         otp_key: otp_mkek.as_ref(),
     };
     let _ = rsk_fido::seed::migrate_keydev_boot(&dev, &mut fs);
-    rsk_rescue::keydev::migrate_kbase(&dev, &mut fs);
+    rsk_rescue::keydev::migrate_kbase(&dev, &mut fs, &mut rng);
     rsk_piv::migrate_kbase(&dev, &mut fs, &mut rng);
     rsk_oath::migrate_seal(&dev, &mut fs, &mut rng);
+    rsk_otp::migrate_seal(&dev, &mut fs, &mut rng);
     rsk_fido::credential::migrate_rp_seal(&dev, &mut fs);
     let _ = rsk_fido::seed::ensure_seed(&dev, &mut fs, &mut rng);
     let _ = rsk_openpgp::scan_files(&dev, &mut fs, &mut rng);
@@ -298,7 +365,7 @@ async fn main(_spawner: Spawner) {
         }
     }
     vendor::load_led_config(&mut fs);
-    rsk_otp::power_up_bump(&mut fs);
+    rsk_otp::power_up_bump(&dev, &mut fs, &mut rng);
 
     let fs_ref = FS.init(RefCell::new(fs));
     let rng_ref = RNG_CELL.init(RefCell::new(rng));
@@ -312,7 +379,9 @@ async fn main(_spawner: Spawner) {
     config.serial_number = Some("rs-key-0001");
     config.max_power = 100;
     config.max_packet_size_0 = 64;
-    config.device_release = 0x0782; // bcdDevice: our build counter
+    // bcdDevice build counter; also surfaced on the trusted-display Firmware screen.
+    let device_release: u16 = 0x07EC;
+    config.device_release = device_release;
 
     let mut builder = Builder::new(
         driver,
@@ -338,8 +407,17 @@ async fn main(_spawner: Spawner) {
         )
     });
 
+    // Advertise CCID secure PIN entry (bPINSupport = VERIFY) only on the display
+    // build, where the trusted touchscreen can collect the PIN; a button build has
+    // no pad and leaves it off. The byte is the single switch every host CCID stack
+    // reads to drive on-device PIN entry.
+    let ccid_pin_support: u8 = if cfg!(feature = "display") {
+        0x01
+    } else {
+        0x00
+    };
     let ccid = (usb_itf & rsk_rescue::phy::USB_ITF_CCID != 0)
-        .then(|| Ccid::new(&mut builder, ClientCcid, ATR_FIDO));
+        .then(|| Ccid::new(&mut builder, ClientCcid, ATR_FIDO, ccid_pin_support));
 
     let kbd = (usb_itf & rsk_rescue::phy::USB_ITF_KB != 0).then(|| {
         HidWriter::<_, 8>::new(
@@ -528,14 +606,111 @@ async fn main(_spawner: Spawner) {
         }
     }
 
+    // Trusted display (the `display` build — always `LED_KIND=none` per the guard
+    // above, so the LED block compiled out and SPI1/I2C1/GPIO16 are free). Build the
+    // panel + touch here, after the USB task is spawned, so its ~200 ms reset runs
+    // while the interrupt executor enumerates — never delaying it. `status_task`
+    // mirrors the device status; the `TouchPresence` backend (the `presence::Presence`
+    // below) paints the confirm prompt. Both share the panel via the `UI` cell on the
+    // thread executor.
+    #[cfg(feature = "display")]
+    let display_ui = {
+        use embassy_rp::gpio::{Level, Output};
+        use embassy_rp::i2c::{Config as I2cConfig, I2c};
+        use embassy_rp::pwm::Pwm;
+        use embassy_rp::spi::{Config as SpiConfig, Spi};
+
+        let mut spi_cfg = SpiConfig::default();
+        // The ST7789 tops out at 62.5 MHz; running there (vs the 40 MHz bringup value)
+        // cuts a full-frame repaint ~35% for snappier screen transitions. If the panel's
+        // flex cable ever shows tearing/garbling, drop back toward 40 MHz.
+        spi_cfg.frequency = 62_500_000;
+        let spi = Spi::new_blocking(p.SPI1, p.PIN_10, p.PIN_11, p.PIN_12, spi_cfg);
+
+        let mut i2c_cfg = I2cConfig::default();
+        i2c_cfg.frequency = 400_000;
+        let i2c = I2c::new_blocking(p.I2C1, p.PIN_7, p.PIN_6, i2c_cfg);
+
+        let cs = Output::new(p.PIN_13, Level::High);
+        let dc = Output::new(p.PIN_14, Level::Low);
+        let rst = Output::new(p.PIN_15, Level::High);
+        // Display-sleep wake button (default the BAT_PWR / KEY_BAT button on GPIO25).
+        // Active-low with an internal pull-up by default (`WAKE_ACTIVE_HIGH` flips it);
+        // `WAKE_PIN=none` leaves it unwired so only a touch wakes. Stealing the pin is
+        // sound: it is never handed to another driver, and a compile-time assert rejects
+        // a `WAKE_PIN` in the LCD/touch range.
+        let wake_btn = if BUILD_WAKE_ENABLED {
+            use embassy_rp::gpio::{AnyPin, Input, Pull};
+            let pull = if BUILD_WAKE_ACTIVE_HIGH {
+                Pull::Down
+            } else {
+                Pull::Up
+            };
+            Some((
+                Input::new(unsafe { AnyPin::steal(BUILD_WAKE_PIN) }, pull),
+                BUILD_WAKE_ACTIVE_HIGH,
+            ))
+        } else {
+            None
+        };
+        // Backlight on GPIO16 as PWM (slice 0, channel A) at zero duty — dark until
+        // `Ui::build` raises it to full after the first render (no white flash).
+        let bl = Pwm::new_output_a(p.PWM_SLICE0, p.PIN_16, display::backlight_cfg(0));
+        let tp_rst = Output::new(p.PIN_17, Level::High);
+
+        let buf = DISPLAY_BUF.init([0u8; DISPLAY_BUF_LEN]);
+        let panel = display::PanelHw {
+            spi,
+            cs,
+            dc,
+            rst,
+            bl,
+            buf,
+        };
+        let touch = display::TouchHw { i2c, rst: tp_rst };
+        let info = display::DeviceInfo {
+            version: device_release,
+            chipid: u64::from_le_bytes(serial_id),
+        };
+        // The device key material the read-only Passkeys tab needs to unbox the
+        // resident-credential seed on demand (the same identity the worker's `Ctx`
+        // carries). Copied — these are all `Copy`, so the worker below still gets them.
+        let keys = display::DeviceKeys {
+            serial_id,
+            serial_hash,
+            otp_mkek,
+        };
+        // Reborrow the `&'static mut` from the cell as a shared `&'static` so both
+        // `status_task` and the `TouchPresence` backend can hold it (a shared
+        // reference is `Copy`; the `RefCell` provides the interior mutability). The
+        // panel also shares the worker's `fs_ref` to enumerate resident credentials.
+        let ui: &'static RefCell<display::Ui> = UI.init(RefCell::new(display::Ui::build(
+            panel, touch, info, fs_ref, keys, rng_ref, wake_btn,
+        )));
+        spawner.spawn(display::status_task(ui).unwrap());
+        ui
+    };
+    // `spawner` is otherwise unused (the standard key spawns on the interrupt
+    // executor `hp`); consume it so `-D warnings` passes without the display task.
+    #[cfg(not(feature = "display"))]
+    let _ = spawner;
+
     core1::spawn(p.CORE1);
 
-    let presence = if BUILD_PRESENCE_IS_GPIO {
-        BootselPresence::new_gpio(BUILD_PRESENCE_PIN)
-    } else {
-        BootselPresence::new_bootsel(p.BOOTSEL)
+    // Standard key: BOOTSEL by default, or a dedicated `PRESENCE_PIN` GPIO button.
+    // Display build: the touchscreen is the presence source (a `PRESENCE_PIN` is
+    // rejected at compile time — see the `BUILD_PRESENCE_IS_GPIO` assert above).
+    #[cfg(not(feature = "display"))]
+    let presence_ref = {
+        let presence = if BUILD_PRESENCE_IS_GPIO {
+            ButtonPresence::new_gpio(BUILD_PRESENCE_PIN, BUILD_PRESENCE_ACTIVE_HIGH)
+        } else {
+            ButtonPresence::new_bootsel(p.BOOTSEL)
+        };
+        PRESENCE.init(RefCell::new(presence))
     };
-    let presence_ref = PRESENCE.init(RefCell::new(presence));
+    #[cfg(feature = "display")]
+    let presence_ref = PRESENCE.init(RefCell::new(display::TouchPresence::new(display_ui)));
     let platform_ref = RESCUE_PLATFORM.init(RefCell::new(rescue_platform::RescuePlatform));
     let (kvm, kvc) = (kvmain_range(), kvcnt_range());
     let kv_total = (kvm.end - kvm.start) + (kvc.end - kvc.start);

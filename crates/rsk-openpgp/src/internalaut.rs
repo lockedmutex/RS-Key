@@ -14,8 +14,6 @@ use crate::keys::{load_ec_key, load_rsa_key, rsa_sign};
 use crate::pin::Session;
 use crate::{Rng, UserPresence, check_uif};
 
-const DEFAULT_ALGO: &[u8] = &[ALGO_RSA, 0x08, 0x00, 0x00, 0x20, 0x00];
-
 /// INTERNAL AUTHENTICATE (INS 0x88, P1P2 = 00 00).
 pub fn internal_aut<S: Storage>(
     dev: &Device,
@@ -47,8 +45,10 @@ fn try_internal_aut<S: Storage>(
     if !sess.has_pw3 && !sess.has_pw2 {
         return Err(Sw::SECURITY_STATUS_NOT_SATISFIED);
     }
-    // UIF (touch policy): AUT → 0xD8. No-op unless DO set.
-    check_uif(fs, EF_UIF_AUT, presence)?;
+    // UIF (touch policy) of the slot actually used — follows an MSE repoint so
+    // an INTERNAL AUTHENTICATE on a cross-wired DEC key still enforces the DEC
+    // touch policy. No-op unless the DO is set.
+    check_uif(fs, slot_uif(sess.pk_aut), presence)?;
     let mut algo_buf = [0u8; 16];
     let algo0 = match fs.read(sess.algo_aut, &mut algo_buf) {
         Some(n) if n > 0 => algo_buf[0],

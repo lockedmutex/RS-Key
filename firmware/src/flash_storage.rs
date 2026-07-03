@@ -48,8 +48,8 @@ const COUNTER_PAGES: usize = COUNTER_LEN / SECTOR; // 32
 
 /// Transient FID the [`Storage::compact`] lap churns to advance the main ring.
 /// Routed to main (not a counter FID), it never reaches `Fs` and is removed at
-/// the end of the lap — pick a slot no protocol uses (the FIDO 0xCExx block
-/// ends at `EF_HARDENED` 0xCE14; creds start at 0xCF00).
+/// the end of the lap — pick a slot no protocol uses (the FIDO 0xCExx fixed-file
+/// block tops out at `EF_DEVICE_PIN` 0xCE20; creds start at 0xCF00, so 0xCEFE is free).
 const SCRUB_FILLER_FID: u16 = 0xCEFE;
 /// One throwaway record's payload during the scrub lap. Larger ⇒ fewer
 /// `store_item` calls; must fit `KV_BUF` alongside the 2-byte key.

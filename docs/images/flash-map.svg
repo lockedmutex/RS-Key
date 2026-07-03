@@ -1,0 +1,79 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 RS-Key contributors -->
+<svg viewBox="0 0 780 480" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="ttl dsc" font-family="'Segoe UI', system-ui, -apple-system, sans-serif">
+  <title id="ttl">RP2350-One 4 MB flash map</title>
+  <desc id="dsc">Address-space map: firmware code region (signed, ~845 KB used of 2.5 MB) then two KV partitions, KVMAIN 1408 KB and KVCNT 128 KB, which survive a reflash.</desc>
+  <defs>
+    <style>
+      .h1{font-size:23px;font-weight:700;fill:#2B2723}
+      .sub{font-size:12.5px;fill:#948A7F}
+      .addr{font-family:'SF Mono','Roboto Mono',ui-monospace,monospace;font-size:11.5px;fill:#7A736A}
+      .seglab{font-weight:700;fill:#fff}
+      .segsub{fill:#F6EBE3;font-size:10.5px}
+      .co{font-size:11.5px;fill:#5A534B}
+      .lg{font-size:11.5px;fill:#6B645C}
+      .foot{font-size:10.5px;fill:#ADA398}
+    </style>
+  </defs>
+  <rect x="6" y="6" width="768" height="468" rx="16" fill="#FBFAF8" stroke="#E4DED5" stroke-width="1.5"/>
+
+  <text class="h1" x="34" y="48">RP2350-One — 4 MB flash map</text>
+  <text class="sub" x="34" y="70">0x1000_0000 – 0x1040_0000 · external QSPI · heights to scale</text>
+
+  <!-- legend -->
+  <rect x="556" y="34" width="13" height="13" rx="3" fill="#C0562B"/>
+  <text class="lg" x="576" y="45">firmware code</text>
+  <rect x="672" y="34" width="13" height="13" rx="3" fill="#2F7E75"/>
+  <text class="lg" x="692" y="45">KV store</text>
+
+  <!-- address ruler -->
+  <g text-anchor="end">
+    <text class="addr" x="196" y="100">0x1000_0000</text>
+    <text class="addr" x="196" y="322">0x1028_0000</text>
+    <text class="addr" x="196" y="444">0x103E_0000</text>
+    <text class="addr" x="196" y="456">0x1040_0000</text>
+  </g>
+  <g stroke="#D9D2C8" stroke-width="1">
+    <line x1="200" y1="96" x2="206" y2="96"/>
+    <line x1="200" y1="318" x2="206" y2="318"/>
+    <line x1="200" y1="440" x2="206" y2="440"/>
+    <line x1="200" y1="452" x2="206" y2="452"/>
+  </g>
+
+  <!-- code region: used + free -->
+  <rect x="206" y="96" width="176" height="73" fill="#C0562B"/>
+  <rect x="206" y="169" width="176" height="149" fill="#EFE0D6"/>
+  <line x1="206" y1="169" x2="382" y2="169" stroke="#C0562B" stroke-width="1" stroke-dasharray="4 3"/>
+  <rect x="206" y="96" width="176" height="9" fill="#3E3A36"/>
+  <text class="seglab" x="294" y="132" text-anchor="middle" font-size="12.5">firmware image</text>
+  <text class="segsub" x="294" y="148" text-anchor="middle">~845 KB used</text>
+  <text x="294" y="240" text-anchor="middle" font-size="12" font-weight="700" fill="#A9764F">free · ~1.7 MB</text>
+  <text x="294" y="256" text-anchor="middle" font-size="10.5px" fill="#BE9578">headroom to grow</text>
+
+  <!-- KVMAIN -->
+  <rect x="206" y="318" width="176" height="122" fill="#2F7E75"/>
+  <text class="seglab" x="294" y="366" text-anchor="middle" font-size="13">KVMAIN</text>
+  <text class="segsub" x="294" y="382" text-anchor="middle">1408 KB</text>
+  <text class="segsub" x="294" y="398" text-anchor="middle" fill="#CFE6E1">creds · keys · DOs</text>
+
+  <!-- KVCNT -->
+  <rect x="206" y="440" width="176" height="12" fill="#7FB5AE"/>
+
+  <!-- callouts -->
+  <g stroke="#C9C1B6" stroke-width="1" fill="none">
+    <path d="M382 130 H400"/>
+    <path d="M382 372 H400"/>
+    <path d="M382 446 H418"/>
+  </g>
+  <text class="co" x="408" y="120">Firmware code — <tspan font-weight="700" fill="#C0562B">signed by secure boot.</tspan></text>
+  <text class="co" x="408" y="137">Only ~⅓ of the 2.5 MB region is used.</text>
+  <text class="co" x="408" y="154" font-style="italic" fill="#8A8177">IMAGE_DEF boot block sits at 0x1000_0000.</text>
+
+  <text class="co" x="408" y="362">Credentials, keys, OpenPGP / PIV objects.</text>
+  <text class="co" x="408" y="379"><tspan font-weight="700" fill="#2F7E75">AEAD-sealed</tspan> at rest — survives a reflash.</text>
+
+  <text class="co" x="426" y="443">KVCNT · 128 KB — high-churn counters,</text>
+  <text class="co" x="426" y="459">kept apart so they never wear the creds.</text>
+
+  <text class="foot" x="34" y="468">KV = rsk-fs over two sequential-storage partitions · layout defined in firmware/memory.x</text>
+</svg>

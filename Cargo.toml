@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["firmware", "rsk-wipe", "crates/rsk-sdk", "crates/rsk-fs", "crates/rsk-usb", "crates/rsk-crypto", "crates/rsk-fido", "crates/rsk-openpgp", "crates/rsk-rsa-asm", "crates/rsk-mgmt", "crates/rsk-oath", "crates/rsk-otp", "crates/rsk-piv", "crates/rsk-rescue"]
+members = ["firmware", "rsk-wipe", "crates/rsk-sdk", "crates/rsk-fs", "crates/rsk-usb", "crates/rsk-crypto", "crates/rsk-fido", "crates/rsk-openpgp", "crates/rsk-rsa-asm", "crates/rsk-mgmt", "crates/rsk-oath", "crates/rsk-otp", "crates/rsk-piv", "crates/rsk-rescue", "crates/rsk-led", "crates/rsk-ui", "crates/rsk-bip39", "crates/rsk-slip39"]
 
 # Embassy crates are versioned together; pin them all to the same git source so
 # they stay mutually compatible. We track `branch = "main"`, not a crates.io
@@ -34,6 +34,28 @@ rsk-oath = { path = "crates/rsk-oath" }
 rsk-otp = { path = "crates/rsk-otp" }
 rsk-piv = { path = "crates/rsk-piv" }
 rsk-rescue = { path = "crates/rsk-rescue" }
+rsk-led = { path = "crates/rsk-led" }
+rsk-ui = { path = "crates/rsk-ui" }
+# On-device BIP-39 encode for the trusted-display recovery-phrase screen (display-gated).
+rsk-bip39 = { path = "crates/rsk-bip39" }
+# On-device SLIP-39 (Shamir) share encode for the trusted-display recovery screen
+# (display-gated). Mirrors the host `shamir_mnemonic` exactly so `rsk backup restore` recombines.
+rsk-slip39 = { path = "crates/rsk-slip39" }
+# Trusted-display driver stack — compiled ONLY into the `display` firmware flavor
+# (and rsk-ui's host tests), never the standard key (all `dep:`-gated). embedded-
+# graphics: no_std 2D text/primitives + the `DrawTarget` trait the renderer is
+# generic over; mipidsi: the ST7789 panel driver (blocking, direct-draw, no
+# framebuffer; keep its default `batch` feature for fast fills); embedded-hal-bus:
+# `ExclusiveDevice`, to present embassy-rp's SPI bus as the `SpiDevice` mipidsi
+# wants (its `std` default off for no_std).
+embedded-graphics = { version = "0.8", default-features = false }
+# Proportional 1-bit bitmap text (helvR/helvB/profont) — the high-fidelity
+# typography the trusted-display redesign calls for, in place of embedded-graphics'
+# monospace built-ins. no_std, renders onto the same `DrawTarget`; rsk-ui-only so it
+# never reaches the standard key (the size-guard asserts rsk-ui absent there).
+u8g2-fonts = { version = "0.8", default-features = false, features = ["embedded_graphics_textstyle"] }
+mipidsi = { version = "0.10" }
+embedded-hal-bus = { version = "0.3", default-features = false }
 minicbor = { version = "2.2", default-features = false }
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic", "ecdh"] }
 # Additional FIDO2 signing curves; same 0.13 RustCrypto ecosystem as p256.

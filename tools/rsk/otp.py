@@ -25,27 +25,26 @@ import tempfile
 
 from . import ccid
 from .common import confirm, die, picotool
+from .status import RESCUE_AID, rescue_read
 
 DEVK_ROW, MKEK_ROW, KEY_ROWS, CHAFF_OFFSET = 0xE80, 0xE90, 16, 0x20
 LOCK1_ROW, LOCK_VALUE = 0xFF5, 0x3C3C3C
 K256_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 
-RESCUE_AID = [0xA0, 0x58, 0x3F, 0xC1, 0x9B, 0x7E, 0x4F, 0x21]
 LOCK_APDU = [0x80, 0x1B, 0x58, 0x00, 0x06] + list(b"LOCK58") + [0x00]
 LOCK_SW = {
-    (0x90, 0x00): "OK — page 58 is now locked (or was already)",
-    (0x69, 0x85): "CONDITIONS_NOT_SATISFIED — keys not provisioned, or the lock row "
-                  "already holds a foreign value (firmware refused)",
+    ccid.SW_OK: "OK — page 58 is now locked (or was already)",
+    ccid.SW_COND_NOT_SATISFIED: "CONDITIONS_NOT_SATISFIED — keys not provisioned, or the lock row "
+                                "already holds a foreign value (firmware refused)",
     (0x69, 0x84): "DATA_INVALID — wrong magic payload",
     (0x6A, 0x86): "INCORRECT_P1P2",
     (0x64, 0x00): "EXEC_ERROR — OTP read/write failed or did not verify",
 }
 ROLLBACK_APDU = [0x80, 0x1B, 0x48, 0x00, 0x06] + list(b"ROLLBK") + [0x00]
-ROLLBACK_STATE_APDU = [0x80, 0x1E, 0x06, 0x00, 0x00]
 ROLLBACK_SW = {
-    (0x90, 0x00): "OK — ROLLBACK_REQUIRED is now fused (or was already)",
-    (0x69, 0x85): "CONDITIONS_NOT_SATISFIED — secure boot is not enabled; the flag "
-                  "does nothing without enforcement, so the firmware refused",
+    ccid.SW_OK: "OK — ROLLBACK_REQUIRED is now fused (or was already)",
+    ccid.SW_COND_NOT_SATISFIED: "CONDITIONS_NOT_SATISFIED — secure boot is not enabled; the flag "
+                                "does nothing without enforcement, so the firmware refused",
     (0x69, 0x84): "DATA_INVALID — wrong magic payload",
     (0x6A, 0x86): "INCORRECT_P1P2 — firmware too old (no anti-rollback support)?",
     (0x64, 0x00): "EXEC_ERROR — OTP read/write failed or did not verify",
@@ -139,7 +138,7 @@ def burn(args):
 def lock_page58(args):
     conn = ccid.connect()
     _, s1, s2 = ccid.select(conn, RESCUE_AID)
-    if (s1, s2) != (0x90, 0x00):
+    if (s1, s2) != ccid.SW_OK:
         die(f"SELECT rescue AID failed: {s1:02X}{s2:02X} (firmware too old?)")
     print("rescue applet selected ✓")
     if args.dry_run:
@@ -149,7 +148,7 @@ def lock_page58(args):
     confirm("LOCK-PAGE58")
     _, s1, s2 = ccid.transmit(conn, LOCK_APDU)
     print(f"OTP_LOCK → SW {s1:02X}{s2:02X}: {LOCK_SW.get((s1, s2), 'unknown status')}")
-    if (s1, s2) != (0x90, 0x00):
+    if (s1, s2) != ccid.SW_OK:
         raise SystemExit(2)
     print("done. From BOOTSEL `picotool otp get -r 0xe90` must now fail (permission).")
 
@@ -157,11 +156,11 @@ def lock_page58(args):
 def rollback_require(args):
     conn = ccid.connect()
     _, s1, s2 = ccid.select(conn, RESCUE_AID)
-    if (s1, s2) != (0x90, 0x00):
+    if (s1, s2) != ccid.SW_OK:
         die(f"SELECT rescue AID failed: {s1:02X}{s2:02X} (firmware too old?)")
     print("rescue applet selected ✓")
-    d, s1, s2 = ccid.transmit(conn, ROLLBACK_STATE_APDU)
-    if (s1, s2) != (0x90, 0x00) or len(d) < 3:
+    d, s1, s2 = rescue_read(conn, 0x06)
+    if (s1, s2) != ccid.SW_OK or len(d) < 3:
         die(f"anti-rollback state read failed: SW {s1:02X}{s2:02X} — firmware too old?")
     required, version, capacity = d[0], d[1], d[2]
     print(f"anti-rollback state: ROLLBACK_REQUIRED={bool(required)}, "
@@ -179,7 +178,7 @@ def rollback_require(args):
     confirm("ROLLBACK-REQUIRED")
     _, s1, s2 = ccid.transmit(conn, ROLLBACK_APDU)
     print(f"OTP_LOCK → SW {s1:02X}{s2:02X}: {ROLLBACK_SW.get((s1, s2), 'unknown status')}")
-    if (s1, s2) != (0x90, 0x00):
+    if (s1, s2) != ccid.SW_OK:
         raise SystemExit(2)
     print("done. Negative-test: a signed-but-versionless UF2 must now refuse to boot")
     print("(falls back to BOOTSEL); the current image keeps booting.")

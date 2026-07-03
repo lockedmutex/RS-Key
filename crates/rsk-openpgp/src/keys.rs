@@ -2,16 +2,16 @@
 // Copyright (C) 2026 RS-Key contributors
 
 //! Private-key sealing and the asymmetric operations. Keys live in the internal
-//! EFs `EF_PK_SIG`/`DEC`/`AUT`, AES-256-CFB-sealed under the random DEK (key =
-//! `dek[16..48]`, IV = `dek[0..16]`; the DEK itself is PIN-wrapped, see
-//! [`crate::pin`]). EC blobs are `[curve_id] ‖ scalar`; signatures are raw
+//! EFs `EF_PK_SIG`/`DEC`/`AUT`, AES-256-GCM-sealed under the random DEK (key =
+//! `dek[16..48]`, nonce-PRF key = `dek[0..16]`; the DEK itself is PIN-wrapped,
+//! see [`crate::pin`]). EC blobs are `[curve_id] ‖ scalar`; signatures are raw
 //! `r ‖ s` (fixed field width), NOT DER.
 
 use alloc::boxed::Box;
 use zeroize::Zeroize;
 
-use rsk_crypto::Device;
-use rsk_crypto::aes::{aes_decrypt_cfb_256, aes_encrypt_cfb_256};
+use rsk_crypto::aes::aes_decrypt_cfb_256;
+use rsk_crypto::{Device, aes256gcm_decrypt, aes256gcm_encrypt, hmac_sha256};
 use rsk_fs::{Fs, KeyFid, Sealed, Storage};
 use rsk_sdk::Sw;
 
@@ -34,9 +34,6 @@ use crate::consts::*;
 use crate::dobj::{ATTR_CV25519, ATTR_ED25519, ATTR_P256K1, ATTR_P256R1, ATTR_P384R1, ATTR_P521R1};
 use crate::pin::{Session, load_dek};
 
-/// Status 0x6A80 (wrong data).
-const WRONG_DATA: Sw = Sw::INCORRECT_PARAMS;
-
 /// Largest raw ECDSA signature: P-521 `r ‖ s` = 2×66 bytes.
 pub const MAX_EC_SIG: usize = 132;
 /// Largest EC public point: P-521 uncompressed `04 ‖ x ‖ y` = 1 + 2×66 bytes.
@@ -45,50 +42,140 @@ pub const MAX_EC_POINT: usize = 133;
 const MAX_EC_KDATA: usize = 1 + 66;
 
 // ---------------------------------------------------------------- DEK seal ---
+//
+// Key blobs are AES-256-GCM-sealed under the PIN-wrapped DEK: the record is
+// `nonce(12) ‖ ct ‖ tag(16)`, GCM key = `dek[16..48]`, AAD = the device serial
+// hash. The 12-byte nonce is SYNTHETIC — `HMAC-SHA256(dek[0..16], fid ‖ plain)`
+// truncated — so two distinct keys (or the same key in two slots) never share a
+// nonce, killing the block-0 keystream reuse the old fixed-IV CFB seal had, and
+// GCM adds the authentication CFB lacked. A synthetic nonce needs no RNG, so the
+// (RNG-less) import path is unaffected. Records written by the older seal (bare
+// fixed-IV CFB ciphertext) still load: `dek_unseal` trial-decrypts under GCM and,
+// on an auth failure, falls back to the legacy CFB decrypt, and the caller then
+// re-seals the key forward the first time it is loaded.
 
-/// Unwrap the DEK with the verified PIN session, then AES-256-CFB decrypt
-/// `data` in place (key = `dek[16..48]`, IV = `dek[0..16]`).
-pub fn dek_decrypt<S: Storage>(
-    dev: &Device,
-    fs: &mut Fs<S>,
-    sess: &Session,
-    data: &mut [u8],
-) -> Result<(), Sw> {
-    let (mut key, mut iv) = load_seal(dev, fs, sess)?;
-    let r = aes_decrypt_cfb_256(&key, &iv, data);
-    key.zeroize();
-    iv.zeroize();
-    r.map_err(|_| Sw::EXEC_ERROR)
+const DEK_NONCE_LEN: usize = 12;
+const DEK_TAG_LEN: usize = 16;
+/// Bytes the GCM seal adds over the plaintext (`nonce ‖ … ‖ tag`).
+pub const DEK_SEAL_OVERHEAD: usize = DEK_NONCE_LEN + DEK_TAG_LEN;
+
+/// Synthetic 12-byte nonce for `fid`'s `plain`: `HMAC(nonce_key, fid)` re-keys a
+/// second HMAC over the plaintext, so distinct key material always yields a
+/// distinct nonce (and identical material re-seals identically — no reuse risk).
+fn synth_nonce(nonce_key: &[u8; IV_SIZE], fid: KeyFid, plain: &[u8]) -> [u8; DEK_NONCE_LEN] {
+    let sub = hmac_sha256(nonce_key, &fid.get().to_be_bytes());
+    let full = hmac_sha256(&sub, plain);
+    let mut nonce = [0u8; DEK_NONCE_LEN];
+    nonce.copy_from_slice(&full[..DEK_NONCE_LEN]);
+    nonce
 }
 
-/// The encrypting counterpart of [`dek_decrypt`].
-pub fn dek_encrypt<S: Storage>(
-    dev: &Device,
-    fs: &mut Fs<S>,
-    sess: &Session,
-    data: &mut [u8],
-) -> Result<(), Sw> {
-    let (mut key, mut iv) = load_seal(dev, fs, sess)?;
-    let r = aes_encrypt_cfb_256(&key, &iv, data);
-    key.zeroize();
-    iv.zeroize();
-    r.map_err(|_| Sw::EXEC_ERROR)
+/// Seal `plain` under the split DEK halves into `out` as `nonce ‖ ct ‖ tag`;
+/// returns the record length. Pure over the key material so it is unit-testable
+/// without a PIN session.
+fn seal_with(
+    key: &[u8; 32],
+    nonce_key: &[u8; IV_SIZE],
+    serial_hash: &[u8],
+    fid: KeyFid,
+    plain: &[u8],
+    out: &mut [u8],
+) -> Result<usize, Sw> {
+    let n = DEK_NONCE_LEN + plain.len() + DEK_TAG_LEN;
+    if out.len() < n {
+        return Err(Sw::WRONG_LENGTH);
+    }
+    let nonce = synth_nonce(nonce_key, fid, plain);
+    out[..DEK_NONCE_LEN].copy_from_slice(&nonce);
+    out[DEK_NONCE_LEN..DEK_NONCE_LEN + plain.len()].copy_from_slice(plain);
+    let tag = aes256gcm_encrypt(
+        key,
+        &nonce,
+        serial_hash,
+        &mut out[DEK_NONCE_LEN..DEK_NONCE_LEN + plain.len()],
+    );
+    out[DEK_NONCE_LEN + plain.len()..n].copy_from_slice(&tag);
+    Ok(n)
 }
 
-/// Load the DEK and split it into the AES-CFB (key, IV) seal halves.
-fn load_seal<S: Storage>(
+/// Unseal a `blob` under the split DEK halves into `out`; returns
+/// `(plaintext_len, was_legacy)`. Tries the GCM format, falling back to the
+/// legacy fixed-IV CFB decrypt on an auth failure. Pure over the key material.
+fn unseal_with(
+    key: &[u8; 32],
+    nonce_key: &[u8; IV_SIZE],
+    serial_hash: &[u8],
+    blob: &[u8],
+    out: &mut [u8],
+) -> Result<(usize, bool), Sw> {
+    if blob.len() >= DEK_NONCE_LEN + DEK_TAG_LEN {
+        let pt_len = blob.len() - DEK_NONCE_LEN - DEK_TAG_LEN;
+        if out.len() >= pt_len {
+            let mut nonce = [0u8; DEK_NONCE_LEN];
+            nonce.copy_from_slice(&blob[..DEK_NONCE_LEN]);
+            let mut tag = [0u8; DEK_TAG_LEN];
+            tag.copy_from_slice(&blob[blob.len() - DEK_TAG_LEN..]);
+            out[..pt_len].copy_from_slice(&blob[DEK_NONCE_LEN..DEK_NONCE_LEN + pt_len]);
+            if aes256gcm_decrypt(key, &nonce, serial_hash, &mut out[..pt_len], &tag).is_ok() {
+                return Ok((pt_len, false));
+            }
+        }
+    }
+    // Legacy fixed-IV CFB record (bare ciphertext, no nonce/tag).
+    if out.len() < blob.len() {
+        return Err(Sw::WRONG_LENGTH);
+    }
+    out[..blob.len()].copy_from_slice(blob);
+    aes_decrypt_cfb_256(key, nonce_key, &mut out[..blob.len()]).map_err(|_| Sw::EXEC_ERROR)?;
+    Ok((blob.len(), true))
+}
+
+/// Load the DEK and split it into the GCM key (`dek[16..48]`) and the nonce-PRF
+/// key (`dek[0..16]`, also the legacy CFB IV) — disjoint bytes of one random DEK.
+fn load_dek_keys<S: Storage>(
     dev: &Device,
     fs: &mut Fs<S>,
     sess: &Session,
-) -> Result<([u8; 32], [u8; 16]), Sw> {
+) -> Result<([u8; 32], [u8; IV_SIZE]), Sw> {
     let mut dek = [0u8; DEK_SIZE];
     load_dek(dev, fs, sess, &mut dek)?;
     let mut key = [0u8; 32];
     key.copy_from_slice(&dek[IV_SIZE..IV_SIZE + 32]);
-    let mut iv = [0u8; 16];
-    iv.copy_from_slice(&dek[..IV_SIZE]);
+    let mut nk = [0u8; IV_SIZE];
+    nk.copy_from_slice(&dek[..IV_SIZE]);
     dek.zeroize();
-    Ok((key, iv))
+    Ok((key, nk))
+}
+
+/// Seal `plain` under the DEK into `out` (`nonce ‖ ct ‖ tag`); returns its length.
+fn dek_seal<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    sess: &Session,
+    fid: KeyFid,
+    plain: &[u8],
+    out: &mut [u8],
+) -> Result<usize, Sw> {
+    let (mut key, mut nk) = load_dek_keys(dev, fs, sess)?;
+    let r = seal_with(&key, &nk, dev.serial_hash, fid, plain, out);
+    key.zeroize();
+    nk.zeroize();
+    r
+}
+
+/// Unseal a DEK `blob` into `out`; returns `(plaintext_len, was_legacy)`.
+fn dek_unseal<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    sess: &Session,
+    blob: &[u8],
+    out: &mut [u8],
+) -> Result<(usize, bool), Sw> {
+    let (mut key, mut nk) = load_dek_keys(dev, fs, sess)?;
+    let r = unseal_with(&key, &nk, dev.serial_hash, blob, out);
+    key.zeroize();
+    nk.zeroize();
+    r
 }
 
 // ------------------------------------------------------------------ curves ---
@@ -486,36 +573,45 @@ pub fn store_ec_key<S: Storage>(
     let mut kdata = [0u8; MAX_EC_KDATA];
     kdata[0] = key.curve().id();
     kdata[1..n].copy_from_slice(scalar);
+    let mut blob = [0u8; MAX_EC_KDATA + DEK_SEAL_OVERHEAD];
     let r = (|| {
-        dek_encrypt(dev, fs, sess, &mut kdata[..n])?;
-        fs.put_key(fid, Sealed::wrap(&kdata[..n]))
+        let bn = dek_seal(dev, fs, sess, fid, &kdata[..n], &mut blob)?;
+        fs.put_key(fid, Sealed::wrap(&blob[..bn]))
             .map_err(|_| Sw::MEMORY_FAILURE)
     })();
     kdata.zeroize();
+    blob.zeroize();
     r
 }
 
-/// Read and unseal the EC key stored at `fid`.
+/// Read and unseal the EC key stored at `fid`. A key still in the legacy CFB
+/// seal is transparently re-sealed to the authenticated fresh-nonce format.
 pub fn load_ec_key<S: Storage>(
     dev: &Device,
     fs: &mut Fs<S>,
     sess: &Session,
     fid: KeyFid,
 ) -> Result<PrivKey, Sw> {
+    let mut blob = [0u8; MAX_EC_KDATA + DEK_SEAL_OVERHEAD];
+    let n = fs.read_key(fid, &mut blob).ok_or(Sw::REFERENCE_NOT_FOUND)?;
+    let n = n.min(blob.len());
     let mut kdata = [0u8; MAX_EC_KDATA];
-    let n = fs
-        .read_key(fid, &mut kdata)
-        .ok_or(Sw::REFERENCE_NOT_FOUND)?;
-    if n < 2 {
-        return Err(WRONG_DATA);
-    }
     let r = (|| {
-        dek_decrypt(dev, fs, sess, &mut kdata[..n])?;
+        let (pt, legacy) = dek_unseal(dev, fs, sess, &blob[..n], &mut kdata)?;
+        if pt < 2 {
+            return Err(WRONG_DATA);
+        }
         let curve = Curve::from_id(kdata[0]).ok_or(WRONG_DATA)?;
-        PrivKey::from_scalar(curve, &kdata[1..n]).ok_or(WRONG_DATA)
+        let key = PrivKey::from_scalar(curve, &kdata[1..pt]).ok_or(WRONG_DATA)?;
+        Ok((key, legacy))
     })();
     kdata.zeroize();
-    r
+    blob.zeroize();
+    let (key, legacy) = r?;
+    if legacy {
+        let _ = store_ec_key(dev, fs, sess, fid, &key);
+    }
+    Ok(key)
 }
 
 /// Wrap a public point as the OpenPGP public-key DO `7F49 { 86 <point> }`, with
@@ -555,13 +651,13 @@ pub fn store_aes_key<S: Storage>(
     sess: &Session,
     key: &[u8; 32],
 ) -> Result<(), Sw> {
-    let mut kdata = *key;
+    let mut blob = [0u8; 32 + DEK_SEAL_OVERHEAD];
     let r = (|| {
-        dek_encrypt(dev, fs, sess, &mut kdata)?;
-        fs.put_key(EF_AES_KEY, Sealed::wrap(&kdata))
+        let bn = dek_seal(dev, fs, sess, EF_AES_KEY, key, &mut blob)?;
+        fs.put_key(EF_AES_KEY, Sealed::wrap(&blob[..bn]))
             .map_err(|_| Sw::MEMORY_FAILURE)
     })();
-    kdata.zeroize();
+    blob.zeroize();
     r
 }
 
@@ -573,14 +669,25 @@ pub fn load_aes_key<S: Storage>(
     fs: &mut Fs<S>,
     sess: &Session,
 ) -> Result<([u8; 32], usize), Sw> {
-    let mut kdata = [0u8; 32];
-    let n = fs
-        .read_key(EF_AES_KEY, &mut kdata)
+    let mut blob = [0u8; 32 + DEK_SEAL_OVERHEAD];
+    let bn = fs
+        .read_key(EF_AES_KEY, &mut blob)
         .filter(|&n| n > 0)
         .ok_or(Sw::REFERENCE_NOT_FOUND)?;
-    if let Err(e) = dek_decrypt(dev, fs, sess, &mut kdata[..n]) {
-        kdata.zeroize();
-        return Err(e);
+    let bn = bn.min(blob.len());
+    let mut kdata = [0u8; 32];
+    let (n, legacy) = match dek_unseal(dev, fs, sess, &blob[..bn], &mut kdata) {
+        Ok(v) => v,
+        Err(e) => {
+            blob.zeroize();
+            kdata.zeroize();
+            return Err(e);
+        }
+    };
+    blob.zeroize();
+    // GENERATE only ever mints a 32-byte AES-256 key; re-seal a legacy one forward.
+    if legacy && n == 32 {
+        let _ = store_aes_key(dev, fs, sess, &kdata);
     }
     Ok((kdata, n))
 }
@@ -892,40 +999,47 @@ pub fn store_rsa_key<S: Storage>(
     kdata[n - qb.len()..n].copy_from_slice(&qb);
     pb.zeroize();
     qb.zeroize();
+    let mut blob = [0u8; MAX_RSA_KDATA + DEK_SEAL_OVERHEAD];
     let r = (|| {
-        dek_encrypt(dev, fs, sess, &mut kdata[..n])?;
-        fs.put_key(fid, Sealed::wrap(&kdata[..n]))
+        let bn = dek_seal(dev, fs, sess, fid, &kdata[..n], &mut blob)?;
+        fs.put_key(fid, Sealed::wrap(&blob[..bn]))
             .map_err(|_| Sw::MEMORY_FAILURE)
     })();
     kdata.zeroize();
+    blob.zeroize();
     r
 }
 
 /// Read and unseal the RSA key at `fid`, rebuilding it from `P ‖ Q` with
-/// `E = 65537`.
+/// `E = 65537`. A key still in the legacy CFB seal is re-sealed forward.
 pub fn load_rsa_key<S: Storage>(
     dev: &Device,
     fs: &mut Fs<S>,
     sess: &Session,
     fid: KeyFid,
 ) -> Result<RsaPrivateKey, Sw> {
+    let mut blob = [0u8; MAX_RSA_KDATA + DEK_SEAL_OVERHEAD];
+    let bn = fs.read_key(fid, &mut blob).ok_or(Sw::REFERENCE_NOT_FOUND)?;
+    let bn = bn.min(blob.len());
     let mut kdata = [0u8; MAX_RSA_KDATA];
-    let n = fs
-        .read_key(fid, &mut kdata)
-        .ok_or(Sw::REFERENCE_NOT_FOUND)?;
-    if n < 2 || n % 2 != 0 {
-        kdata.zeroize();
-        return Err(WRONG_DATA);
-    }
     let res = (|| {
-        dek_decrypt(dev, fs, sess, &mut kdata[..n])?;
+        let (n, legacy) = dek_unseal(dev, fs, sess, &blob[..bn], &mut kdata)?;
+        if n < 2 || n % 2 != 0 {
+            return Err(WRONG_DATA);
+        }
         let half = n / 2;
         let p = BigUint::from_bytes_be(&kdata[..half]);
         let q = BigUint::from_bytes_be(&kdata[half..n]);
-        RsaPrivateKey::from_p_q(p, q, BigUint::from(65_537u32)).map_err(|_| WRONG_DATA)
+        let key = RsaPrivateKey::from_p_q(p, q, BigUint::from(RSA_E)).map_err(|_| WRONG_DATA)?;
+        Ok((key, legacy))
     })();
     kdata.zeroize();
-    res
+    blob.zeroize();
+    let (key, legacy) = res?;
+    if legacy {
+        let _ = store_rsa_key(dev, fs, sess, fid, &key);
+    }
+    Ok(key)
 }
 
 /// Build the public-key DO `7F49 82 LL { 81 82 <N> · 82 <Elen> <E> }` (modulus
@@ -978,14 +1092,8 @@ pub fn rsa_sign_em(data: &[u8], em: &mut [u8; MAX_RSA_DIGESTINFO]) -> Option<usi
     let (prefix, hash): (&[u8], &[u8]) = if let Some(di) = match_digestinfo(data) {
         di
     } else {
-        match data.len() {
-            20 => (DI_SHA1, data),
-            28 => (DI_SHA224, data),
-            32 => (DI_SHA256, data),
-            48 => (DI_SHA384, data),
-            64 => (DI_SHA512, data),
-            _ => return None,
-        }
+        let &(prefix, _) = DIGESTINFOS.iter().find(|&&(_, hlen)| hlen == data.len())?;
+        (prefix, data)
     };
     let dlen = prefix.len() + hash.len();
     em[..prefix.len()].copy_from_slice(prefix);
@@ -1104,378 +1212,13 @@ impl rand_core::RngCore for RngAdapter<'_> {
 impl rand_core::CryptoRng for RngAdapter<'_> {}
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // The end-to-end (applet) tests in lib.rs cover P-256 + Ed25519; these check
-    // the raw r‖s output and public-point round-trip for the heavier curves.
-    struct SeqRng(u64);
-    impl Rng for SeqRng {
-        fn fill(&mut self, buf: &mut [u8]) {
-            for b in buf.iter_mut() {
-                self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
-                *b = (self.0 >> 33) as u8;
-            }
-        }
-    }
-
-    fn sign_and_verify(curve: Curve, scalar: &[u8], expect_sig_len: usize) {
-        let key = PrivKey::from_scalar(curve, scalar).unwrap();
-        // A 64-byte (SHA-512-sized) prehash: ≥ half the field for every curve
-        // here (`bits2field` rejects anything shorter than that for P-521).
-        let digest = [0x42u8; 64];
-        let mut sig = [0u8; MAX_EC_SIG];
-        let n = key.sign(&digest, &mut SeqRng(1), &mut sig).unwrap();
-        assert_eq!(n, expect_sig_len, "raw r‖s width");
-        let mut pt = [0u8; MAX_EC_POINT];
-        let pn = key.public_point(&mut pt).unwrap();
-        let (point, sig) = (&pt[..pn], &sig[..n]);
-        match curve {
-            Curve::P384 => {
-                use p384::ecdsa::{Signature, VerifyingKey, signature::hazmat::PrehashVerifier};
-                let vk = VerifyingKey::from_sec1_bytes(point).unwrap();
-                vk.verify_prehash(&digest, &Signature::from_slice(sig).unwrap())
-                    .unwrap();
-            }
-            Curve::K256 => {
-                use k256::ecdsa::{Signature, VerifyingKey, signature::hazmat::PrehashVerifier};
-                let vk = VerifyingKey::from_sec1_bytes(point).unwrap();
-                vk.verify_prehash(&digest, &Signature::from_slice(sig).unwrap())
-                    .unwrap();
-            }
-            Curve::P521 => {
-                use p521::ecdsa::{Signature, VerifyingKey, signature::hazmat::PrehashVerifier};
-                let vk = VerifyingKey::from_sec1_bytes(point).unwrap();
-                vk.verify_prehash(&digest, &Signature::from_slice(sig).unwrap())
-                    .unwrap();
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    #[test]
-    fn p384_raw_sign_verifies() {
-        sign_and_verify(Curve::P384, &[0x11u8; 48], 96);
-    }
-
-    #[test]
-    fn k256_raw_sign_verifies() {
-        sign_and_verify(Curve::K256, &[0x11u8; 32], 64);
-    }
-
-    #[test]
-    fn p521_raw_sign_verifies() {
-        // Top byte 0 keeps the scalar < n (a P-521 scalar is 521 bits).
-        let mut scalar = [0x11u8; 66];
-        scalar[0] = 0x00;
-        sign_and_verify(Curve::P521, &scalar, 132);
-    }
-
-    /// The raw RSA fallback must be base-blinded yet still compute `m^d mod n`
-    /// exactly, independent of the blinding factor (CT-audit finding #1).
-    #[test]
-    fn rsa_raw_blinded_equals_unblinded() {
-        let key = RsaPrivateKey::new(&mut RngAdapter(&mut SeqRng(7)), 512).unwrap();
-        let ks = key.size();
-        let data = [0x2au8; 40];
-        let mut out = [0u8; MAX_RSA_BYTES];
-        let n = rsa_raw(&key, &data, &mut out, &mut SeqRng(99)).unwrap();
-        assert_eq!(n, ks);
-        let got = BigUint::from_bytes_be(&out[..ks]);
-        let want = BigUint::from_bytes_be(&data).modpow(key.d(), key.n());
-        assert_eq!(got, want, "blinded raw RSA must equal m^d mod n");
-        // The result must not depend on the random blinding factor.
-        let mut out2 = [0u8; MAX_RSA_BYTES];
-        rsa_raw(&key, &data, &mut out2, &mut SeqRng(424242)).unwrap();
-        assert_eq!(out[..ks], out2[..ks], "blinding must cancel");
-    }
-
-    /// ECDH Diffie-Hellman symmetry: `ECDH(a, B_pub) == ECDH(b, A_pub)` proves the
-    /// new Weierstrass agreements (P-384/P-521/secp256k1) compute the right shared
-    /// x-coordinate of the field width. P-256 + X25519 have their own vectors.
-    fn ecdh_symmetry(curve: Curve, sa: &[u8], sb: &[u8], zlen: usize) {
-        let a = PrivKey::from_scalar(curve, sa).unwrap();
-        let b = PrivKey::from_scalar(curve, sb).unwrap();
-        let mut pa = [0u8; MAX_EC_POINT];
-        let na = a.public_point(&mut pa).unwrap();
-        let mut pb = [0u8; MAX_EC_POINT];
-        let nb = b.public_point(&mut pb).unwrap();
-        let mut z1 = [0u8; 66];
-        let n1 = a.ecdh(&pb[..nb], &mut z1).unwrap();
-        let mut z2 = [0u8; 66];
-        let n2 = b.ecdh(&pa[..na], &mut z2).unwrap();
-        assert_eq!(n1, zlen, "shared x-coordinate width");
-        assert_eq!(
-            &z1[..n1],
-            &z2[..n2],
-            "DH shared secret must match both ways"
-        );
-    }
-
-    #[test]
-    fn ecdh_weierstrass_dh_symmetry() {
-        ecdh_symmetry(Curve::P384, &[0x11; 48], &[0x22; 48], 48);
-        ecdh_symmetry(Curve::K256, &[0x11; 32], &[0x22; 32], 32);
-        // P-521 scalars need the top byte clear to stay below n.
-        let (mut a, mut b) = ([0x11u8; 66], [0x22u8; 66]);
-        a[0] = 0;
-        b[0] = 0;
-        ecdh_symmetry(Curve::P521, &a, &b, 66);
-    }
-
-    #[test]
-    fn curve_from_attr_matches_oid_only() {
-        // ECDSA- and ECDH-tagged P-256 share an OID → same curve.
-        assert_eq!(
-            curve_from_attr(&[0x13, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07]),
-            Some(Curve::P256)
-        );
-        assert_eq!(
-            curve_from_attr(&[0x12, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07]),
-            Some(Curve::P256)
-        );
-        // RSA / unknown OIDs are not EC curves.
-        assert_eq!(curve_from_attr(&[0x01, 0x08, 0x00, 0x00, 0x20, 0x00]), None);
-    }
-}
+#[path = "keys_tests.rs"]
+mod tests;
 
 #[cfg(test)]
-mod rsa_tests {
-    use super::*;
-    use rsa::RsaPublicKey;
-
-    // A fixed RSA-2048 key (openssl genrsa), primes sans the DER sign byte.
-    const P_HEX: &str = "f05c23060effc422e4310c13b5aecda74744925c97c17d202aa9ed306941fa1e942e61c8d9c80961cf90459af36b9e7d529610f5165d60836de5aef2aeb47ea500c5a61bb96fd3bb4aca36d45464cce24ff0b67bb3ba382d9bdd95b7133eab86125800f10b0627fe1bd7689802d767dd9911eefb60d76e2ec860163f3077a5bd";
-    const Q_HEX: &str = "c6a96b4a9b7bdd654152f3302dd23bd7b18e62f999cf0d44d01c6ce18cfdfb1c29e523edebe5e6df8967f49afe38d6a9345bc6f4f966e0de2902bddc7caf5a4a1761d18b070cd4cda287388cbdf523c39e246c220af3292fee181b4bb1c3f533b74de89c586e6f9d47ae4bb7f8735d3f0b377a76a7ca6c81324833c2b78b737d";
-    const N_HEX: &str = "ba8654a65ddb75e8cf593ee635345ac0a64d43bd328849683979bf25928cf46489051bf991cdb56a464d83069048c651b049d0181bc08a1e34cb9130a86c67a6283e79100d6c32dce9ddf852ba94cbe1d2b3c89358096cd48a8c90fcb6089819258e44d92d25b0cc4ab2a9224e4489e2eec8abc13a19f520adec2710f8f8ac21b4cebe99a958fe38fe43b50c97375076c2ff5e98980af0c5a719a417ba8f657328ea95f50936d6f459af093bc864b222f89302e9e9972ff491608f7ef93b509c8a65bad0e51bcbf0d2e43d2c9956d762af1d26a01b776471e39a2338babb4f8a30199cf26dd8dbdccf59ef77912b1b700e59c3a7e327ffbb58b6584b827ed449";
-
-    fn hex(s: &str) -> Vec<u8> {
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-            .collect()
-    }
-
-    struct SeqRng(u64);
-    impl Rng for SeqRng {
-        fn fill(&mut self, buf: &mut [u8]) {
-            for b in buf.iter_mut() {
-                self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
-                *b = (self.0 >> 33) as u8;
-            }
-        }
-    }
-
-    fn test_key() -> RsaPrivateKey {
-        rsa_from_pqe(&[0x01, 0x00, 0x01], &hex(P_HEX), &hex(Q_HEX)).unwrap()
-    }
-
-    #[test]
-    fn import_recovers_modulus() {
-        // from_p_q must reconstruct N = P·Q (the make_rsa_response modulus).
-        let key = test_key();
-        let mut out = [0u8; MAX_RSA_PUBDO];
-        let n = make_rsa_response(&key, &mut out);
-        assert_eq!(&out[..3], &[0x7f, 0x49, 0x82]); // outer DO
-        assert_eq!(&out[5..7], &[0x81, 0x82]); // modulus tag + 2-byte length
-        assert_eq!(u16::from_be_bytes([out[7], out[8]]), 256); // RSA-2048 modulus
-        assert_eq!(&out[9..9 + 256], hex(N_HEX).as_slice());
-        // Exponent 0x010001 follows the modulus.
-        assert_eq!(out[9 + 256], 0x82);
-        assert_eq!(out[9 + 256 + 1], 3);
-        assert_eq!(&out[9 + 256 + 2..9 + 256 + 5], &[0x01, 0x00, 0x01]);
-        assert_eq!(n, 270);
-    }
-
-    #[test]
-    fn sign_digestinfo_verifies() {
-        let key = test_key();
-        // A SHA-256 DigestInfo (what gpg sends for an RSA signature).
-        let mut di = DI_SHA256.to_vec();
-        di.extend_from_slice(&[0x42u8; 32]);
-        let mut sig = [0u8; MAX_RSA_BYTES];
-        let n = rsa_sign(&key, &di, &mut SeqRng(1), &mut sig).unwrap();
-        assert_eq!(n, 256);
-        RsaPublicKey::from(&key)
-            .verify(Pkcs1v15Sign::new_unprefixed(), &di, &sig[..n])
-            .unwrap();
-    }
-
-    #[test]
-    fn sign_bare_hash_infers_alg() {
-        // A bare 32-byte hash is treated as SHA-256 (length inference), so it must
-        // verify against the same DigestInfo signature.
-        let key = test_key();
-        let hash = [0x37u8; 32];
-        let mut sig = [0u8; MAX_RSA_BYTES];
-        let n = rsa_sign(&key, &hash, &mut SeqRng(2), &mut sig).unwrap();
-        let mut di = DI_SHA256.to_vec();
-        di.extend_from_slice(&hash);
-        RsaPublicKey::from(&key)
-            .verify(Pkcs1v15Sign::new_unprefixed(), &di, &sig[..n])
-            .unwrap();
-    }
-
-    #[test]
-    fn decipher_roundtrip() {
-        let key = test_key();
-        let msg = b"a-32-byte-openpgp-session-key!!!";
-        let ct = RsaPublicKey::from(&key)
-            .encrypt(&mut RngAdapter(&mut SeqRng(7)), Pkcs1v15Encrypt, msg)
-            .unwrap();
-        // The DECIPHER command prepends the OpenPGP padding-indicator byte.
-        let mut data = vec![0x00u8];
-        data.extend_from_slice(&ct);
-        let mut out = [0u8; MAX_RSA_BYTES];
-        let n = rsa_decipher(&key, &mut SeqRng(8), &data, &mut out).unwrap();
-        assert_eq!(&out[..n], msg);
-    }
-
-    #[test]
-    fn keygen_pool_assembles_in_either_order() {
-        // The dual-core search feeds primes through `offer` in whatever order the
-        // cores find them — both orders must assemble the same modulus.
-        let p = BigUint::from_bytes_be(&hex(P_HEX));
-        let q = BigUint::from_bytes_be(&hex(Q_HEX));
-        for (first, second) in [(p.clone(), q.clone()), (q, p)] {
-            let mut kg = RsaKeygen::new(2048);
-            assert!(kg.usable());
-            assert_eq!(kg.half_bytes(), 128);
-            assert!(matches!(kg.offer(first), RsaStep::More));
-            match kg.offer(second) {
-                RsaStep::Done(k) => assert_eq!(k.n().to_bytes_be(), hex(N_HEX)),
-                _ => panic!("two distinct primes must complete the key"),
-            }
-        }
-    }
-
-    #[test]
-    fn keygen_pool_le_transport() {
-        // The inter-core transport: primes as little-endian bytes, scrubbed on use.
-        let (mut p_le, mut q_le) = (hex(P_HEX), hex(Q_HEX));
-        p_le.reverse();
-        q_le.reverse();
-        let mut kg = RsaKeygen::new(2048);
-        assert!(matches!(kg.offer_le(&mut p_le), RsaStep::More));
-        assert!(
-            p_le.iter().all(|&b| b == 0),
-            "transport buffer not scrubbed"
-        );
-        match kg.offer_le(&mut q_le) {
-            RsaStep::Done(k) => assert_eq!(k.n().to_bytes_be(), hex(N_HEX)),
-            _ => panic!("two distinct primes must complete the key"),
-        }
-    }
-
-    #[test]
-    fn try_candidate_le_finds_exact_half() {
-        // Smallest asm-eligible half (32 bytes = RSA-512) so the host search is
-        // quick; a find must fill the half exactly, odd and with the top bits set.
-        let mut rng = SeqRng(42);
-        let mut sieve = IncrementalSieve::new();
-        let mut out = [0u8; 32];
-        let mut tries = 0;
-        let len = loop {
-            tries += 1;
-            assert!(tries < 200_000, "prime search did not converge");
-            if let Some(n) = RsaKeygen::try_candidate_le(&mut sieve, &mut rng, 32, &mut out) {
-                break n;
-            }
-        };
-        assert_eq!(len, 32);
-        assert_eq!(out[31] & 0xC0, 0xC0);
-        assert_eq!(out[0] & 1, 1);
-    }
-
-    #[test]
-    fn keygen_bpsw_split_matches_library() {
-        // try_candidate's accept = strong-MR(asm) + strong-Lucas. Any prime it
-        // produces must satisfy the library's own one-call Baillie-PSW — the
-        // split changed backends, not the test.
-        use num_bigint_dig::prime::probably_prime;
-        let mut rng = SeqRng(7);
-        let mut sieve = IncrementalSieve::new();
-        let (mut found, mut tries) = (0, 0);
-        while found < 2 {
-            tries += 1;
-            assert!(tries < 200_000, "prime search did not converge");
-            if let Some(p) = RsaKeygen::try_candidate(&mut sieve, &mut rng, 32) {
-                assert!(
-                    probably_prime(&p, 0),
-                    "split BPSW accepted what the library rejects"
-                );
-                found += 1;
-            }
-        }
-    }
-
-    #[test]
-    fn keygen_pool_rejects_duplicate_prime() {
-        let p = BigUint::from_bytes_be(&hex(P_HEX));
-        let mut kg = RsaKeygen::new(2048);
-        assert!(matches!(kg.offer(p.clone()), RsaStep::More));
-        // The same prime again must not assemble a broken p == q key…
-        assert!(matches!(kg.offer(p), RsaStep::More));
-        // …and the held prime survives: a distinct second one completes the key.
-        let q = BigUint::from_bytes_be(&hex(Q_HEX));
-        assert!(matches!(kg.offer(q), RsaStep::Done(_)));
-    }
-}
+#[path = "keys_rsa_tests.rs"]
+mod rsa_tests;
 
 #[cfg(test)]
-mod x25519_tests {
-    use super::*;
-
-    fn hex(s: &str) -> Vec<u8> {
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-            .collect()
-    }
-
-    #[test]
-    fn x25519_rfc7748_vector() {
-        // RFC 7748 §6.1. Alice's scalar arrives as a big-endian OpenPGP MPI (so the
-        // little-endian RFC scalar reversed); Bob's public key is the 0x40-prefixed
-        // native little-endian u-coordinate. The DECIPHER result is the shared K.
-        let alice_le = hex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
-        let bob_pub = hex("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f");
-        let k = hex("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742");
-
-        let mut alice_be = alice_le.clone();
-        alice_be.reverse();
-        let key = PrivKey::from_scalar(Curve::X25519, &alice_be).unwrap();
-
-        let mut point = vec![0x40u8];
-        point.extend_from_slice(&bob_pub);
-        let mut out = [0u8; 32];
-        let n = key.ecdh(&point, &mut out).unwrap();
-        assert_eq!(&out[..n], k.as_slice());
-
-        // The peer point is also accepted without the 0x40 native-format prefix.
-        let mut out2 = [0u8; 32];
-        key.ecdh(&bob_pub, &mut out2).unwrap();
-        assert_eq!(out2, out);
-    }
-
-    #[test]
-    fn x25519_public_point_matches_rfc7748() {
-        // Alice's public key is X25519(scalar, basepoint).
-        let alice_le = hex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
-        let alice_pub = hex("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a");
-        let mut alice_be = alice_le.clone();
-        alice_be.reverse();
-        let key = PrivKey::from_scalar(Curve::X25519, &alice_be).unwrap();
-        let mut out = [0u8; 32];
-        let n = key.public_point(&mut out).unwrap();
-        assert_eq!(&out[..n], alice_pub.as_slice());
-    }
-
-    #[test]
-    fn x25519_rejects_bad_peer_length() {
-        let key = PrivKey::from_scalar(Curve::X25519, &[0x11u8; 32]).unwrap();
-        let mut out = [0u8; 32];
-        assert_eq!(key.ecdh(&[0u8; 31], &mut out), Err(Sw::DATA_INVALID));
-        assert_eq!(key.ecdh(&[0u8; 40], &mut out), Err(Sw::DATA_INVALID));
-    }
-}
+#[path = "keys_x25519_tests.rs"]
+mod x25519_tests;

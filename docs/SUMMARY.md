@@ -28,6 +28,7 @@
 - [Backup key (pair)](guides/backup-key.md)
 - [Soft-lock](guides/soft-lock.md)
 - [LED](guides/led.md)
+- [Trusted display](guides/display.md)
 - [Terminal cockpit (rsk-tui)](guides/tui.md)
 - [Audit journal](guides/audit.md)
 - [Enterprise attestation](guides/attestation.md)
@@ -52,6 +53,7 @@
 # Internals
 
 - [Architecture](architecture.md)
+- [Host protocol](protocol.md)
 - [Testing](testing.md)
 - [Interop matrix](interop.md)
 - [Versions](versioning.md)

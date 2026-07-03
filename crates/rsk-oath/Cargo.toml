@@ -7,6 +7,11 @@ publish = false
 
 # YKOATH applet: TOTP/HOTP credential store + calculate over CCID; what Yubico
 # Authenticator's OATH tab and `ykman oath` speak to.
+
+# `cfg(kani)` guards the proof harnesses (set by `cargo kani`, unknown to rustc).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
 [dependencies]
 rsk-sdk = { workspace = true }
 rsk-fs = { workspace = true }

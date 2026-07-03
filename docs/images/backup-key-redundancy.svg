@@ -1,0 +1,57 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 RS-Key contributors -->
+<svg viewBox="0 0 780 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="ttl dsc" font-family="'Segoe UI', system-ui, -apple-system, sans-serif">
+  <title id="ttl">Primary and backup key redundancy</title>
+  <desc id="dsc">Two independent RS-Key devices enrolled at each account. The primary key (seed A, everyday carry) and the backup key (seed B, stored offsite) are both registered as separate credentials with each relying party. If the primary is lost, you sign in with the backup — no account is locked out on a single lost device.</desc>
+  <defs>
+    <style>
+      .h1{font-size:23px;font-weight:700;fill:#2B2723}
+      .sub{font-size:12.5px;fill:#948A7F}
+      .lg{font-size:11px;fill:#6B645C}
+      .name{font-size:14px;font-weight:700;fill:#fff}
+      .desc{font-size:10.5px;fill:#F3ECE4}
+      .ek{font-size:11px;font-weight:700;fill:#A9764F;font-family:'SF Mono','Roboto Mono',ui-monospace,monospace}
+      .fb{font-size:11px;font-weight:700;fill:#6B645C}
+      .foot{font-size:10.5px;fill:#ADA398}
+    </style>
+    <marker id="af" viewBox="0 0 8 8" refX="6.5" refY="4" markerWidth="6.5" markerHeight="6.5" orient="auto"><path d="M0 0 L8 4 L0 8 z" fill="#A9764F"/></marker>
+    <marker id="ag" viewBox="0 0 8 8" refX="6.5" refY="4" markerWidth="6.5" markerHeight="6.5" orient="auto"><path d="M0 0 L8 4 L0 8 z" fill="#948A7F"/></marker>
+  </defs>
+  <rect x="6" y="6" width="768" height="288" rx="16" fill="#FBFAF8" stroke="#E4DED5" stroke-width="1.5"/>
+
+  <text class="h1" x="34" y="46">Primary + backup key</text>
+  <text class="sub" x="34" y="68">two independent devices enrolled at every account · lose one, keep access</text>
+
+  <!-- legend -->
+  <rect x="540" y="34" width="13" height="13" rx="3" fill="#2F7E75"/>
+  <text class="lg" x="560" y="45">primary (everyday)</text>
+  <rect x="674" y="34" width="13" height="13" rx="3" fill="#C0562B"/>
+  <text class="lg" x="694" y="45">backup (offsite)</text>
+
+  <!-- primary key -->
+  <rect x="46" y="104" width="214" height="56" rx="11" fill="#2F7E75"/>
+  <text class="name" x="153" y="130" text-anchor="middle">Primary key · seed A</text>
+  <text class="desc" x="153" y="148" text-anchor="middle">everyday carry</text>
+
+  <!-- backup key -->
+  <rect x="46" y="188" width="214" height="56" rx="11" fill="#C0562B"/>
+  <text class="name" x="153" y="214" text-anchor="middle">Backup key · seed B</text>
+  <text class="desc" x="153" y="232" text-anchor="middle">stored offsite</text>
+
+  <!-- accounts -->
+  <rect x="500" y="146" width="236" height="56" rx="11" fill="#3E3A36"/>
+  <text class="name" x="618" y="172" text-anchor="middle">Each account</text>
+  <text class="desc" x="618" y="190" text-anchor="middle">GitHub · Google · …</text>
+
+  <!-- enrolled edges -->
+  <path d="M260 132 C 360 132, 400 174, 500 174" fill="none" stroke="#A9764F" stroke-width="2" marker-end="url(#af)"/>
+  <path d="M260 216 C 360 216, 400 174, 500 174" fill="none" stroke="#A9764F" stroke-width="2" marker-end="url(#af)"/>
+  <text class="ek" x="360" y="128" text-anchor="middle">enrolled</text>
+  <text class="ek" x="360" y="238" text-anchor="middle">enrolled</text>
+
+  <!-- fallback dashed edge: account -> backup -->
+  <path d="M560 202 C 470 250, 320 250, 260 232" fill="none" stroke="#948A7F" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ag)"/>
+  <text class="fb" x="410" y="270" text-anchor="middle">lost the primary? sign in with the backup</text>
+
+  <text class="foot" x="34" y="282">Reference: guides/backup-key.md · each device is a distinct credential — the accounts never see one identity, they see two</text>
+</svg>

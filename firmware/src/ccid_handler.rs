@@ -36,9 +36,9 @@ pub struct CcidApplets<'a> {
     fs: &'a RefCell<Store>,
     rng: &'a RefCell<FidoRng>,
     disp: Dispatcher,
-    vendor: VendorApplet,
+    vendor: VendorApplet<'a>,
     openpgp: OpenpgpApplet<'a>,
-    management: ManagementApplet,
+    management: ManagementApplet<'a>,
     oath: OathApplet<'a>,
     otp: OtpApplet<'a>,
     piv: PivApplet<'a>,
@@ -59,6 +59,8 @@ impl<'a> CcidApplets<'a> {
         presence: &'a RefCell<dyn rsk_openpgp::UserPresence>,
         otp_presence: &'a RefCell<dyn rsk_otp::UserPresence>,
         oath_presence: &'a RefCell<dyn rsk_oath::UserPresence>,
+        rescue_presence: &'a RefCell<dyn rsk_rescue::UserPresence>,
+        mgmt_presence: &'a RefCell<dyn rsk_mgmt::UserPresence>,
         platform: &'a RefCell<dyn rsk_rescue::Platform>,
         serial_id: [u8; 8],
         serial_hash: [u8; 32],
@@ -70,12 +72,14 @@ impl<'a> CcidApplets<'a> {
             fs,
             rng,
             disp: Dispatcher::new(),
-            vendor: VendorApplet,
+            // The vendor reboot-to-BOOTSEL (P1=01) is gated by the same presence
+            // as the rescue applet, closing the cross-AID bypass of that gate.
+            vendor: VendorApplet::new(rescue_presence),
             openpgp: OpenpgpApplet::new(serial_id, serial_hash, otp_key, rng, presence),
-            management: ManagementApplet::new(serial_id),
+            management: ManagementApplet::new(serial_id, mgmt_presence),
             // Touch-flagged OATH credentials gate CALCULATE on the same button.
             oath: OathApplet::new(serial_id, serial_hash, otp_key, rng, oath_presence),
-            otp: OtpApplet::new(serial_id, otp_presence),
+            otp: OtpApplet::new(serial_id, serial_hash, otp_key, rng, otp_presence),
             // PIV reuses the OpenPGP user-presence trait, so the same presence
             // source drives its slot/management touch policies.
             piv: PivApplet::new(serial_id, serial_hash, otp_key, rng, presence),
@@ -89,6 +93,7 @@ impl<'a> CcidApplets<'a> {
                 devk,
                 rng,
                 platform,
+                rescue_presence,
                 kv_total,
                 crate::flash_storage::FLASH_SIZE as u32,
             ),
@@ -128,10 +133,18 @@ impl<'a> CcidApplets<'a> {
     /// SW1 SW2). On-card RSA keygen is run to completion inline (see module docs);
     /// everything else goes straight to the applet dispatcher.
     pub fn handle_apdu(&mut self, apdu: &[u8]) -> &[u8] {
+        // The keygen fast paths bypass `Dispatcher::process`, which is what would
+        // normally drop a stale GET RESPONSE remainder and reset an interrupted
+        // command chain; a GENERATE is neither a 0xC0 nor a chain segment, so
+        // clearing both here matches the ordinary dispatch (applet.rs).
         if let Some(n) = self.try_rsa_keygen(apdu) {
+            self.disp.clear_pending();
+            self.disp.clear_chaining();
             return &self.resp[..n];
         }
         if let Some(n) = self.try_piv_rsa_keygen(apdu) {
+            self.disp.clear_pending();
+            self.disp.clear_chaining();
             return &self.resp[..n];
         }
         let (sw, n) = {

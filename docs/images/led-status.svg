@@ -1,0 +1,84 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 RS-Key contributors -->
+<svg viewBox="0 0 780 392" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="ttl dsc" font-family="'Segoe UI', system-ui, -apple-system, sans-serif">
+  <title id="ttl">Status-LED cheat sheet</title>
+  <desc id="dsc">The four device states and their default LED look: idle breathes green (vapor), processing flows a yellow-to-red gradient (flow), waiting-for-touch bounces yellow (bounce), and boot sparkles red (sparkle). WS2812 boards animate; gpio and pimoroni backends fall back to a classic on/off blink.</desc>
+  <defs>
+    <style>
+      .h1{font-size:23px;font-weight:700;fill:#2B2723}
+      .sub{font-size:12px;fill:#948A7F}
+      .st{font-size:13.5px;font-weight:700;fill:#2B2723}
+      .mn{font-size:11px;fill:#948A7F}
+      .ef{font-size:12px;font-weight:700;fill:#5A534B}
+      .efk{font-family:'SF Mono','Roboto Mono',ui-monospace,monospace;font-size:10.5px;fill:#948A7F}
+      .cl{font-size:11px;fill:#5A534B}
+      .foot{font-size:10.5px;fill:#ADA398}
+    </style>
+  </defs>
+  <rect x="6" y="6" width="768" height="380" rx="16" fill="#FBFAF8" stroke="#E4DED5" stroke-width="1.5"/>
+
+  <text class="h1" x="34" y="46">Status-LED cheat sheet</text>
+  <text class="sub" x="34" y="66">the device's only display — one colour + effect per state · animations are the ws2812 backend</text>
+
+  <!-- row separators -->
+  <g stroke="#EFE9E1" stroke-width="1">
+    <line x1="34" y1="154" x2="746" y2="154"/>
+    <line x1="34" y1="222" x2="746" y2="222"/>
+    <line x1="34" y1="290" x2="746" y2="290"/>
+  </g>
+
+  <!-- ROW 1 · idle / vapor / green -->
+  <text class="st" x="40" y="116">idle</text>
+  <text class="mn" x="40" y="134">ready — nothing in flight</text>
+  <g fill="#3F9E5A">
+    <circle cx="306" cy="120" r="9"/><circle cx="340" cy="120" r="9"/><circle cx="374" cy="120" r="9"/><circle cx="408" cy="120" r="9"/><circle cx="442" cy="120" r="9"/>
+    <animate attributeName="opacity" values="1;0.32;1" dur="2.4s" repeatCount="indefinite"/>
+  </g>
+  <text class="ef" x="520" y="117">vapor <tspan class="efk">· 1</tspan></text>
+  <rect x="520" y="124" width="12" height="12" rx="3" fill="#3F9E5A"/>
+  <text class="cl" x="538" y="134">green · breathing</text>
+
+  <!-- ROW 2 · processing / flow / yellow->red -->
+  <text class="st" x="40" y="184">processing</text>
+  <text class="mn" x="40" y="202">handling an APDU / crypto op</text>
+  <g>
+    <circle cx="306" cy="188" r="9" fill="#E8C13A"><animate attributeName="opacity" values="0.4;1;0.4" dur="1.5s" begin="0s"    repeatCount="indefinite"/></circle>
+    <circle cx="340" cy="188" r="9" fill="#E3A23A"><animate attributeName="opacity" values="0.4;1;0.4" dur="1.5s" begin="-0.3s" repeatCount="indefinite"/></circle>
+    <circle cx="374" cy="188" r="9" fill="#D98236"><animate attributeName="opacity" values="0.4;1;0.4" dur="1.5s" begin="-0.6s" repeatCount="indefinite"/></circle>
+    <circle cx="408" cy="188" r="9" fill="#CC6A30"><animate attributeName="opacity" values="0.4;1;0.4" dur="1.5s" begin="-0.9s" repeatCount="indefinite"/></circle>
+    <circle cx="442" cy="188" r="9" fill="#C0562B"><animate attributeName="opacity" values="0.4;1;0.4" dur="1.5s" begin="-1.2s" repeatCount="indefinite"/></circle>
+  </g>
+  <text class="ef" x="520" y="185">flow <tspan class="efk">· 3</tspan></text>
+  <rect x="520" y="192" width="12" height="12" rx="3" fill="#E8C13A"/>
+  <rect x="532" y="192" width="12" height="12" rx="3" fill="#C0562B"/>
+  <text class="cl" x="550" y="202">yellow → red</text>
+
+  <!-- ROW 3 · touch / bounce / yellow -->
+  <text class="st" x="40" y="252">waiting for touch</text>
+  <text class="mn" x="40" y="270">press the button to confirm</text>
+  <g fill="#E8B23A" opacity="0.35">
+    <circle cx="306" cy="256" r="9"/><circle cx="340" cy="256" r="9"/><circle cx="374" cy="256" r="9"/><circle cx="408" cy="256" r="9"/><circle cx="442" cy="256" r="9"/>
+  </g>
+  <circle cy="256" r="9" fill="#F5C542">
+    <animate attributeName="cx" values="306;442;306" keyTimes="0;0.5;1" dur="1.8s" calcMode="spline" keySplines="0.4 0 0.6 1;0.4 0 0.6 1" repeatCount="indefinite"/>
+  </circle>
+  <text class="ef" x="520" y="253">bounce <tspan class="efk">· 2</tspan></text>
+  <rect x="520" y="260" width="12" height="12" rx="3" fill="#E8B23A"/>
+  <text class="cl" x="538" y="270">yellow · gliding hump</text>
+
+  <!-- ROW 4 · boot / sparkle / red -->
+  <text class="st" x="40" y="320">boot</text>
+  <text class="mn" x="40" y="338">the brief power-up state</text>
+  <g fill="#C0562B">
+    <circle cx="306" cy="324" r="9"><animate attributeName="opacity" values="0.2;1;0.3;0.2" dur="1.1s" begin="0s"    repeatCount="indefinite"/></circle>
+    <circle cx="340" cy="324" r="9"><animate attributeName="opacity" values="0.9;0.2;1;0.9" dur="0.9s" begin="-0.4s" repeatCount="indefinite"/></circle>
+    <circle cx="374" cy="324" r="9"><animate attributeName="opacity" values="0.3;0.9;0.2;0.3" dur="1.3s" begin="-0.2s" repeatCount="indefinite"/></circle>
+    <circle cx="408" cy="324" r="9"><animate attributeName="opacity" values="1;0.25;0.8;1"   dur="0.85s" begin="-0.6s" repeatCount="indefinite"/></circle>
+    <circle cx="442" cy="324" r="9"><animate attributeName="opacity" values="0.25;0.85;0.4;0.25" dur="1.05s" begin="-0.15s" repeatCount="indefinite"/></circle>
+  </g>
+  <text class="ef" x="520" y="321">sparkle <tspan class="efk">· 4</tspan></text>
+  <rect x="520" y="328" width="12" height="12" rx="3" fill="#C0562B"/>
+  <text class="cl" x="538" y="338">red · random flashes</text>
+
+  <text class="foot" x="34" y="372">legacy (0) = classic on/off blink · gpio &amp; pimoroni backends always blink whatever the effect · rsk led sets it. Source: guides/led.md</text>
+</svg>

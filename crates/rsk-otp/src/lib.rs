@@ -9,12 +9,21 @@
 
 use core::cell::RefCell;
 
-use rsk_crypto::{aes128_encrypt_block, ct_eq, hmac_sha1};
-use rsk_fs::{Fs, Storage};
+use rsk_crypto::{Device, aes128_encrypt_block, ct_eq, hmac_sha1};
+use rsk_fs::{Fs, KeyFid, Storage};
+pub use rsk_sdk::Confirm;
 use rsk_sdk::{Apdu, Applet, ResBuf, Sw};
+use zeroize::Zeroize;
 
 pub mod hid;
+pub mod seal;
 pub mod ticket;
+
+/// Randomness source for at-rest seal nonces (the firmware backs it with the
+/// hardware TRNG). Mirrors the sibling applets' `Rng` traits.
+pub trait Rng {
+    fn fill(&mut self, buf: &mut [u8]);
+}
 
 #[cfg(test)]
 mod tests_support;
@@ -37,14 +46,16 @@ pub enum Presence {
 /// Physical user presence; the firmware backs this with the BOOTSEL button
 /// (same shape as `rsk_openpgp::UserPresence`).
 pub trait UserPresence {
-    fn request(&mut self) -> Presence;
+    /// Ask for presence. `confirm` names the operation for a trusted on-screen
+    /// Approve/Deny prompt; the BOOTSEL-button backend ignores it.
+    fn request(&mut self, confirm: Confirm<'_>) -> Presence;
 }
 
 /// Test/no-button stand-in: confirms instantly.
 pub struct AlwaysConfirm;
 
 impl UserPresence for AlwaysConfirm {
-    fn request(&mut self) -> Presence {
+    fn request(&mut self, _confirm: Confirm<'_>) -> Presence {
         Presence::Confirmed
     }
 }
@@ -54,6 +65,13 @@ impl UserPresence for AlwaysConfirm {
 // are reached over CCID via the P2 slot offset and typed by three/four BOOTSEL clicks.
 pub(crate) const EF_OTP_SLOT1: u16 = 0xBB00;
 const EF_OTP_SLOT2: u16 = 0xBB01;
+/// Number of OTP slots (1/2 classic short/long press, 3/4 via CCID P2 offset).
+pub(crate) const SLOT_COUNT: usize = 4;
+/// Highest addressable slot FID. Only slots 1..=4 (0xBB00..=0xBB03) are ever read
+/// back (button_ticket, status, migrate_seal, power_up_bump); every command that
+/// derives a FID from a host offset must reject anything past this, or a slot can
+/// be written/relocated to an FID no code ever reaches again.
+const EF_OTP_SLOT_LAST: u16 = EF_OTP_SLOT1 + SLOT_COUNT as u16 - 1;
 
 /// Slot-config field offsets (packed, 52 bytes).
 pub(crate) const FIXED_SIZE: usize = 16;
@@ -101,30 +119,88 @@ const CFG_CHAL_HMAC: u8 = 0x22;
 pub(crate) const CFG_OATH_HOTP8: u8 = 0x02;
 const CFGFLAG_UPDATE_MASK: u8 = 0x0C; // PACING_10MS | PACING_20MS
 
+/// Yubico OTP use-counter ceiling — the counter is 15-bit, high bit reserved.
+pub(crate) const USE_COUNTER_MAX: u16 = 0x7FFF;
+
 const INS_OTP: u8 = 0x01;
+
+// Slot-command P1 codes (ykman's SLOT.* vocabulary).
+const P1_CONFIG_SLOT1: u8 = 0x01;
+const P1_CONFIG_SLOT2: u8 = 0x03;
+const P1_UPDATE_SLOT1: u8 = 0x04;
+const P1_UPDATE_SLOT2: u8 = 0x05;
+const P1_SWAP: u8 = 0x06;
+const P1_CHAL_OTP_SLOT1: u8 = 0x20;
+const P1_CHAL_OTP_SLOT2: u8 = 0x28;
+const P1_CHAL_HMAC_SLOT1: u8 = 0x30;
+const P1_CHAL_HMAC_SLOT2: u8 = 0x38;
 
 /// "Wrong data" in this protocol is reported as `0x6700` (wrong length).
 const SW_WRONG_DATA: Sw = Sw::WRONG_LENGTH;
 
 pub struct OtpApplet<'a> {
     serial_id: [u8; 8],
+    serial_hash: [u8; 32],
+    /// The OTP MKEK, once provisioned — roots the slot seal in the hardware fuse.
+    otp_key: Option<[u8; 32]>,
+    rng: &'a RefCell<dyn Rng>,
     presence: &'a RefCell<dyn UserPresence>,
     /// Status-record sequence number; bumped on every config write, reset on
     /// SELECT to 1/0 depending on whether any slot is programmed.
     config_seq: u8,
     /// Per-slot RAM session-use counter mixed into a typed Yubico-OTP token;
     /// resets each power cycle. One entry per slot (1–4).
-    session_counter: [u8; 4],
+    session_counter: [u8; SLOT_COUNT],
 }
 
 impl<'a> OtpApplet<'a> {
-    pub fn new(serial_id: [u8; 8], presence: &'a RefCell<dyn UserPresence>) -> Self {
+    pub fn new(
+        serial_id: [u8; 8],
+        serial_hash: [u8; 32],
+        otp_key: Option<[u8; 32]>,
+        rng: &'a RefCell<dyn Rng>,
+        presence: &'a RefCell<dyn UserPresence>,
+    ) -> Self {
         Self {
             serial_id,
+            serial_hash,
+            otp_key,
+            rng,
             presence,
             config_seq: 1,
-            session_counter: [0; 4],
+            session_counter: [0; SLOT_COUNT],
         }
+    }
+
+    fn device(&self) -> Device<'_> {
+        Device {
+            serial_hash: &self.serial_hash,
+            serial_id: &self.serial_id,
+            otp_key: self.otp_key.as_ref(),
+        }
+    }
+
+    /// Read+unseal a slot into `buf`; `Some(len)` only when it holds at least a
+    /// full config. A `&self` helper so the `&mut self` command handlers read a
+    /// slot without pinning a device borrow across their own mutations.
+    fn read_slot_m<S: Storage>(
+        &self,
+        fs: &mut Fs<S>,
+        fid: u16,
+        buf: &mut [u8; SLOT_SIZE],
+    ) -> Option<usize> {
+        read_slot(&self.device(), fs, fid, buf)
+    }
+
+    /// Seal+write a slot record. `false` on a storage failure.
+    fn put_slot<S: Storage>(&self, fs: &mut Fs<S>, fid: u16, data: &[u8]) -> bool {
+        seal::seal_put(
+            &self.device(),
+            fs,
+            &mut *self.rng.borrow_mut(),
+            KeyFid::new(fid),
+            data,
+        )
     }
 
     /// Generate the typed ticket for a physical button press on `slot` (1–4: one
@@ -141,12 +217,12 @@ impl<'a> OtpApplet<'a> {
         fs: &mut Fs<S>,
         out: &mut [u8; ticket::MAX_TICKET],
     ) -> Option<(usize, bool)> {
-        if !(1..=4).contains(&slot) {
+        if !(1..=SLOT_COUNT as u8).contains(&slot) {
             return None;
         }
         let fid = EF_OTP_SLOT1 + (slot as u16 - 1);
         let mut buf = [0u8; SLOT_SIZE];
-        let n = read_slot(fs, fid, &mut buf)?;
+        let n = self.read_slot_m(fs, fid, &mut buf)?;
         if n < SLOT_SIZE {
             buf[CONFIG_SIZE..].fill(0);
         }
@@ -162,7 +238,7 @@ impl<'a> OtpApplet<'a> {
         if let Some(tail) = t.new_tail {
             let mut rec = buf;
             rec[CONFIG_SIZE..].copy_from_slice(&tail);
-            let _ = fs.put(fid, &rec);
+            let _ = self.put_slot(fs, fid, &rec);
         }
         Some((t.len, t.encode))
     }
@@ -186,7 +262,7 @@ impl<'a> OtpApplet<'a> {
         let (maj, min, patch) = VERSION;
         let mut opts = 0u8;
         let mut slot = [0u8; SLOT_SIZE];
-        if read_slot(fs, EF_OTP_SLOT1, &mut slot).is_some() {
+        if self.read_slot_m(fs, EF_OTP_SLOT1, &mut slot).is_some() {
             opts |= CONFIG1_VALID;
             if slot[OFF_TKT_FLAGS] & TKT_CHAL_RESP == 0
                 || slot[OFF_CFG_FLAGS] & CFG_CHAL_BTN_TRIG != 0
@@ -194,7 +270,7 @@ impl<'a> OtpApplet<'a> {
                 opts |= CONFIG1_TOUCH;
             }
         }
-        if read_slot(fs, EF_OTP_SLOT2, &mut slot).is_some() {
+        if self.read_slot_m(fs, EF_OTP_SLOT2, &mut slot).is_some() {
             opts |= CONFIG2_VALID;
             if slot[OFF_TKT_FLAGS] & TKT_CHAL_RESP == 0
                 || slot[OFF_CFG_FLAGS] & CFG_CHAL_BTN_TRIG != 0
@@ -219,8 +295,7 @@ impl<'a> OtpApplet<'a> {
     /// at `[1..4]`, the program sequence at `[4]` and the slot valid/touch bits
     /// at `[5]`.
     pub fn hid_status_frame<S: Storage>(&mut self, fs: &mut Fs<S>) -> [u8; 8] {
-        let b = self.status_bytes(fs);
-        [0, b[0], b[1], b[2], b[3], b[4], b[5], b[6]]
+        hid::status_frame(self.status_bytes(fs))
     }
 
     /// Run one keyboard-interface frame command: the 64-byte payload becomes the
@@ -230,12 +305,12 @@ impl<'a> OtpApplet<'a> {
     pub fn process_hid<S: Storage>(
         &mut self,
         slot_id: u8,
-        payload: &[u8; 64],
+        payload: &[u8; hid::PAYLOAD_SIZE],
         fs: &mut Fs<S>,
         res: &mut ResBuf,
     ) -> Sw {
-        let mut raw = [0u8; 5 + 64];
-        raw[..5].copy_from_slice(&[0x00, INS_OTP, slot_id, 0x00, 64]);
+        let mut raw = [0u8; 5 + hid::PAYLOAD_SIZE];
+        raw[..5].copy_from_slice(&[0x00, INS_OTP, slot_id, 0x00, hid::PAYLOAD_SIZE as u8]);
         raw[5..].copy_from_slice(payload);
         match Apdu::parse(&raw) {
             Ok(apdu) => self.process(&apdu, fs, res),
@@ -245,21 +320,24 @@ impl<'a> OtpApplet<'a> {
 
     /// P1 = 0x01/0x03: write or delete a slot config.
     fn cmd_configure<S: Storage>(&mut self, apdu: &Apdu, fs: &mut Fs<S>, res: &mut ResBuf) -> Sw {
-        if apdu.p1 == 0x03 && apdu.p2 != 0 {
+        if apdu.p1 == P1_CONFIG_SLOT2 && apdu.p2 != 0 {
             return Sw::INCORRECT_P1P2;
         }
-        let base = if apdu.p1 == 0x01 {
+        let base = if apdu.p1 == P1_CONFIG_SLOT1 {
             EF_OTP_SLOT1
         } else {
             EF_OTP_SLOT2
         };
         let fid = base + apdu.p2 as u16;
+        if fid > EF_OTP_SLOT_LAST {
+            return Sw::INCORRECT_P1P2;
+        }
         if apdu.nc < CONFIG_SIZE {
             return Sw::WRONG_LENGTH;
         }
         let data = &apdu.data[..apdu.nc];
         let mut stored = [0u8; SLOT_SIZE];
-        if read_slot(fs, fid, &mut stored).is_some() {
+        if self.read_slot_m(fs, fid, &mut stored).is_some() {
             // Existing config: the host must present its access code.
             if data.len() < CONFIG_SIZE + ACC_CODE_SIZE {
                 return Sw::WRONG_LENGTH;
@@ -277,7 +355,7 @@ impl<'a> OtpApplet<'a> {
             }
             let mut rec = [0u8; SLOT_SIZE];
             rec[..CONFIG_SIZE].copy_from_slice(&data[..CONFIG_SIZE]);
-            if fs.put(fid, &rec).is_err() {
+            if !self.put_slot(fs, fid, &rec) {
                 return Sw::MEMORY_FAILURE;
             }
         } else {
@@ -291,15 +369,18 @@ impl<'a> OtpApplet<'a> {
     /// P1 = 0x04/0x05: update the flag bytes of an existing config, keeping its
     /// fixed part / UID / key.
     fn cmd_update<S: Storage>(&mut self, apdu: &Apdu, fs: &mut Fs<S>, res: &mut ResBuf) -> Sw {
-        if apdu.p1 == 0x05 && apdu.p2 != 0 {
+        if apdu.p1 == P1_UPDATE_SLOT2 && apdu.p2 != 0 {
             return Sw::INCORRECT_P1P2;
         }
-        let base = if apdu.p1 == 0x04 {
+        let base = if apdu.p1 == P1_UPDATE_SLOT1 {
             EF_OTP_SLOT1
         } else {
             EF_OTP_SLOT2
         };
         let fid = base + apdu.p2 as u16;
+        if fid > EF_OTP_SLOT_LAST {
+            return Sw::INCORRECT_P1P2;
+        }
         if apdu.nc < CONFIG_SIZE {
             return Sw::WRONG_LENGTH;
         }
@@ -308,7 +389,7 @@ impl<'a> OtpApplet<'a> {
             return SW_WRONG_DATA;
         }
         let mut stored = [0u8; SLOT_SIZE];
-        if read_slot(fs, fid, &mut stored).is_some() {
+        if self.read_slot_m(fs, fid, &mut stored).is_some() {
             if data.len() < CONFIG_SIZE + ACC_CODE_SIZE {
                 return Sw::WRONG_LENGTH;
             }
@@ -334,7 +415,7 @@ impl<'a> OtpApplet<'a> {
             } else {
                 stored[OFF_CFG_FLAGS]
             };
-            if fs.put(fid, &merged).is_err() {
+            if !self.put_slot(fs, fid, &merged) {
                 return Sw::MEMORY_FAILURE;
             }
             self.config_seq = self.config_seq.wrapping_add(1);
@@ -342,24 +423,45 @@ impl<'a> OtpApplet<'a> {
         self.status(fs, res)
     }
 
-    /// P1 = 0x06: swap the two slots; the optional 2-byte body selects other
-    /// slot pairs in the 4-slot layout.
+    /// P1 = 0x06: swap the two slots. Body layouts: empty = slots 1↔2, no code;
+    /// `[a,b]` = slots (1+a)↔(2+b); `[a,b,code0..code5]` = the same pair with a
+    /// 6-byte access code. Swapping moves/deletes stored configs, so — like
+    /// cmd_configure/cmd_update/delete (docs/guides/otp.md) — a programmed slot is
+    /// only touched when the presented code matches its stored access code; an
+    /// unprotected slot's all-zero code is satisfied by the default, so a plain
+    /// `ykman otp swap` of unprotected slots is unchanged. Out-of-range offsets
+    /// are rejected so a swap can never orphan a slot outside the 4-slot range.
     fn cmd_swap<S: Storage>(&mut self, apdu: &Apdu, fs: &mut Fs<S>, res: &mut ResBuf) -> Sw {
         let (mut fid1, mut fid2) = (EF_OTP_SLOT1, EF_OTP_SLOT2);
+        let mut code = [0u8; ACC_CODE_SIZE];
         if apdu.nc > 0 {
-            if apdu.nc != 2 {
+            if apdu.nc != 2 && apdu.nc != 2 + ACC_CODE_SIZE {
                 return Sw::WRONG_LENGTH;
             }
             fid1 += apdu.data[0] as u16;
             fid2 += apdu.data[1] as u16;
+            if apdu.nc == 2 + ACC_CODE_SIZE {
+                code.copy_from_slice(&apdu.data[2..2 + ACC_CODE_SIZE]);
+            }
+        }
+        if fid1 > EF_OTP_SLOT_LAST || fid2 > EF_OTP_SLOT_LAST {
+            return Sw::INCORRECT_P1P2;
         }
         let mut a = [0u8; SLOT_SIZE];
         let mut b = [0u8; SLOT_SIZE];
-        let na = read_slot(fs, fid1, &mut a);
-        let nb = read_slot(fs, fid2, &mut b);
+        let na = self.read_slot_m(fs, fid1, &mut a);
+        let nb = self.read_slot_m(fs, fid2, &mut b);
+        // The access code gates a swap's move/delete just as it gates
+        // overwrite/update/delete: a programmed slot may not be relocated or
+        // deleted without its code (an unprotected slot's stored code is zero).
+        let unmatched =
+            |rec: &[u8; SLOT_SIZE]| !ct_eq(&code, &rec[OFF_ACC_CODE..OFF_ACC_CODE + ACC_CODE_SIZE]);
+        if (na.is_some() && unmatched(&a)) || (nb.is_some() && unmatched(&b)) {
+            return Sw::SECURITY_STATUS_NOT_SATISFIED;
+        }
         match nb {
             Some(n) => {
-                if fs.put(fid1, &b[..n]).is_err() {
+                if !self.put_slot(fs, fid1, &b[..n]) {
                     return Sw::MEMORY_FAILURE;
                 }
             }
@@ -369,7 +471,7 @@ impl<'a> OtpApplet<'a> {
         }
         match na {
             Some(n) => {
-                if fs.put(fid2, &a[..n]).is_err() {
+                if !self.put_slot(fs, fid2, &a[..n]) {
                     return Sw::MEMORY_FAILURE;
                 }
             }
@@ -384,8 +486,8 @@ impl<'a> OtpApplet<'a> {
     /// P1 = 0x14: per-slot flag/fixed-part TLVs (extended status).
     fn cmd_status_ext<S: Storage>(&mut self, fs: &mut Fs<S>, res: &mut ResBuf) -> Sw {
         let mut slot = [0u8; SLOT_SIZE];
-        for i in 0..4u16 {
-            if read_slot(fs, EF_OTP_SLOT1 + i, &mut slot).is_none() {
+        for i in 0..SLOT_COUNT as u16 {
+            if self.read_slot_m(fs, EF_OTP_SLOT1 + i, &mut slot).is_none() {
                 continue;
             }
             let tkt = slot[OFF_TKT_FLAGS];
@@ -412,17 +514,20 @@ impl<'a> OtpApplet<'a> {
     /// P1 = 0x20/0x28 (Yubico mode) / 0x30/0x38 (HMAC-SHA1): challenge-response.
     /// Challenge lengths are required up front — never overread the body.
     fn cmd_calculate<S: Storage>(&mut self, apdu: &Apdu, fs: &mut Fs<S>, res: &mut ResBuf) -> Sw {
-        if (apdu.p1 == 0x38 || apdu.p1 == 0x28) && apdu.p2 != 0 {
+        if (apdu.p1 == P1_CHAL_HMAC_SLOT2 || apdu.p1 == P1_CHAL_OTP_SLOT2) && apdu.p2 != 0 {
             return Sw::INCORRECT_P1P2;
         }
-        let base = if apdu.p1 == 0x30 || apdu.p1 == 0x20 {
+        let base = if apdu.p1 == P1_CHAL_HMAC_SLOT1 || apdu.p1 == P1_CHAL_OTP_SLOT1 {
             EF_OTP_SLOT1
         } else {
             EF_OTP_SLOT2
         };
         let fid = base + apdu.p2 as u16;
+        if fid > EF_OTP_SLOT_LAST {
+            return Sw::INCORRECT_P1P2;
+        }
         let mut slot = [0u8; SLOT_SIZE];
-        if read_slot(fs, fid, &mut slot).is_none() {
+        if self.read_slot_m(fs, fid, &mut slot).is_none() {
             // Protocol quirk: an empty slot answers 9000 with no body.
             return Sw::OK;
         }
@@ -432,16 +537,20 @@ impl<'a> OtpApplet<'a> {
             return SW_WRONG_DATA;
         }
         if cfg & CFG_CHAL_BTN_TRIG != 0
-            && self.presence.borrow_mut().request() != Presence::Confirmed
+            && self
+                .presence
+                .borrow_mut()
+                .request(Confirm::titled("Challenge-response?"))
+                != Presence::Confirmed
         {
             return Sw::CONDITIONS_NOT_SATISFIED;
         }
         let data = &apdu.data[..apdu.nc];
-        if apdu.p1 == 0x30 || apdu.p1 == 0x38 {
+        if apdu.p1 == P1_CHAL_HMAC_SLOT1 || apdu.p1 == P1_CHAL_HMAC_SLOT2 {
             if cfg & CFG_CHAL_HMAC == 0 {
                 return SW_WRONG_DATA;
             }
-            if data.len() < 64 {
+            if data.len() < hid::PAYLOAD_SIZE {
                 return Sw::WRONG_LENGTH;
             }
             // HMAC key = AES field + all 6 UID bytes (22 total). HMAC zero-pads
@@ -451,9 +560,9 @@ impl<'a> OtpApplet<'a> {
             key[KEY_SIZE..].copy_from_slice(&slot[OFF_UID..OFF_UID + UID_SIZE]);
             // Variable-length challenges are padded by repeating the final
             // byte; trim that padding back off.
-            let mut chal_len = 64usize;
+            let mut chal_len = hid::PAYLOAD_SIZE;
             if cfg & CFG_HMAC_LT64 != 0 {
-                while chal_len > 0 && data[chal_len - 1] == data[63] {
+                while chal_len > 0 && data[chal_len - 1] == data[hid::PAYLOAD_SIZE - 1] {
                     chal_len -= 1;
                 }
             }
@@ -479,16 +588,18 @@ impl<'a> OtpApplet<'a> {
 
     fn cmd_otp<S: Storage>(&mut self, apdu: &Apdu, fs: &mut Fs<S>, res: &mut ResBuf) -> Sw {
         match apdu.p1 {
-            0x01 | 0x03 => self.cmd_configure(apdu, fs, res),
-            0x04 | 0x05 => self.cmd_update(apdu, fs, res),
-            0x06 => self.cmd_swap(apdu, fs, res),
+            P1_CONFIG_SLOT1 | P1_CONFIG_SLOT2 => self.cmd_configure(apdu, fs, res),
+            P1_UPDATE_SLOT1 | P1_UPDATE_SLOT2 => self.cmd_update(apdu, fs, res),
+            P1_SWAP => self.cmd_swap(apdu, fs, res),
             0x10 => {
                 res.extend(&rsk_mgmt::serial4(self.serial_id));
                 Sw::OK
             }
             0x13 => rsk_mgmt::config_tlv(&rsk_mgmt::serial4(self.serial_id), fs, res),
             0x14 => self.cmd_status_ext(fs, res),
-            0x20 | 0x28 | 0x30 | 0x38 => self.cmd_calculate(apdu, fs, res),
+            P1_CHAL_OTP_SLOT1 | P1_CHAL_OTP_SLOT2 | P1_CHAL_HMAC_SLOT1 | P1_CHAL_HMAC_SLOT2 => {
+                self.cmd_calculate(apdu, fs, res)
+            }
             // Unknown P1 values fall through to a bare OK.
             _ => Sw::OK,
         }
@@ -517,25 +628,69 @@ impl<S: Storage> Applet<Fs<S>> for OtpApplet<'_> {
     }
 }
 
-/// Read a slot file; `Some(len)` only when it holds at least a full config.
+/// Read+unseal a slot file; `Some(len)` only when it holds at least a full
+/// config. Legacy plaintext (pre-seal) fails GCM authentication and reads as
+/// `None` until [`migrate_seal`] re-seals it at boot.
 pub(crate) fn read_slot<S: Storage>(
+    dev: &Device,
     fs: &mut Fs<S>,
     fid: u16,
     buf: &mut [u8; SLOT_SIZE],
 ) -> Option<usize> {
-    let n = fs.read(fid, buf)?.min(SLOT_SIZE);
+    let n = seal::seal_read(dev, fs, KeyFid::new(fid), buf)?;
     (n >= CONFIG_SIZE).then_some(n)
+}
+
+/// Boot pass: bring every slot to a seal under the current kbase arm. A blob that
+/// already unseals is left alone; a slot sealed under the pre-OTP (NO-OTP) arm is
+/// recovered and re-sealed under the OTP arm once the fuse key is present; a
+/// legacy plaintext config is sealed in place. Idempotent and crash-safe per slot
+/// — GCM authentication tells the generations apart — so it runs unconditionally
+/// at every boot (see `firmware/src/main.rs`), before any host command or
+/// [`power_up_bump`] touches a slot. Closes the one applet that historically
+/// stored its secrets in the clear, and (via the pre-OTP arm, mirroring
+/// keydev/PIV/seed) keeps an OTP burn from orphaning a slot provisioned before it.
+pub fn migrate_seal<S: Storage>(dev: &Device, fs: &mut Fs<S>, rng: &mut dyn Rng) {
+    let mut out = [0u8; SLOT_SIZE];
+    // Sized to hold a full sealed blob so a sealed-but-unauthenticating slot
+    // (e.g. a foreign serial) reads back at its true length and is skipped
+    // rather than truncated and mis-resealed.
+    let mut raw = [0u8; seal::MAX_BLOB];
+    for i in 0..SLOT_COUNT as u16 {
+        let fid = KeyFid::new(EF_OTP_SLOT1 + i);
+        if seal::seal_read(dev, fs, fid, &mut out).is_some() {
+            continue; // already sealed under the current arm
+        }
+        // A slot sealed before the OTP MKEK was burned is under the NO-OTP kbase;
+        // recover it via the pre-OTP arm and re-seal under the current (OTP) arm,
+        // so a burn never silently orphans an existing slot.
+        if dev.otp_key.is_some()
+            && let Some(n) = seal::seal_read(&dev.without_otp(), fs, fid, &mut out)
+        {
+            let _ = seal::seal_put(dev, fs, rng, fid, &out[..n]);
+            continue;
+        }
+        if let Some(n) = fs.read_key(fid, &mut raw) {
+            // Only re-seal a genuine plaintext config; anything longer is not a
+            // legacy record (the smallest sealed blob is already > SLOT_SIZE).
+            if (CONFIG_SIZE..=SLOT_SIZE).contains(&n) {
+                let _ = seal::seal_put(dev, fs, rng, fid, &raw[..n]);
+            }
+        }
+    }
+    out.zeroize();
+    raw.zeroize();
 }
 
 /// Boot-time use-counter bump: on power-up, advance the 16-bit use counter of
 /// every plain Yubico-OTP slot (skipping HOTP / short / static slots), so a
 /// counter never repeats across reboots — the YubiKey replay defence. Runs once
 /// at startup.
-pub fn power_up_bump<S: Storage>(fs: &mut Fs<S>) {
+pub fn power_up_bump<S: Storage>(dev: &Device, fs: &mut Fs<S>, rng: &mut dyn Rng) {
     let mut slot = [0u8; SLOT_SIZE];
-    for i in 0..4u16 {
+    for i in 0..SLOT_COUNT as u16 {
         let fid = EF_OTP_SLOT1 + i;
-        let Some(n) = read_slot(fs, fid, &mut slot) else {
+        let Some(n) = read_slot(dev, fs, fid, &mut slot) else {
             continue;
         };
         let tkt = slot[OFF_TKT_FLAGS];
@@ -549,9 +704,9 @@ pub fn power_up_bump<S: Storage>(fs: &mut Fs<S>) {
             rec[CONFIG_SIZE..].fill(0);
         }
         let counter = u16::from_be_bytes([rec[CONFIG_SIZE], rec[CONFIG_SIZE + 1]]).wrapping_add(1);
-        if counter <= 0x7FFF {
+        if counter <= USE_COUNTER_MAX {
             rec[CONFIG_SIZE..CONFIG_SIZE + 2].copy_from_slice(&counter.to_be_bytes());
-            let _ = fs.put(fid, &rec);
+            let _ = seal::seal_put(dev, fs, rng, KeyFid::new(fid), &rec);
         }
     }
 }
@@ -579,501 +734,4 @@ fn check_crc(config: &[u8]) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use rsk_fs::storage::ram::RamStorage;
-
-    const SERIAL: [u8; 8] = [0x12, 0x34, 0x56, 0x78, 0x9A, 0, 0, 0];
-    /// Typed-ticket flag used to build non-chalresp test slots.
-    const TKT_APPEND_CR: u8 = 0x20;
-
-    /// Presence stub the tests can flip to Declined.
-    struct TestPresence(Presence);
-    impl UserPresence for TestPresence {
-        fn request(&mut self) -> Presence {
-            self.0
-        }
-    }
-
-    fn new_fs() -> Fs<RamStorage> {
-        let mut fs = Fs::new(RamStorage::new(), &[]);
-        fs.scan();
-        fs
-    }
-
-    fn select(app: &mut OtpApplet, fs: &mut Fs<RamStorage>) -> (Sw, Vec<u8>) {
-        let mut out = [0u8; 256];
-        let mut res = ResBuf::new(&mut out);
-        let sw = Applet::select(app, false, fs, &mut res);
-        (sw, res.as_slice().to_vec())
-    }
-
-    fn run(app: &mut OtpApplet, fs: &mut Fs<RamStorage>, raw: &[u8]) -> (Sw, Vec<u8>) {
-        let mut out = [0u8; 1024];
-        let mut res = ResBuf::new(&mut out);
-        let apdu = Apdu::parse(raw).unwrap();
-        let sw = Applet::process(app, &apdu, fs, &mut res);
-        (sw, res.as_slice().to_vec())
-    }
-
-    fn otp_apdu(p1: u8, p2: u8, data: &[u8]) -> Vec<u8> {
-        assert!(data.len() < 256);
-        let mut v = vec![0x00, INS_OTP, p1, p2];
-        if !data.is_empty() {
-            v.push(data.len() as u8);
-            v.extend_from_slice(data);
-        }
-        v
-    }
-
-    /// Build a valid 52-byte config the way ykman does: fill the fields, then
-    /// store the complement of the CRC over the first 50 bytes.
-    fn build_config(
-        fixed: &[u8],
-        uid: &[u8; 6],
-        key: &[u8; 16],
-        acc: &[u8; 6],
-        ext: u8,
-        tkt: u8,
-        cfg: u8,
-    ) -> [u8; CONFIG_SIZE] {
-        let mut c = [0u8; CONFIG_SIZE];
-        c[..fixed.len()].copy_from_slice(fixed);
-        c[OFF_UID..OFF_UID + 6].copy_from_slice(uid);
-        c[OFF_AES_KEY..OFF_AES_KEY + 16].copy_from_slice(key);
-        c[OFF_ACC_CODE..OFF_ACC_CODE + 6].copy_from_slice(acc);
-        c[OFF_FIXED_SIZE] = fixed.len() as u8;
-        c[OFF_EXT_FLAGS] = ext;
-        c[OFF_TKT_FLAGS] = tkt;
-        c[OFF_CFG_FLAGS] = cfg;
-        let crc = !crc16(&c[..CONFIG_SIZE - 2]);
-        c[CONFIG_SIZE - 2..].copy_from_slice(&crc.to_le_bytes());
-        c
-    }
-
-    /// HMAC-SHA1 challenge-response config (the `ykman otp chalresp` layout):
-    /// 16 key bytes in the AES field, 4 in the UID head.
-    fn chalresp_config(key20: &[u8; 20], acc: &[u8; 6], cfg_extra: u8) -> [u8; CONFIG_SIZE] {
-        let mut uid = [0u8; 6];
-        uid[..4].copy_from_slice(&key20[16..]);
-        let mut aes = [0u8; 16];
-        aes.copy_from_slice(&key20[..16]);
-        build_config(
-            &[],
-            &uid,
-            &aes,
-            acc,
-            0,
-            TKT_CHAL_RESP,
-            CFG_CHAL_HMAC | cfg_extra,
-        )
-    }
-
-    fn configure(
-        app: &mut OtpApplet,
-        fs: &mut Fs<RamStorage>,
-        p1: u8,
-        p2: u8,
-        config: &[u8; CONFIG_SIZE],
-        acc: &[u8; 6],
-    ) -> (Sw, Vec<u8>) {
-        let mut d = config.to_vec();
-        d.extend_from_slice(acc);
-        run(app, fs, &otp_apdu(p1, p2, &d))
-    }
-
-    #[test]
-    fn crc16_residual() {
-        // Programming-frame self-check: a stored ~CRC makes the whole-record
-        // CRC equal the X.25 residual.
-        let c = build_config(b"fix", &[1; 6], &[2; 16], &[0; 6], 0, 0, 0);
-        assert!(check_crc(&c));
-        let mut bad = c;
-        bad[0] ^= 1;
-        assert!(!check_crc(&bad));
-    }
-
-    #[test]
-    fn button_types_nitrokey_slots_3_and_4() {
-        // Slots 3/4 (three/four BOOTSEL clicks) type a ticket just like 1/2:
-        // configure over CCID with the P2 slot offset (P1=0x01, P2=2/3 →
-        // EF 0xBB02/0xBB03); a fifth slot is rejected.
-        let mut fs = new_fs();
-        let presence = RefCell::new(AlwaysConfirm);
-        let mut app = OtpApplet::new(SERIAL, &presence);
-        // Plain Yubico-OTP slot (tkt = cfg = 0): types a 44-char modhex + bumps the
-        // use counter, so this also covers per-slot counter persistence on slot 3/4.
-        let cfg = build_config(&[0, 1, 2, 3, 4, 5], &[1; 6], &[2; 16], &[0; 6], 0, 0, 0);
-        assert_eq!(
-            configure(&mut app, &mut fs, 0x01, 2, &cfg, &[0; 6]).0,
-            Sw::OK
-        );
-        assert_eq!(
-            configure(&mut app, &mut fs, 0x01, 3, &cfg, &[0; 6]).0,
-            Sw::OK
-        );
-
-        let mut out = [0u8; ticket::MAX_TICKET];
-        assert!(app.button_ticket(3, 0, [0, 0], &mut fs, &mut out).is_some());
-        assert!(app.button_ticket(4, 0, [0, 0], &mut fs, &mut out).is_some());
-        // Out of range — there is no fifth slot.
-        assert!(app.button_ticket(5, 0, [0, 0], &mut fs, &mut out).is_none());
-        // And a 0x14 extended status now lists all four programmed slots.
-        let (_, body) = run(&mut app, &mut fs, &otp_apdu(0x14, 0, &[]));
-        assert_eq!(
-            body.iter().filter(|&&b| (0xB0..0xB4).contains(&b)).count(),
-            2
-        );
-    }
-
-    #[test]
-    fn select_status_and_config_seq() {
-        let mut fs = new_fs();
-        let presence = RefCell::new(AlwaysConfirm);
-        let mut app = OtpApplet::new(SERIAL, &presence);
-        let (sw, body) = select(&mut app, &mut fs);
-        assert_eq!(sw, Sw::OK);
-        // Empty device: version 5.7.4, seq 0, no valid/touch bits.
-        assert_eq!(body, [5, 7, 4, 0, 0, 0, 0]);
-
-        // Program slot 1 (HMAC chalresp, no touch): VALID without TOUCH.
-        let cfgd = chalresp_config(&[0xAA; 20], &[0; 6], 0);
-        let (sw, body) = configure(&mut app, &mut fs, 0x01, 0, &cfgd, &[0; 6]);
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(&body[..4], &[5, 7, 4, 1]); // seq bumped
-        assert_eq!(body[4], CONFIG1_VALID);
-
-        // Re-SELECT: seq resets to 1 (slots present).
-        let (_, body) = select(&mut app, &mut fs);
-        assert_eq!(body[3], 1);
-
-        // A typed (non-chalresp) slot 2 sets VALID + TOUCH.
-        let typed = build_config(b"public", &[3; 6], &[4; 16], &[0; 6], 0, TKT_APPEND_CR, 0);
-        let (_, body) = configure(&mut app, &mut fs, 0x03, 0, &typed, &[0; 6]);
-        assert_eq!(body[4], CONFIG1_VALID | CONFIG2_VALID | CONFIG2_TOUCH);
-    }
-
-    #[test]
-    fn configure_validates_crc_and_rfu() {
-        let mut fs = new_fs();
-        let presence = RefCell::new(AlwaysConfirm);
-        let mut app = OtpApplet::new(SERIAL, &presence);
-        let mut bad = chalresp_config(&[1; 20], &[0; 6], 0);
-        bad[10] ^= 0xFF; // breaks the CRC
-        let (sw, _) = configure(&mut app, &mut fs, 0x01, 0, &bad, &[0; 6]);
-        assert_eq!(sw, SW_WRONG_DATA);
-
-        let mut bad = chalresp_config(&[1; 20], &[0; 6], 0);
-        bad[OFF_RFU] = 1; // rfu must be zero (CRC recomputed to stay valid)
-        let crc = !crc16(&bad[..CONFIG_SIZE - 2]);
-        bad[CONFIG_SIZE - 2..].copy_from_slice(&crc.to_le_bytes());
-        let (sw, _) = configure(&mut app, &mut fs, 0x01, 0, &bad, &[0; 6]);
-        assert_eq!(sw, SW_WRONG_DATA);
-
-        // Too-short body.
-        let (sw, _) = run(&mut app, &mut fs, &otp_apdu(0x01, 0, &[0u8; 20]));
-        assert_eq!(sw, Sw::WRONG_LENGTH);
-        // Slot-2 configure with nonzero P2 is invalid.
-        let good = chalresp_config(&[1; 20], &[0; 6], 0);
-        let (sw, _) = configure(&mut app, &mut fs, 0x03, 1, &good, &[0; 6]);
-        assert_eq!(sw, Sw::INCORRECT_P1P2);
-    }
-
-    #[test]
-    fn access_code_protects_reconfig_and_delete() {
-        let mut fs = new_fs();
-        let presence = RefCell::new(AlwaysConfirm);
-        let mut app = OtpApplet::new(SERIAL, &presence);
-        let acc = [1, 2, 3, 4, 5, 6];
-        let cfgd = chalresp_config(&[0xBB; 20], &acc, 0);
-        let (sw, _) = configure(&mut app, &mut fs, 0x01, 0, &cfgd, &[0; 6]);
-        assert_eq!(sw, Sw::OK);
-
-        // Overwrite without the access code fails…
-        let newc = chalresp_config(&[0xCC; 20], &[0; 6], 0);
-        let (sw, _) = configure(&mut app, &mut fs, 0x01, 0, &newc, &[0; 6]);
-        assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
-        // …and succeeds with it.
-        let (sw, _) = configure(&mut app, &mut fs, 0x01, 0, &newc, &acc);
-        assert_eq!(sw, Sw::OK);
-
-        // Delete = all-zero config (plus the current access code — now none).
-        let (sw, body) = configure(&mut app, &mut fs, 0x01, 0, &[0; CONFIG_SIZE], &[0; 6]);
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(body[4], 0); // no valid slots
-    }
-
-    #[test]
-    fn hmac_chalresp_full_64() {
-        let mut fs = new_fs();
-        let presence = RefCell::new(AlwaysConfirm);
-        let mut app = OtpApplet::new(SERIAL, &presence);
-        let key20 = [0x0B; 20];
-        let cfgd = chalresp_config(&key20, &[0; 6], 0); // no HMAC_LT64: full 64 bytes
-        configure(&mut app, &mut fs, 0x01, 0, &cfgd, &[0; 6]);
-
-        let chal = [0x5A; 64];
-        let (sw, body) = run(&mut app, &mut fs, &otp_apdu(0x30, 0, &chal));
-        assert_eq!(sw, Sw::OK);
-        // Key = AES field (16) + full UID (6); trailing UID zeros are absorbed
-        // by HMAC key padding, so this equals the plain 20-byte-key HMAC.
-        assert_eq!(body, hmac_sha1(&key20, &chal));
-    }
-
-    #[test]
-    fn hmac_chalresp_lt64_trims_padding() {
-        let mut fs = new_fs();
-        let presence = RefCell::new(AlwaysConfirm);
-        let mut app = OtpApplet::new(SERIAL, &presence);
-        let key20 = [0x0B; 20];
-        let cfgd = chalresp_config(&key20, &[0; 6], CFG_HMAC_LT64);
-        configure(&mut app, &mut fs, 0x01, 0, &cfgd, &[0; 6]);
-
-        // KeePassXC-style: short challenge padded by repeating the last byte.
-        let mut chal = [0x01u8; 64];
-        chal[..9].copy_from_slice(b"challenge");
-        let (sw, body) = run(&mut app, &mut fs, &otp_apdu(0x30, 0, &chal));
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(body, hmac_sha1(&key20, b"challenge"));
-
-        // The classic trim quirk: a challenge ending in the pad byte loses its
-        // own tail ("Hi There" + 'e' padding → "Hi Ther").
-        let mut chal = [b'e'; 64];
-        chal[..8].copy_from_slice(b"Hi There");
-        let (_, body) = run(&mut app, &mut fs, &otp_apdu(0x30, 0, &chal));
-        assert_eq!(body, hmac_sha1(&key20, b"Hi Ther"));
-        // RFC 2202 case 1 pins the PRF itself for the trimmed message.
-        assert_ne!(body, hmac_sha1(&key20, b"Hi There"));
-    }
-
-    #[test]
-    fn yubico_chalresp_mixes_serial() {
-        let mut fs = new_fs();
-        let presence = RefCell::new(AlwaysConfirm);
-        let mut app = OtpApplet::new(SERIAL, &presence);
-        let aes_key = [0x42; 16];
-        let cfgd = build_config(
-            &[],
-            &[0; 6],
-            &aes_key,
-            &[0; 6],
-            0,
-            TKT_CHAL_RESP,
-            CFG_CHAL_YUBICO,
-        );
-        configure(&mut app, &mut fs, 0x01, 0, &cfgd, &[0; 6]);
-
-        let chal6 = [9, 8, 7, 6, 5, 4];
-        let (sw, body) = run(&mut app, &mut fs, &otp_apdu(0x20, 0, &chal6));
-        assert_eq!(sw, Sw::OK);
-        let mut expect = [0u8; 16];
-        expect[..6].copy_from_slice(&chal6);
-        expect[6..].copy_from_slice(b"123456789A"); // serial_str10 of SERIAL
-        aes128_encrypt_block(&aes_key, &mut expect);
-        assert_eq!(body, expect);
-    }
-
-    #[test]
-    fn calculate_rejections_and_empty_slot() {
-        let mut fs = new_fs();
-        let presence = RefCell::new(AlwaysConfirm);
-        let mut app = OtpApplet::new(SERIAL, &presence);
-        // Empty slot: bare OK, no body.
-        let (sw, body) = run(&mut app, &mut fs, &otp_apdu(0x30, 0, &[0; 64]));
-        assert_eq!((sw, body.len()), (Sw::OK, 0));
-
-        // Non-chalresp slot rejects calculation.
-        let typed = build_config(b"public", &[3; 6], &[4; 16], &[0; 6], 0, TKT_APPEND_CR, 0);
-        configure(&mut app, &mut fs, 0x01, 0, &typed, &[0; 6]);
-        let (sw, _) = run(&mut app, &mut fs, &otp_apdu(0x30, 0, &[0; 64]));
-        assert_eq!(sw, SW_WRONG_DATA);
-
-        // Short challenge bodies are length errors, not buffer overreads.
-        let cfgd = chalresp_config(&[1; 20], &[0; 6], 0);
-        configure(&mut app, &mut fs, 0x03, 0, &cfgd, &[0; 6]);
-        let (sw, _) = run(&mut app, &mut fs, &otp_apdu(0x38, 0, &[0; 32]));
-        assert_eq!(sw, Sw::WRONG_LENGTH);
-        // Slot-2 variants demand P2 = 0.
-        let (sw, _) = run(&mut app, &mut fs, &otp_apdu(0x38, 1, &[0; 64]));
-        assert_eq!(sw, Sw::INCORRECT_P1P2);
-        // Unknown INS / CLA.
-        let (sw, _) = run(&mut app, &mut fs, &[0x00, 0x02, 0, 0]);
-        assert_eq!(sw, Sw::INS_NOT_SUPPORTED);
-        let (sw, _) = run(&mut app, &mut fs, &[0x80, 0x01, 0x10, 0]);
-        assert_eq!(sw, Sw::CLA_NOT_SUPPORTED);
-        // Unknown P1 answers a bare OK.
-        let (sw, body) = run(&mut app, &mut fs, &otp_apdu(0x77, 0, &[]));
-        assert_eq!((sw, body.len()), (Sw::OK, 0));
-    }
-
-    #[test]
-    fn touch_gated_chalresp_respects_presence() {
-        let mut fs = new_fs();
-        let presence = RefCell::new(TestPresence(Presence::Declined));
-        let presence_dyn: &RefCell<dyn UserPresence> = &presence;
-        let mut app = OtpApplet::new(SERIAL, presence_dyn);
-        let cfgd = chalresp_config(&[7; 20], &[0; 6], CFG_CHAL_BTN_TRIG);
-        configure(&mut app, &mut fs, 0x01, 0, &cfgd, &[0; 6]);
-
-        let (sw, _) = run(&mut app, &mut fs, &otp_apdu(0x30, 0, &[0; 64]));
-        assert_eq!(sw, Sw::CONDITIONS_NOT_SATISFIED);
-        presence.borrow_mut().0 = Presence::Confirmed;
-        let (sw, body) = run(&mut app, &mut fs, &otp_apdu(0x30, 0, &[0; 64]));
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(body.len(), 20);
-    }
-
-    #[test]
-    fn update_merges_flag_masks_only() {
-        let mut fs = new_fs();
-        let presence = RefCell::new(AlwaysConfirm);
-        let mut app = OtpApplet::new(SERIAL, &presence);
-        // A typed Yubico-OTP slot (not chal-resp) with APPEND_CR.
-        let orig = build_config(b"public", &[3; 6], &[4; 16], &[0; 6], 0, TKT_APPEND_CR, 0);
-        configure(&mut app, &mut fs, 0x01, 0, &orig, &[0; 6]);
-
-        // Update with different key material + flags: only the masked tkt/cfg
-        // bits may change; the key/fixed/uid stay.
-        let upd = build_config(
-            b"other!", &[9; 6], &[9; 16], &[0; 6], 0, 0x02, /* APPEND_TAB1 */
-            0xFF,
-        );
-        let mut d = upd.to_vec();
-        d.extend_from_slice(&[0; 6]);
-        let (sw, _) = run(&mut app, &mut fs, &otp_apdu(0x04, 0, &d));
-        assert_eq!(sw, Sw::OK);
-
-        // status-ext shows the merged flags and the ORIGINAL fixed part.
-        let (_, body) = run(&mut app, &mut fs, &otp_apdu(0x14, 0, &[]));
-        // [0xB0, len, 0xA0, 2, tkt, cfg, 0xC0, 6, fixed6...]
-        assert_eq!(body[0], 0xB0);
-        assert_eq!(body[4], 0x02); // tkt: only the update-mask bit survived
-        assert_eq!(body[5], 0x0C); // cfg: only PACING bits taken from 0xFF
-        assert_eq!(&body[8..14], b"public");
-
-        // Update on an empty slot stores nothing but still returns status.
-        let (sw, body) = run(&mut app, &mut fs, &otp_apdu(0x05, 0, &d));
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(body[4] & CONFIG2_VALID, 0);
-    }
-
-    #[test]
-    fn swap_moves_configs_between_slots() {
-        let mut fs = new_fs();
-        let presence = RefCell::new(AlwaysConfirm);
-        let mut app = OtpApplet::new(SERIAL, &presence);
-        let key20 = [0x33; 20];
-        let cfgd = chalresp_config(&key20, &[0; 6], 0);
-        configure(&mut app, &mut fs, 0x01, 0, &cfgd, &[0; 6]);
-
-        let (sw, body) = run(&mut app, &mut fs, &otp_apdu(0x06, 0, &[]));
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(body[4], CONFIG2_VALID); // moved 1 → 2
-
-        // The moved slot still calculates (now via the slot-2 variant).
-        let chal = [0x11; 64];
-        let (_, resp) = run(&mut app, &mut fs, &otp_apdu(0x38, 0, &chal));
-        assert_eq!(resp, hmac_sha1(&key20, &chal));
-
-        // Swap back with an explicit pair body — the offsets are relative to
-        // slot 1 resp. slot 2, so [0, 0] is the plain 1↔2 swap.
-        let (sw, body) = run(&mut app, &mut fs, &otp_apdu(0x06, 0, &[0, 0]));
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(body[4], CONFIG1_VALID);
-        let (sw, _) = run(&mut app, &mut fs, &otp_apdu(0x06, 0, &[0, 1, 2]));
-        assert_eq!(sw, Sw::WRONG_LENGTH);
-    }
-
-    #[test]
-    fn serial_and_config_passthrough() {
-        let mut fs = new_fs();
-        let presence = RefCell::new(AlwaysConfirm);
-        let mut app = OtpApplet::new(SERIAL, &presence);
-        let (sw, body) = run(&mut app, &mut fs, &otp_apdu(0x10, 0, &[]));
-        assert_eq!(sw, Sw::OK);
-        // serial4: first 4 chip-id bytes, top 6 bits cleared (0x12 → 0x02).
-        assert_eq!(body, [0x02, 0x34, 0x56, 0x78]);
-
-        // GET CONFIG returns the management TLV (leading overall-length byte).
-        let (sw, body) = run(&mut app, &mut fs, &otp_apdu(0x13, 0, &[]));
-        assert_eq!(sw, Sw::OK);
-        assert_eq!(body[0] as usize, body.len() - 1);
-    }
-
-    /// The DeviceInfo read ykman falls back to when CCID is unavailable
-    /// (`yubikit._ManagementOtpBackend.read_config` → slot 0x13), end to end
-    /// over the frame protocol: host frame in via [`hid::FrameRx`], dispatch
-    /// via `process_hid`, response out via [`hid::FrameTx`], validated exactly
-    /// as the host does (length byte + X.25 CRC residual).
-    #[test]
-    fn hid_frame_device_info_read() {
-        let mut fs = new_fs();
-        let presence = RefCell::new(AlwaysConfirm);
-        let mut app = OtpApplet::new(SERIAL, &presence);
-
-        // read_config(page=0) sends a single zero page byte (already zero).
-        let payload = [0u8; hid::PAYLOAD_SIZE];
-        let reports = hid::split_frame(&payload, 0x13);
-        let mut rx = hid::FrameRx::new();
-        let mut frame = None;
-        for r in &reports {
-            if let hid::RxOutcome::Frame { slot, payload } = rx.feed(r) {
-                frame = Some((slot, payload));
-            }
-        }
-        let (slot, payload) = frame.expect("frame did not reassemble");
-        assert_eq!(slot, 0x13);
-
-        let mut out = [0u8; 64];
-        let mut res = ResBuf::new(&mut out);
-        let sw = app.process_hid(slot, &payload, &mut fs, &mut res);
-        assert_eq!(sw, Sw::OK);
-        let body = res.as_slice().to_vec();
-        assert!(!body.is_empty(), "a read command must stream a body");
-
-        // Drain the response reports the way `yubikit._read_frame` does.
-        let mut tx = hid::FrameTx::new();
-        tx.load(&body);
-        let mut resp = Vec::new();
-        let mut rep = [0u8; hid::REPORT_SIZE];
-        let mut seq = 0u8;
-        while tx.next(&mut rep) {
-            let flag = rep[hid::REPORT_DATA];
-            assert_ne!(flag & 0x40, 0, "response report must set RESP_PENDING");
-            if flag & 0x1F == seq {
-                resp.extend_from_slice(&rep[..hid::REPORT_DATA]);
-                seq += 1;
-            } else {
-                assert_eq!(flag & 0x1F, 0, "sequence break that is not the end marker");
-                break;
-            }
-        }
-        // yubikit read_config: r_len = response[0]; check_crc(response[:r_len+3]).
-        let r_len = resp[0] as usize;
-        assert_eq!(r_len, body.len() - 1);
-        assert_eq!(crc16(&resp[..r_len + 3]), 0xF0B8);
-        assert_eq!(&resp[..r_len + 1], &body[..]);
-    }
-
-    /// Frame commands we do not implement (e.g. SLOT_YK4_SET_DEVICE_INFO 0x15)
-    /// answer OK with no body — the firmware glue then serves the idle status
-    /// frame, which yubikit turns into a clean CommandRejectedError("No data")
-    /// instead of blocking in `_read_frame`.
-    #[test]
-    fn hid_frame_unknown_command_answers_empty() {
-        let mut fs = new_fs();
-        let presence = RefCell::new(AlwaysConfirm);
-        let mut app = OtpApplet::new(SERIAL, &presence);
-        for slot in [0x11u8, 0x12, 0x15] {
-            let payload = [0u8; hid::PAYLOAD_SIZE];
-            let mut out = [0u8; 64];
-            let mut res = ResBuf::new(&mut out);
-            let sw = app.process_hid(slot, &payload, &mut fs, &mut res);
-            assert_eq!(sw, Sw::OK);
-            assert!(
-                res.as_slice().is_empty(),
-                "slot {slot:#x} must not stream a body"
-            );
-        }
-    }
-}
+mod tests;

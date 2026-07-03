@@ -22,12 +22,14 @@ import hashlib
 import os
 import sys
 
-from .backup import _gated, _vendor
+from .backup import ERR_NOT_ALLOWED, _die_pin_required, _die_touch_denied, _gated, _vendor
 from .common import add_pin_arg, connect_fido, device_has_pin, die, resolve_pin
 
 AUDIT_READ, AUDIT_CHECKPOINT = 7, 8
 ENTRY_LEN = 20
 CKPT_TAG = b"RSK-AUDIT-CKPT-v1"
+
+EVT_RESET = 0x04  # firmware journal.rs EV_RESET
 
 EVENTS = {
     0x01: "BOOT",
@@ -73,11 +75,37 @@ def _fold(epoch, entries):
     return h
 
 
+def _fingerprint(pubkey):
+    return hashlib.sha256(pubkey).hexdigest()[:16]
+
+
+def verify_checkpoint(m, challenge, distrust, badsig):
+    """Validate the DEVK checkpoint map `m` over `challenge`; die()s fail-closed.
+    Returns (head, seq, sig, pubkey)."""
+    if not all(k in m for k in (1, 2, 3, 4)):
+        die(f"malformed checkpoint response — {distrust}")
+    head, seq, sig, pubkey = m[1], m[2], m[3], m[4]
+
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    try:
+        vk = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), pubkey)
+        msg = CKPT_TAG + head + int(seq).to_bytes(4, "little") + challenge
+    except (ValueError, TypeError, OverflowError):
+        die(f"malformed checkpoint fields — {distrust}")
+    try:
+        vk.verify(sig, msg, ec.ECDSA(hashes.SHA256()))
+    except InvalidSignature:
+        die(badsig)
+    return head, seq, sig, pubkey
+
+
 def read_journal(dev, cid, pin):
     """AUDIT_READ → (start, seq_next, epoch, entries bytes)."""
     st, m = _vendor(dev, cid, _gated(AUDIT_READ, None, dev, cid, pin))
-    if st == 0x36:
-        die("device requires a PIN — pass --pin or enter it when prompted")
+    _die_pin_required(st)
     if st != 0:
         die(f"audit read failed: {st:#x}")
     start, seq_next, epoch, entries = m[1], m[2], m[3], m[4]
@@ -118,24 +146,14 @@ def cmd_verify(args):
     print("touch the device (BOOTSEL) to sign the checkpoint…", file=sys.stderr)
     st, m = _vendor(dev, cid,
                     _gated(AUDIT_CHECKPOINT, {1: challenge}, dev, cid, pin))
-    if st == 0x30:
+    if st == ERR_NOT_ALLOWED:
         die("checkpoint refused — no OTP DEVK provisioned (see docs/production.md)")
-    if st == 0x27:
-        die("denied — no touch within 30 s; press the button when the LED blinks")
+    _die_touch_denied(st)
     if st != 0:
         die(f"checkpoint failed: {st:#x}")
-    head_signed, seq_signed, sig, pubkey = m[1], m[2], m[3], m[4]
-
-    from cryptography.exceptions import InvalidSignature
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.asymmetric import ec
-
-    vk = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), pubkey)
-    msg = CKPT_TAG + head_signed + seq_signed.to_bytes(4, "little") + challenge
-    try:
-        vk.verify(sig, msg, ec.ECDSA(hashes.SHA256()))
-    except InvalidSignature:
-        die("checkpoint SIGNATURE INVALID — do not trust this journal")
+    head_signed, seq_signed, sig, pubkey = verify_checkpoint(
+        m, challenge, "do not trust this journal",
+        "checkpoint SIGNATURE INVALID — do not trust this journal")
 
     if head_signed != head_local:
         die("signed head differs from the exported window — the journal changed "
@@ -143,7 +161,7 @@ def cmd_verify(args):
     if args.expect_key and pubkey.hex() != args.expect_key.lower():
         die("attestation key MISMATCH — this is not the enrolled device")
 
-    fp = hashlib.sha256(pubkey).hexdigest()[:16]
+    fp = _fingerprint(pubkey)
     print_entries(entries)
     print(f"\nchain   : OK — head {head_local.hex()}")
     print(f"sig     : OK — checkpoint over seq_next={seq_signed}, fresh challenge")

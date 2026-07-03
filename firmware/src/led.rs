@@ -39,7 +39,7 @@ use embassy_rp::gpio::{Level, Output};
 use embassy_rp::pwm::{Config as PwmConfig, Pwm};
 
 /// Maximum number of addressable LEDs the PIO buffer and frame arrays are
-/// sized to. Baked at compile time via the `MAX_LEDS` build flag (default 8);
+/// sized to. Baked at compile time via the `MAX_LEDS` build flag (default 1);
 /// the actual connected count is set at runtime via `rsk hw --led-num` and
 /// must be ≤ this value.
 #[cfg(not(led_kind = "none"))]
@@ -173,15 +173,15 @@ pub fn runtime_leds() -> u8 {
     RUNTIME_LEDS.load(Ordering::Relaxed)
 }
 
-/// Set the runtime LED count (called from `main` at boot, or via `rsk hw`).
-/// Panics if `n` exceeds [`MAX_LEDS`].
+/// Set the runtime LED count from the phy record at boot. The phy record is
+/// host/PicoForge-writable and survives every factory reset, so a value above
+/// the compiled [`MAX_LEDS`] ceiling is **saturated**, never asserted — a panic
+/// on this boot path would re-fire on every reboot (the bad value persists),
+/// bricking the device into a loop recoverable only by reflashing. Lighting all
+/// `MAX_LEDS` is the safe degradation for an over-large count.
 #[cfg(not(led_kind = "none"))]
 pub fn set_runtime_leds(n: u8) {
-    assert!(
-        (n as usize) <= MAX_LEDS,
-        "RUNTIME_LEDS={n} exceeds MAX_LEDS={MAX_LEDS}"
-    );
-    RUNTIME_LEDS.store(n, Ordering::Relaxed);
+    RUNTIME_LEDS.store(rsk_led::clamp_leds(n, MAX_LEDS as u8), Ordering::Relaxed);
 }
 
 /// Set the active status (the worker on dispatch start/end, `presence` for a
@@ -204,10 +204,17 @@ pub fn set_status_config(idx: u8, color: u8, brightness: u8) {
     STATUS_BRIGHTNESS[i].store(brightness, Ordering::Relaxed);
 }
 
-/// Override one status's effect and speed (0 = use effect's built-in default).
-pub fn set_status_effect(idx: u8, effect: u8, speed: u8) {
+/// Override one status's effect.
+pub fn set_status_effect(idx: u8, effect: u8) {
     let i = (idx as usize).min(N_STATUS - 1);
     STATUS_EFFECT[i].store(effect, Ordering::Relaxed);
+}
+
+/// Override one status's effect speed (0 = use the effect's built-in default).
+/// Kept separate from [`set_status_effect`] so a SET LED that carries only an
+/// effect byte leaves a previously-set custom speed untouched.
+pub fn set_status_speed(idx: u8, speed: u8) {
+    let i = (idx as usize).min(N_STATUS - 1);
     STATUS_SPEED[i].store(speed, Ordering::Relaxed);
 }
 
@@ -235,59 +242,42 @@ pub fn set_all_brightness(b: u8) {
 
 /// The full config as the persisted/`GET LED` block `[steady, (effect, color, br, speed) × N]`.
 pub fn config_block() -> [u8; CONF_LEN] {
-    let mut b = [0u8; CONF_LEN];
-    b[0] = LED_STEADY.load(Ordering::Relaxed) as u8;
-    for i in 0..N_STATUS {
-        b[1 + 4 * i] = STATUS_EFFECT[i].load(Ordering::Relaxed);
-        b[2 + 4 * i] = STATUS_COLOR[i].load(Ordering::Relaxed);
-        b[3 + 4 * i] = STATUS_BRIGHTNESS[i].load(Ordering::Relaxed);
-        b[4 + 4 * i] = STATUS_SPEED[i].load(Ordering::Relaxed);
+    let mut cfg = rsk_led::LedConfig {
+        steady: LED_STEADY.load(Ordering::Relaxed),
+        ..Default::default()
+    };
+    for (i, s) in cfg.status.iter_mut().enumerate() {
+        s.effect = STATUS_EFFECT[i].load(Ordering::Relaxed);
+        s.color = STATUS_COLOR[i].load(Ordering::Relaxed);
+        s.brightness = STATUS_BRIGHTNESS[i].load(Ordering::Relaxed);
+        s.speed = STATUS_SPEED[i].load(Ordering::Relaxed);
     }
-    b
+    cfg.encode()
 }
 
-/// Apply a config block (boot from flash / SET LED). Handles four wire formats:
-///
-/// | Length | Format |
-/// |--------|--------|
-/// | 17+ | `[steady, (effect, color, brightness, speed) × N]` — current |
-/// | 13–16 | `[steady, (effect, color, brightness) × N]` — pre-speed (atomics keep defaults) |
-/// | 7–12 | `[steady, (color, brightness) × N]` — pre-effect (atomics keep defaults) |
-/// | 2–3  | `[brightness, idle_color[, steady]]` — very old legacy |
+/// Apply a config block (boot from flash / SET LED). The wire-format decode —
+/// including the older 13/9/2-byte layouts an upgrade may still have in flash —
+/// lives in [`rsk_led::LedConfig::apply_block`] (host-unit-tested). We snapshot
+/// the live atomics first so a short block preserves whatever fields it doesn't
+/// carry, overlay the block, then write the result back to the atomics.
 pub fn load_block(b: &[u8]) {
-    if b.len() >= CONF_LEN {
-        // Current format: [steady, (effect, color, brightness, speed) × N_STATUS]
-        LED_STEADY.store(b[0] != 0, Ordering::Relaxed);
-        for i in 0..N_STATUS {
-            STATUS_EFFECT[i].store(b[1 + 4 * i], Ordering::Relaxed);
-            STATUS_COLOR[i].store(b[2 + 4 * i] & 0x7, Ordering::Relaxed);
-            STATUS_BRIGHTNESS[i].store(b[3 + 4 * i], Ordering::Relaxed);
-            STATUS_SPEED[i].store(b[4 + 4 * i], Ordering::Relaxed);
-        }
-    } else if b.len() >= 13 {
-        // Pre-speed format: [steady, (effect, color, brightness) × 4] (3-byte stride)
-        LED_STEADY.store(b[0] != 0, Ordering::Relaxed);
-        for i in 0..N_STATUS {
-            STATUS_EFFECT[i].store(b[1 + 3 * i], Ordering::Relaxed);
-            STATUS_COLOR[i].store(b[2 + 3 * i] & 0x7, Ordering::Relaxed);
-            STATUS_BRIGHTNESS[i].store(b[3 + 3 * i], Ordering::Relaxed);
-            // speed keeps its default (0 = built-in)
-        }
-    } else if b.len() >= 7 {
-        // Pre-effect format: [steady, (color, brightness) × N] — 2-byte stride
-        LED_STEADY.store(b[0] != 0, Ordering::Relaxed);
-        let n = (b.len() - 1) / 2;
-        for i in 0..n.min(N_STATUS) {
-            STATUS_COLOR[i].store(b[1 + 2 * i] & 0x7, Ordering::Relaxed);
-            STATUS_BRIGHTNESS[i].store(b[2 + 2 * i], Ordering::Relaxed);
-        }
-    } else if b.len() >= 2 {
-        // Legacy 2/3-byte: [brightness, idle_color[, steady]]
-        STATUS_BRIGHTNESS[STATUS_IDLE as usize].store(b[0], Ordering::Relaxed);
-        STATUS_COLOR[STATUS_IDLE as usize].store(b[1] & 0x7, Ordering::Relaxed);
-        if b.len() >= 3 {
-            LED_STEADY.store(b[2] != 0, Ordering::Relaxed);
-        }
+    let mut cfg = rsk_led::LedConfig {
+        steady: LED_STEADY.load(Ordering::Relaxed),
+        ..Default::default()
+    };
+    for (i, s) in cfg.status.iter_mut().enumerate() {
+        s.effect = STATUS_EFFECT[i].load(Ordering::Relaxed);
+        s.color = STATUS_COLOR[i].load(Ordering::Relaxed);
+        s.brightness = STATUS_BRIGHTNESS[i].load(Ordering::Relaxed);
+        s.speed = STATUS_SPEED[i].load(Ordering::Relaxed);
+    }
+    cfg.apply_block(b);
+    LED_STEADY.store(cfg.steady, Ordering::Relaxed);
+    for (i, s) in cfg.status.iter().enumerate() {
+        STATUS_EFFECT[i].store(s.effect, Ordering::Relaxed);
+        STATUS_COLOR[i].store(s.color, Ordering::Relaxed);
+        STATUS_BRIGHTNESS[i].store(s.brightness, Ordering::Relaxed);
+        STATUS_SPEED[i].store(s.speed, Ordering::Relaxed);
     }
 }
 
@@ -355,6 +345,10 @@ const _: () = {
     let expected = 1 + bytes_per_status * N_STATUS;
     assert!(CONF_LEN == expected);
     assert!(CONF_LEN == 17);
+    // The firmware atomics and the `rsk-led` codec must agree on the layout —
+    // `config_block` / `load_block` marshal one into the other.
+    assert!(CONF_LEN == rsk_led::CONF_LEN);
+    assert!(N_STATUS == rsk_led::N_STATUS);
 };
 
 // ------------------------------------------------------------------
@@ -495,7 +489,10 @@ fn effect_flow(status: usize, tick: u32) -> [RGB8; MAX_LEDS] {
 }
 
 /// Random sparkle: each LED independently flashes a random colour
-/// (~25 % duty cycle, deterministic splitmix32 hash).
+/// (~25 % duty cycle, deterministic splitmix32 hash). `speed` is the number of
+/// ticks a pattern is held before the field re-rolls (`0` = built-in default
+/// 8 ≈ 40 ms); seeding on `tick / speed` rather than `tick` both honors
+/// `--speed` and tames the otherwise per-tick (~200 Hz) strobe.
 #[cfg(not(led_kind = "none"))]
 fn effect_sparkle(status: usize, tick: u32) -> [RGB8; MAX_LEDS] {
     let peak = STATUS_BRIGHTNESS[status].load(Ordering::Relaxed);
@@ -503,10 +500,12 @@ fn effect_sparkle(status: usize, tick: u32) -> [RGB8; MAX_LEDS] {
         return [RGB8::default(); MAX_LEDS];
     }
 
+    // speed_for never returns 0, so the division is always safe.
+    let step = tick / speed_for(status, 8);
     let mut buf = [RGB8::default(); MAX_LEDS];
     let n = runtime_leds() as usize;
     for (i, led) in buf[..n].iter_mut().enumerate() {
-        let h = splitmix32(tick ^ (i as u32 * 0x9e3779b9));
+        let h = splitmix32(step ^ (i as u32 * 0x9e3779b9));
         if (h & 0xFF) < 64 {
             let scale = |v: u8| -> u8 { (v as u16 * peak as u16 / 255) as u8 };
             *led = RGB8 {

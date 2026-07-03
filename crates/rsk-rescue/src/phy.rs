@@ -20,7 +20,10 @@ const TAG_VIDPID: u8 = 0x0;
 const TAG_LED_GPIO: u8 = 0x4;
 const TAG_LED_BRIGHTNESS: u8 = 0x5;
 const TAG_OPTS: u8 = 0x6;
-const TAG_UP_BTN: u8 = 0x8;
+// Tag `0x08` matches pico-fido / PicoForge `PresenceTimeout`: the touch-wait
+// timeout in seconds. (RS-Key once read this as a presence-button GPIO, but the
+// button is always BOOTSEL, so that was never used — realigned to pico-fido.)
+const TAG_PRESENCE_TIMEOUT: u8 = 0x8;
 const TAG_USB_PRODUCT: u8 = 0x9;
 const TAG_ENABLED_CURVES: u8 = 0xA;
 const TAG_ENABLED_USB_ITF: u8 = 0xB;
@@ -117,7 +120,9 @@ pub struct PhyData {
     pub led_gpio: Option<u8>,
     pub led_brightness: Option<u8>,
     pub opts: u16,
-    pub up_btn: Option<u8>,
+    /// Touch-wait timeout in seconds (tag `0x08`, pico-fido `PresenceTimeout`);
+    /// `None` / `0` keeps the firmware's built-in 30 s default.
+    pub presence_timeout: Option<u8>,
     pub usb_product: Option<Product>,
     pub enabled_curves: Option<u32>,
     pub enabled_usb_itf: Option<u8>,
@@ -153,7 +158,7 @@ impl PhyData {
                 (TAG_LED_GPIO, 1) => phy.led_gpio = Some(v[0]),
                 (TAG_LED_BRIGHTNESS, 1) => phy.led_brightness = Some(v[0]),
                 (TAG_OPTS, 2) => phy.opts = u16::from_be_bytes([v[0], v[1]]),
-                (TAG_UP_BTN, 1) => phy.up_btn = Some(v[0]),
+                (TAG_PRESENCE_TIMEOUT, 1) => phy.presence_timeout = Some(v[0]),
                 (TAG_USB_PRODUCT, 1..=33) => {
                     // Length includes a trailing NUL; the string also stops at
                     // an embedded NUL.
@@ -194,8 +199,8 @@ impl PhyData {
             w.tlv(TAG_LED_BRIGHTNESS, &[b])?;
         }
         w.tlv(TAG_OPTS, &self.opts.to_be_bytes())?;
-        if let Some(b) = self.up_btn {
-            w.tlv(TAG_UP_BTN, &[b])?;
+        if let Some(t) = self.presence_timeout {
+            w.tlv(TAG_PRESENCE_TIMEOUT, &[t])?;
         }
         if let Some(p) = &self.usb_product {
             let s = p.as_bytes();
@@ -246,7 +251,9 @@ impl Writer<'_> {
 /// Load the phy record; `None` when none was ever written.
 pub fn load<S: Storage>(fs: &mut Fs<S>) -> Option<PhyData> {
     let mut buf = [0u8; PHY_MAX_SIZE];
-    let n = fs.read(EF_PHY, &mut buf)?;
+    // Fs::read returns the value's full stored length; clamp before slicing so an
+    // over-long EF_PHY record can never push the slice past the fixed buffer.
+    let n = fs.read(EF_PHY, &mut buf)?.min(buf.len());
     Some(PhyData::parse(&buf[..n]))
 }
 
@@ -265,205 +272,9 @@ pub fn save<S: Storage>(fs: &mut Fs<S>, phy: &PhyData) -> rsk_sdk::error::Result
 /// attacker-/corruption-reachable bytes, so prove them outright (the house
 /// rule from docs/testing.md).
 #[cfg(kani)]
-mod proofs {
-    use super::*;
-
-    /// `parse` over EVERY byte string up to 12 bytes (past every tag/length
-    /// form, with room for several TLVs including a truncated tail): never
-    /// panics, never overreads, always terminates, and always materializes an
-    /// interface mask — the boot path relies on that.
-    #[kani::proof]
-    #[kani::unwind(14)]
-    fn parse_any_input() {
-        const N: usize = 12;
-        let data: [u8; N] = kani::any();
-        let n: usize = kani::any();
-        kani::assume(n <= N);
-        let phy = PhyData::parse(&data[..n]);
-        assert!(phy.enabled_usb_itf.is_some());
-    }
-
-    /// `serialize` then `parse` is the identity on EVERY `PhyData` — every
-    /// field-presence combination, every field value, product strings up to 4
-    /// bytes (the cap gates only the string copy; the TLV structure is fully
-    /// covered) — modulo the one documented normalization: a missing
-    /// ENABLED_USB_ITF parses as ALL. The `unwrap` doubles as proof that
-    /// `PHY_MAX_SIZE` always fits the record.
-    ///
-    /// Fields are compared one by one, the product by content: whole-struct
-    /// `==` would memcmp `Product`'s full 32-byte buffer and force the unwind
-    /// bound (hence every loop's unrolling) from the parser's depth to the
-    /// buffer's — ~5× the solve time for a property that is an artifact of
-    /// construction, not part of the wire spec.
-    #[kani::proof]
-    #[kani::unwind(13)]
-    fn serialize_parse_roundtrip() {
-        const W: usize = 4;
-        let mut phy = PhyData::default();
-        if kani::any() {
-            phy.vid_pid = Some((kani::any(), kani::any()));
-        }
-        if kani::any() {
-            phy.led_gpio = Some(kani::any());
-        }
-        if kani::any() {
-            phy.led_brightness = Some(kani::any());
-        }
-        phy.opts = kani::any();
-        if kani::any() {
-            phy.up_btn = Some(kani::any());
-        }
-        if kani::any() {
-            let raw: [u8; W] = kani::any();
-            let len: usize = kani::any();
-            kani::assume(1 <= len && len <= W);
-            // The wire format is NUL-terminated, so a product string cannot
-            // contain NUL — parse truncates at the first one.
-            for i in 0..len {
-                kani::assume(raw[i] != 0);
-            }
-            phy.usb_product = Product::new(&raw[..len]);
-            assert!(phy.usb_product.is_some());
-        }
-        if kani::any() {
-            phy.enabled_curves = Some(kani::any());
-        }
-        if kani::any() {
-            phy.enabled_usb_itf = Some(kani::any());
-        }
-        if kani::any() {
-            phy.led_driver = Some(kani::any());
-        }
-        if kani::any() {
-            phy.led_order = Some(kani::any());
-        }
-        if kani::any() {
-            phy.led_num = Some(kani::any());
-        }
-
-        let mut buf = [0u8; PHY_MAX_SIZE];
-        let n = phy.serialize(&mut buf).unwrap();
-
-        let got = PhyData::parse(&buf[..n]);
-        assert_eq!(got.vid_pid, phy.vid_pid);
-        assert_eq!(got.led_gpio, phy.led_gpio);
-        assert_eq!(got.led_brightness, phy.led_brightness);
-        assert_eq!(got.opts, phy.opts);
-        assert_eq!(got.up_btn, phy.up_btn);
-        match (&got.usb_product, &phy.usb_product) {
-            (Some(g), Some(p)) => assert_eq!(g.as_bytes(), p.as_bytes()),
-            (None, None) => {}
-            _ => panic!("usb_product presence changed across the roundtrip"),
-        }
-        assert_eq!(got.enabled_curves, phy.enabled_curves);
-        assert_eq!(
-            got.enabled_usb_itf,
-            phy.enabled_usb_itf.or(Some(USB_ITF_ALL))
-        );
-        assert_eq!(got.led_driver, phy.led_driver);
-        assert_eq!(got.led_order, phy.led_order);
-        assert_eq!(got.led_num, phy.led_num);
-    }
-}
+#[path = "phy_kani.rs"]
+mod proofs;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn roundtrip_all_fields() {
-        let phy = PhyData {
-            vid_pid: Some((0x1050, 0x0407)),
-            led_gpio: Some(16),
-            led_brightness: Some(200),
-            opts: OPT_LED_STEADY | OPT_DIMM,
-            up_btn: Some(1),
-            usb_product: Product::new(b"RSK Custom"),
-            enabled_curves: Some(0x3FF),
-            enabled_usb_itf: Some(USB_ITF_CCID | USB_ITF_HID),
-            led_driver: Some(3),
-            led_order: Some(LED_ORDER_GRB),
-            led_num: Some(4),
-        };
-        let mut buf = [0u8; PHY_MAX_SIZE];
-        let n = phy.serialize(&mut buf).unwrap();
-        assert_eq!(PhyData::parse(&buf[..n]), phy);
-    }
-
-    #[test]
-    fn vidpid_wire_is_big_endian() {
-        let phy = PhyData {
-            vid_pid: Some((0x1050, 0x0407)),
-            ..Default::default()
-        };
-        let mut buf = [0u8; PHY_MAX_SIZE];
-        let n = phy.serialize(&mut buf).unwrap();
-        // VIDPID TLV first: tag 0, len 4, VID be, PID be.
-        assert_eq!(
-            &buf[..n],
-            &[
-                0x00, 0x04, 0x10, 0x50, 0x04, 0x07, TAG_OPTS, 0x02, 0x00, 0x00
-            ]
-        );
-    }
-
-    #[test]
-    fn parse_defaults_usb_itf_to_all() {
-        let phy = PhyData::parse(&[]);
-        assert_eq!(phy.enabled_usb_itf, Some(USB_ITF_ALL));
-        assert_eq!(phy.vid_pid, None);
-        assert_eq!(phy.opts, 0);
-    }
-
-    #[test]
-    fn effective_usb_itf_applies_mask_but_guards_lockout() {
-        let mut phy = PhyData::default();
-        // No record / no TLV → ALL.
-        assert_eq!(effective_usb_itf(&phy), USB_ITF_ALL);
-        // Any mask keeping at least one supported interface applies verbatim.
-        phy.enabled_usb_itf = Some(USB_ITF_CCID | USB_ITF_HID);
-        assert_eq!(effective_usb_itf(&phy), USB_ITF_CCID | USB_ITF_HID);
-        phy.enabled_usb_itf = Some(USB_ITF_KB);
-        assert_eq!(effective_usb_itf(&phy), USB_ITF_KB);
-        // A mask with no supported interface (zero, or only WCID/LWIP bits we
-        // do not build) would soft-brick USB → falls back to ALL.
-        phy.enabled_usb_itf = Some(0);
-        assert_eq!(effective_usb_itf(&phy), USB_ITF_ALL);
-        phy.enabled_usb_itf = Some(USB_ITF_WCID | USB_ITF_LWIP);
-        assert_eq!(effective_usb_itf(&phy), USB_ITF_ALL);
-    }
-
-    #[test]
-    fn parse_skips_unknown_tags_and_truncation_is_safe() {
-        // Unknown tag 0x7F (3 bytes), then a valid LED_GPIO, then a TLV whose
-        // length runs past the input.
-        let phy = PhyData::parse(&[0x7F, 3, 1, 2, 3, TAG_LED_GPIO, 1, 9, TAG_OPTS, 2, 0xAA]);
-        assert_eq!(phy.led_gpio, Some(9));
-        assert_eq!(phy.opts, 0); // truncated OPTS ignored
-    }
-
-    #[test]
-    fn product_string_stops_at_nul_and_caps_at_32() {
-        let phy = PhyData::parse(&[TAG_USB_PRODUCT, 5, b'a', b'b', 0, b'c', 0]);
-        assert_eq!(phy.usb_product.unwrap().as_bytes(), b"ab");
-        assert!(Product::new(&[b'x'; 33]).is_none());
-        assert!(Product::new(b"").is_none());
-    }
-
-    #[test]
-    fn save_and_load() {
-        let mut fs = rsk_fs::Fs::new(rsk_fs::storage::ram::RamStorage::new(), &[]);
-        assert!(load(&mut fs).is_none());
-        let phy = PhyData {
-            led_brightness: Some(50),
-            opts: OPT_LED_STEADY,
-            ..Default::default()
-        };
-        save(&mut fs, &phy).unwrap();
-        let got = load(&mut fs).unwrap();
-        assert_eq!(got.led_brightness, Some(50));
-        assert_eq!(got.opts, OPT_LED_STEADY);
-        // The load-time default materializes ITF_ALL.
-        assert_eq!(got.enabled_usb_itf, Some(USB_ITF_ALL));
-    }
-}
+#[path = "phy_tests.rs"]
+mod tests;

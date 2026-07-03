@@ -1,0 +1,2072 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 RS-Key contributors
+
+use super::*;
+use crate::consts::ALG_ES256;
+use crate::makecredential::make_credential;
+use crate::seed::ensure_seed;
+use minicbor::Decoder;
+use p256::EncodedPoint;
+use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
+use rsk_crypto::Device;
+use rsk_fs::Fs;
+use rsk_fs::storage::ram::RamStorage;
+
+struct SeqRng(u64);
+impl Rng for SeqRng {
+    fn fill(&mut self, buf: &mut [u8]) {
+        for b in buf.iter_mut() {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *b = (self.0 >> 33) as u8;
+        }
+    }
+}
+
+const CDH: [u8; 32] = [0xCD; 32];
+
+fn dev() -> Device<'static> {
+    Device {
+        serial_hash: &[0xAB; 32],
+        serial_id: &[1, 2, 3, 4, 5, 6, 7, 8],
+        otp_key: None,
+    }
+}
+
+fn mc_request(rk: bool) -> std::vec::Vec<u8> {
+    let mut buf = [0u8; 512];
+    let n = {
+        let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+        e.map(if rk { 5 } else { 4 }).unwrap();
+        e.u8(1).unwrap().bytes(&CDH).unwrap();
+        e.u8(2)
+            .unwrap()
+            .map(1)
+            .unwrap()
+            .str("id")
+            .unwrap()
+            .str("example.com")
+            .unwrap();
+        e.u8(3).unwrap().map(2).unwrap();
+        e.str("id").unwrap().bytes(&[9, 8, 7, 6]).unwrap();
+        e.str("name").unwrap().str("bob").unwrap();
+        e.u8(4).unwrap().array(1).unwrap().map(2).unwrap();
+        e.str("alg").unwrap().i64(ALG_ES256).unwrap();
+        e.str("type").unwrap().str("public-key").unwrap();
+        if rk {
+            e.u8(7)
+                .unwrap()
+                .map(1)
+                .unwrap()
+                .str("rk")
+                .unwrap()
+                .bool(true)
+                .unwrap();
+        }
+        e.writer().position()
+    };
+    buf[..n].to_vec()
+}
+
+// Pull (credId, pubkey x, y) out of a makeCredential response's authData.
+fn parse_mc(resp: &[u8]) -> (std::vec::Vec<u8>, [u8; 32], [u8; 32]) {
+    let mut d = Decoder::new(resp);
+    // 3 base fields; a largeBlobKey credential adds field 0x05 (read 1 & 2 only).
+    assert!(d.map().unwrap().unwrap() >= 3);
+    assert_eq!(d.u8().unwrap(), 1);
+    assert_eq!(d.str().unwrap(), "packed");
+    assert_eq!(d.u8().unwrap(), 2);
+    let ad = d.bytes().unwrap();
+    let cred_len = u16::from_be_bytes([ad[53], ad[54]]) as usize;
+    let cred_id = ad[55..55 + cred_len].to_vec();
+    let mut cd = Decoder::new(&ad[55 + cred_len..]);
+    assert_eq!(cd.map().unwrap().unwrap(), 5);
+    cd.u8().unwrap(); // 1
+    cd.u8().unwrap(); // kty 2
+    cd.u8().unwrap(); // 3
+    cd.i64().unwrap(); // alg
+    cd.i8().unwrap(); // -1
+    cd.u8().unwrap(); // crv 1
+    cd.i8().unwrap(); // -2
+    let mut x = [0u8; 32];
+    x.copy_from_slice(cd.bytes().unwrap());
+    cd.i8().unwrap(); // -3
+    let mut y = [0u8; 32];
+    y.copy_from_slice(cd.bytes().unwrap());
+    (cred_id, x, y)
+}
+
+fn verify_assertion(resp: &[u8], x: &[u8; 32], y: &[u8; 32]) -> usize {
+    let mut d = Decoder::new(resp);
+    let fields = d.map().unwrap().unwrap() as usize;
+    assert_eq!(d.u8().unwrap(), 1);
+    assert_eq!(d.map().unwrap().unwrap(), 2);
+    assert_eq!(d.str().unwrap(), "id");
+    let _cred_id = d.bytes().unwrap().to_vec();
+    assert_eq!(d.str().unwrap(), "type");
+    assert_eq!(d.str().unwrap(), "public-key");
+    assert_eq!(d.u8().unwrap(), 2);
+    let auth_data = d.bytes().unwrap().to_vec();
+    assert_eq!(d.u8().unwrap(), 3);
+    let sig = d.bytes().unwrap().to_vec();
+
+    // Assertion authData has UP set and NO attested-credential-data (AT) bit
+    // (it is 37 bytes plus any extension output).
+    assert!(auth_data.len() >= 37);
+    assert_eq!(auth_data[32] & 0x01, 0x01); // UP
+    assert_eq!(auth_data[32] & 0x40, 0x00); // no AT
+
+    let pt = EncodedPoint::from_affine_coordinates(x.into(), y.into(), false);
+    let vk = VerifyingKey::from_encoded_point(&pt).unwrap();
+    let mut signed = auth_data;
+    signed.extend_from_slice(&CDH);
+    let s = Signature::from_der(&sig).unwrap();
+    vk.verify(&signed, &s)
+        .expect("assertion signature verifies under the credential key");
+    fields
+}
+
+/// Arm a PIN + live token (GA permission) over an already-seeded device.
+/// The seed stays plain — PIN ops never wrap it.
+fn arm_pin(fs: &mut Fs<RamStorage>, state: &mut crate::FidoState) -> [u8; 32] {
+    let mut pin_file = [0u8; 35];
+    pin_file[0] = 8;
+    pin_file[1] = 4;
+    pin_file[2] = 1;
+    fs.put(EF_PIN, &pin_file).unwrap();
+    let token = [0x99u8; 32];
+    state.paut.token = token;
+    state.paut.permissions = PERM_GA;
+    state.begin_using_token(false);
+    token
+}
+
+fn ga_request_pin(allow: &[u8], param: &[u8], proto: u64) -> std::vec::Vec<u8> {
+    let mut buf = [0u8; 512];
+    let n = {
+        let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+        e.map(5).unwrap();
+        e.u8(1).unwrap().str("example.com").unwrap();
+        e.u8(2).unwrap().bytes(&CDH).unwrap();
+        e.u8(3).unwrap().array(1).unwrap().map(2).unwrap();
+        e.str("type").unwrap().str("public-key").unwrap();
+        e.str("id").unwrap().bytes(allow).unwrap();
+        e.u8(6).unwrap().bytes(param).unwrap();
+        e.u8(7).unwrap().u64(proto).unwrap();
+        e.writer().position()
+    };
+    buf[..n].to_vec()
+}
+
+#[test]
+fn assertion_with_pin_sets_uv_flag() {
+    let (mut fs, mut rng) = setup();
+    let mut state = crate::FidoState::new();
+    let mut out = [0u8; 1024];
+    // Register without a PIN.
+    let mc = {
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 10,
+        };
+        let n = make_credential(&mut ctx, &mc_request(false), &mut out).unwrap();
+        out[..n].to_vec()
+    };
+    let (cred_id, x, y) = parse_mc(&mc);
+
+    // Arm a PIN + token, then log in with a valid pinUvAuthParam.
+    let token = arm_pin(&mut fs, &mut state);
+    let mut param = [0u8; 32];
+    let plen = rsk_crypto::pinproto::authenticate(PinProto::Two, &token, &CDH, &mut param).unwrap();
+    let req = ga_request_pin(&cred_id, &param[..plen], 2);
+    let mut out2 = [0u8; 1024];
+    let n = {
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 20,
+        };
+        get_assertion(&mut ctx, &req, &mut out2).unwrap()
+    };
+    verify_assertion(&out2[..n], &x, &y);
+    // authData must carry the UV flag now.
+    let mut d = Decoder::new(&out2[..n]);
+    d.map().unwrap();
+    d.u8().unwrap();
+    d.skip().unwrap(); // 1: credential
+    d.u8().unwrap(); // 2
+    let ad = d.bytes().unwrap();
+    assert_eq!(ad[32] & FLAG_UV, FLAG_UV, "UV flag must be set");
+}
+
+fn ga_request(allow: Option<&[u8]>) -> std::vec::Vec<u8> {
+    let mut buf = [0u8; 512];
+    let n = {
+        let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+        e.map(if allow.is_some() { 3 } else { 2 }).unwrap();
+        e.u8(1).unwrap().str("example.com").unwrap();
+        e.u8(2).unwrap().bytes(&CDH).unwrap();
+        if let Some(id) = allow {
+            e.u8(3).unwrap().array(1).unwrap().map(2).unwrap();
+            e.str("type").unwrap().str("public-key").unwrap();
+            e.str("id").unwrap().bytes(id).unwrap();
+        }
+        e.writer().position()
+    };
+    buf[..n].to_vec()
+}
+
+fn setup() -> (Fs<RamStorage>, SeqRng) {
+    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut rng = SeqRng(1);
+    ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
+    (fs, rng)
+}
+
+/// A presence source that always declines — `require_presence` then returns
+/// `OperationDenied`, so it proves whether a touch was actually polled.
+struct Decline;
+impl crate::UserPresence for Decline {
+    fn request(&mut self, _confirm: crate::Confirm<'_>) -> crate::Presence {
+        crate::Presence::Declined
+    }
+}
+
+/// A getAssertion for `allow` carrying the options map `{ "up": up }`.
+fn ga_request_up(allow: &[u8], up: bool) -> std::vec::Vec<u8> {
+    let mut buf = [0u8; 512];
+    let n = {
+        let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+        e.map(4).unwrap();
+        e.u8(1).unwrap().str("example.com").unwrap();
+        e.u8(2).unwrap().bytes(&CDH).unwrap();
+        e.u8(3).unwrap().array(1).unwrap().map(2).unwrap();
+        e.str("type").unwrap().str("public-key").unwrap();
+        e.str("id").unwrap().bytes(allow).unwrap();
+        e.u8(5)
+            .unwrap()
+            .map(1)
+            .unwrap()
+            .str("up")
+            .unwrap()
+            .bool(up)
+            .unwrap();
+        e.writer().position()
+    };
+    buf[..n].to_vec()
+}
+
+fn register_non_resident(fs: &mut Fs<RamStorage>, rng: &mut SeqRng) -> std::vec::Vec<u8> {
+    let mut out = [0u8; 1024];
+    let mut state = crate::FidoState::new();
+    let mut presence = crate::AlwaysConfirm;
+    let mut ctx = Ctx {
+        presence: &mut presence,
+        dev: dev(),
+        fs,
+        rng,
+        state: &mut state,
+        now_ms: 10,
+    };
+    let n = make_credential(&mut ctx, &mc_request(false), &mut out).unwrap();
+    let (cred_id, _x, _y) = parse_mc(&out[..n]);
+    cred_id
+}
+
+// Default build: the platform's silent pre-flight (up:false) must return an
+// assertion WITHOUT polling the button and with the UP flag clear — that is
+// what keeps a WebAuthn login to a single touch. Mutation-proof: a Decline
+// presence would deny the operation if the touch were polled, and the same
+// credential with up:true IS denied.
+#[cfg(not(feature = "strict-up"))]
+#[test]
+fn up_false_preflight_is_silent_and_clears_up_flag() {
+    let (mut fs, mut rng) = setup();
+    let cred_id = register_non_resident(&mut fs, &mut rng);
+
+    let mut out = [0u8; 1024];
+    let n = {
+        let mut state = crate::FidoState::new();
+        let mut presence = Decline;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 20,
+        };
+        get_assertion(&mut ctx, &ga_request_up(&cred_id, false), &mut out)
+            .expect("up:false returns an assertion without a touch")
+    };
+    let ad = assertion_auth_data(&out[..n]);
+    assert_eq!(ad[32] & 0x01, 0x00, "up:false → UP flag clear");
+
+    // up:true with the same declined button IS refused — the touch is normally
+    // required, so this guards against the gate becoming a no-op.
+    let mut out2 = [0u8; 1024];
+    let mut state = crate::FidoState::new();
+    let mut presence = Decline;
+    let mut ctx = Ctx {
+        presence: &mut presence,
+        dev: dev(),
+        fs: &mut fs,
+        rng: &mut rng,
+        state: &mut state,
+        now_ms: 30,
+    };
+    assert_eq!(
+        get_assertion(&mut ctx, &ga_request_up(&cred_id, true), &mut out2),
+        Err(CtapError::OperationDenied),
+        "up:true with a declined touch must be denied",
+    );
+}
+
+// strict-up build: even up:false polls the button, so a declined touch denies
+// the assertion (the opt-in two-touch behavior).
+#[cfg(feature = "strict-up")]
+#[test]
+fn strict_up_polls_button_even_on_up_false() {
+    let (mut fs, mut rng) = setup();
+    let cred_id = register_non_resident(&mut fs, &mut rng);
+    let mut out = [0u8; 1024];
+    let mut state = crate::FidoState::new();
+    let mut presence = Decline;
+    let mut ctx = Ctx {
+        presence: &mut presence,
+        dev: dev(),
+        fs: &mut fs,
+        rng: &mut rng,
+        state: &mut state,
+        now_ms: 20,
+    };
+    assert_eq!(
+        get_assertion(&mut ctx, &ga_request_up(&cred_id, false), &mut out),
+        Err(CtapError::OperationDenied),
+        "strict-up: up:false still requires a touch",
+    );
+}
+
+#[test]
+fn register_then_login_non_resident() {
+    let (mut fs, mut rng) = setup();
+    let mut out = [0u8; 1024];
+
+    let mc = {
+        let mut state = crate::FidoState::new();
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 10,
+        };
+        let n = make_credential(&mut ctx, &mc_request(false), &mut out).unwrap();
+        out[..n].to_vec()
+    };
+    let (cred_id, x, y) = parse_mc(&mc);
+    assert!(cred_id.len() > 42, "non-resident returns the full box");
+
+    let mut out2 = [0u8; 1024];
+    let ga = {
+        let mut state = crate::FidoState::new();
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 20,
+        };
+        let n = get_assertion(&mut ctx, &ga_request(Some(&cred_id)), &mut out2).unwrap();
+        out2[..n].to_vec()
+    };
+    // No user field for a non-resident credential.
+    assert_eq!(verify_assertion(&ga, &x, &y), 3);
+}
+
+#[test]
+fn always_uv_requires_user_verification() {
+    let (mut fs, mut rng) = setup();
+    // alwaysUv on → getAssertion demands UV; an up-only request is refused with
+    // PUAT_REQUIRED before any credential lookup. Without the EF_ALWAYS_UV guard
+    // the same request proceeds and returns NO_CREDENTIALS, so this is
+    // mutation-proof for the guard.
+    fs.put(EF_ALWAYS_UV, &[1]).unwrap();
+    let mut out = [0u8; 256];
+    let mut state = crate::FidoState::new();
+    let mut presence = crate::AlwaysConfirm;
+    let mut ctx = Ctx {
+        presence: &mut presence,
+        dev: dev(),
+        fs: &mut fs,
+        rng: &mut rng,
+        state: &mut state,
+        now_ms: 0,
+    };
+    assert_eq!(
+        get_assertion(&mut ctx, &ga_request(None), &mut out),
+        Err(CtapError::PuatRequired)
+    );
+}
+
+#[test]
+fn u2f_handle_usable_via_ctap2_allowlist() {
+    use crate::keyderiv::derive_new;
+    use rsk_crypto::pinproto::public_xy;
+    // A U2F/CTAP1 key handle bound to this rp must be usable in a CTAP2
+    // getAssertion allowList.
+    let (mut fs, mut rng) = setup();
+    let rp_id_hash = sha256(b"example.com");
+    let seed = crate::seed::load_keydev(&dev(), &mut fs).unwrap();
+    // cmd_register would derive this handle + scalar from the device seed.
+    let (kh, scalar) = derive_new(&seed, &rp_id_hash, &mut rng);
+    let (x, y) = public_xy(&scalar).unwrap();
+
+    let mut out = [0u8; 1024];
+    let mut state = crate::FidoState::new();
+    let mut presence = crate::AlwaysConfirm;
+    let mut ctx = Ctx {
+        presence: &mut presence,
+        dev: dev(),
+        fs: &mut fs,
+        rng: &mut rng,
+        state: &mut state,
+        now_ms: 20,
+    };
+    let n = get_assertion(&mut ctx, &ga_request(Some(&kh)), &mut out).unwrap();
+    let ga = out[..n].to_vec();
+    // The handle round-trips as the credential id and the assertion signature
+    // verifies under the U2F-registered public key.
+    assert_eq!(cred_id_of(&ga), kh.to_vec());
+    assert_eq!(verify_assertion(&ga, &x, &y), 3);
+}
+
+#[test]
+fn register_then_login_resident_discovery() {
+    let (mut fs, mut rng) = setup();
+    let mut out = [0u8; 1024];
+
+    let mc = {
+        let mut state = crate::FidoState::new();
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 10,
+        };
+        let n = make_credential(&mut ctx, &mc_request(true), &mut out).unwrap();
+        out[..n].to_vec()
+    };
+    let (_resident_id, x, y) = parse_mc(&mc);
+
+    // No allowList → the device discovers the resident credential.
+    let mut out2 = [0u8; 1024];
+    let ga = {
+        let mut state = crate::FidoState::new();
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 20,
+        };
+        let n = get_assertion(&mut ctx, &ga_request(None), &mut out2).unwrap();
+        out2[..n].to_vec()
+    };
+    // Resident: includes the user field (id 9,8,7,6).
+    assert_eq!(verify_assertion(&ga, &x, &y), 4);
+    let mut d = Decoder::new(&ga);
+    d.map().unwrap();
+    for _ in 0..3 {
+        // skip credential, authData, sig (keys 1,2,3)
+        d.u8().unwrap();
+        d.skip().unwrap();
+    }
+    assert_eq!(d.u8().unwrap(), 4);
+    assert_eq!(d.map().unwrap().unwrap(), 1);
+    assert_eq!(d.str().unwrap(), "id");
+    assert_eq!(d.bytes().unwrap(), &[9, 8, 7, 6]);
+}
+
+#[test]
+fn discovery_returns_stored_resident_id() {
+    // get_assertion (resident discovery) must echo the credential's STORED
+    // 42-byte resident id — not one re-derived from the box — so the id stays
+    // stable after an updateUserInformation reseal (CTAP2.1 §6.8.5). Proven by
+    // overwriting the stored prefix: a re-derived id would not equal it.
+    let (mut fs, mut rng) = setup();
+    let mut out = [0u8; 1024];
+    {
+        let mut state = crate::FidoState::new();
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 10,
+        };
+        make_credential(&mut ctx, &mc_request(true), &mut out).unwrap();
+    }
+
+    // Overwrite the stored resident-id prefix with a sentinel; the box is left
+    // intact, so a re-derived id would differ from this.
+    let mut rec = [0u8; 1024];
+    let n = fs.read(EF_CRED, &mut rec).unwrap();
+    let mut sentinel = [0u8; CRED_RESIDENT_LEN];
+    for (i, b) in sentinel.iter_mut().enumerate() {
+        *b = 0xC0 ^ i as u8;
+    }
+    rec[32..RECORD_PREFIX].copy_from_slice(&sentinel);
+    fs.put(EF_CRED, &rec[..n]).unwrap();
+
+    // Discovery (no allowList) returns the stored sentinel as the credentialId.
+    let mut out2 = [0u8; 1024];
+    let ga = {
+        let mut state = crate::FidoState::new();
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 20,
+        };
+        let m = get_assertion(&mut ctx, &ga_request(None), &mut out2).unwrap();
+        out2[..m].to_vec()
+    };
+    assert_eq!(cred_id_of(&ga), sentinel.to_vec());
+}
+
+#[test]
+fn login_counter_increments() {
+    let (mut fs, mut rng) = setup();
+    let mut out = [0u8; 1024];
+    let mc = {
+        let mut state = crate::FidoState::new();
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 10,
+        };
+        let n = make_credential(&mut ctx, &mc_request(false), &mut out).unwrap();
+        out[..n].to_vec()
+    };
+    let (cred_id, _x, _y) = parse_mc(&mc);
+
+    let counter = |fs: &mut Fs<RamStorage>| crate::seed::get_sign_counter(fs);
+    let c0 = counter(&mut fs);
+    for _ in 0..2 {
+        let mut o = [0u8; 1024];
+        let mut state = crate::FidoState::new();
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 30,
+        };
+        get_assertion(&mut ctx, &ga_request(Some(&cred_id)), &mut o).unwrap();
+    }
+    assert_eq!(counter(&mut fs), c0 + 2);
+}
+
+#[test]
+fn no_matching_credentials() {
+    let (mut fs, mut rng) = setup();
+    let mut out = [0u8; 256];
+    let mut state = crate::FidoState::new();
+    let mut presence = crate::AlwaysConfirm;
+    let mut ctx = Ctx {
+        presence: &mut presence,
+        dev: dev(),
+        fs: &mut fs,
+        rng: &mut rng,
+        state: &mut state,
+        now_ms: 0,
+    };
+    // No credentials registered, no allowList → NoCredentials.
+    assert_eq!(
+        get_assertion(&mut ctx, &ga_request(None), &mut out),
+        Err(CtapError::NoCredentials)
+    );
+}
+
+// A resident makeCredential request with a custom user id.
+fn mc_request_user(uid: &[u8]) -> std::vec::Vec<u8> {
+    let mut buf = [0u8; 512];
+    let n = {
+        let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+        e.map(5).unwrap();
+        e.u8(1).unwrap().bytes(&CDH).unwrap();
+        e.u8(2)
+            .unwrap()
+            .map(1)
+            .unwrap()
+            .str("id")
+            .unwrap()
+            .str("example.com")
+            .unwrap();
+        e.u8(3).unwrap().map(2).unwrap();
+        e.str("id").unwrap().bytes(uid).unwrap();
+        e.str("name").unwrap().str("user").unwrap();
+        e.u8(4).unwrap().array(1).unwrap().map(2).unwrap();
+        e.str("alg").unwrap().i64(ALG_ES256).unwrap();
+        e.str("type").unwrap().str("public-key").unwrap();
+        e.u8(7)
+            .unwrap()
+            .map(1)
+            .unwrap()
+            .str("rk")
+            .unwrap()
+            .bool(true)
+            .unwrap();
+        e.writer().position()
+    };
+    buf[..n].to_vec()
+}
+
+// Pull (user id, numberOfCredentials) out of an assertion response.
+fn user_and_count(resp: &[u8]) -> (std::vec::Vec<u8>, Option<u32>) {
+    let mut d = Decoder::new(resp);
+    let fields = d.map().unwrap().unwrap();
+    let mut user = std::vec::Vec::new();
+    let mut count = None;
+    for _ in 0..fields {
+        match d.u8().unwrap() {
+            4 => {
+                // The user map is {id [, name, displayName]} on a multi-credential
+                // discovery; read every entry, keeping the id.
+                let entries = d.map().unwrap().unwrap();
+                for _ in 0..entries {
+                    match d.str().unwrap() {
+                        "id" => user = d.bytes().unwrap().to_vec(),
+                        _ => {
+                            d.skip().unwrap();
+                        }
+                    }
+                }
+            }
+            5 => count = Some(d.u32().unwrap()),
+            _ => {
+                d.skip().unwrap();
+            }
+        }
+    }
+    (user, count)
+}
+
+// The credential id from response key 1 ({id, type}).
+fn cred_id_of(resp: &[u8]) -> std::vec::Vec<u8> {
+    let mut d = Decoder::new(resp);
+    let fields = d.map().unwrap().unwrap();
+    let mut id = std::vec::Vec::new();
+    for _ in 0..fields {
+        match d.u8().unwrap() {
+            1 => {
+                let m = d.map().unwrap().unwrap();
+                for _ in 0..m {
+                    match d.str().unwrap() {
+                        "id" => id = d.bytes().unwrap().to_vec(),
+                        _ => {
+                            d.skip().unwrap();
+                        }
+                    }
+                }
+            }
+            _ => {
+                d.skip().unwrap();
+            }
+        }
+    }
+    id
+}
+
+// The user "name" (empty if absent) from an assertion response's user map.
+fn user_name_of(resp: &[u8]) -> std::string::String {
+    let mut d = Decoder::new(resp);
+    let fields = d.map().unwrap().unwrap();
+    let mut name = std::string::String::new();
+    for _ in 0..fields {
+        match d.u8().unwrap() {
+            4 => {
+                let m = d.map().unwrap().unwrap();
+                for _ in 0..m {
+                    match d.str().unwrap() {
+                        "name" => name = d.str().unwrap().into(),
+                        _ => {
+                            d.skip().unwrap();
+                        }
+                    }
+                }
+            }
+            _ => {
+                d.skip().unwrap();
+            }
+        }
+    }
+    name
+}
+
+// A getAssertion request with a two-item allowList.
+fn ga_request_allow2(id1: &[u8], id2: &[u8]) -> std::vec::Vec<u8> {
+    let mut buf = [0u8; 512];
+    let n = {
+        let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+        e.map(3).unwrap();
+        e.u8(1).unwrap().str("example.com").unwrap();
+        e.u8(2).unwrap().bytes(&CDH).unwrap();
+        e.u8(3).unwrap().array(2).unwrap();
+        for id in [id1, id2] {
+            e.map(2).unwrap();
+            e.str("type").unwrap().str("public-key").unwrap();
+            e.str("id").unwrap().bytes(id).unwrap();
+        }
+        e.writer().position()
+    };
+    buf[..n].to_vec()
+}
+
+#[test]
+fn allowlist_returns_single_assertion_without_count() {
+    let (mut fs, mut rng) = setup();
+    let mut state = crate::FidoState::new();
+
+    // Two resident credentials for the same rp.
+    for (uid, t) in [(&[9u8, 8, 7, 6][..], 10u64), (&[1u8, 1, 1, 1][..], 20u64)] {
+        let mut out = [0u8; 1024];
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: t,
+        };
+        make_credential(&mut ctx, &mc_request_user(uid), &mut out).unwrap();
+    }
+
+    // Discover both ids via a no-allowList walk.
+    let (id_a, id_b) = {
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 30,
+        };
+        let mut o1 = [0u8; 1024];
+        let n1 = get_assertion(&mut ctx, &ga_request(None), &mut o1).unwrap();
+        let a = cred_id_of(&o1[..n1]);
+        let mut o2 = [0u8; 1024];
+        let n2 = get_next_assertion(&mut ctx, &mut o2).unwrap();
+        (a, cred_id_of(&o2[..n2]))
+    };
+
+    // With an allowList of BOTH, CTAP2.1 returns one assertion, no count, and
+    // getNextAssertion is not armed.
+    let mut presence = crate::AlwaysConfirm;
+    let mut ctx = Ctx {
+        presence: &mut presence,
+        dev: dev(),
+        fs: &mut fs,
+        rng: &mut rng,
+        state: &mut state,
+        now_ms: 40,
+    };
+    let mut o = [0u8; 1024];
+    let n = get_assertion(&mut ctx, &ga_request_allow2(&id_a, &id_b), &mut o).unwrap();
+    let (_user, count) = user_and_count(&o[..n]);
+    assert_eq!(count, None);
+    let mut o3 = [0u8; 256];
+    assert_eq!(
+        get_next_assertion(&mut ctx, &mut o3),
+        Err(CtapError::NotAllowed)
+    );
+}
+
+#[test]
+fn get_next_assertion_walks_resident_credentials() {
+    let (mut fs, mut rng) = setup();
+    let mut state = crate::FidoState::new();
+
+    // Register two resident credentials for the same rp (distinct users/times).
+    for (uid, t) in [(&[9u8, 8, 7, 6][..], 10u64), (&[1u8, 1, 1, 1][..], 20u64)] {
+        let mut out = [0u8; 1024];
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: t,
+        };
+        make_credential(&mut ctx, &mc_request_user(uid), &mut out).unwrap();
+    }
+
+    // getAssertion (no allowList) → newest credential + numberOfCredentials = 2.
+    let mut o1 = [0u8; 1024];
+    let n1 = {
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 30,
+        };
+        get_assertion(&mut ctx, &ga_request(None), &mut o1).unwrap()
+    };
+    let (u1, count1) = user_and_count(&o1[..n1]);
+    assert_eq!(count1, Some(2));
+    assert_eq!(u1, &[1, 1, 1, 1]); // newest (created 20)
+    // Without user verification the user map is id-only — name/displayName are
+    // user-identifiable info, withheld unless uv (§6.2.2 privacy rule).
+    assert_eq!(user_name_of(&o1[..n1]), "");
+
+    // getNextAssertion → the older credential, no numberOfCredentials field.
+    let mut o2 = [0u8; 1024];
+    let n2 = {
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 31,
+        };
+        get_next_assertion(&mut ctx, &mut o2).unwrap()
+    };
+    let (u2, count2) = user_and_count(&o2[..n2]);
+    assert_eq!(count2, None);
+    assert_eq!(u2, &[9, 8, 7, 6]); // older (created 10)
+    // getNextAssertion likewise withholds name/displayName without uv.
+    assert_eq!(user_name_of(&o2[..n2]), "");
+
+    // The list is exhausted → NOT_ALLOWED, and stays that way.
+    let mut o3 = [0u8; 256];
+    let mut presence = crate::AlwaysConfirm;
+    let mut ctx = Ctx {
+        presence: &mut presence,
+        dev: dev(),
+        fs: &mut fs,
+        rng: &mut rng,
+        state: &mut state,
+        now_ms: 32,
+    };
+    assert_eq!(
+        get_next_assertion(&mut ctx, &mut o3),
+        Err(CtapError::NotAllowed)
+    );
+}
+
+#[test]
+fn declined_get_assertion_disarms_get_next_assertion() {
+    // run-4 (HIGH): getNextAssertion performs no presence check of its own, so a
+    // getAssertion whose touch was declined/ignored must leave nothing armed —
+    // else the next getNextAssertion emits a UP=1 assertion the user never
+    // approved (a user-presence bypass for resident credentials #2..N).
+    let (mut fs, mut rng) = setup();
+    let mut state = crate::FidoState::new();
+    for (uid, t) in [(&[9u8, 8, 7, 6][..], 10u64), (&[1u8, 1, 1, 1][..], 20u64)] {
+        let mut out = [0u8; 1024];
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: t,
+        };
+        make_credential(&mut ctx, &mc_request_user(uid), &mut out).unwrap();
+    }
+
+    // getAssertion (no allowList) with the touch DECLINED → OPERATION_DENIED,
+    // and the multi-credential queue must be torn down, not left armed.
+    let mut o1 = [0u8; 1024];
+    {
+        let mut presence = Decline;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 30,
+        };
+        assert_eq!(
+            get_assertion(&mut ctx, &ga_request(None), &mut o1),
+            Err(CtapError::OperationDenied)
+        );
+    }
+
+    // getNextAssertion must refuse — no touchless assertion for the older cred.
+    let mut o2 = [0u8; 1024];
+    let mut presence = Decline;
+    let mut ctx = Ctx {
+        presence: &mut presence,
+        dev: dev(),
+        fs: &mut fs,
+        rng: &mut rng,
+        state: &mut state,
+        now_ms: 31,
+    };
+    assert_eq!(
+        get_next_assertion(&mut ctx, &mut o2),
+        Err(CtapError::NotAllowed)
+    );
+}
+
+#[test]
+fn multi_cred_user_identity_returned_with_uv() {
+    // The uv side of the §6.2.2 privacy rule: with user verification a
+    // multi-credential discovery returns the full user identity (id + name).
+    let (mut fs, mut rng) = setup();
+    let mut state = crate::FidoState::new();
+    for (uid, t) in [(&[9u8, 8, 7, 6][..], 10u64), (&[1u8, 1, 1, 1][..], 20u64)] {
+        let mut out = [0u8; 1024];
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: t,
+        };
+        make_credential(&mut ctx, &mc_request_user(uid), &mut out).unwrap();
+    }
+
+    // Arm a PIN + token and present a valid pinUvAuthParam, no allowList
+    // (so the discovery returns multiple credentials) → uv is set.
+    let token = arm_pin(&mut fs, &mut state);
+    let mut param = [0u8; 32];
+    let plen = rsk_crypto::pinproto::authenticate(PinProto::Two, &token, &CDH, &mut param).unwrap();
+    let req = {
+        let mut buf = [0u8; 256];
+        let n = {
+            let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+            e.map(4).unwrap();
+            e.u8(1).unwrap().str("example.com").unwrap();
+            e.u8(2).unwrap().bytes(&CDH).unwrap();
+            e.u8(6).unwrap().bytes(&param[..plen]).unwrap();
+            e.u8(7).unwrap().u64(2).unwrap();
+            e.writer().position()
+        };
+        buf[..n].to_vec()
+    };
+    let mut o = [0u8; 1024];
+    let n = {
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 30,
+        };
+        get_assertion(&mut ctx, &req, &mut o).unwrap()
+    };
+    let (_u, count) = user_and_count(&o[..n]);
+    assert_eq!(count, Some(2));
+    assert_eq!(user_name_of(&o[..n]), "user");
+}
+
+// A resident makeCredential request carrying a credProtect level.
+fn mc_request_credprotect(level: u64) -> std::vec::Vec<u8> {
+    let mut buf = [0u8; 512];
+    let n = {
+        let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+        e.map(6).unwrap();
+        e.u8(1).unwrap().bytes(&CDH).unwrap();
+        e.u8(2)
+            .unwrap()
+            .map(1)
+            .unwrap()
+            .str("id")
+            .unwrap()
+            .str("example.com")
+            .unwrap();
+        e.u8(3).unwrap().map(2).unwrap();
+        e.str("id").unwrap().bytes(&[9, 8, 7, 6]).unwrap();
+        e.str("name").unwrap().str("bob").unwrap();
+        e.u8(4).unwrap().array(1).unwrap().map(2).unwrap();
+        e.str("alg").unwrap().i64(ALG_ES256).unwrap();
+        e.str("type").unwrap().str("public-key").unwrap();
+        e.u8(6)
+            .unwrap()
+            .map(1)
+            .unwrap()
+            .str("credProtect")
+            .unwrap()
+            .u64(level)
+            .unwrap();
+        e.u8(7)
+            .unwrap()
+            .map(1)
+            .unwrap()
+            .str("rk")
+            .unwrap()
+            .bool(true)
+            .unwrap();
+        e.writer().position()
+    };
+    buf[..n].to_vec()
+}
+
+fn run_mc(fs: &mut Fs<RamStorage>, rng: &mut SeqRng, req: &[u8]) -> std::vec::Vec<u8> {
+    let mut out = [0u8; 1024];
+    let mut state = crate::FidoState::new();
+    let mut presence = crate::AlwaysConfirm;
+    let mut ctx = Ctx {
+        presence: &mut presence,
+        dev: dev(),
+        fs,
+        rng,
+        state: &mut state,
+        now_ms: 10,
+    };
+    let n = make_credential(&mut ctx, req, &mut out).unwrap();
+    out[..n].to_vec()
+}
+
+fn run_ga(fs: &mut Fs<RamStorage>, rng: &mut SeqRng, req: &[u8]) -> CtapResult {
+    let mut out = [0u8; 1024];
+    let mut state = crate::FidoState::new();
+    let mut presence = crate::AlwaysConfirm;
+    let mut ctx = Ctx {
+        presence: &mut presence,
+        dev: dev(),
+        fs,
+        rng,
+        state: &mut state,
+        now_ms: 20,
+    };
+    get_assertion(&mut ctx, req, &mut out).map(|n| out[..n].to_vec().len())
+}
+
+#[test]
+fn credprotect_optional_with_list_hidden_in_discovery() {
+    let (mut fs, mut rng) = setup();
+    // Register a UV-optional-with-list (level 2) resident credential.
+    let mc = run_mc(&mut fs, &mut rng, &mc_request_credprotect(2));
+    let (resident_id, x, y) = parse_mc(&mc);
+
+    // Resident discovery (no allowList) without UV → hidden → NoCredentials.
+    assert_eq!(
+        run_ga(&mut fs, &mut rng, &ga_request(None)),
+        Err(CtapError::NoCredentials)
+    );
+
+    // The same credential via an allowList is visible.
+    let mut out = [0u8; 1024];
+    let n = {
+        let mut state = crate::FidoState::new();
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 20,
+        };
+        get_assertion(&mut ctx, &ga_request(Some(&resident_id)), &mut out).unwrap()
+    };
+    verify_assertion(&out[..n], &x, &y);
+}
+
+#[test]
+fn credprotect_uv_required_hidden_even_with_allow_list() {
+    let (mut fs, mut rng) = setup();
+    // Register a UV-required (level 3) resident credential.
+    let mc = run_mc(&mut fs, &mut rng, &mc_request_credprotect(3));
+    let (resident_id, _x, _y) = parse_mc(&mc);
+
+    // Hidden in discovery and via the allowList without UV.
+    assert_eq!(
+        run_ga(&mut fs, &mut rng, &ga_request(None)),
+        Err(CtapError::NoCredentials)
+    );
+    assert_eq!(
+        run_ga(&mut fs, &mut rng, &ga_request(Some(&resident_id))),
+        Err(CtapError::NoCredentials)
+    );
+}
+
+// A resident makeCredential request carrying a credBlob.
+fn mc_request_credblob(blob: &[u8]) -> std::vec::Vec<u8> {
+    let mut buf = [0u8; 512];
+    let n = {
+        let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+        e.map(6).unwrap();
+        e.u8(1).unwrap().bytes(&CDH).unwrap();
+        e.u8(2)
+            .unwrap()
+            .map(1)
+            .unwrap()
+            .str("id")
+            .unwrap()
+            .str("example.com")
+            .unwrap();
+        e.u8(3).unwrap().map(2).unwrap();
+        e.str("id").unwrap().bytes(&[9, 8, 7, 6]).unwrap();
+        e.str("name").unwrap().str("bob").unwrap();
+        e.u8(4).unwrap().array(1).unwrap().map(2).unwrap();
+        e.str("alg").unwrap().i64(ALG_ES256).unwrap();
+        e.str("type").unwrap().str("public-key").unwrap();
+        e.u8(6)
+            .unwrap()
+            .map(1)
+            .unwrap()
+            .str("credBlob")
+            .unwrap()
+            .bytes(blob)
+            .unwrap();
+        e.u8(7)
+            .unwrap()
+            .map(1)
+            .unwrap()
+            .str("rk")
+            .unwrap()
+            .bool(true)
+            .unwrap();
+        e.writer().position()
+    };
+    buf[..n].to_vec()
+}
+
+fn ga_request_credblob(allow: &[u8]) -> std::vec::Vec<u8> {
+    let mut buf = [0u8; 512];
+    let n = {
+        let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+        e.map(4).unwrap();
+        e.u8(1).unwrap().str("example.com").unwrap();
+        e.u8(2).unwrap().bytes(&CDH).unwrap();
+        e.u8(3).unwrap().array(1).unwrap().map(2).unwrap();
+        e.str("type").unwrap().str("public-key").unwrap();
+        e.str("id").unwrap().bytes(allow).unwrap();
+        e.u8(4)
+            .unwrap()
+            .map(1)
+            .unwrap()
+            .str("credBlob")
+            .unwrap()
+            .bool(true)
+            .unwrap();
+        e.writer().position()
+    };
+    buf[..n].to_vec()
+}
+
+fn assertion_auth_data(resp: &[u8]) -> std::vec::Vec<u8> {
+    let mut d = Decoder::new(resp);
+    let fields = d.map().unwrap().unwrap();
+    let mut ad = std::vec::Vec::new();
+    for _ in 0..fields {
+        if d.u8().unwrap() == 2 {
+            ad = d.bytes().unwrap().to_vec();
+        } else {
+            d.skip().unwrap();
+        }
+    }
+    ad
+}
+
+#[test]
+fn credblob_echoed_in_assertion() {
+    let (mut fs, mut rng) = setup();
+    let mc = run_mc(&mut fs, &mut rng, &mc_request_credblob(&[0x11, 0x22, 0x33]));
+    let (resident_id, x, y) = parse_mc(&mc);
+
+    let mut out = [0u8; 1024];
+    let n = {
+        let mut state = crate::FidoState::new();
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 20,
+        };
+        get_assertion(&mut ctx, &ga_request_credblob(&resident_id), &mut out).unwrap()
+    };
+    verify_assertion(&out[..n], &x, &y);
+    let ad = assertion_auth_data(&out[..n]);
+    assert_eq!(ad[32] & FLAG_ED, FLAG_ED, "ED flag set");
+    // authData extension map: credBlob bytes echoed from the stored credential.
+    let mut d = Decoder::new(&ad[37..]);
+    assert_eq!(d.map().unwrap().unwrap(), 1);
+    assert_eq!(d.str().unwrap(), "credBlob");
+    assert_eq!(d.bytes().unwrap(), &[0x11, 0x22, 0x33]);
+}
+
+// A resident makeCredential request that opts into largeBlobKey (+ hmac-secret).
+fn mc_request_lbk_hmac() -> std::vec::Vec<u8> {
+    let mut buf = [0u8; 512];
+    let n = {
+        let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+        e.map(6).unwrap();
+        e.u8(1).unwrap().bytes(&CDH).unwrap();
+        e.u8(2)
+            .unwrap()
+            .map(1)
+            .unwrap()
+            .str("id")
+            .unwrap()
+            .str("example.com")
+            .unwrap();
+        e.u8(3).unwrap().map(2).unwrap();
+        e.str("id").unwrap().bytes(&[9, 8, 7, 6]).unwrap();
+        e.str("name").unwrap().str("bob").unwrap();
+        e.u8(4).unwrap().array(1).unwrap().map(2).unwrap();
+        e.str("alg").unwrap().i64(ALG_ES256).unwrap();
+        e.str("type").unwrap().str("public-key").unwrap();
+        e.u8(6).unwrap().map(2).unwrap();
+        e.str("hmac-secret").unwrap().bool(true).unwrap();
+        e.str("largeBlobKey").unwrap().bool(true).unwrap();
+        e.u8(7)
+            .unwrap()
+            .map(1)
+            .unwrap()
+            .str("rk")
+            .unwrap()
+            .bool(true)
+            .unwrap();
+        e.writer().position()
+    };
+    buf[..n].to_vec()
+}
+
+// The stored credential box for EF_CRED slot 0, and the device seed.
+fn stored_box_and_seed(fs: &mut Fs<RamStorage>) -> (std::vec::Vec<u8>, [u8; 32]) {
+    let mut rec = [0u8; 1024];
+    let n = fs.read(EF_CRED, &mut rec).unwrap();
+    let seed = crate::seed::load_keydev(&dev(), fs).unwrap();
+    (rec[RECORD_PREFIX..n].to_vec(), seed)
+}
+
+fn cose_xy(e: &mut Encoder<Cursor<&mut [u8]>>, x: &[u8; 32], y: &[u8; 32]) {
+    e.map(5).unwrap();
+    e.u8(1).unwrap().u8(2).unwrap(); // kty EC2
+    e.u8(3).unwrap().i64(-25).unwrap(); // alg ECDH
+    e.i8(-1).unwrap().u8(1).unwrap(); // crv P-256
+    e.i8(-2).unwrap().bytes(x).unwrap();
+    e.i8(-3).unwrap().bytes(y).unwrap();
+}
+
+fn ga_request_hmac(
+    allow: &[u8],
+    px: &[u8; 32],
+    py: &[u8; 32],
+    se: &[u8],
+    sa: &[u8],
+) -> std::vec::Vec<u8> {
+    let mut buf = [0u8; 512];
+    let n = {
+        let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+        e.map(4).unwrap();
+        e.u8(1).unwrap().str("example.com").unwrap();
+        e.u8(2).unwrap().bytes(&CDH).unwrap();
+        e.u8(3).unwrap().array(1).unwrap().map(2).unwrap();
+        e.str("type").unwrap().str("public-key").unwrap();
+        e.str("id").unwrap().bytes(allow).unwrap();
+        e.u8(4).unwrap().map(1).unwrap();
+        e.str("hmac-secret").unwrap().map(4).unwrap();
+        e.u8(1).unwrap();
+        cose_xy(&mut e, px, py);
+        e.u8(2).unwrap().bytes(se).unwrap();
+        e.u8(3).unwrap().bytes(sa).unwrap();
+        e.u8(4).unwrap().u8(2).unwrap();
+        e.writer().position()
+    };
+    buf[..n].to_vec()
+}
+
+#[test]
+fn hmac_secret_assertion_end_to_end() {
+    use rsk_crypto::pinproto::{authenticate, ecdh, encrypt, public_xy};
+    let (mut fs, mut rng) = setup();
+    let mut state = crate::FidoState::new();
+    state.regenerate(&mut rng); // the clientPIN getKeyAgreement ephemeral key
+    let (ax, ay) = state.ephemeral_public().unwrap();
+
+    let mc = run_mc_state(&mut fs, &mut rng, &mut state, &mc_request_lbk_hmac());
+    let (resident_id, _x, _y) = parse_mc(&mc);
+
+    // Platform half (protocol two): ECDH, encrypt the salt, MAC it.
+    let plat = {
+        let mut s = [0u8; 32];
+        s[0] = 0x22;
+        s[31] = 0x22;
+        s
+    };
+    let (px, py) = public_xy(&plat).unwrap();
+    let mut shared = [0u8; 64];
+    let slen = ecdh(PinProto::Two, &plat, &ax, &ay, &mut shared).unwrap();
+    let salt = [0x77u8; 32];
+    let iv = [0x01u8; 16];
+    let mut se = [0u8; 48];
+    let ne = encrypt(PinProto::Two, &shared[..slen], &iv, &salt, &mut se).unwrap();
+    let mut sa = [0u8; 32];
+    let na = authenticate(PinProto::Two, &shared[..slen], &se[..ne], &mut sa).unwrap();
+
+    let req = ga_request_hmac(&resident_id, &px, &py, &se[..ne], &sa[..na]);
+    let mut out = [0u8; 1024];
+    let n = {
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 20,
+        };
+        get_assertion(&mut ctx, &req, &mut out).unwrap()
+    };
+    let ad = assertion_auth_data(&out[..n]);
+    assert_eq!(ad[32] & FLAG_ED, FLAG_ED);
+
+    // Pull the hmac-secret output from the authData extensions and decrypt it.
+    let mut d = Decoder::new(&ad[37..]);
+    assert_eq!(d.map().unwrap().unwrap(), 1);
+    assert_eq!(d.str().unwrap(), "hmac-secret");
+    let hmac_out = d.bytes().unwrap();
+    assert_eq!(hmac_out.len(), 48); // v2: 16 IV + 32
+    let mut dec = [0u8; 32];
+    rsk_crypto::pinproto::decrypt(PinProto::Two, &shared[..slen], hmac_out, &mut dec).unwrap();
+
+    // It must equal HMAC(CredRandomWithoutUV, salt) for the stored credential.
+    let (cred_box, seed) = stored_box_and_seed(&mut fs);
+    let cr = crate::credential::derive_hmac_key(&seed, &cred_box);
+    assert_eq!(&dec[..], &rsk_crypto::hmac_sha256(&cr[..32], &salt)[..]);
+}
+
+fn run_mc_state(
+    fs: &mut Fs<RamStorage>,
+    rng: &mut SeqRng,
+    state: &mut crate::FidoState,
+    req: &[u8],
+) -> std::vec::Vec<u8> {
+    let mut out = [0u8; 1024];
+    let mut presence = crate::AlwaysConfirm;
+    let mut ctx = Ctx {
+        presence: &mut presence,
+        dev: dev(),
+        fs,
+        rng,
+        state,
+        now_ms: 10,
+    };
+    let n = make_credential(&mut ctx, req, &mut out).unwrap();
+    out[..n].to_vec()
+}
+
+#[test]
+fn large_blob_key_in_assertion() {
+    let (mut fs, mut rng) = setup();
+    let mut state = crate::FidoState::new();
+    let mc = run_mc_state(&mut fs, &mut rng, &mut state, &mc_request_lbk_hmac());
+    let (resident_id, _x, _y) = parse_mc(&mc);
+
+    // getAssertion requesting largeBlobKey → response field 0x07 with the key.
+    let mut buf = [0u8; 512];
+    let req = {
+        let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+        e.map(4).unwrap();
+        e.u8(1).unwrap().str("example.com").unwrap();
+        e.u8(2).unwrap().bytes(&CDH).unwrap();
+        e.u8(3).unwrap().array(1).unwrap().map(2).unwrap();
+        e.str("type").unwrap().str("public-key").unwrap();
+        e.str("id").unwrap().bytes(&resident_id).unwrap();
+        e.u8(4)
+            .unwrap()
+            .map(1)
+            .unwrap()
+            .str("largeBlobKey")
+            .unwrap()
+            .bool(true)
+            .unwrap();
+        let n = e.writer().position();
+        buf[..n].to_vec()
+    };
+    let mut out = [0u8; 1024];
+    let n = {
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 20,
+        };
+        get_assertion(&mut ctx, &req, &mut out).unwrap()
+    };
+    // Field 0x07 is the 32-byte largeBlobKey for this credential.
+    let mut d = Decoder::new(&out[..n]);
+    let fields = d.map().unwrap().unwrap();
+    let mut lbk = None;
+    for _ in 0..fields {
+        if d.u8().unwrap() == 7 {
+            lbk = Some(d.bytes().unwrap().to_vec());
+        } else {
+            d.skip().unwrap();
+        }
+    }
+    let (cred_box, seed) = stored_box_and_seed(&mut fs);
+    let expected = crate::credential::derive_large_blob_key(&seed, &cred_box);
+    assert_eq!(lbk.as_deref(), Some(&expected[..]));
+}
+
+// makeCredential request offering a single non-default algorithm.
+fn mc_request_alg(alg: i64) -> std::vec::Vec<u8> {
+    let mut buf = [0u8; 512];
+    let n = {
+        let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+        e.map(4).unwrap();
+        e.u8(1).unwrap().bytes(&CDH).unwrap();
+        e.u8(2).unwrap().map(1).unwrap();
+        e.str("id").unwrap().str("example.com").unwrap();
+        e.u8(3).unwrap().map(1).unwrap();
+        e.str("id").unwrap().bytes(&[7, 7, 7, 7]).unwrap();
+        e.u8(4).unwrap().array(1).unwrap().map(2).unwrap();
+        e.str("alg").unwrap().i64(alg).unwrap();
+        e.str("type").unwrap().str("public-key").unwrap();
+        e.writer().position()
+    };
+    buf[..n].to_vec()
+}
+
+// makeCredential authData → (credId, cose x, cose y) for any EC2 curve.
+fn parse_mc_ec2(resp: &[u8]) -> (std::vec::Vec<u8>, std::vec::Vec<u8>, std::vec::Vec<u8>) {
+    let mut d = Decoder::new(resp);
+    assert!(d.map().unwrap().unwrap() >= 3);
+    assert_eq!(d.u8().unwrap(), 1);
+    assert_eq!(d.str().unwrap(), "packed");
+    assert_eq!(d.u8().unwrap(), 2);
+    let ad = d.bytes().unwrap();
+    let cred_len = u16::from_be_bytes([ad[53], ad[54]]) as usize;
+    let cred_id = ad[55..55 + cred_len].to_vec();
+    let mut cd = Decoder::new(&ad[55 + cred_len..]);
+    assert_eq!(cd.map().unwrap().unwrap(), 5);
+    cd.u8().unwrap();
+    cd.u8().unwrap(); // 1: kty 2
+    cd.u8().unwrap();
+    cd.i64().unwrap(); // 3: alg
+    cd.i8().unwrap();
+    cd.u8().unwrap(); // -1: crv
+    cd.i8().unwrap();
+    let x = cd.bytes().unwrap().to_vec(); // -2
+    cd.i8().unwrap();
+    let y = cd.bytes().unwrap().to_vec(); // -3
+    (cred_id, x, y)
+}
+
+fn assertion_sig(resp: &[u8]) -> std::vec::Vec<u8> {
+    let mut d = Decoder::new(resp);
+    let fields = d.map().unwrap().unwrap();
+    let mut sig = std::vec::Vec::new();
+    for _ in 0..fields {
+        if d.u8().unwrap() == 3 {
+            sig = d.bytes().unwrap().to_vec();
+        } else {
+            d.skip().unwrap();
+        }
+    }
+    sig
+}
+
+#[test]
+fn es384_register_then_login_verifies() {
+    use crate::consts::ALG_ES384;
+    use p384::ecdsa::{Signature, VerifyingKey, signature::Verifier};
+    let (mut fs, mut rng) = setup();
+
+    // Register a P-384 (ES384) credential and pull its COSE public key.
+    let mut o1 = [0u8; 1024];
+    let mc = {
+        let mut state = crate::FidoState::new();
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 10,
+        };
+        let n = make_credential(&mut ctx, &mc_request_alg(ALG_ES384), &mut o1).unwrap();
+        o1[..n].to_vec()
+    };
+    let (cred_id, x, y) = parse_mc_ec2(&mc);
+    assert_eq!(x.len(), 48, "P-384 coordinates are 48 bytes");
+
+    // Log in with the credential and verify the assertion under the P-384 key.
+    let mut o2 = [0u8; 1024];
+    let ga = {
+        let mut state = crate::FidoState::new();
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 20,
+        };
+        let n = get_assertion(&mut ctx, &ga_request(Some(&cred_id)), &mut o2).unwrap();
+        o2[..n].to_vec()
+    };
+    let ad = assertion_auth_data(&ga);
+    let sig = assertion_sig(&ga);
+    let pt = p384::EncodedPoint::from_affine_coordinates(
+        p384::FieldBytes::from_slice(&x),
+        p384::FieldBytes::from_slice(&y),
+        false,
+    );
+    let vk = VerifyingKey::from_encoded_point(&pt).unwrap();
+    let mut signed = ad;
+    signed.extend_from_slice(&CDH);
+    vk.verify(&signed, &Signature::from_der(&sig).unwrap())
+        .expect("ES384 assertion verifies under the credential key");
+}
+
+// makeCredential authData → (credId, OKP pubkey) for Ed25519.
+fn parse_mc_okp(resp: &[u8]) -> (std::vec::Vec<u8>, [u8; 32]) {
+    let mut d = Decoder::new(resp);
+    assert!(d.map().unwrap().unwrap() >= 3);
+    assert_eq!(d.u8().unwrap(), 1);
+    assert_eq!(d.str().unwrap(), "packed");
+    assert_eq!(d.u8().unwrap(), 2);
+    let ad = d.bytes().unwrap();
+    let cred_len = u16::from_be_bytes([ad[53], ad[54]]) as usize;
+    let cred_id = ad[55..55 + cred_len].to_vec();
+    let mut cd = Decoder::new(&ad[55 + cred_len..]);
+    assert_eq!(cd.map().unwrap().unwrap(), 4);
+    cd.u8().unwrap();
+    assert_eq!(cd.u8().unwrap(), 1); // kty OKP
+    cd.u8().unwrap();
+    cd.i64().unwrap(); // alg
+    cd.i8().unwrap();
+    cd.u8().unwrap(); // crv
+    cd.i8().unwrap();
+    let pk: [u8; 32] = cd.bytes().unwrap().try_into().unwrap();
+    (cred_id, pk)
+}
+
+#[test]
+fn ed25519_register_then_login_verifies() {
+    use crate::consts::ALG_EDDSA;
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    let (mut fs, mut rng) = setup();
+
+    let mut o1 = [0u8; 1024];
+    let mc = {
+        let mut state = crate::FidoState::new();
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 10,
+        };
+        let n = make_credential(&mut ctx, &mc_request_alg(ALG_EDDSA), &mut o1).unwrap();
+        o1[..n].to_vec()
+    };
+    let (cred_id, pk) = parse_mc_okp(&mc);
+
+    let mut o2 = [0u8; 1024];
+    let ga = {
+        let mut state = crate::FidoState::new();
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 20,
+        };
+        let n = get_assertion(&mut ctx, &ga_request(Some(&cred_id)), &mut o2).unwrap();
+        o2[..n].to_vec()
+    };
+    let ad = assertion_auth_data(&ga);
+    let sig = assertion_sig(&ga);
+    let vk = VerifyingKey::from_bytes(&pk).unwrap();
+    let mut signed = ad;
+    signed.extend_from_slice(&CDH);
+    vk.verify(&signed, &Signature::from_slice(&sig).unwrap())
+        .expect("Ed25519 assertion verifies under the credential key");
+}
+
+#[test]
+fn get_next_assertion_without_state_is_not_allowed() {
+    let (mut fs, mut rng) = setup();
+    let mut state = crate::FidoState::new();
+    let mut out = [0u8; 64];
+    let mut presence = crate::AlwaysConfirm;
+    let mut ctx = Ctx {
+        presence: &mut presence,
+        dev: dev(),
+        fs: &mut fs,
+        rng: &mut rng,
+        state: &mut state,
+        now_ms: 0,
+    };
+    assert_eq!(
+        get_next_assertion(&mut ctx, &mut out),
+        Err(CtapError::NotAllowed)
+    );
+}
+
+// ---- ML-DSA-44 (PQC) end-to-end ----
+
+// Run one CTAP call against `fs` with a PQC-sized response buffer.
+fn call(
+    fs: &mut Fs<RamStorage>,
+    rng: &mut SeqRng,
+    now_ms: u64,
+    f: impl FnOnce(&mut Ctx<RamStorage, SeqRng>, &mut [u8]) -> crate::error::CtapResult,
+) -> Result<std::vec::Vec<u8>, CtapError> {
+    let mut out = [0u8; 8192];
+    let mut state = crate::FidoState::new();
+    let mut presence = crate::AlwaysConfirm;
+    let mut ctx = Ctx {
+        presence: &mut presence,
+        dev: dev(),
+        fs,
+        rng,
+        state: &mut state,
+        now_ms,
+    };
+    let n = f(&mut ctx, &mut out)?;
+    Ok(out[..n].to_vec())
+}
+
+// makeCredential authData → (credId, AKP alg, AKP pubkey) for ML-DSA.
+fn parse_mc_akp(resp: &[u8]) -> (std::vec::Vec<u8>, i64, std::vec::Vec<u8>) {
+    let mut d = Decoder::new(resp);
+    assert!(d.map().unwrap().unwrap() >= 3);
+    assert_eq!(d.u8().unwrap(), 1);
+    assert_eq!(d.str().unwrap(), "packed");
+    assert_eq!(d.u8().unwrap(), 2);
+    let ad = d.bytes().unwrap();
+    let cred_len = u16::from_be_bytes([ad[53], ad[54]]) as usize;
+    let cred_id = ad[55..55 + cred_len].to_vec();
+    let mut cd = Decoder::new(&ad[55 + cred_len..]);
+    assert_eq!(
+        cd.map().unwrap().unwrap(),
+        3,
+        "AKP COSE key is a 3-entry map"
+    );
+    cd.u8().unwrap();
+    assert_eq!(cd.u8().unwrap(), crate::consts::KTY_AKP); // 1: kty
+    cd.u8().unwrap();
+    let alg = cd.i64().unwrap(); // 3: alg
+    cd.i8().unwrap(); // -1: pub
+    let pk = cd.bytes().unwrap().to_vec();
+    (cred_id, alg, pk)
+}
+
+// Pull the packed attStmt `(alg, sig)` and authData out of a makeCredential
+// response.
+fn mc_att(resp: &[u8]) -> (i64, std::vec::Vec<u8>, std::vec::Vec<u8>) {
+    let mut d = Decoder::new(resp);
+    let fields = d.map().unwrap().unwrap();
+    let (mut alg, mut sig, mut ad) = (0i64, std::vec::Vec::new(), std::vec::Vec::new());
+    for _ in 0..fields {
+        match d.u8().unwrap() {
+            2 => ad = d.bytes().unwrap().to_vec(),
+            3 => {
+                assert_eq!(d.map().unwrap().unwrap(), 2);
+                assert_eq!(d.str().unwrap(), "alg");
+                alg = d.i64().unwrap();
+                assert_eq!(d.str().unwrap(), "sig");
+                sig = d.bytes().unwrap().to_vec();
+            }
+            _ => d.skip().unwrap(),
+        }
+    }
+    (alg, sig, ad)
+}
+
+fn mldsa_verify(pk: &[u8], msg: &[u8], sig: &[u8]) -> bool {
+    let pk: [u8; rsk_crypto::MLDSA44_PK_LEN] = pk.try_into().expect("AKP pk length");
+    let sig: [u8; rsk_crypto::MLDSA44_SIG_LEN] = sig.try_into().expect("ML-DSA sig length");
+    rsk_crypto::mldsa44_verify(&pk, msg, &sig)
+}
+
+#[test]
+fn mldsa44_register_then_login_verifies() {
+    use crate::consts::ALG_MLDSA44;
+    let (mut fs, mut rng) = setup();
+
+    // Register: the self-attestation must verify under the AKP COSE key.
+    let mc = call(&mut fs, &mut rng, 10, |ctx, out| {
+        make_credential(ctx, &mc_request_alg(ALG_MLDSA44), out)
+    })
+    .unwrap();
+    let (cred_id, alg, pk) = parse_mc_akp(&mc);
+    assert_eq!(alg, ALG_MLDSA44);
+    assert_eq!(pk.len(), rsk_crypto::MLDSA44_PK_LEN);
+    let (att_alg, att_sig, ad) = mc_att(&mc);
+    assert_eq!(att_alg, ALG_MLDSA44);
+    let mut signed = ad;
+    signed.extend_from_slice(&CDH);
+    assert!(
+        mldsa_verify(&pk, &signed, &att_sig),
+        "ML-DSA-44 self-attestation verifies"
+    );
+
+    // Login with the returned credential id; the assertion signature must
+    // verify under the same key.
+    let ga = call(&mut fs, &mut rng, 20, |ctx, out| {
+        get_assertion(ctx, &ga_request(Some(&cred_id)), out)
+    })
+    .unwrap();
+    let ad = assertion_auth_data(&ga);
+    let sig = assertion_sig(&ga);
+    assert_eq!(sig.len(), rsk_crypto::MLDSA44_SIG_LEN);
+    let mut signed = ad;
+    signed.extend_from_slice(&CDH);
+    assert!(
+        mldsa_verify(&pk, &signed, &sig),
+        "ML-DSA-44 assertion verifies under the credential key"
+    );
+}
+
+// rk makeCredential with an explicit algorithm and user id (the upgrade flow).
+fn mc_request_alg_rk(alg: i64, uid: &[u8]) -> std::vec::Vec<u8> {
+    let mut buf = [0u8; 512];
+    let n = {
+        let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+        e.map(5).unwrap();
+        e.u8(1).unwrap().bytes(&CDH).unwrap();
+        e.u8(2).unwrap().map(1).unwrap();
+        e.str("id").unwrap().str("example.com").unwrap();
+        e.u8(3).unwrap().map(2).unwrap();
+        e.str("id").unwrap().bytes(uid).unwrap();
+        e.str("name").unwrap().str("user").unwrap();
+        e.u8(4).unwrap().array(1).unwrap().map(2).unwrap();
+        e.str("alg").unwrap().i64(alg).unwrap();
+        e.str("type").unwrap().str("public-key").unwrap();
+        e.u8(7).unwrap().map(1).unwrap();
+        e.str("rk").unwrap().bool(true).unwrap();
+        e.writer().position()
+    };
+    buf[..n].to_vec()
+}
+
+/// The classic→PQC upgrade: re-registering the same rp/user with ML-DSA-44
+/// overwrites the resident slot (one credential, now PQC) while an old
+/// *non-resident* ES256 credential id keeps asserting — the box is
+/// self-contained, so downstream state survives the upgrade.
+#[test]
+fn classic_to_pqc_upgrade() {
+    use crate::consts::{ALG_ES256, ALG_MLDSA44};
+    use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
+    let (mut fs, mut rng) = setup();
+    let uid = [9u8, 9, 9];
+
+    // An old non-resident ES256 credential (the box IS the credential id).
+    let mc_old = call(&mut fs, &mut rng, 10, |ctx, out| {
+        make_credential(ctx, &mc_request_alg(ALG_ES256), out)
+    })
+    .unwrap();
+    let (old_id, x, y) = parse_mc_ec2(&mc_old);
+
+    // A resident ES256 credential, then the PQC re-registration of the SAME
+    // rp/user — the slot is overwritten, not duplicated.
+    call(&mut fs, &mut rng, 20, |ctx, out| {
+        make_credential(ctx, &mc_request_alg_rk(ALG_ES256, &uid), out)
+    })
+    .unwrap();
+    let mc_pqc = call(&mut fs, &mut rng, 30, |ctx, out| {
+        make_credential(ctx, &mc_request_alg_rk(ALG_MLDSA44, &uid), out)
+    })
+    .unwrap();
+    let (_, alg, pqc_pk) = parse_mc_akp(&mc_pqc);
+    assert_eq!(alg, ALG_MLDSA44);
+
+    // Resident discovery: exactly one credential survives, and it signs
+    // with ML-DSA-44.
+    let ga = call(&mut fs, &mut rng, 40, |ctx, out| {
+        get_assertion(ctx, &ga_request(None), out)
+    })
+    .unwrap();
+    let (_, n_creds) = user_and_count(&ga);
+    assert_eq!(n_creds, None, "a single credential omits the count");
+    let sig = assertion_sig(&ga);
+    assert_eq!(sig.len(), rsk_crypto::MLDSA44_SIG_LEN);
+    let mut signed = assertion_auth_data(&ga);
+    signed.extend_from_slice(&CDH);
+    assert!(mldsa_verify(&pqc_pk, &signed, &sig));
+
+    // The old non-resident ES256 id still works via allowList.
+    let ga_old = call(&mut fs, &mut rng, 50, |ctx, out| {
+        get_assertion(ctx, &ga_request(Some(&old_id)), out)
+    })
+    .unwrap();
+    let sig = assertion_sig(&ga_old);
+    let mut signed = assertion_auth_data(&ga_old);
+    signed.extend_from_slice(&CDH);
+    let pt = p256::EncodedPoint::from_affine_coordinates(
+        p256::FieldBytes::from_slice(&x),
+        p256::FieldBytes::from_slice(&y),
+        false,
+    );
+    let vk = VerifyingKey::from_encoded_point(&pt).unwrap();
+    vk.verify(&signed, &Signature::from_der(&sig).unwrap())
+        .expect("pre-upgrade ES256 credential still asserts");
+}
+
+// A ceiling-sized credential must round-trip. A 253-byte rpId (the DNS
+// ceiling) plus overlong user strings (truncated to 64, CTAP 2.1 §6.1.2) and a
+// credBlob pushes the box past the OLD 512-byte assert cap — the create/assert
+// divergence stranded exactly these: create succeeded, then Best::consider
+// silently skipped the id and every assertion ended NO_CREDENTIALS.
+#[test]
+fn near_ceiling_credential_roundtrips() {
+    let (mut fs, mut rng) = setup();
+    let rp = "a".repeat(249) + ".com";
+    let uid = [0x42u8; 64];
+    let long_name = "n".repeat(100);
+
+    let mut buf = [0u8; 1024];
+    let n = {
+        let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+        e.map(5).unwrap();
+        e.u8(1).unwrap().bytes(&CDH).unwrap();
+        e.u8(2).unwrap().map(1).unwrap();
+        e.str("id").unwrap().str(&rp).unwrap();
+        e.u8(3).unwrap().map(3).unwrap();
+        e.str("id").unwrap().bytes(&uid).unwrap();
+        e.str("name").unwrap().str(&long_name).unwrap();
+        e.str("displayName").unwrap().str(&long_name).unwrap();
+        e.u8(4).unwrap().array(1).unwrap().map(2).unwrap();
+        e.str("alg").unwrap().i64(ALG_ES256).unwrap();
+        e.str("type").unwrap().str("public-key").unwrap();
+        e.u8(6).unwrap().map(1).unwrap();
+        e.str("credBlob").unwrap().bytes(&[0x5A; 32]).unwrap();
+        e.writer().position()
+    };
+    let mc_req = buf[..n].to_vec();
+
+    let mut out = [0u8; 2048];
+    let mc = {
+        let mut state = crate::FidoState::new();
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 10,
+        };
+        let n = make_credential(&mut ctx, &mc_req, &mut out).unwrap();
+        out[..n].to_vec()
+    };
+    let (cred_id, x, y) = parse_mc(&mc);
+    assert!(
+        cred_id.len() > 512,
+        "box must cross the old assert cap (len {})",
+        cred_id.len()
+    );
+    assert!(cred_id.len() <= crate::credential::CRED_BOX_MAX);
+
+    let mut gbuf = [0u8; 1024];
+    let n = {
+        let mut e = Encoder::new(Cursor::new(&mut gbuf[..]));
+        e.map(3).unwrap();
+        e.u8(1).unwrap().str(&rp).unwrap();
+        e.u8(2).unwrap().bytes(&CDH).unwrap();
+        e.u8(3).unwrap().array(1).unwrap().map(2).unwrap();
+        e.str("type").unwrap().str("public-key").unwrap();
+        e.str("id").unwrap().bytes(&cred_id).unwrap();
+        e.writer().position()
+    };
+    let ga_req = gbuf[..n].to_vec();
+
+    let mut out2 = [0u8; 2048];
+    let ga = {
+        let mut state = crate::FidoState::new();
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 20,
+        };
+        let n = get_assertion(&mut ctx, &ga_req, &mut out2).unwrap();
+        out2[..n].to_vec()
+    };
+    verify_assertion(&ga, &x, &y);
+}
+
+// The TRUE maximal box — 253-byte rpId + 64-byte user.id + 64-byte names + a
+// 127-byte credBlob + hmac-secret — must create and assert. This box is
+// ~670-748 bytes, well over the old 640 ceiling that CRED_BOX_MAX=640 (a
+// literal that omitted credBlob + extensions) silently rejected as Other.
+#[test]
+fn maximal_box_creates_and_asserts() {
+    let (mut fs, mut rng) = setup();
+    let rp = "a".repeat(249) + ".com"; // 253 bytes, DNS max
+    let uid = [0x42u8; 64];
+    let long = "n".repeat(100); // truncated to 64 at seal
+
+    let mut buf = [0u8; 2048];
+    let n = {
+        let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+        e.map(5).unwrap();
+        e.u8(1).unwrap().bytes(&CDH).unwrap();
+        e.u8(2).unwrap().map(1).unwrap();
+        e.str("id").unwrap().str(&rp).unwrap();
+        e.u8(3).unwrap().map(3).unwrap();
+        e.str("id").unwrap().bytes(&uid).unwrap();
+        e.str("name").unwrap().str(&long).unwrap();
+        e.str("displayName").unwrap().str(&long).unwrap();
+        e.u8(4).unwrap().array(1).unwrap().map(2).unwrap();
+        e.str("alg").unwrap().i64(ALG_ES256).unwrap();
+        e.str("type").unwrap().str("public-key").unwrap();
+        e.u8(6).unwrap().map(2).unwrap();
+        e.str("credBlob").unwrap().bytes(&[0x5A; 127]).unwrap();
+        e.str("hmac-secret").unwrap().bool(true).unwrap();
+        e.writer().position()
+    };
+    let mc_req = buf[..n].to_vec();
+
+    let mut out = [0u8; 2048];
+    let mc = {
+        let mut state = crate::FidoState::new();
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: u64::MAX, // largest createdMs → widest box
+        };
+        let n = make_credential(&mut ctx, &mc_req, &mut out).unwrap();
+        out[..n].to_vec()
+    };
+    let (cred_id, x, y) = parse_mc(&mc);
+    assert!(
+        cred_id.len() > 640,
+        "box must cross the old 640 cap (len {})",
+        cred_id.len()
+    );
+    assert!(cred_id.len() <= crate::credential::CRED_BOX_MAX);
+
+    let mut gbuf = [0u8; 1024];
+    let n = {
+        let mut e = Encoder::new(Cursor::new(&mut gbuf[..]));
+        e.map(3).unwrap();
+        e.u8(1).unwrap().str(&rp).unwrap();
+        e.u8(2).unwrap().bytes(&CDH).unwrap();
+        e.u8(3).unwrap().array(1).unwrap().map(2).unwrap();
+        e.str("type").unwrap().str("public-key").unwrap();
+        e.str("id").unwrap().bytes(&cred_id).unwrap();
+        e.writer().position()
+    };
+    let mut out2 = [0u8; 2048];
+    let ga = {
+        let mut state = crate::FidoState::new();
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 20,
+        };
+        let n = get_assertion(&mut ctx, &gbuf[..n], &mut out2).unwrap();
+        out2[..n].to_vec()
+    };
+    verify_assertion(&ga, &x, &y);
+}
+
+// An rpId or user.id past its ceiling is rejected explicitly (InvalidLength),
+// not by a downstream box overflow that would surface as a vague Other.
+#[test]
+fn overlong_rpid_or_userid_rejected() {
+    let (mut fs, mut rng) = setup();
+    let over_rp = "a".repeat(251) + ".com"; // 255 > RP_ID_MAX(253)
+    let mk = |rp: &str, uid: &[u8]| {
+        let mut buf = [0u8; 512];
+        let n = {
+            let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+            e.map(4).unwrap();
+            e.u8(1).unwrap().bytes(&CDH).unwrap();
+            e.u8(2).unwrap().map(1).unwrap();
+            e.str("id").unwrap().str(rp).unwrap();
+            e.u8(3).unwrap().map(1).unwrap();
+            e.str("id").unwrap().bytes(uid).unwrap();
+            e.u8(4).unwrap().array(1).unwrap().map(2).unwrap();
+            e.str("alg").unwrap().i64(ALG_ES256).unwrap();
+            e.str("type").unwrap().str("public-key").unwrap();
+            e.writer().position()
+        };
+        buf[..n].to_vec()
+    };
+    for req in [mk(&over_rp, &[1, 2, 3, 4]), mk("ok.com", &[0u8; 65])] {
+        let mut out = [0u8; 512];
+        let mut state = crate::FidoState::new();
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 10,
+        };
+        assert_eq!(
+            make_credential(&mut ctx, &req, &mut out),
+            Err(CtapError::InvalidLength)
+        );
+    }
+}

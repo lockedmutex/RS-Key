@@ -84,13 +84,15 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
 
-      - name: build the 8 reproducible firmware flavors
+      - name: build the 4 reproducible firmware flavors
         run: |
           tag="${{ steps.tag.outputs.tag }}"
           mkdir -p dist
-          for pkg in firmware firmware-pqc firmware-fips firmware-fips-pqc \
-                     firmware-no-touch firmware-no-touch-pqc \
-                     firmware-no-touch-fips firmware-no-touch-fips-pqc; do
+          # Only the touch-required flavors ship. The `no-touch` flavors auto-confirm
+          # user presence (test-only; see firmware/Cargo.toml "Never ship a no-touch
+          # build") and MUST NOT be published — a signed no-touch asset would remove
+          # the physical-consent gate from an end-user build.
+          for pkg in firmware firmware-pqc firmware-fips firmware-fips-pqc; do
             echo "::group::nix build .#$pkg"
             out="$(nix build ".#$pkg" --no-link --print-out-paths)"
             label="${pkg#firmware}"; label="${label#-}"
@@ -100,19 +102,17 @@ jobs:
           done
           ls -l dist
 
-      - name: reproducibility gate — rebuild all 8, require bit-identical
+      - name: reproducibility gate — rebuild all 4, require bit-identical
         run: |
           # `nix build --rebuild` recompiles the derivation already in the store
           # and fails with a hash mismatch if the output is not bit-identical.
           # A non-reproducible flavor fails here, before the release is created.
-          for pkg in firmware firmware-pqc firmware-fips firmware-fips-pqc \
-                     firmware-no-touch firmware-no-touch-pqc \
-                     firmware-no-touch-fips firmware-no-touch-fips-pqc; do
+          for pkg in firmware firmware-pqc firmware-fips firmware-fips-pqc; do
             echo "::group::nix build .#$pkg --rebuild"
             nix build ".#$pkg" --rebuild --no-link
             echo "::endgroup::"
           done
-          echo "all 8 flavors rebuilt bit-identical"
+          echo "all 4 flavors rebuilt bit-identical"
 
       - name: generate the CycloneDX SBOM
         run: |
@@ -184,6 +184,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="${{ steps.tag.outputs.tag }}"
+          # Belt-and-suspenders: never publish a presence-bypass no-touch asset.
+          if ls dist/*no-touch* >/dev/null 2>&1; then
+            echo "refusing to publish a no-touch firmware asset" >&2
+            exit 1
+          fi
           gh release create "$tag" \
             --title "RS-Key $tag" \
             --notes-file release-notes.md \

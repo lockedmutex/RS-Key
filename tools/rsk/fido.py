@@ -140,7 +140,7 @@ def att_import(args):
 
     from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
-    from .backup import _gated, _vendor, mse_handshake
+    from .backup import _die_pin_required, _gated, _vendor, mse_handshake
     from .common import connect_fido
 
     scalar, chain = _att_scalar(args.key), _att_chain(args.chain)
@@ -153,15 +153,14 @@ def att_import(args):
     blob = nonce + ChaCha20Poly1305(key).encrypt(nonce, scalar, aad)
     print("touch the device (BOOTSEL) to authorise the import…", file=sys.stderr)
     st, _ = _vendor(dev, cid, _gated(ATT_IMPORT, {1: blob, 2: chain}, dev, cid, pin))
-    if st == 0x36:
-        die("device requires a PIN — pass --pin or enter it when prompted")
+    _die_pin_required(st)
     if st != 0:
         die(f"import failed: {st:#x}")
     print("org attestation installed ✓ — EA makeCredential and U2F now use the org chain")
 
 
 def att_clear(args):
-    from .backup import _gated, _vendor, mse_handshake
+    from .backup import _die_pin_required, _gated, _vendor, mse_handshake
     from .common import connect_fido
 
     dev, cid = connect_fido()
@@ -169,8 +168,7 @@ def att_clear(args):
     mse_handshake(dev, cid)
     print("touch the device (BOOTSEL) to remove the attestation…", file=sys.stderr)
     st, _ = _vendor(dev, cid, _gated(ATT_CLEAR, None, dev, cid, pin))
-    if st == 0x36:
-        die("device requires a PIN — pass --pin or enter it when prompted")
+    _die_pin_required(st)
     if st != 0:
         die(f"clear failed: {st:#x}")
     print("org attestation removed ✓ (back to the self-signed device cert)")

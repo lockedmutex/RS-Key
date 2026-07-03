@@ -15,6 +15,8 @@ audit, identity verify). Irreversible production rituals — secure-boot staging
 OTP fuses, factory resets, soft-lock, attestation import — stay in the CLI on
 purpose, and the cockpit points you at the exact command instead of doing them.
 
+![rsk-tui cockpit — a terminal dashboard: a header with the device summary, a sidebar of sections (Overview selected, then FIDO, OpenPGP, PIV, OATH/OTP, Backup, LED, Audit, Reboot/Maintenance, Help), an Overview panel grouping Identity, Transports and Security rows, an actions panel, an events log and a key-binding footer](../images/tui-cockpit.svg)
+
 ```mermaid
 flowchart LR
     tui["rsk-tui (host process)"] -->|hidapi / CTAPHID| fido["Device — FIDO"]
@@ -87,7 +89,7 @@ firmware   : 5.7.4  bcdDevice 0x0759  sdk 3.4
 fido       : U2F_V2, FIDO_2_0, FIDO_2_1  clientPin=true
 backup     : sealed=false  has_seed=true
 seed lock  : off
-secure boot: ENABLED  (enabled=true locked=false bootkey=0x1)
+secure boot: ENABLED (not locked)  (enabled=true locked=false bootkey=0x1)
 rollback   : not required  boot version 0/48
 org attest : not installed
 applets    : OpenPGP present  PIV present  OATH present  OTP present
@@ -151,7 +153,7 @@ as you type, `↑`/`↓` pick, `Enter` jumps to that action's section and starts
 | OpenPGP | applet presence | — |
 | PIV | applet presence | — |
 | OATH / OTP | applet presence | — |
-| Backup | seed / sealed / lock state | Export, Restore, Finalize (BIP-39) |
+| Backup | seed / sealed / lock state | Export (BIP-39 · SLIP-39 2-of-3), Restore, Finalize |
 | LED | LED mode + per-state color/brightness | Read state, Cycle idle color |
 | Audit | journal head + checkpoint key hint | Read journal, Verify identity |
 | Reboot / Maintenance | device summary | Reboot → app, Reboot → BOOTSEL |
@@ -207,8 +209,10 @@ to run — they are never performed from the cockpit:
   `ykman piv reset`, …). The `ykman` commands gate on the "Yubico YubiKey"
   reader name, so they only see the device on the opt-in `VIDPID=Yubikey5`
   build; `gpg` and `rsk` work on the default RS-Key build.
-- **Backup**: SLIP-39 (Shamir T-of-N) export/restore — `rsk backup export
-  --scheme slip39` ([seed-backup.md](seed-backup.md))
+- **Backup**: SLIP-39 *restore* (recombining shares) — `rsk backup restore
+  --scheme slip39`. SLIP-39 *export* is now in the cockpit (2-of-3 shares, via
+  the in-tree `rsk-slip39` crate); other T-of-N splits stay in the CLI
+  ([seed-backup.md](seed-backup.md))
 - **Maintenance** (Reboot section): seed soft-lock (`rsk lock enable | unlock |
   disable`), org-attestation import/clear (`rsk fido attestation import | clear`),
   secure-boot staging, OTP fuses — see [production.md](../production.md) and

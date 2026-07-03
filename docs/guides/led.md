@@ -12,10 +12,10 @@ PicoForge) and must be ≤ `MAX_LEDS`.
 
 | Knob | Default | When to change it |
 |---|---|---|
-| `LED_KIND` | `ws2812` | `ws2812` (addressable RGB, default), `gpio` (plain on/off), `pimoroni` (3-pin PWM RGB), or `none` (no indicator). See [build.md](build.md). |
+| `LED_KIND` | `ws2812` | `ws2812` (addressable RGB, default), `gpio` (plain on/off), `pimoroni` (3-pin PWM RGB), or `none` (no indicator). See [build.md](../build.md). |
 | `LED_PIN` | `16` | A board whose addressable LED is on a different GPIO (`0..=29`). |
 | `LED_ORDER` | `rgb` | A WS2812 board with swapped red/green — set `grb` (the WS2812B standard). The Waveshare RP2350-One is `rgb`; most other parts are `grb`. |
-| `MAX_LEDS` | `8` | A board with **more than 8** daisy-chained addressable LEDs (max `64`). The actual connected count is set at runtime with `rsk hw --led-num`. |
+| `MAX_LEDS` | `1` | A board with **multiple** daisy-chained addressable LEDs — set it to the chain length (max `64`). Default `1` is a single onboard LED. The actual connected count is set at runtime with `rsk hw --led-num`. |
 
 ```sh
 # example: build for a 4-LED board with standard GRB order
@@ -59,6 +59,8 @@ effect setting — they lack per-LED control and pixel-level colour.
 | processing | `flow` — warm-colour flow | yellow→red gradient | handling an APDU / crypto op |
 | **waiting for touch** | `bounce` — smooth bounce | yellow | press the button to confirm |
 | boot | `sparkle` — random sparkle | red | the brief power-up state |
+
+![Status-LED cheat sheet — idle breathes green (vapor), processing flows a yellow-to-red gradient (flow), waiting-for-touch bounces yellow (bounce), and boot sparkles red (sparkle); the swatches and animations show each state's default colour and effect](../images/led-status.svg)
 
 A few honest details:
 
@@ -136,8 +138,8 @@ steady toggle, use `rsk led`.
 
 ## Hardware wiring (`rsk hw`)
 
-See [hw.md](hw.md) for the full reference. The LED wiring — pin, driver, wire
-order — lives in the `phy` record, shared with PicoForge:
+See the [phy record spec](../protocol.md) for the full reference. The LED wiring
+— pin, driver, wire order — lives in the `phy` record, shared with PicoForge:
 
 ```sh
 rsk hw --led-pin 22                     # move the WS2812/gpio data pin to GPIO22
@@ -172,8 +174,8 @@ so your settings survive a power cycle but not an OpenPGP/FIDO factory reset
 that the render task reads live — SET LED updates them immediately, then
 persists the full block to flash.
 
-For the wiring half (`rsk hw`), see [hw.md](hw.md); it writes to `EF_PHY` via
-the rescue applet and applies at next boot.
+For the wiring half (`rsk hw`), see the [phy record spec](../protocol.md); it
+writes to `EF_PHY` via the rescue applet and applies at next boot.
 
 ## Troubleshooting
 

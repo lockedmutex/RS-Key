@@ -5,9 +5,11 @@
 //! persisted in `EF_LED_CONF` and applied live), and the reboot command — which
 //! is only queued here and run by the worker after the response has flushed.
 
+use core::cell::RefCell;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use rsk_fs::{Fs, Storage};
+use rsk_rescue::{Confirm, Presence, UserPresence};
 use rsk_sdk::{Apdu, Applet, ResBuf, Sw};
 
 /// Vendor AID (RID `F0 00 00 00`, app `01`).
@@ -65,9 +67,31 @@ pub fn request_reboot(bootsel: bool) {
     REBOOT.store(if bootsel { 2 } else { 1 }, Ordering::Relaxed);
 }
 
-pub struct VendorApplet;
+/// Whether a reboot is queued but not yet serviced (peek, does not clear). The display's
+/// ambient loop reads this to park itself once a Settings → Firmware update is requested —
+/// it must stop busy-waiting and yield so the worker (same thread-mode executor) gets
+/// scheduled to scrub the live secrets and reset. Display-only: the standard key never
+/// queues a reboot off-transport (the worker services those inline after the SW_OK).
+#[cfg(feature = "display")]
+pub fn reboot_pending() -> bool {
+    REBOOT.load(Ordering::Relaxed) != 0
+}
 
-impl<S: Storage> Applet<Fs<S>> for VendorApplet {
+pub struct VendorApplet<'a> {
+    /// Gates the reboot-to-BOOTSEL command (P1=01). The same physical presence
+    /// source the rescue applet uses, so a hostile host cannot drop the device
+    /// into the mass-storage bootloader without the operator via *either*
+    /// transport (this applet is reachable over both CCID and CTAPHID).
+    presence: &'a RefCell<dyn UserPresence>,
+}
+
+impl<'a> VendorApplet<'a> {
+    pub fn new(presence: &'a RefCell<dyn UserPresence>) -> Self {
+        Self { presence }
+    }
+}
+
+impl<S: Storage> Applet<Fs<S>> for VendorApplet<'_> {
     fn aid(&self) -> &'static [u8] {
         VENDOR_AID
     }
@@ -96,12 +120,14 @@ impl<S: Storage> Applet<Fs<S>> for VendorApplet {
                 let status = (apdu.p2 >> 4) & 0x3;
                 crate::led::set_status_config(status, apdu.p2 & 0x7, apdu.p1);
                 crate::led::set_steady(apdu.p2 & P2_STEADY != 0);
+                // Optional data bytes: data[0] = effect, data[1] = speed. They
+                // are independent, so an effect-only update (one data byte)
+                // keeps the status's current speed rather than resetting it.
                 if apdu.nc >= 1 {
-                    crate::led::set_status_effect(
-                        status,
-                        apdu.data[0],
-                        apdu.data.get(1).copied().unwrap_or(0),
-                    );
+                    crate::led::set_status_effect(status, apdu.data[0]);
+                }
+                if apdu.nc >= 2 {
+                    crate::led::set_status_speed(status, apdu.data[1]);
                 }
                 if fs.put(EF_LED_CONF, &crate::led::config_block()).is_err() {
                     return Sw::MEMORY_FAILURE;
@@ -149,7 +175,22 @@ impl<S: Storage> Applet<Fs<S>> for VendorApplet {
                 }
                 match apdu.p1 {
                     0x00 => request_reboot(false),
-                    0x01 => request_reboot(true),
+                    0x01 => {
+                        // Reboot-to-BOOTSEL aids an at-rest flash/OTP dump; gate it
+                        // behind the operator, matching the rescue applet's
+                        // REBOOT_BOOTSEL — otherwise this ungated twin would let a
+                        // hostile host bypass that gate. A warm restart (P1=00)
+                        // stays ungated.
+                        if self
+                            .presence
+                            .borrow_mut()
+                            .request(Confirm::titled("Reboot to BOOTSEL?"))
+                            != Presence::Confirmed
+                        {
+                            return Sw::CONDITIONS_NOT_SATISFIED;
+                        }
+                        request_reboot(true)
+                    }
                     _ => return Sw::INCORRECT_P1P2,
                 }
                 Sw::OK

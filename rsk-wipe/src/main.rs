@@ -41,8 +41,28 @@ bind_interrupts!(struct Irqs {
     DMA_IRQ_0 => DmaIrq<DMA_CH0>;
 });
 
-/// External QSPI flash size on the Waveshare RP2350-One (4 MB).
-const FLASH_SIZE: usize = 4 * 1024 * 1024;
+/// Target QSPI flash size, resolved from the `FLASH_SIZE` build knob (default
+/// 4 MB) by [`build.rs`]. Erasing the whole chip — not a fixed 4 MB — is what
+/// keeps a larger board (e.g. the 16 MiB display board) from retaining sealed
+/// secrets above the assumed size.
+const FLASH_SIZE: usize = parse_dec(env!("PK_FLASH_SIZE"));
+
+/// Compile-time decimal parse for the build-emitted `PK_FLASH_SIZE`.
+const fn parse_dec(s: &str) -> usize {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut n = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        assert!(
+            b.is_ascii_digit(),
+            "PK_FLASH_SIZE must be a decimal byte count"
+        );
+        n = n * 10 + (b - b'0') as usize;
+        i += 1;
+    }
+    n
+}
 /// One flash programming page.
 const PAGE_SIZE: usize = 256;
 /// 64 KiB block erase (pico-sdk `FLASH_BLOCK_SIZE` / `FLASH_BLOCK_ERASE_CMD`).

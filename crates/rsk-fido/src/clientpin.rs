@@ -3,7 +3,10 @@
 
 //! `authenticatorClientPIN`: getPINRetries (1), getKeyAgreement (2), setPIN
 //! (3), changePIN (4), getPinToken (5) and
-//! getPinUvAuthTokenUsingPinWithPermissions (9); the PIN/UV-auth state lives in
+//! getPinUvAuthTokenUsingPinWithPermissions (9). The trusted-display build adds
+//! built-in user verification — getPinUvAuthTokenUsingUvWithPermissions (6) and
+//! getUVRetries (7), where the user types the PIN on the device's own pad so it
+//! never reaches the host. The PIN/UV-auth state lives in
 //! [`crate::state::FidoState`]. PIN commands never touch the seed's at-rest
 //! format (UP-only operations must keep working across power cycles); a
 //! successful verify only migrates legacy PIN-wrapped blobs back to plain
@@ -14,20 +17,28 @@ use minicbor::{Decoder, Encoder};
 use zeroize::Zeroize;
 
 use rsk_crypto::pinproto::{self, PinProto};
-use rsk_crypto::sha256;
-use rsk_fs::Storage;
+use rsk_crypto::{Device, sha256};
+use rsk_fs::{Fs, Storage};
 
 use crate::cbordec::{cbor, def_map};
-use crate::consts::{EF_MINPINLEN, EF_PIN, MAX_PIN_RETRIES, MIN_PIN_LENGTH};
+use crate::consts::{
+    CP_GET_PIN_TOKEN, CP_GET_PIN_UV_TOKEN_USING_PIN, EF_DEVICE_PIN, EF_MINPINLEN, EF_PIN,
+    MAX_MIN_PIN_RPIDS, MAX_PIN_RETRIES, MIN_PIN_LENGTH,
+};
 use crate::cose::cose_key_ecdh;
 use crate::error::{CtapError, CtapResult};
 use crate::journal;
 use crate::seed::migrate_keydev_pin;
 use crate::state::{PERM_BE, PERM_GA, PERM_MC, PERM_PCMR};
-use crate::{Ctx, Rng};
+use crate::{Ctx, PinEntry, Rng};
 
-const PIN_FILE_LEN: usize = 35; // retries(1) + len(1) + format(1) + verifier(32)
+pub(crate) const PIN_FILE_LEN: usize = 35; // retries(1) + len(1) + format(1) + verifier(32)
 const PADDED_PIN_LEN: usize = 64;
+/// The longest PIN the host clientPIN path can represent: CTAP pads the PIN into a
+/// 64-byte buffer that must keep a trailing zero, so 63 bytes is the ceiling (the host
+/// rejects a 64th non-zero byte). The device-local set enforces the same cap so a PIN
+/// chosen on the panel always stays verifiable over USB too.
+pub const MAX_PIN_LENGTH: usize = PADDED_PIN_LEN - 1;
 
 #[derive(Default)]
 struct Req<'a> {
@@ -112,7 +123,11 @@ pub fn client_pin<S: Storage, R: Rng>(
         0x2 => get_key_agreement(ctx, &req, out),
         0x3 => set_pin(ctx, &req, out),
         0x4 => change_pin(ctx, &req, out),
-        0x5 | 0x9 => get_pin_token(ctx, &req, out),
+        CP_GET_PIN_TOKEN | CP_GET_PIN_UV_TOKEN_USING_PIN => get_pin_token(ctx, &req, out),
+        // Built-in UV (0x06 token / 0x07 retries) exists only where the firmware can
+        // collect a PIN on its own UI; elsewhere it falls through to UnsupportedOption.
+        0x6 if ctx.presence.uv_available() => get_uv_token(ctx, &req, out),
+        0x7 if ctx.presence.uv_available() => get_uv_retries(ctx, out),
         _ => Err(CtapError::UnsupportedOption),
     }
 }
@@ -157,7 +172,7 @@ fn set_pin<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [u8]) -
         return Err(CtapError::NotAllowed);
     }
     let new_pin_enc = req.new_pin_enc.unwrap();
-    let want = 64 + proto.iv_overhead();
+    let want = PADDED_PIN_LEN + proto.iv_overhead();
     // A padded new PIN longer than 64 bytes means the PIN exceeds the 63-byte
     // maximum → a policy violation, not a malformed request (conformance
     // ClientPin*-Policy F-2; protocol 2's 16-byte IV made this hit the strict
@@ -196,10 +211,10 @@ fn change_pin<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [u8]
     let new_pin_enc = req.new_pin_enc.unwrap();
     pin_set_and_unblocked(ctx)?;
     // An over-long padded new PIN is a policy violation (see `set_pin`).
-    if new_pin_enc.len() > 64 + proto.iv_overhead() {
+    if new_pin_enc.len() > PADDED_PIN_LEN + proto.iv_overhead() {
         return Err(CtapError::PinPolicyViolation);
     }
-    if new_pin_enc.len() != 64 + proto.iv_overhead()
+    if new_pin_enc.len() != PADDED_PIN_LEN + proto.iv_overhead()
         || pin_hash_enc.len() != 16 + proto.iv_overhead()
     {
         return Err(CtapError::InvalidParameter);
@@ -231,7 +246,7 @@ fn change_pin<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [u8]
         shared.zeroize();
         return Err(CtapError::PinAuthInvalid);
     }
-    if let Err(e) = verify_pin_hash(ctx, &old_hash[..16]) {
+    if let Err(e) = spend_and_verify_pin_hash(ctx, &old_hash[..16]) {
         shared.zeroize();
         old_hash.zeroize();
         return Err(e);
@@ -252,7 +267,7 @@ fn change_pin<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [u8]
     res?;
     // The new PIN met minPINLength (store_new_pin), so the change satisfies a
     // pending forced-PIN-change policy.
-    clear_force_change(ctx)?;
+    clear_force_change(ctx.fs)?;
     ctx.state.reset_pin_uv_auth_token(ctx.rng);
     ctx.state.reset_persistent_token(ctx.rng);
     ctx.state.needs_power_cycle = false;
@@ -262,8 +277,8 @@ fn change_pin<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [u8]
 
 fn get_pin_token<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [u8]) -> CtapResult {
     let proto = require_pin_inputs(req, false, true)?;
-    let mut permissions = req.permissions as u8;
-    if req.subcommand == 0x5 {
+    let permissions = req.permissions as u8;
+    if req.subcommand == CP_GET_PIN_TOKEN {
         if req.permissions != 0 || req.rp_id.is_some() {
             return Err(CtapError::InvalidParameter);
         }
@@ -292,7 +307,7 @@ fn get_pin_token<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [
         shared.zeroize();
         return Err(CtapError::PinAuthInvalid);
     }
-    if let Err(e) = verify_pin_hash(ctx, &pin_hash[..16]) {
+    if let Err(e) = spend_and_verify_pin_hash(ctx, &pin_hash[..16]) {
         shared.zeroize();
         pin_hash.zeroize();
         return Err(e);
@@ -309,25 +324,45 @@ fn get_pin_token<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [
     // (0x37) (ClientPin2-GetPinUvAuthTokenUsingPinWithPermissions F-1). The PIN
     // verify above already succeeded, so the retry counter is untouched either way.
     if force_change_pending(ctx) {
-        return Err(if req.subcommand == 0x5 {
+        return Err(if req.subcommand == CP_GET_PIN_TOKEN {
             CtapError::PinInvalid
         } else {
             CtapError::PinPolicyViolation
         });
     }
 
-    // Build the token and return it encrypted under the shared secret.
+    // The legacy getPinToken (0x05) grants the fixed mc|ga permission set; the
+    // permissions-based variant (0x09) uses exactly what was requested.
+    let permissions = if req.subcommand == CP_GET_PIN_TOKEN {
+        PERM_MC | PERM_GA
+    } else {
+        permissions
+    };
+    let res = issue_token(ctx, proto, secret, permissions, req.rp_id, out);
+    shared.zeroize();
+    res
+}
+
+/// Build the requested pinUvAuthToken, encrypt it under the ECDH `secret`, and
+/// write the clientPIN response. Shared by the PIN (0x05/0x09) and the built-in-UV
+/// (0x06) token paths once verification has already succeeded — the token itself
+/// is identical; only *how* the user verified differs.
+fn issue_token<S: Storage, R: Rng>(
+    ctx: &mut Ctx<S, R>,
+    proto: PinProto,
+    secret: &[u8],
+    permissions: u8,
+    rp_id: Option<&str>,
+    out: &mut [u8],
+) -> CtapResult {
     let pdata = if permissions & PERM_PCMR != 0 {
         ctx.state.ppaut_permissions = PERM_PCMR;
         ctx.state.ppaut_token
     } else {
         ctx.state.reset_pin_uv_auth_token(ctx.rng);
         ctx.state.begin_using_token(false);
-        if req.subcommand == 0x5 {
-            permissions = PERM_MC | PERM_GA;
-        }
         ctx.state.paut.permissions = permissions;
-        match req.rp_id {
+        match rp_id {
             Some(rp) => {
                 ctx.state.paut.rp_id_hash = sha256(rp.as_bytes());
                 ctx.state.paut.has_rp_id = true;
@@ -338,12 +373,101 @@ fn get_pin_token<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [
     };
 
     let mut token_enc = [0u8; 32 + 16];
-    let enc_len = pinproto::encrypt(proto, secret, &[0u8; 16], &pdata, &mut token_enc);
-    shared.zeroize();
-    let enc_len = enc_len.map_err(|_| CtapError::Other)?;
+    let enc_len = pinproto::encrypt(proto, secret, &[0u8; 16], &pdata, &mut token_enc)
+        .map_err(|_| CtapError::Other)?;
     ctx.state.needs_power_cycle = false;
     let len = encode(out, |e| {
         e.map(1)?.u8(2)?.bytes(&token_enc[..enc_len])?;
+        Ok(())
+    })?;
+    Ok(len)
+}
+
+/// `getPinUvAuthTokenUsingUvWithPermissions` (0x06): the built-in-UV counterpart of
+/// the permissions-based PIN token (0x09). Instead of the host sending the PIN, the
+/// user verifies on the device's own UI (the trusted-display PIN pad) — the PIN
+/// never crosses the host — and the same EF_PIN verifier is checked locally. Only
+/// reached on a build that advertises `options.uv` (gated in the dispatch).
+fn get_uv_token<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [u8]) -> CtapResult {
+    let proto = require_pin_inputs(req, false, false)?;
+    let permissions = req.permissions as u8;
+    // WithPermissions: a non-zero permission set is mandatory; bio-enrollment (be)
+    // is unsupported, and pcm-readonly (pcmr) may not be combined with anything else.
+    if req.permissions == 0 {
+        return Err(CtapError::InvalidParameter);
+    }
+    if permissions & PERM_BE != 0 {
+        return Err(CtapError::UnauthorizedPermission);
+    }
+    if permissions & PERM_PCMR != 0 && permissions != PERM_PCMR {
+        return Err(CtapError::UnauthorizedPermission);
+    }
+    // Built-in UV verifies the same EF_PIN as clientPIN and shares its retry budget.
+    pin_set_and_unblocked(ctx)?;
+    if ctx.state.needs_power_cycle {
+        return Err(CtapError::UvBlocked);
+    }
+
+    // The interactive step: collect the PIN on the device and verify it locally. A
+    // short entry (below minPINLength) is refused by the pad without a verify, so it
+    // can't burn a retry; an actual mismatch does, exactly like a host PIN.
+    let min = min_pin_length(ctx.fs) as usize;
+    let mut pin = [0u8; PADDED_PIN_LEN];
+    let entry = ctx.presence.collect_pin(min, &mut pin);
+    let verified = perform_builtin_uv(ctx, entry, &pin);
+    pin.zeroize();
+    verified?;
+
+    // A pending forced PIN change still blocks token issuance (changePIN first).
+    if force_change_pending(ctx) {
+        return Err(CtapError::PinPolicyViolation);
+    }
+
+    let mut shared = [0u8; 64];
+    let slen = derive_shared(ctx, req, proto, &mut shared)?;
+    let res = issue_token(ctx, proto, &shared[..slen], permissions, req.rp_id, out);
+    shared.zeroize();
+    res
+}
+
+/// Verify a PIN entered via built-in UV against EF_PIN, mapping the entry outcome
+/// and translating the host-PIN error dialect of [`spend_and_verify_pin_hash`] into the
+/// built-in-UV codes a platform expects (UV_INVALID / UV_BLOCKED). A non-entry
+/// (decline / timeout / cancel) returns before the verify, so it never spends a
+/// retry; only a real mismatch does.
+fn perform_builtin_uv<S: Storage, R: Rng>(
+    ctx: &mut Ctx<S, R>,
+    entry: PinEntry,
+    pin: &[u8],
+) -> Result<(), CtapError> {
+    let len = match entry {
+        PinEntry::Entered(len) => len.min(pin.len()),
+        PinEntry::Declined => return Err(CtapError::OperationDenied),
+        PinEntry::Timeout => return Err(CtapError::UserActionTimeout),
+        PinEntry::Cancelled => return Err(CtapError::KeepAliveCancel),
+        PinEntry::Unsupported => return Err(CtapError::UnsupportedOption),
+    };
+    let mut dhash = sha256(&pin[..len]);
+    let res = spend_and_verify_pin_hash(ctx, &dhash[..16]);
+    dhash.zeroize();
+    res.map_err(|e| match e {
+        CtapError::PinInvalid => CtapError::UvInvalid,
+        CtapError::PinBlocked | CtapError::PinAuthBlocked => CtapError::UvBlocked,
+        other => other,
+    })
+}
+
+/// `getUVRetries` (0x07): the built-in-UV retry budget. Built-in UV verifies the
+/// same EF_PIN as clientPIN and shares its counter, so this mirrors getPINRetries
+/// (response key 0x05 `uvRetries`, plus 0x04 `powerCycleState` while soft-locked).
+fn get_uv_retries<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, out: &mut [u8]) -> CtapResult {
+    let retries = pin_retries(ctx);
+    let pc = ctx.state.needs_power_cycle;
+    let len = encode(out, |e| {
+        e.map(if pc { 2 } else { 1 })?.u8(5)?.u8(retries)?;
+        if pc {
+            e.u8(4)?.bool(true)?;
+        }
         Ok(())
     })?;
     Ok(len)
@@ -405,7 +529,7 @@ fn derive_shared<S: Storage, R: Rng>(
 
 /// Compare a candidate 16-byte PIN hash against the stored verifier. Decrements
 /// the retry counter first; on mismatch applies the lockout ladder.
-fn verify_pin_hash<S: Storage, R: Rng>(
+fn spend_and_verify_pin_hash<S: Storage, R: Rng>(
     ctx: &mut Ctx<S, R>,
     pin_hash: &[u8],
 ) -> Result<(), CtapError> {
@@ -416,6 +540,13 @@ fn verify_pin_hash<S: Storage, R: Rng>(
         .ok_or(CtapError::PinNotSet)?;
     if n != PIN_FILE_LEN {
         return Err(CtapError::Other);
+    }
+    // Self-defend the decrement rather than trusting the external
+    // pin_set_and_unblocked() gate: release builds have no overflow-checks, so a
+    // future caller reaching here at 0 would wrap the retry budget to 255. The
+    // sibling spend_and_verify_pin_at has the same in-function guard.
+    if pin_data[0] == 0 {
+        return Err(CtapError::PinBlocked);
     }
     pin_data[0] -= 1;
     ctx.fs
@@ -475,11 +606,32 @@ fn verify_pin_hash<S: Storage, R: Rng>(
     Ok(())
 }
 
-/// Validate the padded new PIN and store the EF_PIN verifier. The seed is not
-/// touched — it stays kbase-only so UP-only operations keep working.
+/// Hash the PIN, derive its device-sealed verifier, and persist it to `EF_PIN` with a
+/// fresh retry budget — the storage core shared by the host set/change path
+/// ([`store_new_pin`]) and the device-local set ([`store_local_pin`]). It enforces no
+/// policy and touches no CTAP session state; the callers do. The seed is not touched —
+/// it stays kbase-only so UP-only operations keep working.
+fn write_pin_verifier<S: Storage>(
+    fid: u16,
+    dev: &Device,
+    fs: &mut Fs<S>,
+    pin: &[u8],
+) -> Result<(), CtapError> {
+    let mut dhash = sha256(pin);
+    let mut pin_data = [0u8; PIN_FILE_LEN];
+    pin_data[0] = MAX_PIN_RETRIES;
+    pin_data[1] = pin.len() as u8;
+    pin_data[2] = 1; // verifier format 1
+    pin_data[3..].copy_from_slice(&dev.pin_derive_verifier(&dhash[..16]));
+    dhash.zeroize();
+    fs.put(fid, &pin_data).map_err(|_| CtapError::Other)
+}
+
+/// Validate the padded new PIN and store the EF_PIN verifier (the host setPIN/changePIN
+/// path).
 fn store_new_pin<S: Storage, R: Rng>(
     ctx: &mut Ctx<S, R>,
-    padded: &[u8; 64],
+    padded: &[u8; PADDED_PIN_LEN],
 ) -> Result<(), CtapError> {
     if padded[PADDED_PIN_LEN - 1] != 0 {
         return Err(CtapError::PinPolicyViolation);
@@ -488,27 +640,21 @@ fn store_new_pin<S: Storage, R: Rng>(
         .iter()
         .position(|&b| b == 0)
         .unwrap_or(PADDED_PIN_LEN);
-    let min_pin = min_pin_length(ctx);
+    let min_pin = min_pin_length(ctx.fs);
     if (pin_len as u8) < min_pin {
         return Err(CtapError::PinPolicyViolation);
     }
-    let mut dhash = sha256(&padded[..pin_len]);
-    let mut pin_data = [0u8; PIN_FILE_LEN];
-    pin_data[0] = MAX_PIN_RETRIES;
-    pin_data[1] = pin_len as u8;
-    pin_data[2] = 1; // verifier format 1
-    pin_data[3..].copy_from_slice(&ctx.dev.pin_derive_verifier(&dhash[..16]));
-    dhash.zeroize();
-    ctx.fs
-        .put(EF_PIN, &pin_data)
-        .map_err(|_| CtapError::Other)?;
+    write_pin_verifier(EF_PIN, &ctx.dev, ctx.fs, &padded[..pin_len])?;
     ctx.state.needs_power_cycle = false;
     Ok(())
 }
 
-fn min_pin_length<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>) -> u8 {
+/// The configured minimum PIN length (`EF_MINPINLEN[0]`), or the CTAP default when no
+/// policy is set. Takes `Fs` directly (not a `Ctx`) so the trusted-display set-PIN flow
+/// can read the floor it must enforce without a `Ctx` it does not hold.
+pub fn min_pin_length<S: Storage>(fs: &mut Fs<S>) -> u8 {
     let mut buf = [0u8; 2];
-    match ctx.fs.read(EF_MINPINLEN, &mut buf) {
+    match fs.read(EF_MINPINLEN, &mut buf) {
         Some(n) if n >= 1 => buf[0],
         _ => MIN_PIN_LENGTH,
     }
@@ -522,15 +668,14 @@ fn force_change_pending<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>) -> bool {
 
 /// A successful changePIN satisfies the policy: drop the flag, keep the
 /// minimum and the RP-id hash list (EF_MINPINLEN = [min, force, hashes…]).
-fn clear_force_change<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>) -> Result<(), CtapError> {
-    let mut buf = [0u8; 2 + 32 * 8]; // matches config's MAX_MIN_PIN_RPIDS cap
-    if let Some(n) = ctx.fs.read(EF_MINPINLEN, &mut buf)
+fn clear_force_change<S: Storage>(fs: &mut Fs<S>) -> Result<(), CtapError> {
+    let mut buf = [0u8; 2 + 32 * MAX_MIN_PIN_RPIDS];
+    if let Some(n) = fs.read(EF_MINPINLEN, &mut buf)
         && n >= 2
         && buf[1] != 0
     {
         buf[1] = 0;
-        ctx.fs
-            .put(EF_MINPINLEN, &buf[..n])
+        fs.put(EF_MINPINLEN, &buf[..n])
             .map_err(|_| CtapError::Other)?;
     }
     Ok(())
@@ -538,6 +683,226 @@ fn clear_force_change<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>) -> Result<(), Cta
 
 fn pinproto_ct_eq(a: &[u8], b: &[u8]) -> bool {
     rsk_crypto::ct_eq(a, b)
+}
+
+/// Outcome of a device-local PIN verify ([`spend_and_verify_local_pin`]).
+pub enum LocalPin {
+    /// Correct PIN; the retry counter was reset to the full budget.
+    Ok,
+    /// Wrong PIN; `retries_left` attempts remain before the hard lock.
+    Wrong { retries_left: u8 },
+    /// No PIN set, the retry budget is spent, or a flash glitch was caught on
+    /// read-back — the gated action must not proceed.
+    Blocked,
+}
+
+/// Why a device-local PIN set/change ([`store_local_pin`]) was refused.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SetPinError {
+    /// The new PIN is shorter than the configured `minPINLength`; `min` is that floor.
+    TooShort { min: u8 },
+    /// The new PIN is longer than [`MAX_PIN_LENGTH`] — the host clientPIN path could not
+    /// represent it, so it is refused here too; `max` is that ceiling.
+    TooLong { max: u8 },
+    /// The `EF_PIN` write failed (flash error) — no PIN was stored.
+    Storage,
+}
+
+/// Whether a clientPIN is set. The trusted display gates a destructive local
+/// action behind the PIN only when one exists (otherwise the hold gesture alone
+/// stands in for user verification).
+pub fn pin_is_set<S: Storage>(fs: &mut Fs<S>) -> bool {
+    fs.has_data(EF_PIN)
+}
+
+/// The PIN's remaining retry budget (the `EF_PIN` counter), or `None` when no PIN is
+/// set. Read-only — unlike [`spend_and_verify_local_pin`] it never decrements — so the trusted
+/// display can show "N tries remaining" up front on the unlock pad without spending a
+/// try. It is the same persistent counter the host clientPIN path enforces.
+pub fn pin_retries_left<S: Storage>(fs: &mut Fs<S>) -> Option<u8> {
+    retries_left_at(EF_PIN, fs)
+}
+
+/// Whether the trusted-display **device PIN** ([`EF_DEVICE_PIN`]) is set. The display
+/// boot-locks and gates its destructive on-device actions on this, not the FIDO clientPIN.
+pub fn device_pin_is_set<S: Storage>(fs: &mut Fs<S>) -> bool {
+    fs.has_data(EF_DEVICE_PIN)
+}
+
+/// The device PIN's remaining retry budget (read-only, like [`pin_retries_left`]).
+pub fn device_pin_retries_left<S: Storage>(fs: &mut Fs<S>) -> Option<u8> {
+    retries_left_at(EF_DEVICE_PIN, fs)
+}
+
+/// Read the retry counter from a PIN record (`fid`'s byte 0) without decrementing it.
+fn retries_left_at<S: Storage>(fid: u16, fs: &mut Fs<S>) -> Option<u8> {
+    let mut pin_data = [0u8; PIN_FILE_LEN];
+    let out = match fs.read(fid, &mut pin_data) {
+        Some(PIN_FILE_LEN) => Some(pin_data[0]),
+        _ => None,
+    };
+    pin_data.zeroize();
+    out
+}
+
+/// Verify a PIN typed on the device's own pad for a display-initiated action (a
+/// local Passkeys delete — there is no host and no CTAP session). It reuses
+/// [`spend_and_verify_pin_hash`]'s persistent anti-bruteforce gate verbatim — the EF_PIN
+/// retry counter is decremented before the compare and read back fail-closed, a
+/// correct PIN resets it and migrates a legacy PIN-wrapped seed, a wrong attempt
+/// at zero is a hard block — but deliberately omits the CTAP-session side effects
+/// (`state.regenerate`, the RAM 3-strikes power-cycle lock, the journal) that are
+/// meaningless off the host path and need a `Ctx` the display task does not hold.
+/// The persistent 8-try counter is the real gate and is identical here, so this
+/// opens no faster path to grind the PIN than USB already does. The caller
+/// zeroizes `pin`.
+pub fn spend_and_verify_local_pin<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    pin: &[u8],
+) -> LocalPin {
+    spend_and_verify_pin_at(EF_PIN, dev, fs, pin, true)
+}
+
+/// Verify the trusted-display **device PIN** ([`EF_DEVICE_PIN`]) — the same fail-closed
+/// retry-counter gate as [`spend_and_verify_local_pin`], but against the device PIN's own record and
+/// **without** the seed migration (the device PIN never wraps the seed; that is the FIDO
+/// clientPIN's job). Used by the display lock / on-device delete / factory-reset gates.
+pub fn spend_and_verify_device_pin<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    pin: &[u8],
+) -> LocalPin {
+    spend_and_verify_pin_at(EF_DEVICE_PIN, dev, fs, pin, false)
+}
+
+/// Shared core for the device-local PIN verifies. Reads `fid`'s `[retries, len, format,
+/// verifier]` record, decrements the counter **before** the compare and reads it back
+/// fail-closed, resets it on a match, and (only when `migrate_seed`) migrates a legacy
+/// PIN-wrapped seed — the EF_PIN path keeps that; the device PIN does not. The caller
+/// zeroizes `pin`.
+fn spend_and_verify_pin_at<S: Storage>(
+    fid: u16,
+    dev: &Device,
+    fs: &mut Fs<S>,
+    pin: &[u8],
+    migrate_seed: bool,
+) -> LocalPin {
+    let mut pin_data = [0u8; PIN_FILE_LEN];
+    let Some(n) = fs.read(fid, &mut pin_data) else {
+        return LocalPin::Blocked;
+    };
+    if n != PIN_FILE_LEN || pin_data[0] == 0 {
+        return LocalPin::Blocked;
+    }
+    pin_data[0] -= 1;
+    if fs.put(fid, &pin_data).is_err() {
+        return LocalPin::Blocked;
+    }
+    // Trust the decremented counter only after reading it back — the same
+    // fail-closed anti-glitch gate `spend_and_verify_pin_hash` applies (a torn program could
+    // otherwise persist the old, higher count while RAM marched on).
+    let mut readback = [0u8; PIN_FILE_LEN];
+    match fs.read(fid, &mut readback) {
+        Some(PIN_FILE_LEN) if readback[0] == pin_data[0] => {}
+        _ => return LocalPin::Blocked,
+    }
+    let retries = pin_data[0];
+
+    let mut pin_hash = sha256(pin);
+    let cand = dev.pin_derive_verifier(&pin_hash[..16]);
+    let mut matched = pinproto_ct_eq(&cand, &pin_data[3..PIN_FILE_LEN]);
+    if !matched && dev.otp_key.is_some() {
+        // Pre-OTP verifier fallback, identical to `spend_and_verify_pin_hash`.
+        let cand_old = dev.without_otp().pin_derive_verifier(&pin_hash[..16]);
+        if pinproto_ct_eq(&cand_old, &pin_data[3..PIN_FILE_LEN]) {
+            pin_data[3..PIN_FILE_LEN].copy_from_slice(&cand);
+            matched = true;
+        }
+    }
+    if !matched {
+        pin_hash.zeroize();
+        if retries == 0 {
+            return LocalPin::Blocked;
+        }
+        return LocalPin::Wrong {
+            retries_left: retries,
+        };
+    }
+
+    // Correct PIN: for the FIDO clientPIN, migrate a legacy PIN-wrapped seed (only
+    // openable now) before resetting the counter; the device PIN has no seed to migrate.
+    // Fail closed if a required flash write fails.
+    if migrate_seed {
+        let migrated = migrate_keydev_pin(dev, fs, &pin_hash[..16]).is_ok();
+        pin_hash.zeroize();
+        if !migrated {
+            return LocalPin::Blocked;
+        }
+    } else {
+        pin_hash.zeroize();
+    }
+    pin_data[0] = MAX_PIN_RETRIES;
+    if fs.put(fid, &pin_data).is_err() {
+        return LocalPin::Blocked;
+    }
+    LocalPin::Ok
+}
+
+/// Set or replace the device PIN from the trusted display (the on-device Set / Change
+/// PIN flow). Writes the same `EF_PIN` verifier the host setPIN/changePIN path stores —
+/// device-sealed, format 1, with a fresh retry budget — so the host afterwards sees a
+/// clientPIN exactly as if it had been set over USB. It enforces both `minPINLength` and
+/// the host-representable [`MAX_PIN_LENGTH`] ceiling (so a panel-set PIN stays usable over
+/// USB) but, mirroring [`spend_and_verify_local_pin`], deliberately omits the CTAP-session
+/// side effects (token regeneration, the journal) that need a `Ctx` the display task
+/// does not hold and are meaningless with no host session. The CALLER verifies the
+/// *current* PIN first when one is set (so a change still proves knowledge of the old
+/// PIN) and zeroizes `pin`. A pending forced-PIN-change flag is cleared best-effort
+/// since a satisfied new PIN meets the policy.
+pub fn store_local_pin<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    pin: &[u8],
+) -> Result<(), SetPinError> {
+    let min = min_pin_length(fs);
+    if (pin.len() as u8) < min {
+        return Err(SetPinError::TooShort { min });
+    }
+    if pin.len() > MAX_PIN_LENGTH {
+        return Err(SetPinError::TooLong {
+            max: MAX_PIN_LENGTH as u8,
+        });
+    }
+    write_pin_verifier(EF_PIN, dev, fs, pin).map_err(|_| SetPinError::Storage)?;
+    // The new PIN meets the policy, so drop any pending forced-change marker. The PIN is
+    // already stored, so a flash hiccup here is benign (a stale flag only re-prompts a
+    // change on the host) — don't fail the set over it.
+    let _ = clear_force_change(fs);
+    Ok(())
+}
+
+/// Set or replace the trusted-display **device PIN** ([`EF_DEVICE_PIN`]) — the same
+/// device-sealed, format-1 verifier with a fresh retry budget as the FIDO clientPIN, but
+/// in its own record and **independent** of it (no `minPINLength` policy, no forced-change
+/// flag — those are FIDO-side; the device PIN's floor is the fixed [`MIN_PIN_LENGTH`]).
+/// The caller verifies the *current* device PIN first when one is set, and zeroizes `pin`.
+pub fn store_device_pin<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    pin: &[u8],
+) -> Result<(), SetPinError> {
+    if (pin.len() as u8) < MIN_PIN_LENGTH {
+        return Err(SetPinError::TooShort {
+            min: MIN_PIN_LENGTH,
+        });
+    }
+    if pin.len() > MAX_PIN_LENGTH {
+        return Err(SetPinError::TooLong {
+            max: MAX_PIN_LENGTH as u8,
+        });
+    }
+    write_pin_verifier(EF_DEVICE_PIN, dev, fs, pin).map_err(|_| SetPinError::Storage)
 }
 
 fn encode<F>(out: &mut [u8], f: F) -> Result<usize, CtapError>
@@ -552,811 +917,5 @@ where
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::FidoState;
-    use crate::consts::EF_KEY_DEV;
-    use crate::seed::{ensure_seed, load_keydev};
-    use rsk_crypto::Device;
-    use rsk_crypto::pinproto::public_xy;
-    use rsk_fs::Fs;
-    use rsk_fs::storage::ram::RamStorage;
-
-    struct SeqRng(u64);
-    impl Rng for SeqRng {
-        fn fill(&mut self, buf: &mut [u8]) {
-            for b in buf.iter_mut() {
-                self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
-                *b = (self.0 >> 33) as u8;
-            }
-        }
-    }
-
-    fn dev() -> Device<'static> {
-        Device {
-            serial_hash: &[0xAB; 32],
-            serial_id: &[1, 2, 3, 4, 5, 6, 7, 8],
-            otp_key: None,
-        }
-    }
-
-    fn setup() -> (Fs<RamStorage>, SeqRng) {
-        let mut fs = Fs::new(RamStorage::new(), &[]);
-        let mut rng = SeqRng(1);
-        ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
-        (fs, rng)
-    }
-
-    fn run(
-        fs: &mut Fs<RamStorage>,
-        rng: &mut SeqRng,
-        state: &mut FidoState,
-        data: &[u8],
-        out: &mut [u8],
-    ) -> CtapResult {
-        let mut presence = crate::AlwaysConfirm;
-        let mut ctx = Ctx {
-            presence: &mut presence,
-            dev: dev(),
-            fs,
-            rng,
-            state,
-            now_ms: 0,
-        };
-        client_pin(&mut ctx, data, out)
-    }
-
-    // A clientPIN request field value.
-    enum V<'a> {
-        U(u64),
-        B(&'a [u8]),
-        Cose(&'a [u8; 32], &'a [u8; 32]),
-    }
-
-    fn build(fields: &[(u8, V)]) -> std::vec::Vec<u8> {
-        let mut buf = [0u8; 1024];
-        let n = {
-            let mut e = Encoder::new(Cursor::new(&mut buf[..]));
-            e.map(fields.len() as u64).unwrap();
-            for (k, v) in fields {
-                e.u8(*k).unwrap();
-                match v {
-                    V::U(x) => {
-                        e.u64(*x).unwrap();
-                    }
-                    V::B(b) => {
-                        e.bytes(b).unwrap();
-                    }
-                    V::Cose(x, y) => cose_key_ecdh(&mut e, x, y).unwrap(),
-                }
-            }
-            e.writer().position()
-        };
-        buf[..n].to_vec()
-    }
-
-    // The platform's ephemeral key + the shared secret with the authenticator.
-    struct Platform {
-        proto: PinProto,
-        wire: u64,
-        x: [u8; 32],
-        y: [u8; 32],
-        shared: [u8; 64],
-        slen: usize,
-    }
-
-    fn key_agreement(
-        fs: &mut Fs<RamStorage>,
-        rng: &mut SeqRng,
-        state: &mut FidoState,
-        proto: PinProto,
-        wire: u64,
-    ) -> Platform {
-        let req = build(&[(1, V::U(wire)), (2, V::U(2))]);
-        let mut out = [0u8; 256];
-        let n = run(fs, rng, state, &req, &mut out).unwrap();
-        // { 1: { 1:2, 3:-25, -1:1, -2:x, -3:y } }
-        let mut d = Decoder::new(&out[..n]);
-        assert_eq!(d.map().unwrap().unwrap(), 1);
-        assert_eq!(d.u8().unwrap(), 1);
-        assert_eq!(d.map().unwrap().unwrap(), 5);
-        assert_eq!(d.u8().unwrap(), 1);
-        assert_eq!(d.u8().unwrap(), 2);
-        assert_eq!(d.u8().unwrap(), 3);
-        assert_eq!(d.i64().unwrap(), crate::consts::ALG_ECDH_ES_HKDF_256);
-        assert_eq!(d.i8().unwrap(), -1);
-        assert_eq!(d.u8().unwrap(), 1);
-        assert_eq!(d.i8().unwrap(), -2);
-        let mut ax = [0u8; 32];
-        ax.copy_from_slice(d.bytes().unwrap());
-        assert_eq!(d.i8().unwrap(), -3);
-        let mut ay = [0u8; 32];
-        ay.copy_from_slice(d.bytes().unwrap());
-
-        // The authenticator's key must be a valid P-256 point.
-        let pscalar = {
-            let mut s = [0u8; 32];
-            s[31] = 0x42;
-            s[0] = 0x13;
-            s
-        };
-        let (x, y) = public_xy(&pscalar).unwrap();
-        let mut shared = [0u8; 64];
-        let slen = pinproto::ecdh(proto, &pscalar, &ax, &ay, &mut shared).unwrap();
-        Platform {
-            proto,
-            wire,
-            x,
-            y,
-            shared,
-            slen,
-        }
-    }
-
-    impl Platform {
-        fn secret(&self) -> &[u8] {
-            &self.shared[..self.slen]
-        }
-
-        // Encrypt a value with a fixed IV (deterministic test vectors).
-        fn enc(&self, pt: &[u8]) -> std::vec::Vec<u8> {
-            let mut out = [0u8; 96];
-            let n =
-                pinproto::encrypt(self.proto, self.secret(), &[0x55; 16], pt, &mut out).unwrap();
-            out[..n].to_vec()
-        }
-
-        fn mac(&self, data: &[u8]) -> std::vec::Vec<u8> {
-            let mut out = [0u8; 32];
-            let n = pinproto::authenticate(self.proto, self.secret(), data, &mut out).unwrap();
-            out[..n].to_vec()
-        }
-
-        fn set_pin_req(&self, pin: &[u8]) -> std::vec::Vec<u8> {
-            let mut padded = [0u8; 64];
-            padded[..pin.len()].copy_from_slice(pin);
-            let npe = self.enc(&padded);
-            let puap = self.mac(&npe);
-            build(&[
-                (1, V::U(self.wire)),
-                (2, V::U(3)),
-                (3, V::Cose(&self.x, &self.y)),
-                (4, V::B(&puap)),
-                (5, V::B(&npe)),
-            ])
-        }
-
-        fn get_token_req(&self, pin: &[u8]) -> std::vec::Vec<u8> {
-            let h = sha256(pin);
-            let phe = self.enc(&h[..16]);
-            build(&[
-                (1, V::U(self.wire)),
-                (2, V::U(5)),
-                (3, V::Cose(&self.x, &self.y)),
-                (6, V::B(&phe)),
-            ])
-        }
-
-        // getPinUvAuthTokenUsingPinWithPermissions (subCommand 9) with `perms`.
-        fn get_token_perms_req(&self, pin: &[u8], perms: u64) -> std::vec::Vec<u8> {
-            let h = sha256(pin);
-            let phe = self.enc(&h[..16]);
-            build(&[
-                (1, V::U(self.wire)),
-                (2, V::U(9)),
-                (3, V::Cose(&self.x, &self.y)),
-                (6, V::B(&phe)),
-                (9, V::U(perms)),
-            ])
-        }
-
-        fn change_pin_req(&self, old: &[u8], new: &[u8]) -> std::vec::Vec<u8> {
-            let mut padded = [0u8; 64];
-            padded[..new.len()].copy_from_slice(new);
-            let npe = self.enc(&padded);
-            let oh = sha256(old);
-            let phe = self.enc(&oh[..16]);
-            let mut macd = npe.clone();
-            macd.extend_from_slice(&phe);
-            let puap = self.mac(&macd);
-            build(&[
-                (1, V::U(self.wire)),
-                (2, V::U(4)),
-                (3, V::Cose(&self.x, &self.y)),
-                (4, V::B(&puap)),
-                (5, V::B(&npe)),
-                (6, V::B(&phe)),
-            ])
-        }
-
-        // Decrypt the pinUvAuthToken from a getPinToken response.
-        fn decrypt_token(&self, resp: &[u8]) -> [u8; 32] {
-            let mut d = Decoder::new(resp);
-            assert_eq!(d.map().unwrap().unwrap(), 1);
-            assert_eq!(d.u8().unwrap(), 2);
-            let enc = d.bytes().unwrap();
-            let mut tok = [0u8; 32];
-            let n = pinproto::decrypt(self.proto, self.secret(), enc, &mut tok).unwrap();
-            assert_eq!(n, 32);
-            tok
-        }
-    }
-
-    fn set_and_get_token(proto: PinProto, wire: u64) {
-        let (mut fs, mut rng) = setup();
-        let mut state = FidoState::new();
-        let plat = key_agreement(&mut fs, &mut rng, &mut state, proto, wire);
-
-        // setPIN replies with only the status byte (empty body).
-        let mut out = [0u8; 256];
-        let n = run(
-            &mut fs,
-            &mut rng,
-            &mut state,
-            &plat.set_pin_req(b"1234"),
-            &mut out,
-        )
-        .unwrap();
-        assert_eq!(n, 0);
-        assert!(fs.has_data(EF_PIN));
-
-        // getPinToken returns the encrypted token; it decrypts to paut.token.
-        let n = run(
-            &mut fs,
-            &mut rng,
-            &mut state,
-            &plat.get_token_req(b"1234"),
-            &mut out,
-        )
-        .unwrap();
-        let token = plat.decrypt_token(&out[..n]);
-        assert_eq!(token, state.paut.token);
-        assert_eq!(state.paut.permissions, PERM_MC | PERM_GA);
-    }
-
-    #[test]
-    fn set_pin_then_get_token_protocol_two() {
-        set_and_get_token(PinProto::Two, 2);
-    }
-
-    #[test]
-    fn set_pin_then_get_token_protocol_one() {
-        set_and_get_token(PinProto::One, 1);
-    }
-
-    #[test]
-    fn set_pin_over_max_length_is_policy_violation() {
-        // A new PIN longer than 63 bytes (padded > 64) must be a
-        // PIN_POLICY_VIOLATION, not INVALID_PARAMETER — conformance
-        // ClientPin2-Policy F-2. Protocol 2's 16-byte IV pushed the 96-byte
-        // ciphertext past the strict `== 80` guard, wrongly yielding 0x02.
-        let (mut fs, mut rng) = setup();
-        let mut state = FidoState::new();
-        let plat = key_agreement(&mut fs, &mut rng, &mut state, PinProto::Two, 2);
-        // 80-byte padded block → an over-length PIN; encrypts to 96 bytes (> 80).
-        let padded = [0x31u8; 80];
-        let npe = plat.enc(&padded);
-        let puap = plat.mac(&npe);
-        let req = build(&[
-            (1, V::U(plat.wire)),
-            (2, V::U(3)),
-            (3, V::Cose(&plat.x, &plat.y)),
-            (4, V::B(&puap)),
-            (5, V::B(&npe)),
-        ]);
-        let mut out = [0u8; 64];
-        assert_eq!(
-            run(&mut fs, &mut rng, &mut state, &req, &mut out),
-            Err(CtapError::PinPolicyViolation)
-        );
-    }
-
-    #[cfg(feature = "fips-profile")]
-    #[test]
-    fn fips_min_pin_floor_is_six() {
-        let (mut fs, mut rng) = setup();
-        let mut state = FidoState::new();
-        let plat = key_agreement(&mut fs, &mut rng, &mut state, PinProto::Two, 2);
-        let mut out = [0u8; 256];
-        // Four code points sit under the profile's floor…
-        assert_eq!(
-            run(
-                &mut fs,
-                &mut rng,
-                &mut state,
-                &plat.set_pin_req(b"1234"),
-                &mut out
-            ),
-            Err(CtapError::PinPolicyViolation)
-        );
-        // …six pass.
-        run(
-            &mut fs,
-            &mut rng,
-            &mut state,
-            &plat.set_pin_req(b"123456"),
-            &mut out,
-        )
-        .unwrap();
-        assert!(fs.has_data(EF_PIN));
-    }
-
-    #[test]
-    fn forced_pin_change_blocks_tokens_until_change_pin() {
-        let (mut fs, mut rng) = setup();
-        let mut state = FidoState::new();
-        let plat = key_agreement(&mut fs, &mut rng, &mut state, PinProto::Two, 2);
-        let mut out = [0u8; 256];
-        run(
-            &mut fs,
-            &mut rng,
-            &mut state,
-            &plat.set_pin_req(b"1234"),
-            &mut out,
-        )
-        .unwrap();
-
-        // setMinPINLength(forceChangePin) state: [min, force, rpIdHash…].
-        let mut mp = [0u8; 2 + 32];
-        mp[0] = 4;
-        mp[1] = 1;
-        mp[2..].copy_from_slice(&sha256(b"example.com"));
-        fs.put(EF_MINPINLEN, &mp).unwrap();
-
-        // The *correct* PIN is refused while the flag is up. Via the legacy
-        // getPinToken (0x05) the code is PIN_INVALID (the conformance tool's
-        // ClientPin2-GetPinToken F-5; 0x09 instead uses POLICY_VIOLATION — see
-        // `forced_pin_change_0x09_is_policy_violation`). The verify already
-        // succeeded, so this is not a failed verify and the retry counter stays full.
-        assert_eq!(
-            run(
-                &mut fs,
-                &mut rng,
-                &mut state,
-                &plat.get_token_req(b"1234"),
-                &mut out
-            ),
-            Err(CtapError::PinInvalid)
-        );
-        let mut pf = [0u8; PIN_FILE_LEN];
-        assert_eq!(fs.read(EF_PIN, &mut pf), Some(PIN_FILE_LEN));
-        assert_eq!(pf[0], MAX_PIN_RETRIES);
-
-        // changePIN satisfies the policy: flag drops, min + RP list survive.
-        let n = run(
-            &mut fs,
-            &mut rng,
-            &mut state,
-            &plat.change_pin_req(b"1234", b"123456"),
-            &mut out,
-        )
-        .unwrap();
-        assert_eq!(n, 0);
-        let mut after = [0u8; 2 + 32];
-        assert_eq!(fs.read(EF_MINPINLEN, &mut after), Some(2 + 32));
-        assert_eq!(after[..2], [4, 0]);
-        assert_eq!(after[2..], mp[2..]);
-
-        // Tokens flow again with the new PIN.
-        run(
-            &mut fs,
-            &mut rng,
-            &mut state,
-            &plat.get_token_req(b"123456"),
-            &mut out,
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn forced_pin_change_0x09_is_policy_violation() {
-        // getPinUvAuthTokenUsingPinWithPermissions (0x09) reports a pending forced
-        // PIN change as PIN_POLICY_VIOLATION (0x37) — unlike the legacy getPinToken
-        // (0x05) above, which reports PIN_INVALID. The FIDO conformance
-        // ClientPin2-GetPinUvAuthTokenUsingPinWithPermissions F-1 asserts
-        // POLICY_VIOLATION, so a single shared code can satisfy only one of the two.
-        let (mut fs, mut rng) = setup();
-        let mut state = FidoState::new();
-        let plat = key_agreement(&mut fs, &mut rng, &mut state, PinProto::Two, 2);
-        let mut out = [0u8; 256];
-        run(
-            &mut fs,
-            &mut rng,
-            &mut state,
-            &plat.set_pin_req(b"1234"),
-            &mut out,
-        )
-        .unwrap();
-        let mut mp = [0u8; 2 + 32];
-        mp[0] = 4;
-        mp[1] = 1;
-        mp[2..].copy_from_slice(&sha256(b"example.com"));
-        fs.put(EF_MINPINLEN, &mp).unwrap();
-        assert_eq!(
-            run(
-                &mut fs,
-                &mut rng,
-                &mut state,
-                &plat.get_token_perms_req(b"1234", PERM_MC as u64),
-                &mut out
-            ),
-            Err(CtapError::PinPolicyViolation)
-        );
-    }
-
-    #[test]
-    fn seed_stays_loadable_after_pin_ops_and_legacy_wrap_migrates() {
-        let (mut fs, mut rng) = setup();
-        let mut state = FidoState::new();
-        let plat = key_agreement(&mut fs, &mut rng, &mut state, PinProto::Two, 2);
-
-        // Before a PIN, the seed loads.
-        let seed0 = load_keydev(&dev(), &mut fs).unwrap();
-
-        let mut out = [0u8; 256];
-        run(
-            &mut fs,
-            &mut rng,
-            &mut state,
-            &plat.set_pin_req(b"1234"),
-            &mut out,
-        )
-        .unwrap();
-        // Setting a PIN leaves the seed loadable with no session, so a
-        // power-cycled UP-only assertion keeps working.
-        assert_eq!(load_keydev(&dev(), &mut fs), Some(seed0));
-
-        // A legacy PIN-wrapped blob is unreadable (the UP-only failure window)…
-        let pin_hash = sha256(b"1234");
-        crate::seed::wrap_keydev_legacy(&dev(), &mut fs, &pin_hash[..16]);
-        assert_eq!(load_keydev(&dev(), &mut fs), None);
-
-        // …until the first successful PIN op of any boot migrates it back.
-        let mut state2 = FidoState::new();
-        let plat2 = key_agreement(&mut fs, &mut rng, &mut state2, PinProto::Two, 2);
-        let n = run(
-            &mut fs,
-            &mut rng,
-            &mut state2,
-            &plat2.get_token_req(b"1234"),
-            &mut out,
-        )
-        .unwrap();
-        let _ = plat2.decrypt_token(&out[..n]);
-        assert_eq!(load_keydev(&dev(), &mut fs), Some(seed0));
-    }
-
-    #[test]
-    fn wrong_pin_decrements_then_locks_out() {
-        let (mut fs, mut rng) = setup();
-        let mut state = FidoState::new();
-        let plat = key_agreement(&mut fs, &mut rng, &mut state, PinProto::Two, 2);
-        let mut out = [0u8; 256];
-        run(
-            &mut fs,
-            &mut rng,
-            &mut state,
-            &plat.set_pin_req(b"1234"),
-            &mut out,
-        )
-        .unwrap();
-
-        // First two wrong attempts: PinInvalid, retry counter drops.
-        for _ in 0..2 {
-            assert_eq!(
-                run(
-                    &mut fs,
-                    &mut rng,
-                    &mut state,
-                    &plat.get_token_req(b"9999"),
-                    &mut out
-                ),
-                Err(CtapError::PinInvalid)
-            );
-        }
-        // Third consecutive mismatch trips the per-boot lockout.
-        assert_eq!(
-            run(
-                &mut fs,
-                &mut rng,
-                &mut state,
-                &plat.get_token_req(b"9999"),
-                &mut out
-            ),
-            Err(CtapError::PinAuthBlocked)
-        );
-        assert!(state.needs_power_cycle);
-
-        // getPINRetries reflects the three decrements (8 -> 5) and powerCycleState.
-        let n = run(
-            &mut fs,
-            &mut rng,
-            &mut state,
-            &build(&[(1, V::U(2)), (2, V::U(1))]),
-            &mut out,
-        )
-        .unwrap();
-        let mut d = Decoder::new(&out[..n]);
-        assert_eq!(d.map().unwrap().unwrap(), 2);
-        assert_eq!(d.u8().unwrap(), 3);
-        assert_eq!(d.u8().unwrap(), MAX_PIN_RETRIES - 3);
-    }
-
-    #[test]
-    fn change_pin_then_new_pin_works_and_old_fails() {
-        let (mut fs, mut rng) = setup();
-        let mut state = FidoState::new();
-        let plat = key_agreement(&mut fs, &mut rng, &mut state, PinProto::Two, 2);
-        let mut out = [0u8; 256];
-        run(
-            &mut fs,
-            &mut rng,
-            &mut state,
-            &plat.set_pin_req(b"1234"),
-            &mut out,
-        )
-        .unwrap();
-
-        // changePIN replies with only the status byte.
-        let n = run(
-            &mut fs,
-            &mut rng,
-            &mut state,
-            &plat.change_pin_req(b"1234", b"5678"),
-            &mut out,
-        )
-        .unwrap();
-        assert_eq!(n, 0);
-
-        // The new PIN yields a token; the old PIN is now invalid.
-        assert!(
-            run(
-                &mut fs,
-                &mut rng,
-                &mut state,
-                &plat.get_token_req(b"5678"),
-                &mut out
-            )
-            .is_ok()
-        );
-        assert_eq!(
-            run(
-                &mut fs,
-                &mut rng,
-                &mut state,
-                &plat.get_token_req(b"1234"),
-                &mut out
-            ),
-            Err(CtapError::PinInvalid)
-        );
-    }
-
-    #[test]
-    fn set_pin_rejects_short_pin_and_double_set() {
-        let (mut fs, mut rng) = setup();
-        let mut state = FidoState::new();
-        let plat = key_agreement(&mut fs, &mut rng, &mut state, PinProto::Two, 2);
-        let mut out = [0u8; 256];
-        // 3-char PIN < minimum 4.
-        assert_eq!(
-            run(
-                &mut fs,
-                &mut rng,
-                &mut state,
-                &plat.set_pin_req(b"123"),
-                &mut out
-            ),
-            Err(CtapError::PinPolicyViolation)
-        );
-        // A valid set, then a second set is NotAllowed.
-        run(
-            &mut fs,
-            &mut rng,
-            &mut state,
-            &plat.set_pin_req(b"1234"),
-            &mut out,
-        )
-        .unwrap();
-        assert_eq!(
-            run(
-                &mut fs,
-                &mut rng,
-                &mut state,
-                &plat.set_pin_req(b"4321"),
-                &mut out
-            ),
-            Err(CtapError::NotAllowed)
-        );
-    }
-
-    #[test]
-    fn bad_pin_auth_param_rejected() {
-        let (mut fs, mut rng) = setup();
-        let mut state = FidoState::new();
-        let plat = key_agreement(&mut fs, &mut rng, &mut state, PinProto::Two, 2);
-        let mut out = [0u8; 256];
-        // A setPIN with a wrong (all-zero) pinUvAuthParam fails authentication.
-        let mut padded = [0u8; 64];
-        padded[..4].copy_from_slice(b"1234");
-        let npe = plat.enc(&padded);
-        let bad_mac = [0u8; 32];
-        let req = build(&[
-            (1, V::U(2)),
-            (2, V::U(3)),
-            (3, V::Cose(&plat.x, &plat.y)),
-            (4, V::B(&bad_mac[..plat.proto.mac_len()])),
-            (5, V::B(&npe)),
-        ]);
-        assert_eq!(
-            run(&mut fs, &mut rng, &mut state, &req, &mut out),
-            Err(CtapError::PinAuthInvalid)
-        );
-    }
-
-    #[test]
-    fn pin_verifier_and_pinwrapped_seed_migrate_at_verify() {
-        const OTP_KEY: [u8; 32] = [0x77; 32];
-        fn otp_dev() -> Device<'static> {
-            Device {
-                otp_key: Some(&OTP_KEY),
-                ..dev()
-            }
-        }
-
-        // Legacy pre-OTP state: seed exists, a PIN is set, and the seed was
-        // left PIN-wrapped (0x03).
-        let (mut fs, mut rng) = setup();
-        let seed0 = load_keydev(&dev(), &mut fs).unwrap();
-        let mut padded = [0u8; PADDED_PIN_LEN];
-        padded[..4].copy_from_slice(b"9246");
-        let mut state = FidoState::new();
-        {
-            let mut presence = crate::AlwaysConfirm;
-            let mut ctx = Ctx {
-                presence: &mut presence,
-                dev: dev(),
-                fs: &mut fs,
-                rng: &mut rng,
-                state: &mut state,
-                now_ms: 0,
-            };
-            store_new_pin(&mut ctx, &padded).unwrap();
-        }
-        let pin_hash = sha256(b"9246");
-        crate::seed::wrap_keydev_legacy(&dev(), &mut fs, &pin_hash[..16]);
-        let mut raw = [0u8; 61];
-        assert_eq!(fs.read(EF_KEY_DEV.get(), &mut raw), Some(61));
-        assert_eq!(raw[0], 0x03);
-
-        // The OTP build: first verify migrates the verifier and unwraps the
-        // seed straight to a plain 0x11, costing no retry.
-        let mut state2 = FidoState::new();
-        let mut presence = crate::AlwaysConfirm;
-        let mut ctx = Ctx {
-            presence: &mut presence,
-            dev: otp_dev(),
-            fs: &mut fs,
-            rng: &mut rng,
-            state: &mut state2,
-            now_ms: 0,
-        };
-        verify_pin_hash(&mut ctx, &pin_hash[..16]).unwrap();
-        let mut pin_rec = [0u8; PIN_FILE_LEN];
-        ctx.fs.read(EF_PIN, &mut pin_rec).unwrap();
-        assert_eq!(pin_rec[0], MAX_PIN_RETRIES);
-        assert_eq!(ctx.fs.read(EF_KEY_DEV.get(), &mut raw), Some(33));
-        assert_eq!(raw[0], 0x11);
-        assert_eq!(load_keydev(&otp_dev(), ctx.fs), Some(seed0));
-
-        // Second verify takes the direct path (verifier already re-stored).
-        let mut state3 = FidoState::new();
-        let mut presence3 = crate::AlwaysConfirm;
-        let mut ctx3 = Ctx {
-            presence: &mut presence3,
-            dev: otp_dev(),
-            fs: &mut fs,
-            rng: &mut rng,
-            state: &mut state3,
-            now_ms: 0,
-        };
-        verify_pin_hash(&mut ctx3, &pin_hash[..16]).unwrap();
-    }
-
-    #[test]
-    fn pin_verify_fails_closed_when_the_retry_write_does_not_persist() {
-        use std::cell::Cell;
-        use std::rc::Rc;
-
-        // A backend that, once armed, accepts the EF_PIN write (returns Ok) but
-        // silently fails to persist it — modelling a glitch / partial flash
-        // program. The decremented retry counter never reaches storage, so a later
-        // read sees the stale (higher) count: exactly what verify_pin_hash's
-        // read-back must catch before trusting the count.
-        struct StaleEfPin {
-            inner: RamStorage,
-            drop_ef_pin_writes: Rc<Cell<bool>>,
-        }
-        impl Storage for StaleEfPin {
-            fn read(&mut self, fid: u16, buf: &mut [u8]) -> Option<usize> {
-                self.inner.read(fid, buf)
-            }
-            fn write(&mut self, fid: u16, data: &[u8]) -> rsk_sdk::error::Result<()> {
-                if fid == EF_PIN && self.drop_ef_pin_writes.get() {
-                    return Ok(()); // reports success, persists nothing
-                }
-                self.inner.write(fid, data)
-            }
-            fn remove(&mut self, fid: u16) -> rsk_sdk::error::Result<()> {
-                self.inner.remove(fid)
-            }
-            fn size(&mut self, fid: u16) -> Option<usize> {
-                self.inner.size(fid)
-            }
-            fn for_each_key(&mut self, f: &mut dyn FnMut(u16)) {
-                self.inner.for_each_key(f)
-            }
-        }
-
-        let drop_writes = Rc::new(Cell::new(false));
-        let mut fs = Fs::new(
-            StaleEfPin {
-                inner: RamStorage::new(),
-                drop_ef_pin_writes: drop_writes.clone(),
-            },
-            &[],
-        );
-        let mut rng = SeqRng(1);
-        ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
-
-        // Enroll PIN "1234" with writes persisting normally.
-        let mut padded = [0u8; PADDED_PIN_LEN];
-        padded[..4].copy_from_slice(b"1234");
-        {
-            let mut presence = crate::AlwaysConfirm;
-            let mut ctx = Ctx {
-                presence: &mut presence,
-                dev: dev(),
-                fs: &mut fs,
-                rng: &mut rng,
-                state: &mut FidoState::new(),
-                now_ms: 0,
-            };
-            store_new_pin(&mut ctx, &padded).unwrap();
-        }
-
-        let pin_hash = sha256(b"1234");
-
-        // Control: with the backend healthy, the correct PIN verifies (and resets
-        // the counter to full) — so a PinBlocked below can only be the read-back.
-        {
-            let mut presence = crate::AlwaysConfirm;
-            let mut ctx = Ctx {
-                presence: &mut presence,
-                dev: dev(),
-                fs: &mut fs,
-                rng: &mut rng,
-                state: &mut FidoState::new(),
-                now_ms: 0,
-            };
-            verify_pin_hash(&mut ctx, &pin_hash[..16]).unwrap();
-        }
-
-        // Arm the fault: the decremented counter no longer reaches storage. Even
-        // with the CORRECT PIN, the read-back sees the stale count and must fail
-        // closed rather than proceed on an unverified (un-decremented) counter.
-        drop_writes.set(true);
-        let mut presence = crate::AlwaysConfirm;
-        let mut ctx = Ctx {
-            presence: &mut presence,
-            dev: dev(),
-            fs: &mut fs,
-            rng: &mut rng,
-            state: &mut FidoState::new(),
-            now_ms: 0,
-        };
-        assert_eq!(
-            verify_pin_hash(&mut ctx, &pin_hash[..16]),
-            Err(CtapError::PinBlocked),
-        );
-    }
-}
+#[path = "clientpin_tests.rs"]
+mod tests;

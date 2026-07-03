@@ -17,12 +17,19 @@ use rsk_openpgp::keys::{Curve, PrivKey};
 use rsk_sdk::Sw;
 use zeroize::Zeroize;
 
+use crate::files::{
+    SLOT_ATTESTATION, SLOT_AUTHENTICATION, SLOT_CARDAUTH, SLOT_RETIRED_FIRST, SLOT_RETIRED_LAST,
+};
+
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
-/// Largest sealed plaintext: RSA-2048 `P ‖ Q` (the largest key the applet
-/// stores; keygen/import are gated to RSA ≤ 2048).
-const MAX_PLAIN: usize = 256;
-const MAX_BLOB: usize = NONCE_LEN + MAX_PLAIN + TAG_LEN;
+/// Largest sealed plaintext: RSA-4096 `P ‖ Q` (two 256-byte primes — the
+/// largest key the applet stores). Existing smaller blobs (EC, RSA-2048) still
+/// load: the buffer is a maximum, the real length rides in the record.
+const MAX_PLAIN: usize = 512;
+/// Largest sealed-record length (`nonce ‖ ct ‖ tag`). Public so other PIV paths
+/// that move a sealed blob verbatim (MOVE KEY) can size their buffer to it.
+pub const MAX_BLOB: usize = NONCE_LEN + MAX_PLAIN + TAG_LEN;
 
 const INFO_PIV_KEYS: &[u8] = b"PIV/KEYS";
 
@@ -119,7 +126,9 @@ pub fn migrate_kbase<S: Storage>(dev: &Device, fs: &mut Fs<S>, rng: &mut dyn Rng
     }
     let old = dev.without_otp();
     // Retired (82–95), active (9A–9E incl. the 9B management key), attestation.
-    let slots = (0x82..=0x95).chain(0x9A..=0x9E).chain([0xF9u8]);
+    let slots = (SLOT_RETIRED_FIRST..=SLOT_RETIRED_LAST)
+        .chain(SLOT_AUTHENTICATION..=SLOT_CARDAUTH)
+        .chain([SLOT_ATTESTATION]);
     for slot in slots {
         let fid = crate::files::key_fid(slot);
         if !fs.has_key(fid) {
@@ -237,6 +246,8 @@ fn curve_from_id(b: u8) -> Option<Curve> {
     Some(match b {
         3 => Curve::P256,
         4 => Curve::P384,
-        _ => return None, // PIV only ever stores P-256/P-384
+        30 => Curve::Ed25519,
+        31 => Curve::X25519,
+        _ => return None, // PIV stores P-256/P-384 and the 25519 curves
     })
 }

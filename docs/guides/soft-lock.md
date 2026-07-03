@@ -15,14 +15,7 @@ stops *your own device in the wrong hands*.
 Needs firmware with soft-lock support (`bcdDevice >= 0x0742`); older builds
 answer `rsk lock status` with "firmware too old". Check with `rsk status`.
 
-```mermaid
-stateDiagram-v2
-    [*] --> Sealed: normal (device-root-sealed seed)
-    Sealed --> Locked: rsk lock enable (PIN + touch)
-    Locked --> Unlocked: rsk lock unlock (256-bit key)
-    Unlocked --> Locked: power cycle / unplug (RAM zeroized)
-    Unlocked --> Sealed: rsk lock disable (PIN + touch)
-```
+![Soft-lock state machine — from power-on the device is Sealed (device-root-sealed seed); rsk lock enable (PIN + touch) moves it to Locked, where FIDO operations are refused and the seed carries an extra ChaCha20-Poly1305 wrap; rsk lock unlock with the 256-bit key moves it to Unlocked with the key held in RAM; a power cycle returns it to Locked and zeroizes the RAM key, and rsk lock disable (PIN + touch) returns it to Sealed](../images/soft-lock-states.svg)
 
 ## Prerequisite: a FIDO2 PIN
 

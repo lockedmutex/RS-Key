@@ -78,6 +78,14 @@ impl rsk_rescue::Rng for CountRng {
         }
     }
 }
+impl rsk_otp::Rng for CountRng {
+    fn fill(&mut self, b: &mut [u8]) {
+        for x in b.iter_mut() {
+            *x = self.0;
+            self.0 = self.0.wrapping_add(1);
+        }
+    }
+}
 fn dev() -> Device<'static> {
     Device {
         serial_hash: &[0xAB; 32],
@@ -928,7 +936,8 @@ fn miri_pqc() {
 
 #[test]
 fn miri_mgmt_apdu() {
-    use rsk_mgmt::ManagementApplet;
+    use rsk_mgmt::{AlwaysConfirm, ManagementApplet};
+    let presence = RefCell::new(AlwaysConfirm);
     for data in [
         &b"\x00\xa4\x04\x00"[..],
         b"\x00\xcb\x00\x00",
@@ -937,7 +946,7 @@ fn miri_mgmt_apdu() {
     ] {
         let mut fs = Fs::new(RamStorage::new(), &[]);
         fs.scan();
-        let mut app = ManagementApplet::new([0x12, 0x34, 0x56, 0x78, 1, 2, 3, 4]);
+        let mut app = ManagementApplet::new([0x12, 0x34, 0x56, 0x78, 1, 2, 3, 4], &presence);
         if let Ok(apdu) = Apdu::parse(data) {
             let mut buf = [0u8; 256];
             let mut res = ResBuf::new(&mut buf);
@@ -952,9 +961,9 @@ fn miri_mgmt_apdu() {
 
 #[test]
 fn miri_mgmt_config() {
-    use rsk_mgmt::ManagementApplet;
+    use rsk_mgmt::{AlwaysConfirm, ManagementApplet};
 
-    fn run(app: &mut ManagementApplet, fs: &mut Fs<RamStorage>, raw: &[u8]) {
+    fn run(app: &mut ManagementApplet<'_>, fs: &mut Fs<RamStorage>, raw: &[u8]) {
         if let Ok(apdu) = Apdu::parse(raw) {
             let mut buf = [0u8; 256];
             let mut res = ResBuf::new(&mut buf);
@@ -964,7 +973,8 @@ fn miri_mgmt_config() {
 
     let mut fs = Fs::new(RamStorage::new(), &[]);
     fs.scan();
-    let mut app = ManagementApplet::new([0x12, 0x34, 0x56, 0x78, 1, 2, 3, 4]);
+    let presence = RefCell::new(AlwaysConfirm);
+    let mut app = ManagementApplet::new([0x12, 0x34, 0x56, 0x78, 1, 2, 3, 4], &presence);
     // Write blobs of several lengths — including past the 64-byte read buffer,
     // the case that used to panic READ CONFIG — then read each back.
     for inner in [0usize, 4, 64, 65, 200] {
@@ -1006,6 +1016,14 @@ fn miri_cross_applet() {
             }
         }
     }
+    impl rsk_otp::Rng for R {
+        fn fill(&mut self, b: &mut [u8]) {
+            for x in b.iter_mut() {
+                self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+                *x = (self.0 >> 33) as u8;
+            }
+        }
+    }
 
     fn sel(aid: &[u8]) -> std::vec::Vec<u8> {
         let mut v = std::vec![0x00u8, 0xA4, 0x04, 0x00, aid.len() as u8];
@@ -1022,10 +1040,11 @@ fn miri_cross_applet() {
     let pgp_pres = RefCell::new(rsk_openpgp::AlwaysConfirm);
     let oath_pres = RefCell::new(rsk_oath::AlwaysConfirm);
     let otp_pres = RefCell::new(rsk_otp::AlwaysConfirm);
+    let mgmt_pres = RefCell::new(rsk_mgmt::AlwaysConfirm);
     let mut openpgp = OpenpgpApplet::new(SID, SH, None, &rng, &pgp_pres);
-    let mut management = ManagementApplet::new(SID);
+    let mut management = ManagementApplet::new(SID, &mgmt_pres);
     let mut oath = OathApplet::new(SID, SH, None, &rng, &oath_pres);
-    let mut otp = OtpApplet::new(SID, &otp_pres);
+    let mut otp = OtpApplet::new(SID, SH, None, &rng, &otp_pres);
     let mut piv = PivApplet::new(SID, SH, None, &rng, &pgp_pres);
     let mut disp = Dispatcher::new();
     let mut applets: [&mut dyn Applet<Fs<RamStorage>>; 5] =
@@ -1131,8 +1150,9 @@ fn miri_otp_apdu() {
 
     let mut fs = Fs::new(RamStorage::new(), &[]);
     fs.scan();
+    let rng = RefCell::new(CountRng(0));
     let presence = RefCell::new(AlwaysConfirm);
-    let mut app = OtpApplet::new([1, 2, 3, 4, 5, 6, 7, 8], &presence);
+    let mut app = OtpApplet::new([1, 2, 3, 4, 5, 6, 7, 8], [0x22; 32], None, &rng, &presence);
 
     let mut cfg = [0u8; 52];
     cfg[22..38].copy_from_slice(&[0xAB; 16]);
@@ -1269,10 +1289,17 @@ fn miri_piv_apdu() {
 #[test]
 fn miri_rescue_apdu() {
     use rsk_rescue::rollback::{ROLLBACK_REQUIRED_BIT, RollbackRaw};
-    use rsk_rescue::{Platform, RescueApplet, SecureBootStatus};
+    use rsk_rescue::{Confirm, Platform, Presence, RescueApplet, SecureBootStatus, UserPresence};
 
     const SERIAL_ID: [u8; 8] = [0xAA, 0xBB, 0xCC, 0xDD, 5, 6, 7, 8];
     const SERIAL_HASH: [u8; 32] = [0x22; 32];
+
+    struct AlwaysConfirm;
+    impl UserPresence for AlwaysConfirm {
+        fn request(&mut self, _c: Confirm<'_>) -> Presence {
+            Presence::Confirmed
+        }
+    }
 
     struct FakePlatform {
         time: Option<u32>,
@@ -1332,6 +1359,7 @@ fn miri_rescue_apdu() {
             time: None,
             flags0: [0; 3],
         });
+        let presence = RefCell::new(AlwaysConfirm);
         let mut app = RescueApplet::new(
             SERIAL_ID,
             SERIAL_HASH,
@@ -1339,6 +1367,7 @@ fn miri_rescue_apdu() {
             None,
             &rng,
             &platform,
+            &presence,
             64 * 1024,
             4 * 1024 * 1024,
         );

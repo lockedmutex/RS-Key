@@ -38,6 +38,8 @@ const CTAPHID_INIT: u8 = 0x86;
 const CTAPHID_CBOR: u8 = 0x90;
 const FIDO_USAGE_PAGE: u16 = 0xF1D0;
 const CTAP_VENDOR: u8 = 0x41;
+const CTAP2_ERR_PIN_REQUIRED: u8 = 0x36;
+const MSG_PIN_REQUIRED: &str = "device requires a PIN (set one and retry)";
 const PERM_ACFG: i64 = 0x20;
 
 const VENDOR_AID: &[u8] = &[0xF0, 0x00, 0x00, 0x00, 0x01];
@@ -49,7 +51,14 @@ const PIV_AID: &[u8] = &[
 const OATH_AID: &[u8] = &[0xA0, 0x00, 0x00, 0x05, 0x27, 0x21, 0x01];
 const OTP_AID: &[u8] = &[0xA0, 0x00, 0x00, 0x05, 0x27, 0x20, 0x01];
 
+const INS_LED_GET: u8 = 0x11;
+const SW_OK: (u8, u8) = (0x90, 0x00);
+
 // Vendor subcommands (CTAP_VENDOR).
+const VENDOR_MSE: u8 = 1;
+const VENDOR_BACKUP_EXPORT: u8 = 2;
+const VENDOR_BACKUP_LOAD: u8 = 3;
+const VENDOR_BACKUP_FINALIZE: u8 = 4;
 const VENDOR_STATE: u8 = 5;
 const VENDOR_ATT_STATE: u8 = 11;
 const VENDOR_AUDIT_READ: u8 = 7;
@@ -58,9 +67,19 @@ const VENDOR_AUDIT_CHECKPOINT: u8 = 8;
 const AUDIT_ENTRY_LEN: usize = 20;
 const CKPT_TAG: &[u8] = b"RSK-AUDIT-CKPT-v1";
 
+// Per-frame HID read budgets (ms): quick probe, CBOR exchange, touch-gated op.
+const READ_TIMEOUT_MS: i32 = 2000;
+const EXCHANGE_TIMEOUT_MS: i32 = 5000;
+const TOUCH_TIMEOUT_MS: i32 = 20_000;
+
 pub const COLORS: [&str; 8] = [
     "off", "red", "green", "blue", "yellow", "magenta", "cyan", "white",
 ];
+
+/// Next idle color: wrap through the non-"off" colours.
+fn next_idle_color(current: usize) -> usize {
+    (current % (COLORS.len() - 1)) + 1
+}
 
 const AUDIT_EVENTS: &[(u8, &str)] = &[
     (0x01, "BOOT"),
@@ -144,6 +163,13 @@ impl DeviceProvider for HardwareProvider {
                 },
                 Err(e) => ActionResult::Failed(format!("export failed: {e}")),
             },
+            Action::BackupExportSlip39 => match backup_export_slip39(pin) {
+                Ok(body) => ActionResult::Reveal {
+                    title: "seed · SLIP-39 (2-of-3 shares)".into(),
+                    body: Zeroizing::new(body),
+                },
+                Err(e) => ActionResult::Failed(format!("export failed: {e}")),
+            },
             Action::BackupRestore => {
                 let phrase = input.phrase.as_deref().map(String::as_str).unwrap_or("");
                 match backup_restore(phrase, pin) {
@@ -206,7 +232,7 @@ fn ctaphid_init(dev: &hidapi::HidDevice) -> Option<[u8; 4]> {
     let mut f = vec![0xff, 0xff, 0xff, 0xff, CTAPHID_INIT, 0, 8];
     f.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
     hid_write(dev, &f);
-    let r = hid_read(dev, 2000);
+    let r = hid_read(dev, READ_TIMEOUT_MS);
     if r.len() < 19 || r[4] != CTAPHID_INIT {
         return None;
     }
@@ -416,7 +442,7 @@ fn read_fido(snap: &mut DeviceSnapshot) {
         return;
     };
 
-    let gi = send_cbor(&dev, cid, &[0x04], 2000);
+    let gi = send_cbor(&dev, cid, &[0x04], READ_TIMEOUT_MS);
     if gi.first() == Some(&0)
         && let Ok(v) = ciborium::de::from_reader::<Value, _>(&gi[1..])
     {
@@ -436,7 +462,7 @@ fn read_fido(snap: &mut DeviceSnapshot) {
             ));
         }
         if let Some(Value::Bytes(b)) = map_get(&v, 3) {
-            snap.identity.aaguid = Some(b.iter().map(|x| format!("{x:02x}")).collect());
+            snap.identity.aaguid = Some(hex(b));
         }
         if let Some(Value::Map(opts)) = map_get(&v, 4) {
             for (k, val) in opts {
@@ -458,7 +484,7 @@ fn read_fido(snap: &mut DeviceSnapshot) {
         &dev,
         cid,
         Value::Map(vec![(iv(1), iv(VENDOR_STATE as i64))]),
-        2000,
+        READ_TIMEOUT_MS,
     ) {
         snap.backup = Some(BackupState {
             sealed: map_get(&v, 1).and_then(Value::as_bool).unwrap_or(false),
@@ -477,13 +503,11 @@ fn read_fido(snap: &mut DeviceSnapshot) {
         &dev,
         cid,
         Value::Map(vec![(iv(1), iv(VENDOR_ATT_STATE as i64))]),
-        2000,
+        READ_TIMEOUT_MS,
     ) {
         let installed = map_get(&v, 1).and_then(Value::as_bool).unwrap_or(false);
         let chain = match map_get(&v, 2) {
-            Some(Value::Bytes(b)) if installed => {
-                Some(b.iter().map(|x| format!("{x:02x}")).collect())
-            }
+            Some(Value::Bytes(b)) if installed => Some(hex(b)),
             _ => None,
         };
         snap.attestation = Some(AttestationState {
@@ -514,16 +538,7 @@ fn read_ccid(snap: &mut DeviceSnapshot) {
         return;
     }
     snap.transport.pcsc = Link::Present;
-    let target = readers
-        .iter()
-        .find(|r| {
-            // Default build's product carries "RS-Key"; the opt-in Yubico interop
-            // flavor carries "RSK". Neither is in a genuine YubiKey's reader name.
-            let n = r.to_string_lossy();
-            n.contains("RS-Key") || n.contains("RSK")
-        })
-        .copied()
-        .unwrap_or(readers[0]);
+    let target = rs_key_reader(&readers);
     let card = match ctx.connect(target, ShareMode::Shared, Protocols::ANY) {
         Ok(c) => c,
         Err(e) => {
@@ -540,13 +555,15 @@ fn read_ccid(snap: &mut DeviceSnapshot) {
     // Rescue applet: identity + secure boot + rollback + flash.
     if ccid.select(RESCUE_AID).is_ok() {
         snap.transport.ccid = Link::Present;
-        if let Ok((d, 0x90, 0x00)) = ccid.apdu_select(RESCUE_AID)
+        if let Ok((d, s1, s2)) = ccid.apdu_select(RESCUE_AID)
+            && (s1, s2) == SW_OK
             && d.len() >= 12
         {
-            snap.identity.serial = Some(d[4..12].iter().map(|b| format!("{b:02x}")).collect());
+            snap.identity.serial = Some(hex(&d[4..12]));
             snap.identity.sdk = Some(format!("{}.{}", d[2], d[3]));
         }
-        if let Ok((d, 0x90, 0x00)) = ccid.apdu(&[0x80, 0x1E, 0x03, 0x00, 0x00])
+        if let Ok((d, s1, s2)) = ccid.apdu(&[0x80, 0x1E, 0x03, 0x00, 0x00])
+            && (s1, s2) == SW_OK
             && d.len() >= 3
         {
             snap.secure_boot = Some(SecureBootState {
@@ -555,7 +572,8 @@ fn read_ccid(snap: &mut DeviceSnapshot) {
                 bootkey: d[2],
             });
         }
-        if let Ok((d, 0x90, 0x00)) = ccid.apdu(&[0x80, 0x1E, 0x06, 0x00, 0x00])
+        if let Ok((d, s1, s2)) = ccid.apdu(&[0x80, 0x1E, 0x06, 0x00, 0x00])
+            && (s1, s2) == SW_OK
             && d.len() >= 3
         {
             snap.rollback = Some(RollbackState {
@@ -564,7 +582,8 @@ fn read_ccid(snap: &mut DeviceSnapshot) {
                 capacity: d[2],
             });
         }
-        if let Ok((d, 0x90, 0x00)) = ccid.apdu(&[0x80, 0x1E, 0x02, 0x00, 0x00])
+        if let Ok((d, s1, s2)) = ccid.apdu(&[0x80, 0x1E, 0x02, 0x00, 0x00])
+            && (s1, s2) == SW_OK
             && d.len() >= 20
         {
             snap.flash = Some(FlashState {
@@ -590,6 +609,22 @@ fn read_ccid(snap: &mut DeviceSnapshot) {
 // CCID applets (PC/SC)
 // ===========================================================================
 
+// Default build's product carries "RS-Key"; the opt-in Yubico interop
+// flavor carries "RSK". Neither is in a genuine YubiKey's reader name.
+const READER_TOKEN_DEFAULT: &str = "RS-Key";
+const READER_TOKEN_INTEROP: &str = "RSK";
+
+fn rs_key_reader<'a>(readers: &[&'a std::ffi::CStr]) -> &'a std::ffi::CStr {
+    readers
+        .iter()
+        .find(|r| {
+            let n = r.to_string_lossy();
+            n.contains(READER_TOKEN_DEFAULT) || n.contains(READER_TOKEN_INTEROP)
+        })
+        .copied()
+        .unwrap_or(readers[0])
+}
+
 struct Ccid {
     card: pcsc::Card,
     buf: [u8; 1024],
@@ -606,16 +641,7 @@ impl Ccid {
         if readers.is_empty() {
             return Err("no PC/SC readers".into());
         }
-        let target = readers
-            .iter()
-            .find(|r| {
-                // Default build's product carries "RS-Key"; the opt-in Yubico interop
-                // flavor carries "RSK". Neither is in a genuine YubiKey's reader name.
-                let n = r.to_string_lossy();
-                n.contains("RS-Key") || n.contains("RSK")
-            })
-            .copied()
-            .unwrap_or(readers[0]);
+        let target = rs_key_reader(&readers);
         let card = ctx
             .connect(target, ShareMode::Shared, Protocols::ANY)
             .map_err(|e| format!("connect (reader busy?): {e}"))?;
@@ -646,7 +672,7 @@ impl Ccid {
 
     fn select(&mut self, aid: &[u8]) -> Result<(), String> {
         let (_, s1, s2) = self.apdu_select(aid)?;
-        if (s1, s2) != (0x90, 0x00) {
+        if (s1, s2) != SW_OK {
             return Err(format!("SELECT failed {s1:02X}{s2:02X}"));
         }
         Ok(())
@@ -657,11 +683,10 @@ impl Ccid {
 // LED / reboot (native, unauthenticated)
 // ===========================================================================
 
-pub fn led_get() -> Result<String, String> {
-    let mut c = Ccid::open()?;
-    c.select(VENDOR_AID)?;
-    let (d, s1, s2) = c.apdu(&[0x00, 0x11, 0x00, 0x00, 0x00])?;
-    if (s1, s2) != (0x90, 0x00) || d.len() < 9 {
+/// Send GET LED and return the raw EF_LED_CONF record plus its per-status stride.
+fn led_read_config(c: &mut Ccid) -> Result<(Vec<u8>, usize), String> {
+    let (d, s1, s2) = c.apdu(&[0x00, INS_LED_GET, 0x00, 0x00, 0x00])?;
+    if (s1, s2) != SW_OK || d.len() < 9 {
         return Err(format!("GET LED {s1:02X}{s2:02X}"));
     }
     let stride = if d.len() >= 17 {
@@ -671,6 +696,13 @@ pub fn led_get() -> Result<String, String> {
     } else {
         2
     };
+    Ok((d, stride))
+}
+
+pub fn led_get() -> Result<String, String> {
+    let mut c = Ccid::open()?;
+    c.select(VENDOR_AID)?;
+    let (d, stride) = led_read_config(&mut c)?;
     let names = ["idle", "processing", "touch", "boot"];
     let effect_names = ["legacy", "vapor", "bounce", "flow", "sparkle"];
     let mut out = format!("mode = {}\n", if d[0] != 0 { "steady" } else { "blink" });
@@ -703,24 +735,14 @@ pub fn led_get() -> Result<String, String> {
 pub fn led_cycle_idle() -> Result<String, String> {
     let mut c = Ccid::open()?;
     c.select(VENDOR_AID)?;
-    let (d, s1, s2) = c.apdu(&[0x00, 0x11, 0x00, 0x00, 0x00])?;
-    if (s1, s2) != (0x90, 0x00) || d.len() < 9 {
-        return Err(format!("GET LED {s1:02X}{s2:02X}"));
-    }
-    let stride = if d.len() >= 17 {
-        4
-    } else if d.len() >= 13 {
-        3
-    } else {
-        2
-    };
+    let (d, stride) = led_read_config(&mut c)?;
     // idle status: color/brightness offset depends on stride.
     let (idle_color, idle_brightness) = if stride >= 3 {
         (d[2], d[3]) // [steady, (effect, color, brightness, …), …]
     } else {
         (d[1], d[2]) // [steady, (color, brightness), …]
     };
-    let next = ((idle_color as usize) % 7) + 1;
+    let next = next_idle_color(idle_color as usize);
     let brightness = if idle_brightness == 0 {
         16
     } else {
@@ -728,7 +750,7 @@ pub fn led_cycle_idle() -> Result<String, String> {
     };
     let p2 = (next as u8 & 0x7) | if d[0] != 0 { 0x08 } else { 0 };
     let (_, s1, s2) = c.apdu(&[0x00, 0x10, brightness, p2])?;
-    if (s1, s2) != (0x90, 0x00) {
+    if (s1, s2) != SW_OK {
         return Err(format!("SET LED {s1:02X}{s2:02X}"));
     }
     Ok(format!("idle color → {}", COLORS[next]))
@@ -760,10 +782,10 @@ pub fn audit_read(pin: Option<&str>) -> Result<(String, String), String> {
         req.push((iv(3), iv(2)));
         req.push((iv(4), v));
     }
-    let (st, v) = vendor(&dev, cid, Value::Map(req), 5000);
+    let (st, v) = vendor(&dev, cid, Value::Map(req), EXCHANGE_TIMEOUT_MS);
     match st {
         0 => {}
-        0x36 => return Err("device requires a PIN (set one and retry)".into()),
+        CTAP2_ERR_PIN_REQUIRED => return Err(MSG_PIN_REQUIRED.into()),
         s => return Err(format!("status {s:#x}")),
     }
     let v = v.ok_or("decode failed")?;
@@ -777,6 +799,12 @@ pub fn audit_read(pin: Option<&str>) -> Result<(String, String), String> {
         Some(Value::Bytes(b)) => b.clone(),
         _ => return Err("no entries".into()),
     };
+    // Treat the device as untrusted: a length that is not a whole number of
+    // entries would make the fixed-stride display slice run past the end and
+    // panic (matches the Python client's rejection at audit.py).
+    if entries.len() % AUDIT_ENTRY_LEN != 0 {
+        return Err("malformed audit journal (length not a multiple of entry size)".into());
+    }
 
     let head = fold(&epoch, &entries);
     let count = entries.len() / AUDIT_ENTRY_LEN;
@@ -848,7 +876,7 @@ pub fn verify_identity(pin: Option<&str>) -> Result<(String, String), String> {
     let (st, v) = vendor(&dev, cid, Value::Map(req), 30000);
     match st {
         0 => {}
-        0x36 => return Err("device requires a PIN (set one and retry)".into()),
+        CTAP2_ERR_PIN_REQUIRED => return Err(MSG_PIN_REQUIRED.into()),
         0x30 => {
             return Err(
                 "no OTP DEVK provisioned — attestation unavailable (docs/production.md)".into(),
@@ -916,7 +944,7 @@ fn hex(b: &[u8]) -> String {
 fn client_pin(dev: &hidapi::HidDevice, cid: [u8; 4], fields: Value) -> Option<Value> {
     let mut p = vec![0x06];
     p.extend_from_slice(&cbor(&fields));
-    let r = send_cbor(dev, cid, &p, 5000);
+    let r = send_cbor(dev, cid, &p, EXCHANGE_TIMEOUT_MS);
     if r.first() != Some(&0) {
         return None;
     }
@@ -968,10 +996,10 @@ fn coord(cose: &Value, key: i128) -> Result<[u8; 32], String> {
 fn mse(dev: &hidapi::HidDevice, cid: [u8; 4]) -> Result<([u8; 32], [u8; 65]), String> {
     let (sk, px, py) = ecdh_pub();
     let req = Value::Map(vec![
-        (iv(1), iv(1)),
+        (iv(1), iv(VENDOR_MSE as i64)),
         (iv(2), Value::Map(vec![(iv(1), cose_key(&px, &py))])),
     ]);
-    let (st, v) = vendor(dev, cid, req, 5000);
+    let (st, v) = vendor(dev, cid, req, EXCHANGE_TIMEOUT_MS);
     if st != 0 {
         return Err(format!("MSE failed: {st:#x}"));
     }
@@ -995,23 +1023,26 @@ fn gate_param(token: Option<&[u8; 32]>, subcmd: u8, raw_subpara: &[u8]) -> Optio
 }
 
 /// Export the 32-byte seed and return it as a 24-word BIP-39 phrase.
-pub fn backup_export(pin: Option<&str>) -> Result<String, String> {
+/// Run the MSE channel + vendor BACKUP_EXPORT and decrypt the blob to the raw
+/// 32-byte seed. Shared by the BIP-39 and SLIP-39 export paths; the returned
+/// buffer zeroizes on drop.
+fn fetch_backup_seed(pin: Option<&str>) -> Result<Zeroizing<Vec<u8>>, String> {
     let dev = hid_open().ok_or("no FIDO device")?;
     let cid = ctaphid_init(&dev).ok_or("CTAPHID init failed")?;
     let token = pin.map(|p| acfg_token(&dev, cid, p)).transpose()?;
     let (key, aad) = mse(&dev, cid)?;
 
-    let mut req = vec![(iv(1), iv(2))]; // BACKUP_EXPORT
-    if let Some((_, v)) = gate_param(token.as_ref(), 2, &[]) {
+    let mut req = vec![(iv(1), iv(VENDOR_BACKUP_EXPORT as i64))];
+    if let Some((_, v)) = gate_param(token.as_ref(), VENDOR_BACKUP_EXPORT, &[]) {
         req.push((iv(3), iv(2)));
         req.push((iv(4), v));
     }
     let mut payload = vec![CTAP_VENDOR];
     payload.extend_from_slice(&cbor(&Value::Map(req)));
-    let r = send_cbor(&dev, cid, &payload, 20000);
+    let r = send_cbor(&dev, cid, &payload, TOUCH_TIMEOUT_MS);
     match r.first() {
         Some(&0) => {}
-        Some(&0x36) => return Err("device requires a PIN (set one and retry)".into()),
+        Some(&CTAP2_ERR_PIN_REQUIRED) => return Err(MSG_PIN_REQUIRED.into()),
         Some(&0x30) => return Err("export refused — already sealed".into()),
         Some(s) => return Err(format!("export failed: {s:#x}")),
         None => return Err("no response (timeout / no touch)".into()),
@@ -1021,13 +1052,50 @@ pub fn backup_export(pin: Option<&str>) -> Result<String, String> {
         Some(Value::Bytes(b)) if b.len() == 60 => b.clone(),
         _ => return Err("bad export blob".into()),
     };
-    let mut seed =
-        chacha_decrypt(&key, &blob[..12], &aad, &blob[12..]).ok_or("AEAD decrypt failed")?;
-    let mnemonic = bip39::Mnemonic::from_entropy(&seed)
+    let seed = chacha_decrypt(&key, &blob[..12], &aad, &blob[12..]).ok_or("AEAD decrypt failed")?;
+    Ok(Zeroizing::new(seed))
+}
+
+pub fn backup_export(pin: Option<&str>) -> Result<String, String> {
+    let seed = fetch_backup_seed(pin)?;
+    Ok(bip39::Mnemonic::from_entropy(&seed)
         .map_err(|e| e.to_string())?
-        .to_string();
-    seed.zeroize();
-    Ok(mnemonic)
+        .to_string())
+}
+
+/// Export the seed as a printable SLIP-39 share set (2-of-3, the host CLI's
+/// default). Generate-only via the in-tree `rsk-slip39` crate; recombining the
+/// shares to restore stays in the CLI.
+pub fn backup_export_slip39(pin: Option<&str>) -> Result<String, String> {
+    let seed = fetch_backup_seed(pin)?;
+    let mut secret = <[u8; 32]>::try_from(&seed[..]).map_err(|_| "seed not 32 bytes")?;
+    let body = slip39_body(&secret, 2, 3);
+    secret.zeroize();
+    body
+}
+
+/// Split a 32-byte secret into a printable `threshold`-of-`count` SLIP-39 share
+/// block, bit-compatible with `rsk backup restore --scheme slip39`. The returned
+/// string is secret — the caller wraps it in `Zeroizing`.
+fn slip39_body(secret: &[u8; 32], threshold: u8, count: u8) -> Result<String, String> {
+    let mut out = [[0u16; rsk_slip39::WORDS_PER_SHARE]; rsk_slip39::MAX_SHARES];
+    let mut fill = |b: &mut [u8]| OsRng.fill_bytes(b);
+    rsk_slip39::generate(secret, threshold, count, &mut fill, &mut out)
+        .map_err(|e| format!("slip39 encode failed: {e:?}"))?;
+    let mut body = format!(
+        "Any {threshold} of these {count} SLIP-39 shares reconstruct the seed.\n\
+         Write each on its own card; keep them apart.\n"
+    );
+    for (s, share) in out.iter().take(count as usize).enumerate() {
+        body.push_str(&format!("\nshare {} of {count}\n", s + 1));
+        for (j, &idx) in share.iter().enumerate() {
+            body.push_str(rsk_slip39::word(idx));
+            let last = j + 1 == share.len();
+            body.push(if last || (j + 1) % 7 == 0 { '\n' } else { ' ' });
+        }
+    }
+    out.zeroize();
+    Ok(body)
 }
 
 /// Seal the one-time backup export window (vendor BACKUP_FINALIZE, subcmd 4).
@@ -1035,7 +1103,12 @@ pub fn backup_export(pin: Option<&str>) -> Result<String, String> {
 pub fn backup_finalize() -> Result<String, String> {
     let dev = hid_open().ok_or("no FIDO device")?;
     let cid = ctaphid_init(&dev).ok_or("CTAPHID init failed")?;
-    let (st, _) = vendor(&dev, cid, Value::Map(vec![(iv(1), iv(4))]), 20000);
+    let (st, _) = vendor(
+        &dev,
+        cid,
+        Value::Map(vec![(iv(1), iv(VENDOR_BACKUP_FINALIZE as i64))]),
+        TOUCH_TIMEOUT_MS,
+    );
     match st {
         0 => Ok("backup window sealed — a factory reset reopens it".into()),
         0x27 => Err("finalize cancelled — no touch".into()),
@@ -1090,15 +1163,15 @@ pub fn backup_restore(phrase: &str, pin: Option<&str>) -> Result<String, String>
 
     let subpara = Value::Map(vec![(iv(1), Value::Bytes(blob))]);
     let raw_subpara = cbor(&subpara);
-    let mut req = vec![(iv(1), iv(3)), (iv(2), subpara)]; // BACKUP_LOAD
-    if let Some((_, v)) = gate_param(token.as_ref(), 3, &raw_subpara) {
+    let mut req = vec![(iv(1), iv(VENDOR_BACKUP_LOAD as i64)), (iv(2), subpara)];
+    if let Some((_, v)) = gate_param(token.as_ref(), VENDOR_BACKUP_LOAD, &raw_subpara) {
         req.push((iv(3), iv(2)));
         req.push((iv(4), v));
     }
-    let (st, _) = vendor(&dev, cid, Value::Map(req), 20000);
+    let (st, _) = vendor(&dev, cid, Value::Map(req), TOUCH_TIMEOUT_MS);
     match st {
         0 => Ok("seed restored — FIDO identity matches the backup".into()),
-        0x36 => Err("device requires a PIN (set one and retry)".into()),
+        CTAP2_ERR_PIN_REQUIRED => Err(MSG_PIN_REQUIRED.into()),
         s => Err(format!("restore failed: {s:#x}")),
     }
 }
@@ -1209,7 +1282,7 @@ impl DeviceProvider for MockProvider {
                 ),
             },
             Action::LedCycle => {
-                self.idle_color = (self.idle_color % 7) + 1;
+                self.idle_color = next_idle_color(self.idle_color);
                 ActionResult::Ok(format!("[demo] idle color → {}", COLORS[self.idle_color]))
             }
             Action::RebootApp => ActionResult::Ok("[demo] reboot → app (no device touched)".into()),
@@ -1224,6 +1297,14 @@ impl DeviceProvider for MockProvider {
                 ActionResult::Reveal {
                     title: "seed · BIP-39 (DEMO — not a real key)".into(),
                     body: Zeroizing::new(words),
+                }
+            }
+            Action::BackupExportSlip39 => {
+                // Obviously-fake shares from an all-zero secret.
+                let body = slip39_body(&[0u8; 32], 2, 3).unwrap_or_default();
+                ActionResult::Reveal {
+                    title: "seed · SLIP-39 2-of-3 (DEMO — not a real key)".into(),
+                    body: Zeroizing::new(body),
                 }
             }
             Action::BackupRestore => ActionResult::Ok("[demo] seed restored".into()),

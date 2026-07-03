@@ -1,0 +1,73 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 RS-Key contributors -->
+<svg viewBox="0 0 780 480" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="ttl dsc" font-family="'Segoe UI', system-ui, -apple-system, sans-serif">
+  <title id="ttl">Flash map: 4 MB vs 16 MB</title>
+  <desc id="dsc">Comparison of the 4 MB and 16 MB flash layouts. The KV store (KVMAIN 1408 KB + KVCNT 128 KB) is the same size on both and pinned to the top of flash; only the code region's free headroom grows, from about 1.7 MB to 13.3 MB, and the KV origin shifts up.</desc>
+  <defs>
+    <style>
+      .h1{font-size:22px;font-weight:700;fill:#2B2723}
+      .sub{font-size:12.5px;fill:#948A7F}
+      .addr{font-family:'SF Mono','Roboto Mono',ui-monospace,monospace;font-size:11px;fill:#7A736A}
+      .colh{font-size:16px;font-weight:700;fill:#2B2723}
+      .cols{font-size:11px;fill:#948A7F}
+      .seglab{font-weight:700;fill:#fff;font-size:11.5px}
+      .lg{font-size:11.5px;fill:#6B645C}
+      .foot{font-size:11px;fill:#8A8177}
+    </style>
+  </defs>
+  <rect x="6" y="6" width="768" height="468" rx="16" fill="#FBFAF8" stroke="#E4DED5" stroke-width="1.5"/>
+
+  <text class="h1" x="34" y="44">Flash map scales with <tspan font-family="'SF Mono',monospace" font-size="18px">FLASH_SIZE</tspan></text>
+  <text class="sub" x="34" y="65">The KV store stays a fixed 1,536 KB at the top of flash — only the code region grows.</text>
+
+  <rect x="556" y="30" width="13" height="13" rx="3" fill="#C0562B"/>
+  <text class="lg" x="576" y="41">firmware code</text>
+  <rect x="672" y="30" width="13" height="13" rx="3" fill="#2F7E75"/>
+  <text class="lg" x="692" y="41">KV store</text>
+
+  <!-- column headers -->
+  <text class="colh" x="225" y="92" text-anchor="middle">4 MB</text>
+  <text class="cols" x="225" y="107" text-anchor="middle">RP2350-One</text>
+  <text class="colh" x="545" y="92" text-anchor="middle">16 MB</text>
+  <text class="cols" x="545" y="107" text-anchor="middle">Waveshare display · TenStar</text>
+
+  <!-- ================= COLUMN A : 4 MB (x 150..300, center 225) ================= -->
+  <rect x="150" y="118" width="150" height="9"  fill="#3E3A36"/>
+  <rect x="150" y="127" width="150" height="44" fill="#C0562B"/>
+  <rect x="150" y="171" width="150" height="66" fill="#EFE0D6"/>
+  <rect x="150" y="237" width="150" height="84" fill="#2F7E75"/>
+  <rect x="150" y="321" width="150" height="13" fill="#7FB5AE"/>
+  <path d="M150 204 l18 -6 l18 6 l18 -6 l18 6 l18 -6 l18 6 l18 -6 l6 2" fill="none" stroke="#C0562B" stroke-width="1" opacity="0.5"/>
+  <text class="seglab" x="225" y="153" text-anchor="middle">firmware ~845 KB</text>
+  <text x="225" y="196" text-anchor="middle" font-size="11.5px" font-weight="700" fill="#A9764F">free · ~1.7 MB</text>
+  <text class="seglab" x="225" y="277" text-anchor="middle">KVMAIN 1408 KB</text>
+  <g text-anchor="end">
+    <text class="addr" x="140" y="122">0x1000_0000</text>
+    <text class="addr" x="140" y="241">0x1028_0000</text>
+    <text class="addr" x="140" y="325">0x103E_0000</text>
+    <text class="addr" x="140" y="341">0x1040_0000</text>
+  </g>
+  <path d="M300 327 h20" stroke="#C9C1B6" stroke-width="1"/>
+  <text class="addr" x="324" y="330" fill="#8A8177">KVCNT 128 KB</text>
+
+  <!-- ================= COLUMN B : 16 MB (x 470..620, center 545) ================= -->
+  <rect x="470" y="118" width="150" height="9"   fill="#3E3A36"/>
+  <rect x="470" y="127" width="150" height="44"  fill="#C0562B"/>
+  <rect x="470" y="171" width="150" height="150" fill="#EFE0D6"/>
+  <rect x="470" y="321" width="150" height="84"  fill="#2F7E75"/>
+  <rect x="470" y="405" width="150" height="13"  fill="#7FB5AE"/>
+  <path d="M470 246 l18 -6 l18 6 l18 -6 l18 6 l18 -6 l18 6 l18 -6 l6 2" fill="none" stroke="#C0562B" stroke-width="1" opacity="0.5"/>
+  <text class="seglab" x="545" y="153" text-anchor="middle">firmware ~845 KB</text>
+  <text x="545" y="222" text-anchor="middle" font-size="11.5px" font-weight="700" fill="#A9764F">free · ~13.3 MB</text>
+  <text class="seglab" x="545" y="367" text-anchor="middle">KVMAIN 1408 KB</text>
+  <g text-anchor="start">
+    <text class="addr" x="632" y="122">0x1000_0000</text>
+    <text class="addr" x="632" y="325">0x10E8_0000</text>
+    <text class="addr" x="632" y="409">0x10FE_0000</text>
+    <text class="addr" x="632" y="422">0x1100_0000</text>
+  </g>
+  <path d="M470 411 h-20" stroke="#C9C1B6" stroke-width="1"/>
+  <text class="addr" x="446" y="414" text-anchor="end" fill="#8A8177">128 KB</text>
+
+  <text class="foot" x="34" y="458"><tspan font-family="'SF Mono',monospace">code = FLASH_SIZE − 1,536 KB</tspan>  ·  same firmware image + KV store on both  ·  only free headroom and the KV origin change  ·  max 16 MiB</text>
+</svg>
