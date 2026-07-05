@@ -18,6 +18,9 @@
 #          a regression alarm on the host-testable surface (the embedded
 #          firmware image is not host-measurable). scripts/metrics.sh is the
 #          separate, un-gated refactor-reconnaissance tool.
+#   complexity — scripts/complexity_gate.sh: cognitive-complexity ceiling over
+#          the crate libraries (rust-code-analysis). A ratchet that catches a
+#          new hotspot the day it lands; the coverage floor's sibling.
 #
 # Runs daily, on demand (workflow_dispatch, with a per-target time knob),
 # and self-tests on any push that edits this file. Local equivalents:
@@ -25,6 +28,7 @@
 #   nix develop .#fuzz -c cargo fuzz run <target> -- -max_total_time=120
 #   cargo kani -p rsk-sdk -p rsk-fs -p rsk-rsa-asm -p rsk-crypto -p rsk-rescue -p rsk-openpgp -p rsk-otp -p rsk-piv -p rsk-oath -p rsk-usb  (cargo install kani-verifier)
 #   nix develop -c cargo llvm-cov --summary-only --fail-under-lines 80 --target <host> -p rsk-sdk … -p rsk-slip39
+#   nix develop -c ./scripts/complexity_gate.sh
 
 name: deep-checks
 
@@ -228,3 +232,22 @@ jobs:
             -p rsk-sdk -p rsk-fs -p rsk-usb -p rsk-crypto -p rsk-fido -p rsk-openpgp \
             -p rsk-rsa-asm -p rsk-mgmt -p rsk-oath -p rsk-otp -p rsk-piv -p rsk-rescue \
             -p rsk-led -p rsk-ui -p rsk-bip39 -p rsk-slip39
+
+  complexity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+
+      # Cognitive-complexity ratchet over the crate libraries — fails on a new
+      # hotspot above the ceiling in scripts/complexity_gate.sh. rust-code-analysis
+      # is pulled ad-hoc (nix shell) and never joins the pinned shell / SBOM.
+      - name: complexity — crate-library cognitive ceiling
+        run: nix develop -c ./scripts/complexity_gate.sh

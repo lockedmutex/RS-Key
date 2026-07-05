@@ -15,13 +15,19 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Added
 
-- **Firmware flash-size budget in the gate.** `check.sh` fails if the shipping
-  image exceeds a soft ceiling (1 MiB of the 2560K code region) — a runaway
-  dependency trips it long before the linker's hard limit. Bump
-  `FIRMWARE_FLASH_BUDGET_KIB` intentionally for a legitimate feature.
+- **Firmware flash-size ratchet in the gate.** `check.sh` fails if the shipping
+  image grows past a ceiling that hugs the current size (well under the 2560K
+  code region) — a runaway dependency or surprise growth trips it early. Ratchet
+  it down when the image shrinks; bump `FIRMWARE_FLASH_BUDGET_KIB` for a
+  legitimate feature.
 - **Host-crate coverage floor.** `deep-checks` gained an `llvm-cov` job that
   floors host-crate line coverage (a regression alarm; the embedded image is
   not host-measurable).
+- **Cognitive-complexity ratchet in `deep-checks`.** `scripts/complexity_gate.sh`
+  fails if any crate-library function crosses a cognitive-complexity ceiling — a
+  daily regression alarm for new hotspots, the coverage floor's sibling. Lower
+  the ceiling as the peak falls. rust-code-analysis is pulled ad-hoc, so it
+  never joins the pinned dev shell.
 - **`scripts/metrics.sh`** — advisory refactor reconnaissance (function
   complexity, firmware size, generic monomorphization). Not a gate; the tools
   are pulled ad-hoc so they never join the pinned dev shell.
@@ -29,7 +35,7 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 ### Changed
 
 - **`deep-checks` runs daily** rather than weekly (Miri, fuzz, Kani, repro,
-  coverage).
+  coverage, complexity).
 
 ## [0.3.0] — 2026-07-03
 

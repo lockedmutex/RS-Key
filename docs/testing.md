@@ -29,8 +29,9 @@ nix develop -c ./scripts/check.sh
 
 runs fmt, clippy (embedded **and** host targets, `-D warnings`), all host
 tests, both firmware builds (touch + no-touch), the rsk-wipe build, a firmware
-flash-size budget (the shipping image must stay under a soft ceiling of the
-2560K code region), `cargo-audit`, `cargo-deny`, `cargo-vet` and `gitleaks`.
+flash-size ratchet (the shipping image must stay under a ceiling that hugs its
+current size, well below the 2560K code region), `cargo-audit`, `cargo-deny`,
+`cargo-vet` and `gitleaks`.
 Green check.sh is the bar for every commit.
 
 ## Host tests
@@ -268,13 +269,14 @@ parser rejected the reply.
 attached, the `tests/` scripts. The scheduled `deep-checks` workflow is the
 Miri, fuzz and Kani commands from this page, daily, plus a `repro` job that
 builds the hermetic firmware twice and requires bit-identical outputs
-([build.md](build.md#nix-build-hermetic-no-dev-shell)) and an `llvm-cov` job
-that floors host-crate line coverage. No hidden state.
+([build.md](build.md#nix-build-hermetic-no-dev-shell)), an `llvm-cov` job that
+floors host-crate line coverage, and a `complexity` job that ratchets
+crate-library cognitive complexity. No hidden state.
 
 ```mermaid
 flowchart TB
-    a["Merge gate — every commit / PR<br/>check.sh: fmt · clippy · host tests · firmware builds · size budget · audit · deny · vet · gitleaks"]
-    b["Daily — deep-checks<br/>Miri · timed libFuzzer · Kani · repro (bit-identical build) · llvm-cov (coverage floor)"]
+    a["Merge gate — every commit / PR<br/>check.sh: fmt · clippy · host tests · firmware builds · size ratchet · audit · deny · vet · gitleaks"]
+    b["Daily — deep-checks<br/>Miri · timed libFuzzer · Kani · repro (bit-identical build) · llvm-cov (coverage floor) · complexity (cognitive ratchet)"]
     a ~~~ b
 ```
 
@@ -295,3 +297,10 @@ nix develop -c ./scripts/metrics.sh crates/rsk-piv/src
 Read the cognitive column, not cyclomatic: a high cyclomatic with a low
 cognitive is a flat serializer (a long `match` that just encodes), not a
 refactor target.
+
+The same signal has a ratcheted, automated sibling. `scripts/complexity_gate.sh`
+runs in `deep-checks` and fails if any crate-library function crosses a
+cognitive-complexity ceiling (`COGNITIVE_CEILING`) — catching a new hotspot the
+day it lands. Lower the ceiling as the peak falls; raise it only for a justified
+growth, in the same commit. `firmware/` is out of scope: it is embedded glue plus
+the trusted-display UI state machines, whose complexity is a separate concern.

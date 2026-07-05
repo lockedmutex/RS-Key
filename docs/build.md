@@ -82,10 +82,11 @@ empty by design: [architecture.md](architecture.md)).
 ![4 MB vs 16 MB flash layout — the KV store is identical on both; only the code region and the KV origin move with FLASH_SIZE](images/flash-map-sizes.svg)
 
 At the `4M` default the code region is `2560K`; the shipping image uses roughly a
-third of it. `check.sh` enforces a soft ceiling well under that (a runaway
-dependency — a whole extra EC curve is ~150 KiB — trips it long before the
-linker's hard limit); raise `FIRMWARE_FLASH_BUDGET_KIB` in the same commit when a
-real feature legitimately crosses it.
+third of it. `check.sh` enforces a *ratchet* well under that — a ceiling that
+hugs the current image, so a runaway dependency (a whole extra EC curve is
+~150 KiB) or any surprise growth trips it long before the linker's hard limit.
+Lower `FIRMWARE_FLASH_BUDGET_KIB` when the image shrinks; raise it in the same
+commit when a real feature legitimately grows it.
 
 ## Examples
 
