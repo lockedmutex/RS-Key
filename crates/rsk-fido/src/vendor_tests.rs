@@ -1238,3 +1238,35 @@ fn config_write_with_pin_and_token_succeeds() {
     );
     assert!(dev_conf_readback(&mut fs).ends_with(DEV_CONF_BLOB));
 }
+
+#[test]
+fn config_write_persists_phy_over_fido() {
+    let (mut fs, mut rng, mut st) = setup();
+    // A phy record setting the touch-wait timeout (tag 0x08) — the same record
+    // the CCID rescue WRITE 0x1C persists.
+    let phy = rsk_rescue::phy::PhyData {
+        presence_timeout: Some(45),
+        ..Default::default()
+    };
+    let mut blob = [0u8; rsk_rescue::phy::PHY_MAX_SIZE];
+    let blen = phy.serialize(&mut blob).unwrap();
+    let mut req = [0u8; 128];
+    let n = config_write_req(CONFIG_TARGET_PHY, &blob[..blen], false, &mut req);
+    let mut out = [0u8; 16];
+    assert_eq!(
+        call(
+            &mut fs,
+            &mut rng,
+            &mut st,
+            &mut AlwaysConfirm,
+            &req[..n],
+            &mut out
+        ),
+        Ok(0)
+    );
+    // The FIDO write lands in EF_PHY; boot / the CCID rescue READ path sees it.
+    assert_eq!(
+        rsk_rescue::phy::load(&mut fs).unwrap().presence_timeout,
+        Some(45)
+    );
+}

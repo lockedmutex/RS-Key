@@ -34,14 +34,16 @@ use rsk_crypto::pinproto::{PinProto, ecdh_raw};
 use rsk_crypto::sha256;
 use rsk_fs::Storage;
 use rsk_mgmt::{DevConfError, persist_dev_conf};
+use rsk_rescue::phy;
 
 use crate::cbordec::{cbor, def_map};
 use crate::cert;
 use crate::consts::{
-    CONFIG_TARGET_DEV_CONF, CTAP_VENDOR, EF_ATT_CHAIN, EF_ATT_KEY, EF_BACKUP_SEALED, EF_EE_DEV,
-    EF_KEY_DEV, EF_KEY_DEV_ENC, EF_PIN, VENDOR_ATT_CLEAR, VENDOR_ATT_IMPORT, VENDOR_ATT_STATE,
-    VENDOR_AUDIT_CHECKPOINT, VENDOR_AUDIT_READ, VENDOR_BACKUP_EXPORT, VENDOR_BACKUP_FINALIZE,
-    VENDOR_BACKUP_LOAD, VENDOR_BACKUP_STATE, VENDOR_CONFIG_WRITE, VENDOR_MSE, VENDOR_UNLOCK,
+    CONFIG_TARGET_DEV_CONF, CONFIG_TARGET_PHY, CTAP_VENDOR, EF_ATT_CHAIN, EF_ATT_KEY,
+    EF_BACKUP_SEALED, EF_EE_DEV, EF_KEY_DEV, EF_KEY_DEV_ENC, EF_PIN, VENDOR_ATT_CLEAR,
+    VENDOR_ATT_IMPORT, VENDOR_ATT_STATE, VENDOR_AUDIT_CHECKPOINT, VENDOR_AUDIT_READ,
+    VENDOR_BACKUP_EXPORT, VENDOR_BACKUP_FINALIZE, VENDOR_BACKUP_LOAD, VENDOR_BACKUP_STATE,
+    VENDOR_CONFIG_WRITE, VENDOR_MSE, VENDOR_UNLOCK,
 };
 use crate::cose::cose_key_ecdh;
 use crate::ec::P256Key;
@@ -189,6 +191,12 @@ fn config_write<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req) -> CtapResul
             DevConfError::TooLong => CtapError::InvalidLength,
             DevConfError::Store => CtapError::Other,
         })?,
+        // The phy record (VID/PID, USB interfaces, LED, presence-timeout) — the
+        // same lenient parse + save the CCID rescue WRITE 0x1C uses; takes effect
+        // on the next boot (main reads EF_PHY), like the CCID path.
+        CONFIG_TARGET_PHY => {
+            phy::save(ctx.fs, &phy::PhyData::parse(req.blob)).map_err(|_| CtapError::Other)?
+        }
         _ => return Err(CtapError::InvalidParameter),
     }
     journal::append(ctx, journal::EV_CONFIG_WRITE, req.target as u8, &[]);

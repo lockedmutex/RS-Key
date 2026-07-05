@@ -17,6 +17,7 @@ ed25519-dalek = { workspace = true }
 rsk-crypto = { workspace = true }
 rsk-fs = { workspace = true }
 rsk-mgmt = { workspace = true }
+rsk-rescue = { workspace = true }
 rsk-sdk = { workspace = true }
 zeroize = { workspace = true }
 

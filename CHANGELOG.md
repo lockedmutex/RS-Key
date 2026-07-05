@@ -18,8 +18,9 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 - **Device configuration over FIDO (CTAPHID), PIN + touch gated.** A new
   `authenticatorVendor 0x41` subcommand `CONFIG_WRITE (0x0C)` writes device config
   over the FIDO HID transport — for hosts where PC/SC / pcscd can't read or write
-  the CCID interface. The first target is the management enabled-apps TLV
-  (`EF_DEV_CONF`); it lands in the same record a CCID READ CONFIG echoes. Gated by
+  the CCID interface. Targets: the management enabled-apps TLV (`EF_DEV_CONF`) and
+  the phy record (`EF_PHY` — VID/PID, USB interfaces, LED, presence-timeout); each
+  lands in the same record the CCID read path echoes. Gated by
   a physical touch and, when a PIN is set, a `pinUvAuthToken` (`acfg` permission)
   — stronger than the CCID path's presence-only, since CTAPHID is reachable by any
   unprivileged host process. Wire format in `docs/protocol.md` §9.

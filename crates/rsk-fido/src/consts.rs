@@ -55,6 +55,7 @@ pub const VENDOR_CONFIG_WRITE: u64 = 0x0C; // persist a device-config blob (PIN 
 // working pcscd can still configure the key (gated by PIN + touch, not the CCID
 // path's presence-only).
 pub const CONFIG_TARGET_DEV_CONF: u64 = 0x00; // management enabled-apps TLV (EF_DEV_CONF)
+pub const CONFIG_TARGET_PHY: u64 = 0x01; // phy record: VID/PID, USB itf, LED, presence-timeout (EF_PHY)
 
 // authenticatorConfig subcommands.
 pub const CONFIG_ENABLE_EA: u64 = 0x01; // enableEnterpriseAttestation
