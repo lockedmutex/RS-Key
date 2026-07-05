@@ -545,60 +545,24 @@ fn make_credential_inner<S: Storage, R: Rng>(
     // attestation signed by the device key, carrying its x5c cert and the `ep`
     // response flag.
     ad[ad_len..ad_len + 32].copy_from_slice(req.client_data_hash);
-    // Any enterpriseAttestation request (type 1/2, with EA enabled) yields a
-    // basic_full (x5c) attestation; a request WITHOUT it keeps the default
-    // self-attestation. `ea_performed` — platform-managed (type 2), or
-    // vendor-facilitated (type 1) for an RP on the built-in enterprise list (empty
-    // in shipping firmware) — presents the org/EP cert and sets the `ep` flag. A
-    // type-1 request for a non-listed RP is NOT enterprise: it presents the device's
-    // own cert with no `ep` (a normal, non-enterprise attestation — CTAP2.1 §6.1.3,
-    // conformance Enterprise-Attestation F-6). The EP/org cert comes from an
-    // org-provisioned key (vendor ATT_IMPORT); the non-enterprise / no-org-key path
-    // signs with the device key (the seed scalar) + its self-signed EF_EE_DEV cert
-    // (the pair U2F register uses).
+    // `ea_performed` — platform-managed (type 2), or vendor-facilitated (type 1)
+    // for an RP on the built-in enterprise list (empty in shipping firmware) —
+    // presents the org/EP cert and sets the `ep` flag. A type-1 request for a
+    // non-listed RP is NOT enterprise: full attestation with the device's own
+    // cert and no `ep` (CTAP2.1 §6.1.3, conformance Enterprise-Attestation F-6).
     let ea_performed = req.enterprise_attestation == 2
         || (req.enterprise_attestation == 1 && rp_eligible_for_vendor_ea(req.rp_id));
     let full_attestation = req.enterprise_attestation > 0;
-    let org_key = if ea_performed {
-        load_att_key(&ctx.dev, ctx.fs)
-    } else {
-        None
-    };
-    let mut sig = [0u8; MAX_SIG_LEN];
-    let mut chain = [0u8; cert::ATT_CHAIN_REC_MAX];
-    let (att_alg, sig_len, chain_len, certs) = if full_attestation {
-        if let Some(mut scalar) = org_key {
-            let k = P256Key::from_scalar(&scalar);
-            scalar.zeroize();
-            let k = k.ok_or(CtapError::Other)?;
-            let sl = k.sign_der(&ad[..ad_len + 32], &mut sig);
-            let cl = ctx
-                .fs
-                .read(EF_ATT_CHAIN, &mut chain)
-                .map(|n| n.min(chain.len()))
-                .filter(|&n| cert::att_chain_count(&chain[..n]) > 0)
-                .ok_or(CtapError::Other)?;
-            let count = cert::att_chain_count(&chain[..cl]);
-            (ALG_ES256, sl, cl, count)
-        } else {
-            let device_key = P256Key::from_scalar(seed).ok_or(CtapError::Other)?;
-            let sl = device_key.sign_der(&ad[..ad_len + 32], &mut sig);
-            let mut one = [0u8; 512];
-            let cl = match ctx.fs.read(EF_EE_DEV, &mut one) {
-                Some(n) if n > 0 => n.min(one.len()),
-                _ => return Err(CtapError::Other),
-            };
-            // Wrap the single self-signed cert in the packed-chain layout so
-            // the x5c encode below has one shape.
-            chain[0] = 1;
-            chain[1..3].copy_from_slice(&(cl as u16).to_le_bytes());
-            chain[3..3 + cl].copy_from_slice(&one[..cl]);
-            (ALG_ES256, sl, 3 + cl, 1)
-        }
-    } else {
-        let sl = key.sign(&ad[..ad_len + 32], ctx.rng, &mut sig);
-        (key.alg(), sl, 0, 0)
-    };
+    let mut att = AttBufs::new();
+    let (att_alg, sig_len, chain_len, certs) = make_attestation(
+        ctx,
+        seed,
+        &key,
+        &ad[..ad_len + 32],
+        ea_performed,
+        full_attestation,
+        &mut att,
+    )?;
 
     // largeBlobKey response field (0x05) — resident credentials only.
     let large_blob_key = if req.ext_large_blob_key == Some(true) && req.rk {
@@ -617,14 +581,14 @@ fn make_credential_inner<S: Storage, R: Rng>(
             .and_then(|e| e.u8(2)?.bytes(&ad[..ad_len]))
             .and_then(|e| e.u8(3)?.map(2 + u64::from(full_attestation)))
             .and_then(|e| e.str("alg")?.i64(att_alg))
-            .and_then(|e| e.str("sig")?.bytes(&sig[..sig_len]))
+            .and_then(|e| e.str("sig")?.bytes(&att.sig[..sig_len]))
             .map_err(|_| CtapError::Other)?;
         if full_attestation {
             enc.str("x5c")
                 .and_then(|e| e.array(u64::from(certs)))
                 .map_err(|_| CtapError::Other)?;
             for i in 0..certs {
-                let c = cert::att_chain_cert(&chain[..chain_len], i).ok_or(CtapError::Other)?;
+                let c = cert::att_chain_cert(&att.chain[..chain_len], i).ok_or(CtapError::Other)?;
                 enc.bytes(c).map_err(|_| CtapError::Other)?;
             }
         }
@@ -658,6 +622,77 @@ fn make_credential_inner<S: Storage, R: Rng>(
     bump_sign_counter(ctx.fs).map_err(|_| CtapError::Other)?;
     journal::append(ctx, journal::EV_MAKE_CRED, 0, &rp_id_hash[..8]);
     Ok(resp_len)
+}
+
+/// Output buffers for [`make_attestation`]: the raw signature and the packed x5c
+/// chain, filled in place and then sliced by the returned lengths.
+struct AttBufs {
+    sig: [u8; MAX_SIG_LEN],
+    chain: [u8; cert::ATT_CHAIN_REC_MAX],
+}
+
+impl AttBufs {
+    fn new() -> Self {
+        Self {
+            sig: [0u8; MAX_SIG_LEN],
+            chain: [0u8; cert::ATT_CHAIN_REC_MAX],
+        }
+    }
+}
+
+/// Sign `signed` (authData ‖ clientDataHash) into `att` and shape the attestation
+/// statement. Self-attestation (the default, `full` = false) signs with the
+/// credential key. A `full` attestation is basic/enterprise (x5c): with the org
+/// attestation key present it signs with that key + the EF_ATT_CHAIN chain;
+/// otherwise with the device key (the seed scalar) + its self-signed EF_EE_DEV
+/// cert (the pair U2F register uses). Returns `(alg, sig_len, chain_len,
+/// cert_count)`; the chain fields are 0 for self-attestation.
+fn make_attestation<S: Storage, R: Rng>(
+    ctx: &mut Ctx<S, R>,
+    seed: &[u8; 32],
+    key: &CredKey,
+    signed: &[u8],
+    ea_performed: bool,
+    full: bool,
+    att: &mut AttBufs,
+) -> Result<(i64, usize, usize, u8), CtapError> {
+    if !full {
+        let sl = key.sign(signed, ctx.rng, &mut att.sig);
+        return Ok((key.alg(), sl, 0, 0));
+    }
+    let org_key = if ea_performed {
+        load_att_key(&ctx.dev, ctx.fs)
+    } else {
+        None
+    };
+    if let Some(mut scalar) = org_key {
+        let k = P256Key::from_scalar(&scalar);
+        scalar.zeroize();
+        let k = k.ok_or(CtapError::Other)?;
+        let sl = k.sign_der(signed, &mut att.sig);
+        let cl = ctx
+            .fs
+            .read(EF_ATT_CHAIN, &mut att.chain[..])
+            .map(|n| n.min(att.chain.len()))
+            .filter(|&n| cert::att_chain_count(&att.chain[..n]) > 0)
+            .ok_or(CtapError::Other)?;
+        let count = cert::att_chain_count(&att.chain[..cl]);
+        Ok((ALG_ES256, sl, cl, count))
+    } else {
+        let device_key = P256Key::from_scalar(seed).ok_or(CtapError::Other)?;
+        let sl = device_key.sign_der(signed, &mut att.sig);
+        let mut one = [0u8; 512];
+        let cl = match ctx.fs.read(EF_EE_DEV, &mut one) {
+            Some(n) if n > 0 => n.min(one.len()),
+            _ => return Err(CtapError::Other),
+        };
+        // Wrap the single self-signed cert in the packed-chain layout so the
+        // x5c encode has one shape.
+        att.chain[0] = 1;
+        att.chain[1..3].copy_from_slice(&(cl as u16).to_le_bytes());
+        att.chain[3..3 + cl].copy_from_slice(&one[..cl]);
+        Ok((ALG_ES256, sl, 3 + cl, 1))
+    }
 }
 
 /// Is `id` an existing credential for this rp that is *visible* now? A
