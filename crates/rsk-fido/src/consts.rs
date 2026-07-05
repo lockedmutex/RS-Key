@@ -49,6 +49,7 @@ pub const VENDOR_ATT_IMPORT: u64 = 0x09; // install org attestation key + chain
 pub const VENDOR_ATT_CLEAR: u64 = 0x0A; // remove the org attestation
 pub const VENDOR_ATT_STATE: u64 = 0x0B; // {present, chain hash} — ungated
 pub const VENDOR_CONFIG_WRITE: u64 = 0x0C; // persist a device-config blob (PIN + touch)
+pub const VENDOR_CONFIG_READ: u64 = 0x0D; // read a device-config record (ungated, for host RMW)
 
 // Config-write targets — `subCommandParams` key 1 of `VENDOR_CONFIG_WRITE`. The
 // FIDO-transport twin of the CCID device-config writes, so a host without a

@@ -23,7 +23,9 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   lands in the same record the CCID read path echoes. Gated by
   a physical touch and, when a PIN is set, a `pinUvAuthToken` (`acfg` permission)
   — stronger than the CCID path's presence-only, since CTAPHID is reachable by any
-  unprivileged host process. Wire format in `docs/protocol.md` §9.
+  unprivileged host process. `CONFIG_READ (0x0D)` returns the phy record (ungated)
+  so a host can read-modify-write it over FIDO with no PC/SC at all; `rsk hw
+  --transport fido` uses this. Wire format in `docs/protocol.md` §9.
 - **Firmware flash-size ratchet in the gate.** `check.sh` fails if the shipping
   image grows past a ceiling that hugs the current size (well under the 2560K
   code region) — a runaway dependency or surprise growth trips it early. Ratchet

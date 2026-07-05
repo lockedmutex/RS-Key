@@ -43,7 +43,7 @@ use crate::consts::{
     EF_BACKUP_SEALED, EF_EE_DEV, EF_KEY_DEV, EF_KEY_DEV_ENC, EF_PIN, VENDOR_ATT_CLEAR,
     VENDOR_ATT_IMPORT, VENDOR_ATT_STATE, VENDOR_AUDIT_CHECKPOINT, VENDOR_AUDIT_READ,
     VENDOR_BACKUP_EXPORT, VENDOR_BACKUP_FINALIZE, VENDOR_BACKUP_LOAD, VENDOR_BACKUP_STATE,
-    VENDOR_CONFIG_WRITE, VENDOR_MSE, VENDOR_UNLOCK,
+    VENDOR_CONFIG_READ, VENDOR_CONFIG_WRITE, VENDOR_MSE, VENDOR_UNLOCK,
 };
 use crate::cose::cose_key_ecdh;
 use crate::ec::P256Key;
@@ -117,7 +117,9 @@ fn parse(data: &[u8]) -> Result<Req<'_>, CtapError> {
                         req.chain = cbor(d.bytes())?;
                     } else if sk == 2 && req.subcommand == VENDOR_MSE {
                         req.mlkem_ek = cbor(d.bytes())?;
-                    } else if sk == 1 && req.subcommand == VENDOR_CONFIG_WRITE {
+                    } else if sk == 1
+                        && matches!(req.subcommand, VENDOR_CONFIG_WRITE | VENDOR_CONFIG_READ)
+                    {
                         req.target = cbor(d.u32())? as u64;
                     } else if sk == 2 && req.subcommand == VENDOR_CONFIG_WRITE {
                         req.blob = cbor(d.bytes())?;
@@ -171,6 +173,29 @@ pub fn vendor<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, data: &[u8], out: &mut [u
         VENDOR_ATT_CLEAR => att_clear(ctx, &req),
         VENDOR_ATT_STATE => att_state(ctx, out),
         VENDOR_CONFIG_WRITE => config_write(ctx, &req),
+        VENDOR_CONFIG_READ => config_read(ctx, &req, out),
+        _ => Err(CtapError::InvalidParameter),
+    }
+}
+
+/// `CONFIG_READ`: return a device-config record so a host can read-modify-write it
+/// over FIDO (the phy record has no CCID-free read otherwise). Ungated — the
+/// config is not secret, like READ CONFIG (`0x42`) and the `*_STATE` subcommands.
+/// Only the phy record: `EF_DEV_CONF` already round-trips via READ CONFIG.
+fn config_read<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [u8]) -> CtapResult {
+    match req.target {
+        CONFIG_TARGET_PHY => {
+            let mut buf = [0u8; phy::PHY_MAX_SIZE];
+            let n = ctx
+                .fs
+                .read(phy::EF_PHY, &mut buf)
+                .unwrap_or(0)
+                .min(buf.len());
+            encode(out, |e| {
+                e.map(1)?.u8(1)?.bytes(&buf[..n])?;
+                Ok(())
+            })
+        }
         _ => Err(CtapError::InvalidParameter),
     }
 }

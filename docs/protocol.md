@@ -489,6 +489,7 @@ Keys 3/4 are present only when a PIN is set (see gating).
 | `0A` | ATT_CLEAR | — | — | MSE + touch + PIN-token |
 | `0B` | ATT_STATE | — | `{1: present, 2: sha256(chain)?}` | **ungated** |
 | `0C` | CONFIG_WRITE | `{1: target(uint), 2: blob(bstr)}` — target `0`=DEV_CONF, `1`=PHY | — | touch + PIN-token; **no MSE** |
+| `0D` | CONFIG_READ | `{1: target(uint)}` — target `1`=PHY | `{1: blob(bstr)}` | **ungated** |
 
 > ### Device configuration over FIDO (`CONFIG_WRITE 0x0C`)
 > The pcscd-free twin of the CCID device-config writes (§6 WRITE CONFIG and the

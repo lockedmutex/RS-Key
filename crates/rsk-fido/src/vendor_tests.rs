@@ -1270,3 +1270,67 @@ fn config_write_persists_phy_over_fido() {
         Some(45)
     );
 }
+
+/// Build a `VENDOR_CONFIG_READ` request `{1: subcmd, 2: {1: target}}` (ungated).
+fn config_read_req(target: u64, buf: &mut [u8]) -> usize {
+    let mut e = Encoder::new(Cursor::new(buf));
+    e.map(2).unwrap();
+    e.u8(1).unwrap().u64(VENDOR_CONFIG_READ).unwrap();
+    e.u8(2)
+        .unwrap()
+        .map(1)
+        .unwrap()
+        .u8(1)
+        .unwrap()
+        .u64(target)
+        .unwrap();
+    e.writer().position()
+}
+
+#[test]
+fn config_read_returns_the_phy_record_ungated() {
+    let (mut fs, mut rng, mut st) = setup();
+    // Seed a phy record through the write path.
+    let phy = rsk_rescue::phy::PhyData {
+        presence_timeout: Some(30),
+        ..Default::default()
+    };
+    let mut blob = [0u8; rsk_rescue::phy::PHY_MAX_SIZE];
+    let blen = phy.serialize(&mut blob).unwrap();
+    let mut wreq = [0u8; 128];
+    let wn = config_write_req(CONFIG_TARGET_PHY, &blob[..blen], false, &mut wreq);
+    let mut wout = [0u8; 16];
+    call(
+        &mut fs,
+        &mut rng,
+        &mut st,
+        &mut AlwaysConfirm,
+        &wreq[..wn],
+        &mut wout,
+    )
+    .unwrap();
+
+    // CONFIG_READ is ungated — no PIN, no touch (Decline would refuse a gate).
+    let mut rreq = [0u8; 32];
+    let rn = config_read_req(CONFIG_TARGET_PHY, &mut rreq);
+    let mut rout = [0u8; 128];
+    let r = call(
+        &mut fs,
+        &mut rng,
+        &mut st,
+        &mut Decline,
+        &rreq[..rn],
+        &mut rout,
+    )
+    .unwrap();
+
+    // Response {1: blob}; the blob parses back to the record just written.
+    let mut d = Decoder::new(&rout[..r]);
+    assert_eq!(d.map().unwrap(), Some(1));
+    assert_eq!(d.u8().unwrap(), 1);
+    let got = d.bytes().unwrap();
+    assert_eq!(
+        rsk_rescue::phy::PhyData::parse(got).presence_timeout,
+        Some(30)
+    );
+}
