@@ -33,14 +33,15 @@ use rsk_crypto::mlkem::{MLKEM768_CT_LEN, MLKEM768_EK_LEN, mlkem768_encapsulate};
 use rsk_crypto::pinproto::{PinProto, ecdh_raw};
 use rsk_crypto::sha256;
 use rsk_fs::Storage;
+use rsk_mgmt::{DevConfError, persist_dev_conf};
 
 use crate::cbordec::{cbor, def_map};
 use crate::cert;
 use crate::consts::{
-    CTAP_VENDOR, EF_ATT_CHAIN, EF_ATT_KEY, EF_BACKUP_SEALED, EF_EE_DEV, EF_KEY_DEV, EF_KEY_DEV_ENC,
-    EF_PIN, VENDOR_ATT_CLEAR, VENDOR_ATT_IMPORT, VENDOR_ATT_STATE, VENDOR_AUDIT_CHECKPOINT,
-    VENDOR_AUDIT_READ, VENDOR_BACKUP_EXPORT, VENDOR_BACKUP_FINALIZE, VENDOR_BACKUP_LOAD,
-    VENDOR_BACKUP_STATE, VENDOR_MSE, VENDOR_UNLOCK,
+    CONFIG_TARGET_DEV_CONF, CTAP_VENDOR, EF_ATT_CHAIN, EF_ATT_KEY, EF_BACKUP_SEALED, EF_EE_DEV,
+    EF_KEY_DEV, EF_KEY_DEV_ENC, EF_PIN, VENDOR_ATT_CLEAR, VENDOR_ATT_IMPORT, VENDOR_ATT_STATE,
+    VENDOR_AUDIT_CHECKPOINT, VENDOR_AUDIT_READ, VENDOR_BACKUP_EXPORT, VENDOR_BACKUP_FINALIZE,
+    VENDOR_BACKUP_LOAD, VENDOR_BACKUP_STATE, VENDOR_CONFIG_WRITE, VENDOR_MSE, VENDOR_UNLOCK,
 };
 use crate::cose::cose_key_ecdh;
 use crate::ec::P256Key;
@@ -67,6 +68,8 @@ struct Req<'a> {
     blob: &'a [u8],
     /// ATT_IMPORT subCommandParams key 2: the DER cert chain, leaf first.
     chain: &'a [u8],
+    /// CONFIG_WRITE subCommandParams key 1: which device-config record to write.
+    target: u64,
     raw_subpara: &'a [u8],
     proto: u64,
     pin_uv_auth_param: Option<&'a [u8]>,
@@ -112,6 +115,10 @@ fn parse(data: &[u8]) -> Result<Req<'_>, CtapError> {
                         req.chain = cbor(d.bytes())?;
                     } else if sk == 2 && req.subcommand == VENDOR_MSE {
                         req.mlkem_ek = cbor(d.bytes())?;
+                    } else if sk == 1 && req.subcommand == VENDOR_CONFIG_WRITE {
+                        req.target = cbor(d.u32())? as u64;
+                    } else if sk == 2 && req.subcommand == VENDOR_CONFIG_WRITE {
+                        req.blob = cbor(d.bytes())?;
                     } else {
                         cbor(d.skip())?;
                     }
@@ -161,8 +168,31 @@ pub fn vendor<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, data: &[u8], out: &mut [u
         VENDOR_ATT_IMPORT => att_import(ctx, &req),
         VENDOR_ATT_CLEAR => att_clear(ctx, &req),
         VENDOR_ATT_STATE => att_state(ctx, out),
+        VENDOR_CONFIG_WRITE => config_write(ctx, &req),
         _ => Err(CtapError::InvalidParameter),
     }
+}
+
+/// `CONFIG_WRITE`: persist a device-configuration record over FIDO — the
+/// pcscd-free twin of the CCID device-config writes, for hosts that can't reach
+/// the CCID interface. Gated by a pinUvAuthToken (PERM_ACFG, when a PIN is set)
+/// AND a physical touch: a *stronger* gate than the CCID path's presence-only,
+/// because CTAPHID is reachable by any unprivileged host process. No MSE channel
+/// — the config blobs are not secret, only their authorship must be proven.
+fn config_write<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req) -> CtapResult {
+    pin_gate(ctx, req)?;
+    if !ctx.check_user_presence(crate::Confirm::titled("Write device config?")) {
+        return Err(CtapError::OperationDenied);
+    }
+    match req.target {
+        CONFIG_TARGET_DEV_CONF => persist_dev_conf(ctx.fs, req.blob).map_err(|e| match e {
+            DevConfError::TooLong => CtapError::InvalidLength,
+            DevConfError::Store => CtapError::Other,
+        })?,
+        _ => return Err(CtapError::InvalidParameter),
+    }
+    journal::append(ctx, journal::EV_CONFIG_WRITE, req.target as u8, &[]);
+    Ok(0)
 }
 
 /// `ATT_IMPORT`: install an org attestation key + DER chain (leaf first). The

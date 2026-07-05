@@ -59,6 +59,7 @@ pub const EV_CHECKPOINT: u8 = 0x11;
 pub const EV_ATT_IMPORT: u8 = 0x12;
 pub const EV_ATT_CLEAR: u8 = 0x13;
 pub const EV_CFG_ALWAYS_UV: u8 = 0x14;
+pub const EV_CONFIG_WRITE: u8 = 0x15; // device-config write over the FIDO vendor channel
 
 /// Entry: `seq(4 LE) ‖ uptime_ms(4 LE) ‖ event(1) ‖ aux(1) ‖ detail(8) ‖ rsvd(2)`.
 pub const ENTRY_LEN: usize = 20;

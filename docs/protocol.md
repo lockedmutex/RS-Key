@@ -488,6 +488,19 @@ Keys 3/4 are present only when a PIN is set (see gating).
 | `09` | ATT_IMPORT | `{1: blob(60), 2: DER chain}` | — | MSE + touch + PIN-token |
 | `0A` | ATT_CLEAR | — | — | MSE + touch + PIN-token |
 | `0B` | ATT_STATE | — | `{1: present, 2: sha256(chain)?}` | **ungated** |
+| `0C` | CONFIG_WRITE | `{1: target(uint), 2: blob(bstr)}` | — | touch + PIN-token; **no MSE** |
+
+> ### Device configuration over FIDO (`CONFIG_WRITE 0x0C`)
+> The pcscd-free twin of the CCID device-config writes (§6 WRITE CONFIG and the
+> `§7`/`§8` phy/LED records): a host that cannot reach the CCID interface writes
+> the same config over CTAPHID. `target` selects the record — `0x00` = the
+> management enabled-apps TLV (`EF_DEV_CONF`, the §6 blob, `≤ 64` bytes → the same
+> `CTAP1_ERR_INVALID_LENGTH 0x03` cap); further targets (phy, LED) are added as
+> `bcdDevice` grows. No MSE channel — the config is not secret. It is gated by a
+> physical touch **and**, when a PIN is set, a `pinUvAuthToken` with the `acfg`
+> permission (the MAC below): a **stronger** gate than the CCID path's
+> presence-only, because CTAPHID is reachable by any unprivileged host process.
+> The write lands in the same `EF_DEV_CONF`, so a later CCID READ CONFIG echoes it.
 
 > ### ⚠️ Seed export hands out a normally non-exportable key
 > `BACKUP_EXPORT (0x02)` returns the device's 32-byte master seed (encrypted over

@@ -150,6 +150,29 @@ pub fn config_tlv<S: Storage>(serial: &[u8; 4], fs: &mut Fs<S>, res: &mut ResBuf
     Sw::OK
 }
 
+/// Failure to persist a device-config blob — shared by the CCID WRITE CONFIG and
+/// the FIDO vendor config-write, which map it to their own status/error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DevConfError {
+    /// Over `EF_DEV_CONF_MAX` — refused so READ CONFIG can never slice past its
+    /// fixed buffer (an over-length blob in flash is a sticky DoS).
+    TooLong,
+    /// The flash write failed.
+    Store,
+}
+
+/// Validate and persist the device-config TLV to `EF_DEV_CONF` — the
+/// transport-agnostic core of WRITE CONFIG, shared by the CCID applet and the
+/// FIDO vendor config-write ([`crate::ManagementApplet`] / `rsk-fido`). `blob` is
+/// the enabled-applications TLV *without* any transport length prefix; the caller
+/// applies its own auth gate (CCID presence, FIDO PIN + touch) before this.
+pub fn persist_dev_conf<S: Storage>(fs: &mut Fs<S>, blob: &[u8]) -> Result<(), DevConfError> {
+    if blob.len() > EF_DEV_CONF_MAX {
+        return Err(DevConfError::TooLong);
+    }
+    fs.put(EF_DEV_CONF, blob).map_err(|_| DevConfError::Store)
+}
+
 impl<'a> ManagementApplet<'a> {
     /// `serial_id` is the device chip id; its first 4 bytes form the serial.
     pub fn new(serial_id: [u8; 8], presence: &'a RefCell<dyn UserPresence>) -> Self {
@@ -192,9 +215,10 @@ impl<'a> ManagementApplet<'a> {
         if !self.require_presence(Confirm::titled("Write device config?")) {
             return Sw::CONDITIONS_NOT_SATISFIED;
         }
-        match fs.put(EF_DEV_CONF, &apdu.data[1..apdu.nc]) {
+        match persist_dev_conf(fs, &apdu.data[1..apdu.nc]) {
             Ok(()) => Sw::OK,
-            Err(_) => Sw::MEMORY_FAILURE,
+            Err(DevConfError::TooLong) => Sw::INCORRECT_PARAMS,
+            Err(DevConfError::Store) => Sw::MEMORY_FAILURE,
         }
     }
 }

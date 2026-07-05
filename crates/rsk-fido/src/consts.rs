@@ -48,6 +48,13 @@ pub const VENDOR_AUDIT_CHECKPOINT: u64 = 0x08; // DEVK-signed chain checkpoint
 pub const VENDOR_ATT_IMPORT: u64 = 0x09; // install org attestation key + chain
 pub const VENDOR_ATT_CLEAR: u64 = 0x0A; // remove the org attestation
 pub const VENDOR_ATT_STATE: u64 = 0x0B; // {present, chain hash} — ungated
+pub const VENDOR_CONFIG_WRITE: u64 = 0x0C; // persist a device-config blob (PIN + touch)
+
+// Config-write targets — `subCommandParams` key 1 of `VENDOR_CONFIG_WRITE`. The
+// FIDO-transport twin of the CCID device-config writes, so a host without a
+// working pcscd can still configure the key (gated by PIN + touch, not the CCID
+// path's presence-only).
+pub const CONFIG_TARGET_DEV_CONF: u64 = 0x00; // management enabled-apps TLV (EF_DEV_CONF)
 
 // authenticatorConfig subcommands.
 pub const CONFIG_ENABLE_EA: u64 = 0x01; // enableEnterpriseAttestation
