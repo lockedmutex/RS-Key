@@ -10,7 +10,19 @@ Per-status color + brightness + effect + speed; --steady is a solid color
 (global). Persists in flash, applies live.
 """
 
+import sys
+
 from . import ccid
+from .backup import (
+    CONFIG_READ,
+    CONFIG_TARGET_LED,
+    CONFIG_WRITE,
+    _die_pin_required,
+    _die_touch_denied,
+    _gated,
+    _vendor,
+)
+from .common import add_pin_arg, connect_fido, device_has_pin, die, resolve_pin
 
 COLORS = {
     "off": 0,
@@ -35,6 +47,7 @@ BLOCK_OFF_EFFECT = 1  # first status starts here
 BLOCK_OFF_COLOR = 2
 BLOCK_OFF_BRIGHTNESS = 3
 BLOCK_OFF_SPEED = 4
+CONF_LEN = 1 + BLOCK_STRIDE * len(STATUSES)  # 17
 
 
 def register(sub):
@@ -62,6 +75,14 @@ def register(sub):
     g.add_argument("--steady", action="store_true", help="solid color, no blinking")
     g.add_argument("--blink", action="store_true", help="restore status blinking")
     p.add_argument("--get", action="store_true", help="read the current config")
+    p.add_argument(
+        "--transport",
+        choices=["ccid", "fido"],
+        default="ccid",
+        help="ccid (PC/SC, default) or fido (CTAPHID — when pcscd can't reach the "
+        "card; read-modify-write via CONFIG_READ/WRITE, gated by PIN + touch, applied live)",
+    )
+    add_pin_arg(p)
     p.set_defaults(func=run)
 
 
@@ -78,10 +99,8 @@ def _status_offset(st):
     return BLOCK_OFF_EFFECT + st * BLOCK_STRIDE
 
 
-def run(args):
-    conn = ccid.connect()
-    ccid.select(conn, ccid.VENDOR_AID)
-    changing = (
+def _changing(args):
+    return (
         args.brightness is not None
         or args.color is not None
         or args.effect is not None
@@ -89,7 +108,54 @@ def run(args):
         or args.steady
         or args.blink
     )
-    if changing:
+
+
+def _apply_block(block, args):
+    """Read-modify-write the 17-byte block for `--status` from the CLI overrides —
+    the whole-block form the FIDO CONFIG_WRITE takes. Validates ranges in place."""
+    st = STATUSES[args.status]
+    off = _status_offset(st)
+    if args.effect is not None:
+        block[off] = EFFECTS[args.effect]
+    if args.color is not None:
+        block[off + 1] = COLORS[args.color]
+    if args.brightness is not None:
+        if not 0 <= args.brightness <= 255:
+            raise SystemExit("--brightness must be 0–255")
+        block[off + 2] = args.brightness
+    if args.speed is not None:
+        if not 0 <= args.speed <= 255:
+            raise SystemExit("--speed must be 0–255")
+        block[off + 3] = args.speed
+    if args.steady:
+        block[BLOCK_OFF_STEADY] = 1
+    elif args.blink:
+        block[BLOCK_OFF_STEADY] = 0
+
+
+def _show_block(d):
+    print(f"mode={'steady' if d[BLOCK_OFF_STEADY] else 'blink'}")
+    for st, name in sorted(STATUS_NAMES.items()):
+        off = _status_offset(st)
+        effect = EFFECT_NAMES.get(d[off], d[off])
+        color = COLOR_NAMES.get(d[off + 1], d[off + 1])
+        brightness = d[off + 2]
+        print(
+            f"  {name:<10} color={color:<8} brightness={brightness:<3} effect={effect}"
+        )
+
+
+def run(args):
+    if args.transport == "fido":
+        _run_fido(args)
+    else:
+        _run_ccid(args)
+
+
+def _run_ccid(args):
+    conn = ccid.connect()
+    ccid.select(conn, ccid.VENDOR_AID)
+    if _changing(args):
         block = _get_block(conn)
         st = STATUSES[args.status]
         off = _status_offset(st)
@@ -131,15 +197,45 @@ def run(args):
             f"(mode={'steady' if steady else 'blink'})",
         ]
         print(" ".join(parts))
-    if args.get or not changing:
-        d = _get_block(conn)
-        print(f"mode={'steady' if d[BLOCK_OFF_STEADY] else 'blink'}")
-        for st, name in sorted(STATUS_NAMES.items()):
-            off = _status_offset(st)
-            effect = EFFECT_NAMES.get(d[off], d[off])
-            color = COLOR_NAMES.get(d[off + 1], d[off + 1])
-            brightness = d[off + 2]
-            print(
-                f"  {name:<10} color={color:<8} brightness={brightness:<3}"
-                f" effect={effect}"
-            )
+    if args.get or not _changing(args):
+        _show_block(_get_block(conn))
+
+
+def _read_block_fido(dev, cid):
+    """Read EF_LED_CONF over CTAPHID (CONFIG_READ LED, ungated) as a mutable block.
+    The firmware seeds the record with the defaults on first boot, so this is
+    always a full block to read-modify-write."""
+    st, m = _vendor(dev, cid, {1: CONFIG_READ, 2: {1: CONFIG_TARGET_LED}})
+    if st != 0:
+        die(
+            f"CONFIG_READ LED failed: {st:#x} — firmware too old for LED-over-FIDO "
+            "(needs bcdDevice ≥ 0x07F0)"
+        )
+    b = bytes(m[1]) if m and 1 in m else b""
+    if len(b) < CONF_LEN:
+        die("device returned no LED block — update firmware, or set it once via CCID")
+    return bytearray(b[:CONF_LEN])
+
+
+def _run_fido(args):
+    """The pcscd-free path: read-modify-write EF_LED_CONF over CTAPHID (CONFIG_READ
+    + the PIN/touch-gated CONFIG_WRITE). The firmware applies it live."""
+    dev, cid = connect_fido()
+    block = _read_block_fido(dev, cid)
+    if args.get or not _changing(args):
+        _show_block(block)
+        return
+    _apply_block(block, args)
+    pin = resolve_pin(args, has_pin=device_has_pin(dev, cid))
+    print(
+        "approve on the device (touch) to write the LED config over FIDO…",
+        file=sys.stderr,
+    )
+    fields = _gated(CONFIG_WRITE, {1: CONFIG_TARGET_LED, 2: bytes(block)}, dev, cid, pin)
+    st, _ = _vendor(dev, cid, fields)
+    _die_pin_required(st)
+    _die_touch_denied(st)
+    if st != 0:
+        die(f"CONFIG_WRITE LED failed: {st:#x}")
+    print("LED config written over FIDO ✓ (applied live)")
+    _show_block(block)

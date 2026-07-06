@@ -19,13 +19,14 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   `authenticatorVendor 0x41` subcommand `CONFIG_WRITE (0x0C)` writes device config
   over the FIDO HID transport — for hosts where PC/SC / pcscd can't read or write
   the CCID interface. Targets: the management enabled-apps TLV (`EF_DEV_CONF`) and
-  the phy record (`EF_PHY` — VID/PID, USB interfaces, LED, presence-timeout); each
-  lands in the same record the CCID read path echoes. Gated by
-  a physical touch and, when a PIN is set, a `pinUvAuthToken` (`acfg` permission)
-  — stronger than the CCID path's presence-only, since CTAPHID is reachable by any
-  unprivileged host process. `CONFIG_READ (0x0D)` returns the phy record (ungated)
-  so a host can read-modify-write it over FIDO with no PC/SC at all; `rsk hw
-  --transport fido` uses this. Wire format in `docs/protocol.md` §9.
+  the phy record (`EF_PHY` — VID/PID, USB interfaces, LED wiring, presence-timeout)
+  and the LED config block (`EF_LED_CONF`, applied **live**); each lands in the same
+  record the CCID read path echoes. Gated by a physical touch and, when a PIN is
+  set, a `pinUvAuthToken` (`acfg` permission) — stronger than the CCID path's
+  presence-only, since CTAPHID is reachable by any unprivileged host process.
+  `CONFIG_READ (0x0D)` returns the phy / LED record (ungated) so a host can
+  read-modify-write it over FIDO with no PC/SC at all; `rsk hw --transport fido`
+  and `rsk led --transport fido` use this. Wire format in `docs/protocol.md` §9.
 - **Firmware flash-size ratchet in the gate.** `check.sh` fails if the shipping
   image grows past a ceiling that hugs the current size (well under the 2560K
   code region) — a runaway dependency or surprise growth trips it early. Ratchet

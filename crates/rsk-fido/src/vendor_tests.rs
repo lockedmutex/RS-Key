@@ -1334,3 +1334,64 @@ fn config_read_returns_the_phy_record_ungated() {
         Some(30)
     );
 }
+
+#[test]
+fn config_write_read_led_block_over_fido() {
+    let (mut fs, mut rng, mut st) = setup();
+    // A distinctive 17-byte block [steady, (effect, color, brightness, speed)×4].
+    let mut led = [0u8; rsk_led::CONF_LEN];
+    for (i, b) in led.iter_mut().enumerate() {
+        *b = i as u8 + 1;
+    }
+    let mut wreq = [0u8; 96];
+    let wn = config_write_req(CONFIG_TARGET_LED, &led, false, &mut wreq);
+    let mut wout = [0u8; 16];
+    call(
+        &mut fs,
+        &mut rng,
+        &mut st,
+        &mut AlwaysConfirm,
+        &wreq[..wn],
+        &mut wout,
+    )
+    .unwrap();
+
+    // Read the block back (ungated). Live-apply of the atomics is a firmware
+    // handler concern (reload after 0x41) — exercised on-device, not here.
+    let mut rreq = [0u8; 32];
+    let rn = config_read_req(CONFIG_TARGET_LED, &mut rreq);
+    let mut rout = [0u8; 64];
+    let r = call(
+        &mut fs,
+        &mut rng,
+        &mut st,
+        &mut Decline,
+        &rreq[..rn],
+        &mut rout,
+    )
+    .unwrap();
+    let mut d = Decoder::new(&rout[..r]);
+    assert_eq!(d.map().unwrap(), Some(1));
+    assert_eq!(d.u8().unwrap(), 1);
+    assert_eq!(d.bytes().unwrap(), &led[..]);
+}
+
+#[test]
+fn config_write_led_rejects_short_block() {
+    let (mut fs, mut rng, mut st) = setup();
+    let short = [0u8; 4]; // < CONF_LEN (17)
+    let mut req = [0u8; 64];
+    let n = config_write_req(CONFIG_TARGET_LED, &short, false, &mut req);
+    let mut out = [0u8; 16];
+    assert_eq!(
+        call(
+            &mut fs,
+            &mut rng,
+            &mut st,
+            &mut AlwaysConfirm,
+            &req[..n],
+            &mut out
+        ),
+        Err(CtapError::InvalidLength)
+    );
+}

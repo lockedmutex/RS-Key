@@ -24,6 +24,11 @@ pub const N_STATUS: usize = 4;
 /// `EF_LED_CONF` length: `[steady, (effect, color, brightness, speed) × N_STATUS]`.
 pub const CONF_LEN: usize = 1 + 4 * N_STATUS;
 
+/// The flash FID that persists the config block — outside both reset scopes
+/// (sticky). Single-sourced here so the firmware LED applet and the FIDO
+/// `CONFIG_WRITE`/`CONFIG_READ` LED target agree on where it lives.
+pub const EF_LED_CONF: u16 = 0x1123;
+
 /// One status's configurable look. `color` is a `0..=7` palette index (`0` = off).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct StatusCfg {

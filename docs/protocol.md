@@ -488,8 +488,8 @@ Keys 3/4 are present only when a PIN is set (see gating).
 | `09` | ATT_IMPORT | `{1: blob(60), 2: DER chain}` | — | MSE + touch + PIN-token |
 | `0A` | ATT_CLEAR | — | — | MSE + touch + PIN-token |
 | `0B` | ATT_STATE | — | `{1: present, 2: sha256(chain)?}` | **ungated** |
-| `0C` | CONFIG_WRITE | `{1: target(uint), 2: blob(bstr)}` — target `0`=DEV_CONF, `1`=PHY | — | touch + PIN-token; **no MSE** |
-| `0D` | CONFIG_READ | `{1: target(uint)}` — target `1`=PHY | `{1: blob(bstr)}` | **ungated** |
+| `0C` | CONFIG_WRITE | `{1: target(uint), 2: blob(bstr)}` — target `0`=DEV_CONF, `1`=PHY, `2`=LED | — | touch + PIN-token; **no MSE** |
+| `0D` | CONFIG_READ | `{1: target(uint)}` — target `1`=PHY, `2`=LED | `{1: blob(bstr)}` | **ungated** |
 
 > ### Device configuration over FIDO (`CONFIG_WRITE 0x0C`)
 > The pcscd-free twin of the CCID device-config writes (§6 WRITE CONFIG and the
@@ -497,10 +497,13 @@ Keys 3/4 are present only when a PIN is set (see gating).
 > the same config over CTAPHID. `target` selects the record — `0x00` = the
 > management enabled-apps TLV (`EF_DEV_CONF`, the §6 blob, `≤ 64` bytes → the same
 > `CTAP1_ERR_INVALID_LENGTH 0x03` cap); `0x01` = the phy record (`EF_PHY`, §7.1 —
-> VID/PID, USB interfaces, LED, presence-timeout; the same lenient TLV parse the
-> CCID path uses, effective on the next boot). The LED block (`EF_LED_CONF`, §8)
-> stays CCID-only for now (its live state lives in the firmware, not a record). No
-> MSE channel — the config is not secret. It is gated by a
+> VID/PID, USB interfaces, LED wiring, presence-timeout; the same lenient TLV parse
+> the CCID path uses, effective on the next boot); `0x02` = the LED config block
+> (`EF_LED_CONF`, §8, `CONF_LEN` bytes) — persisted and then applied **live** by the
+> firmware, which reloads the block after a `0x41` command (the LED atomics are
+> firmware-side; `CONFIG_READ 0x02` returns the current block, seeded with the build
+> defaults on first boot, so a host can read-modify-write it). No MSE channel — the
+> config is not secret. It is gated by a
 > physical touch **and**, when a PIN is set, a `pinUvAuthToken` with the `acfg`
 > permission (the MAC below): a **stronger** gate than the CCID path's
 > presence-only, because CTAPHID is reachable by any unprivileged host process.

@@ -57,6 +57,7 @@ pub const VENDOR_CONFIG_READ: u64 = 0x0D; // read a device-config record (ungate
 // path's presence-only).
 pub const CONFIG_TARGET_DEV_CONF: u64 = 0x00; // management enabled-apps TLV (EF_DEV_CONF)
 pub const CONFIG_TARGET_PHY: u64 = 0x01; // phy record: VID/PID, USB itf, LED, presence-timeout (EF_PHY)
+pub const CONFIG_TARGET_LED: u64 = 0x02; // LED config block (EF_LED_CONF); applied live after the write
 
 // authenticatorConfig subcommands.
 pub const CONFIG_ENABLE_EA: u64 = 0x01; // enableEnterpriseAttestation

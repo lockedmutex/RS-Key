@@ -33,14 +33,15 @@ use rsk_crypto::mlkem::{MLKEM768_CT_LEN, MLKEM768_EK_LEN, mlkem768_encapsulate};
 use rsk_crypto::pinproto::{PinProto, ecdh_raw};
 use rsk_crypto::sha256;
 use rsk_fs::Storage;
+use rsk_led::{CONF_LEN as LED_CONF_LEN, EF_LED_CONF};
 use rsk_mgmt::{DevConfError, persist_dev_conf};
 use rsk_rescue::phy;
 
 use crate::cbordec::{cbor, def_map};
 use crate::cert;
 use crate::consts::{
-    CONFIG_TARGET_DEV_CONF, CONFIG_TARGET_PHY, CTAP_VENDOR, EF_ATT_CHAIN, EF_ATT_KEY,
-    EF_BACKUP_SEALED, EF_EE_DEV, EF_KEY_DEV, EF_KEY_DEV_ENC, EF_PIN, VENDOR_ATT_CLEAR,
+    CONFIG_TARGET_DEV_CONF, CONFIG_TARGET_LED, CONFIG_TARGET_PHY, CTAP_VENDOR, EF_ATT_CHAIN,
+    EF_ATT_KEY, EF_BACKUP_SEALED, EF_EE_DEV, EF_KEY_DEV, EF_KEY_DEV_ENC, EF_PIN, VENDOR_ATT_CLEAR,
     VENDOR_ATT_IMPORT, VENDOR_ATT_STATE, VENDOR_AUDIT_CHECKPOINT, VENDOR_AUDIT_READ,
     VENDOR_BACKUP_EXPORT, VENDOR_BACKUP_FINALIZE, VENDOR_BACKUP_LOAD, VENDOR_BACKUP_STATE,
     VENDOR_CONFIG_READ, VENDOR_CONFIG_WRITE, VENDOR_MSE, VENDOR_UNLOCK,
@@ -196,6 +197,18 @@ fn config_read<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [u8
                 Ok(())
             })
         }
+        CONFIG_TARGET_LED => {
+            let mut buf = [0u8; LED_CONF_LEN];
+            let n = ctx
+                .fs
+                .read(EF_LED_CONF, &mut buf)
+                .unwrap_or(0)
+                .min(buf.len());
+            encode(out, |e| {
+                e.map(1)?.u8(1)?.bytes(&buf[..n])?;
+                Ok(())
+            })
+        }
         _ => Err(CtapError::InvalidParameter),
     }
 }
@@ -221,6 +234,17 @@ fn config_write<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req) -> CtapResul
         // on the next boot (main reads EF_PHY), like the CCID path.
         CONFIG_TARGET_PHY => {
             phy::save(ctx.fs, &phy::PhyData::parse(req.blob)).map_err(|_| CtapError::Other)?
+        }
+        // The LED config block; persisted here and applied *live* by the firmware
+        // CTAPHID handler, which reloads EF_LED_CONF after a 0x41 command (the LED
+        // atomics are firmware-side). The CCID SET_LED writes the same record.
+        CONFIG_TARGET_LED => {
+            if req.blob.len() < LED_CONF_LEN {
+                return Err(CtapError::InvalidLength);
+            }
+            ctx.fs
+                .put(EF_LED_CONF, &req.blob[..LED_CONF_LEN])
+                .map_err(|_| CtapError::Other)?;
         }
         _ => return Err(CtapError::InvalidParameter),
     }

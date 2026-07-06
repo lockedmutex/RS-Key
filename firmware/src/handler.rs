@@ -256,6 +256,15 @@ impl AppletHandler<'_> {
             };
             rsk_fido::process_cbor(&mut ctx, data, &mut self.resp)
         };
+        // A vendor (0x41) CONFIG_WRITE with the LED target persists EF_LED_CONF,
+        // but the LED atomics live here in the firmware — reload the block after
+        // any 0x41 command to apply it live, matching the CCID SET_LED. 0x41 is
+        // rare (backup/audit/config), so the extra flash read is negligible, and
+        // it is a no-op when the record is absent or unchanged.
+        if data.first() == Some(&rsk_fido::consts::CTAP_VENDOR) {
+            let mut fsb = self.fs.borrow_mut();
+            crate::vendor::load_led_config(&mut fsb);
+        }
         &self.resp[..n]
     }
 }
