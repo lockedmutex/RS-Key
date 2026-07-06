@@ -595,15 +595,28 @@ SET     00 10 40 11        # P1=0x40 brightness, P2 = color 1 | status 1<<4 = 0x
    **AID** is `A0 58 3F C1 9B 7E 4F 21` (not pico-fido's), the Rescue **CLA is
    `0x80`**, and tag `0x0D` (LED_ORDER) is an RS-Key extension you can skip on read
    but should preserve on a read-modify-write.
-2. **Applet enable/disable** is the Yubico-compatible Management applet (§6) —
+2. **Hardware config over FIDO (no PC/SC) is supported** — PicoForge's legacy
+   hardware-config path. Send `authenticatorConfig` (CTAP `0x0D`) with subCommand
+   `vendorPrototype` (`0xFF`) and subCommandParams `{1: vendorCommandId(u64),
+   3: value(uint)}`, gated by an `acfg` pinUvAuthToken (no touch). The supported
+   IDs — the ones PicoForge writes — set the phy record and take effect on the
+   next boot: `PhysicalVidPid 0x6fcb19b0cbe3acfa` (value `(vid<<16)|pid`),
+   `PhysicalLedGpio 0x7b392a394de9f948`, `PhysicalLedBrightness 0x76a85945985d02fd`,
+   `PhysicalOptions 0x269f3b09eceb805f` (bitmask `0x2` dimmable / `0x4`
+   disable-power-reset / `0x8` led-steady). Product name, touch-timeout, LED driver
+   and curves stay Rescue-only. RS-Key reports firmware `5.x` (< 7), so PicoForge
+   enables its legacy hardware-config path. (RS-Key's own `rsk` uses the CTAPHID
+   `0x41` `CONFIG_WRITE/READ` path instead — see §9 — which also covers those
+   extras.)
+3. **Applet enable/disable** is the Yubico-compatible Management applet (§6) —
    identical to how you'd configure a YubiKey's USB applications.
-3. **Version-gate** on the Rescue SELECT identity (`01 02 08 06 …`, §7) and the
+4. **Version-gate** on the Rescue SELECT identity (`01 02 08 06 …`, §7) and the
    Management SELECT version string. Treat unknown phy tags / `0x41` subcommands as
    skippable, not errors.
-4. **Keep the dangerous surface behind explicit confirmation** — the OTP fuse
+5. **Keep the dangerous surface behind explicit confirmation** — the OTP fuse
    burns (§7), BOOTSEL reboot (§7/§8), and seed export (§9). Consider not exposing
    the fuse burns at all in a general management UI.
-5. **Reference client:** `tools/rsk` is a complete, runnable
+6. **Reference client:** `tools/rsk` is a complete, runnable
    implementation of everything here — `ccid.py` (transport), `ctaphid.py` (CTAP),
    `hw.py` (phy), `led.py` (LED), `backup.py` (`0x41`), `status.py`/`inventory.py`
    (DeviceInfo). When in doubt, match its bytes.

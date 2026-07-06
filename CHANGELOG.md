@@ -15,6 +15,11 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Added
 
+- **PicoForge hardware config over FIDO.** `authenticatorConfig`'s vendorPrototype
+  (`0xFF`) arm now accepts PicoForge's physical-config command IDs (`PhysicalVidPid`,
+  `PhysicalLedGpio`, `PhysicalLedBrightness`, `PhysicalOptions`), writing the phy
+  record — so PicoForge can set VID/PID, LED and options over FIDO with no PC/SC.
+  Gated by an `acfg` pinUvAuthToken. Details in `docs/protocol.md` §11.
 - **Device configuration over FIDO (CTAPHID), PIN + touch gated.** A new
   `authenticatorVendor 0x41` subcommand `CONFIG_WRITE (0x0C)` writes device config
   over the FIDO HID transport — for hosts where PC/SC / pcscd can't read or write

@@ -69,6 +69,15 @@ pub const CONFIG_VENDOR: u64 = 0xFF; // vendor subcommands, selected by a u64 id
 pub const CONFIG_AUT_ENABLE: u64 = 0x03e43f56b34285e2;
 pub const CONFIG_AUT_DISABLE: u64 = 0x1831a40f04a25ed9;
 
+// PicoForge physical-config vendor ids — hardware config over FIDO
+// (authenticatorConfig 0xFF, integer param at subCommandParams key 3). These are
+// the ids PicoForge's legacy hardware-config path writes, so it configures the phy
+// record over FIDO with no PC/SC. Each writes EF_PHY (effective on the next boot).
+pub const CONFIG_PHY_VIDPID: u64 = 0x6fcb19b0cbe3acfa; // param = (vid << 16) | pid
+pub const CONFIG_PHY_LED_BRIGHTNESS: u64 = 0x76a85945985d02fd; // param = brightness u8
+pub const CONFIG_PHY_LED_GPIO: u64 = 0x7b392a394de9f948; // param = gpio u8
+pub const CONFIG_PHY_OPTIONS: u64 = 0x269f3b09eceb805f; // param = opts u16 bitmask
+
 // authenticatorClientPIN subcommands compared at more than one site (the rest
 // are dispatched once as literals).
 pub const CP_GET_PIN_TOKEN: u64 = 0x05;

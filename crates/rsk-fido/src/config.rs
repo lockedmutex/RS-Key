@@ -2,8 +2,10 @@
 // Copyright (C) 2026 RS-Key contributors
 
 //! `authenticatorConfig`: enableEnterpriseAttestation (0x01), toggleAlwaysUv
-//! (0x02), setMinPINLength (0x03) and the vendor arm (0xFF) carrying the soft-lock
-//! pair AUT_ENABLE / AUT_DISABLE — all gated on a `pinUvAuthParam` with the `acfg`
+//! (0x02), setMinPINLength (0x03) and the vendor arm (0xFF) — the soft-lock pair
+//! AUT_ENABLE / AUT_DISABLE and the PicoForge physical-config ids (VID/PID, LED
+//! gpio/brightness, options → the phy record, so PicoForge configures hardware
+//! over FIDO with no PC/SC). All gated on a `pinUvAuthParam` with the `acfg`
 //! permission; the soft-lock pair additionally requires a physical touch.
 
 use minicbor::Decoder;
@@ -12,12 +14,15 @@ use zeroize::Zeroize;
 
 use rsk_crypto::pinproto::PinProto;
 use rsk_crypto::sha256;
+use rsk_rescue::phy;
 
 use crate::cbordec::{cbor, def_arr, def_map};
 use crate::consts::{
-    CONFIG_AUT_DISABLE, CONFIG_AUT_ENABLE, CONFIG_ENABLE_EA, CONFIG_SET_MIN_PIN,
-    CONFIG_TOGGLE_ALWAYS_UV, CONFIG_VENDOR, CTAP_CONFIG, EF_ALWAYS_UV, EF_EA_ENABLED, EF_KEY_DEV,
-    EF_KEY_DEV_ENC, EF_MINPINLEN, EF_PIN, MAX_MIN_PIN_RPIDS, MAX_RAW_SUBPARA, MIN_PIN_LENGTH,
+    CONFIG_AUT_DISABLE, CONFIG_AUT_ENABLE, CONFIG_ENABLE_EA, CONFIG_PHY_LED_BRIGHTNESS,
+    CONFIG_PHY_LED_GPIO, CONFIG_PHY_OPTIONS, CONFIG_PHY_VIDPID, CONFIG_SET_MIN_PIN,
+    CONFIG_TARGET_PHY, CONFIG_TOGGLE_ALWAYS_UV, CONFIG_VENDOR, CTAP_CONFIG, EF_ALWAYS_UV,
+    EF_EA_ENABLED, EF_KEY_DEV, EF_KEY_DEV_ENC, EF_MINPINLEN, EF_PIN, MAX_MIN_PIN_RPIDS,
+    MAX_RAW_SUBPARA, MIN_PIN_LENGTH,
 };
 use crate::error::{CtapError, CtapResult};
 use crate::journal;
@@ -35,9 +40,12 @@ struct Req<'a> {
     force_change: bool,
     rp_ids: [&'a str; MAX_MIN_PIN_RPIDS],
     rp_ids_len: usize,
-    /// Vendor (0xFF) subCommandParams: `{1: vendorCommandId, 2: byte param}`.
+    /// Vendor (0xFF) subCommandParams: `{1: vendorCommandId, 2: byte param,
+    /// 3: int param}`. The soft-lock ids use the byte param; the PicoForge
+    /// physical-config ids use the integer param.
     vendor_id: u64,
     vendor_param: &'a [u8],
+    vendor_param_int: u64,
 }
 
 fn parse(data: &[u8]) -> Result<Req<'_>, CtapError> {
@@ -53,6 +61,7 @@ fn parse(data: &[u8]) -> Result<Req<'_>, CtapError> {
         rp_ids_len: 0,
         vendor_id: 0,
         vendor_param: &[],
+        vendor_param_int: 0,
     };
     let n = def_map(&mut d)?;
     let mut expected = 1u64;
@@ -122,11 +131,13 @@ fn parse_min_pin_sub<'a>(d: &mut Decoder<'a>, req: &mut Req<'a>, sk: u64) -> Res
     Ok(())
 }
 
-/// One vendor (0xFF) subCommandParam: vendorCommandId (1) or its byte param (2).
+/// One vendor (0xFF) subCommandParam: vendorCommandId (1), its byte param (2,
+/// soft-lock), or its integer param (3, PicoForge physical config).
 fn parse_vendor_sub<'a>(d: &mut Decoder<'a>, req: &mut Req<'a>, sk: u64) -> Result<(), CtapError> {
     match sk {
         1 => req.vendor_id = cbor(d.u64())?,
         2 => req.vendor_param = cbor(d.bytes())?,
+        3 => req.vendor_param_int = cbor(d.u64())?,
         _ => cbor(d.skip())?,
     }
     Ok(())
@@ -180,10 +191,36 @@ pub fn authenticator_config<S: Storage, R: Rng>(
         CONFIG_VENDOR => match req.vendor_id {
             CONFIG_AUT_ENABLE => aut_enable(ctx, req.vendor_param),
             CONFIG_AUT_DISABLE => aut_disable(ctx),
+            // PicoForge physical config over FIDO → the phy record. Gated by the
+            // acfg pinUvAuthToken already verified above (no touch — matching
+            // PicoForge's authenticatorConfig flow so it works out of the box).
+            CONFIG_PHY_VIDPID => set_phy(ctx, |p| {
+                let v = req.vendor_param_int;
+                p.vid_pid = Some(((v >> 16) as u16, v as u16));
+            }),
+            CONFIG_PHY_LED_GPIO => set_phy(ctx, |p| p.led_gpio = Some(req.vendor_param_int as u8)),
+            CONFIG_PHY_LED_BRIGHTNESS => {
+                set_phy(ctx, |p| p.led_brightness = Some(req.vendor_param_int as u8))
+            }
+            CONFIG_PHY_OPTIONS => set_phy(ctx, |p| p.opts = req.vendor_param_int as u16),
             _ => Err(CtapError::InvalidSubcommand),
         },
         _ => Err(CtapError::UnsupportedOption),
     }
+}
+
+/// Read-modify-write the phy record for a PicoForge physical-config command: apply
+/// `f`, persist to EF_PHY (effective on the next boot, like the CCID phy write),
+/// and journal it. The auth was already verified by the caller.
+fn set_phy<S: Storage, R: Rng>(
+    ctx: &mut Ctx<S, R>,
+    f: impl FnOnce(&mut phy::PhyData),
+) -> CtapResult {
+    let mut p = phy::load(ctx.fs).unwrap_or_default();
+    f(&mut p);
+    phy::save(ctx.fs, &p).map_err(|_| CtapError::Other)?;
+    journal::append(ctx, journal::EV_CONFIG_WRITE, CONFIG_TARGET_PHY as u8, &[]);
+    Ok(0)
 }
 
 /// `toggleAlwaysUv` (CTAP 2.1 §6.11): flip the alwaysUv state. While enabled,
