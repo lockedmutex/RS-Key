@@ -23,6 +23,7 @@ mod clientpin;
 mod config;
 mod credmgmt;
 mod credprotect;
+mod errors;
 mod extensions;
 mod getassertion;
 mod getinfo;
