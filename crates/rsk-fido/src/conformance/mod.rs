@@ -13,7 +13,10 @@ use super::*;
 use minicbor::Decoder;
 use rsk_fs::storage::ram::RamStorage;
 
+mod clientpin;
+mod getassertion;
 mod getinfo;
+mod makecredential;
 
 /// Deterministic RNG (copied per test file, matching the repo convention).
 struct SeqRng(u64);
