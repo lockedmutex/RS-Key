@@ -11,9 +11,12 @@
 
 use super::*;
 use minicbor::Decoder;
+use rsk_crypto::pinproto::PinProto;
 use rsk_fs::storage::ram::RamStorage;
 
 mod clientpin;
+mod credmgmt;
+mod credprotect;
 mod getassertion;
 mod getinfo;
 mod makecredential;
@@ -93,6 +96,30 @@ impl Authr {
     fn get_info(&mut self) -> Resp {
         self.send(consts::CTAP_GET_INFO, &[])
     }
+
+    /// Arm a live pinUvAuthToken with `permissions` and mark a PIN configured;
+    /// returns the token so a caller can MAC a message with [`pin_auth`]. Call
+    /// AFTER any up-only registration — a configured PIN gates a bare
+    /// makeCredential. Mirrors `getassertion_tests::arm_pin`.
+    fn arm_token(&mut self, permissions: u8) -> [u8; 32] {
+        let mut pin_file = [0u8; 35];
+        pin_file[0] = 8; // retries
+        pin_file[1] = 4; // min length
+        pin_file[2] = 1;
+        self.fs.put(consts::EF_PIN, &pin_file).unwrap();
+        let token = [0x99u8; 32];
+        self.state.paut.token = token;
+        self.state.paut.permissions = permissions;
+        self.state.begin_using_token(false);
+        token
+    }
+}
+
+/// A protocol-2 `pinUvAuthParam`: the HMAC of `msg` under the armed `token`.
+fn pin_auth(token: &[u8; 32], msg: &[u8]) -> Vec<u8> {
+    let mut out = [0u8; 48];
+    let n = rsk_crypto::pinproto::authenticate(PinProto::Two, token, msg, &mut out).unwrap();
+    out[..n].to_vec()
 }
 
 /// A successful response carries `CTAP2_OK` and a non-empty CBOR body.

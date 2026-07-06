@@ -1,0 +1,145 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 RS-Key contributors
+
+//! CTAP 2.1 credProtect (§12.1 + §6.2.2 privacy) conformance, driven through the
+//! wire envelope (`process_cbor`): a level-3 (userVerificationRequired) extension
+//! is echoed in the makeCredential authData, and a level-3 discoverable
+//! credential is invisible to getAssertion without user verification — but
+//! returned once a pinUvAuthToken supplies UV.
+
+use super::{Authr, assert_ok, field_at, pin_auth};
+use crate::consts::{
+    ALG_ES256, CRED_PROT_UV_REQUIRED, CTAP_GET_ASSERTION, CTAP_MAKE_CREDENTIAL, FLAG_ED,
+};
+use crate::error::CtapError;
+use crate::state::PERM_GA;
+use minicbor::Encoder;
+use minicbor::encode::write::Cursor;
+
+const RP_ID: &str = "protect.example";
+const USER_ID: &[u8] = &[7, 7, 7, 7];
+const CDH: [u8; 32] = [0xCD; 32];
+
+/// makeCredential with a `credProtect` extension (request key 6), optionally rk.
+fn mc_credprotect(level: u64, rk: bool) -> Vec<u8> {
+    let mut buf = [0u8; 256];
+    let n = {
+        let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+        e.map(if rk { 6 } else { 5 }).unwrap();
+        e.u8(1).unwrap().bytes(&CDH).unwrap();
+        e.u8(2)
+            .unwrap()
+            .map(1)
+            .unwrap()
+            .str("id")
+            .unwrap()
+            .str(RP_ID)
+            .unwrap();
+        e.u8(3).unwrap().map(2).unwrap();
+        e.str("id").unwrap().bytes(USER_ID).unwrap();
+        e.str("name").unwrap().str("carol").unwrap();
+        e.u8(4).unwrap().array(1).unwrap().map(2).unwrap();
+        e.str("alg").unwrap().i64(ALG_ES256).unwrap();
+        e.str("type").unwrap().str("public-key").unwrap();
+        e.u8(6)
+            .unwrap()
+            .map(1)
+            .unwrap()
+            .str("credProtect")
+            .unwrap()
+            .u64(level)
+            .unwrap();
+        if rk {
+            e.u8(7)
+                .unwrap()
+                .map(1)
+                .unwrap()
+                .str("rk")
+                .unwrap()
+                .bool(true)
+                .unwrap();
+        }
+        e.writer().position()
+    };
+    buf[..n].to_vec()
+}
+
+/// A getAssertion request over `RP_ID`, optionally carrying a pinUvAuthParam
+/// (keys 6/7) to supply UV.
+fn ga(uv: Option<&[u8]>) -> Vec<u8> {
+    let mut buf = [0u8; 128];
+    let n = {
+        let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+        e.map(if uv.is_some() { 4 } else { 2 }).unwrap();
+        e.u8(1).unwrap().str(RP_ID).unwrap();
+        e.u8(2).unwrap().bytes(&CDH).unwrap();
+        if let Some(param) = uv {
+            e.u8(6).unwrap().bytes(param).unwrap();
+            e.u8(7).unwrap().u64(2).unwrap();
+        }
+        e.writer().position()
+    };
+    buf[..n].to_vec()
+}
+
+#[test]
+fn credprotect_echoed_in_authdata() {
+    let r = Authr::fresh().send(
+        CTAP_MAKE_CREDENTIAL,
+        &mc_credprotect(CRED_PROT_UV_REQUIRED, false),
+    );
+    assert_ok(&r);
+    let mut d = field_at(&r.body, 2).expect("authData (0x02) present");
+    let ad = d.bytes().unwrap();
+    assert_eq!(
+        ad[32] & FLAG_ED,
+        FLAG_ED,
+        "ED flag must be set when extensions are present"
+    );
+    // Walk past the attested credential data (aaguid, credId, COSE key) to the
+    // authData extension map and read back the credProtect level.
+    let cred_len = u16::from_be_bytes([ad[53], ad[54]]) as usize;
+    let mut ext = minicbor::Decoder::new(&ad[55 + cred_len..]);
+    ext.skip().unwrap(); // the COSE public key map
+    let n = ext.map().unwrap().expect("authData extension map");
+    let mut level = None;
+    for _ in 0..n {
+        if ext.str().unwrap() == "credProtect" {
+            level = Some(ext.u64().unwrap());
+        } else {
+            ext.skip().unwrap();
+        }
+    }
+    assert_eq!(
+        level,
+        Some(CRED_PROT_UV_REQUIRED),
+        "credProtect level must echo the request"
+    );
+}
+
+#[test]
+fn credprotect3_hidden_without_uv() {
+    let mut a = Authr::fresh();
+    assert_ok(&a.send(
+        CTAP_MAKE_CREDENTIAL,
+        &mc_credprotect(CRED_PROT_UV_REQUIRED, true),
+    ));
+    // A userVerificationRequired credential is invisible to a no-UV assertion
+    // (CTAP 2.1 §6.2.2 / §12.1) → CTAP2_ERR_NO_CREDENTIALS.
+    let r = a.send(CTAP_GET_ASSERTION, &ga(None));
+    assert_eq!(r.status, CtapError::NoCredentials.as_u8());
+}
+
+#[test]
+fn credprotect3_visible_with_uv() {
+    let mut a = Authr::fresh();
+    assert_ok(&a.send(
+        CTAP_MAKE_CREDENTIAL,
+        &mc_credprotect(CRED_PROT_UV_REQUIRED, true),
+    ));
+    // Supply UV via a pinUvAuthToken → the same credential is now returned.
+    let token = a.arm_token(PERM_GA);
+    let param = pin_auth(&token, &CDH);
+    let r = a.send(CTAP_GET_ASSERTION, &ga(Some(&param)));
+    assert_ok(&r);
+}
