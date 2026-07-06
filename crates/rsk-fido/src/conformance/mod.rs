@@ -10,9 +10,12 @@
 //! so a protocol regression fails at commit time, not on a flashed board.
 
 use super::*;
+use crate::u2f::process_u2f;
 use minicbor::Decoder;
 use rsk_crypto::pinproto::PinProto;
 use rsk_fs::storage::ram::RamStorage;
+use rsk_sdk::apdu::Apdu;
+use rsk_sdk::sw::Sw;
 
 mod clientpin;
 mod config;
@@ -24,6 +27,7 @@ mod largeblobs;
 mod makecredential;
 mod reset;
 mod selection;
+mod u2f;
 
 /// Deterministic RNG (copied per test file, matching the repo convention).
 struct SeqRng(u64);
@@ -135,6 +139,28 @@ impl Authr {
         self.state.paut.permissions = permissions;
         self.state.begin_using_token(false);
         token
+    }
+
+    /// Send a raw U2F (CTAP1) APDU and return its status word and response body.
+    /// U2F answers with `(Sw, body)` rather than the CTAP2 status-byte envelope.
+    fn send_u2f(&mut self, raw: &[u8]) -> (Sw, Vec<u8>) {
+        let apdu = Apdu::parse(raw).unwrap();
+        let mut out = [0u8; 1024];
+        let mut yes = AlwaysConfirm;
+        let mut no = Decline;
+        let presence: &mut dyn UserPresence = if self.confirm { &mut yes } else { &mut no };
+        let (sw, n) = {
+            let mut ctx = Ctx {
+                dev: dev(),
+                fs: &mut self.fs,
+                rng: &mut self.rng,
+                state: &mut self.state,
+                now_ms: 0,
+                presence,
+            };
+            process_u2f(&mut ctx, &apdu, &mut out)
+        };
+        (sw, out[..n].to_vec())
     }
 }
 
