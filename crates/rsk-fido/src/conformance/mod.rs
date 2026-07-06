@@ -26,6 +26,7 @@ mod getassertion;
 mod getinfo;
 mod largeblobs;
 mod makecredential;
+mod pin;
 mod reset;
 mod selection;
 mod u2f;
