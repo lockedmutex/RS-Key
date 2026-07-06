@@ -360,7 +360,7 @@ firmware predates the rescue applet.
 ### 7.1 The phy record (`EF_PHY`) — **PicoForge-compatible**
 
 The phy record is the device-config TLV blob. **It is the same format PicoForge
-already writes for pico-fido**, so an existing PicoForge config path largely works
+already writes**, so an existing PicoForge config path largely works
 as-is. Source: `crates/rsk-rescue/src/phy.rs`.
 
 Wire format: a flat sequence of `TAG(1) LEN(1) VALUE(LEN)` records, any order, all
@@ -376,11 +376,11 @@ hardware).
 | `04` | LED_GPIO | 1 | data-pin GPIO `0..=29` |
 | `05` | LED_BRIGHTNESS | 1 | global channel max `0..=255` |
 | `06` | OPTS | 2 | flags (BE16): `WCID 0x1`, `DIMM 0x2`, `DISABLE_POWER_RESET 0x4`, `LED_STEADY 0x8` |
-| `08` | PRESENCE_TIMEOUT | 1 | touch-wait timeout in **seconds** (`0`/absent ⇒ firmware default 30 s). Matches pico-fido / PicoForge `PresenceTimeout`. |
+| `08` | PRESENCE_TIMEOUT | 1 | touch-wait timeout in **seconds** (`0`/absent ⇒ firmware default 30 s). Matches PicoForge `PresenceTimeout`. |
 | `09` | USB_PRODUCT | 1..33 | product string + trailing `NUL` (length **includes** the NUL) |
 | `0A` | ENABLED_CURVES | 4 | FIDO curve bitmask (BE32) |
 | `0B` | ENABLED_USB_ITF | 1 | interface mask: `CCID 0x1`, `WCID 0x2`, `HID 0x4`, `KB 0x8`, `LWIP 0x10` |
-| `0C` | LED_DRIVER | 1 | `1` = gpio, `2` = pimoroni, `3` = ws2812 (follows pico-fido/PicoForge `LedDriverType`) |
+| `0C` | LED_DRIVER | 1 | `1` = gpio, `2` = pimoroni, `3` = ws2812 (follows PicoForge `LedDriverType`) |
 | `0D` | LED_ORDER | 1 | **RS-Key extension** — WS2812 wire order: `0` = rgb, `1` = grb |
 | `0E` | LED_NUM | 1 | **RS-Key extension** — addressable LEDs actually connected (`1..=255`; `0`/absent = the build's `MAX_LEDS`). Firmware saturates a value above its compiled `MAX_LEDS` ceiling. |
 
@@ -393,7 +393,7 @@ Notes for a host implementation:
   sets how many daisy-chained addressable LEDs are lit (the binary carries a
   compile-time `MAX_LEDS` ceiling and drives the first LED_NUM of it). The rest —
   including `0x08` (PRESENCE_TIMEOUT) and `0x0D` (LED_ORDER) — is shared with
-  pico-fido / PicoForge.
+  PicoForge.
 - **`ENABLED_USB_ITF`**: absent ⇒ ALL. A mask that would disable every interface
   the firmware actually builds (`CCID | HID | KB`) is rejected and falls back to
   ALL — otherwise CCID would vanish and the rescue applet that could fix it would
@@ -590,9 +590,9 @@ SET     00 10 40 11        # P1=0x40 brightness, P2 = color 1 | status 1<<4 = 0x
 
 ## 11. Integration notes for PicoForge
 
-1. **The phy record (§7.1) is your existing pico-fido config path.** Same TLV
+1. **The phy record (§7.1) is your existing PicoForge config path.** Same TLV
    layout, same `LedDriverType` numbering. The differences to handle: the Rescue
-   **AID** is `A0 58 3F C1 9B 7E 4F 21` (not pico-fido's), the Rescue **CLA is
+   **AID** is `A0 58 3F C1 9B 7E 4F 21` (not the upstream one), the Rescue **CLA is
    `0x80`**, and tag `0x0D` (LED_ORDER) is an RS-Key extension you can skip on read
    but should preserve on a read-modify-write.
 2. **Hardware config over FIDO (no PC/SC) is supported** — PicoForge's legacy

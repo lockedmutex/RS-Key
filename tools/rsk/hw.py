@@ -39,9 +39,9 @@ TAG_LED_GPIO = 0x04
 TAG_LED_DRIVER = 0x0C
 TAG_LED_ORDER = 0x0D  # RS-Key vendor tag (PicoForge skips it as unknown)
 TAG_LED_NUM = 0x0E  # RS-Key vendor tag: addressable LED count
-TAG_PRESENCE_TIMEOUT = 0x08  # touch-wait timeout (seconds); pico-fido/PicoForge compatible
+TAG_PRESENCE_TIMEOUT = 0x08  # touch-wait timeout (seconds); PicoForge compatible
 
-# Driver numbering follows pico-fido / PicoForge's LedDriverType.
+# Driver numbering follows PicoForge's LedDriverType.
 DRIVERS = {"gpio": 1, "pimoroni": 2, "ws2812": 3}
 DRIVER_NAMES = {v: k for k, v in DRIVERS.items()}
 ORDERS = {"rgb": 0, "grb": 1}
@@ -78,7 +78,7 @@ def register(sub):
         "--touch-timeout",
         type=int,
         metavar="1-255",
-        help="touch-wait timeout in seconds (pico-fido/PicoForge compatible; firmware default 30)",
+        help="touch-wait timeout in seconds (PicoForge compatible; firmware default 30)",
     )
     p.add_argument(
         "--get", action="store_true", help="read the current phy config and exit"

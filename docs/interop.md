@@ -131,7 +131,7 @@ four failures are test-side, not firmware defects:
   (conftest.py:205 human prompt, unanswered headless) → our spec-correct
   `PIN_AUTH_BLOCKED` correctly persists.
 - `test_option_up` calls `doGA(options=…)` — no such kwarg; broken upstream test.
-- `test_bad_auth` expects pico-fido's `0xE0` for an invalid `(0,0)` EC
+- `test_bad_auth` expects the upstream `0xE0` for an invalid `(0,0)` EC
   keyAgreement, where our `INVALID_PARAMETER` is spec-reasonable.
 - The 9 errors are `test_070_oath` fixture setup, not core CTAP2.
 

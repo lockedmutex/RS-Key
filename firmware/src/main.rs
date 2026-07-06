@@ -295,7 +295,7 @@ async fn main(spawner: Spawner) {
             }
         }
         usb_itf = rsk_rescue::phy::effective_usb_itf(phy);
-        // Touch-wait timeout (pico-fido phy tag 0x08, seconds; 0/absent = default).
+        // Touch-wait timeout (phy tag 0x08, seconds; 0/absent = default).
         presence::set_timeout_secs(phy.presence_timeout.unwrap_or(0));
     }
 

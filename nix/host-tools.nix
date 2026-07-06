@@ -21,7 +21,7 @@ let
     doCheck = false;
   };
 
-  # Tiny prompt-with-timeout helper the vendored pico-fido suite imports — not
+  # Tiny prompt-with-timeout helper the vendored third-party test suite imports — not
   # in nixpkgs.
   inputimeoutPy = pkgs.python3Packages.buildPythonPackage rec {
     pname = "inputimeout";
