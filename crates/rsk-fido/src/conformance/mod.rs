@@ -24,6 +24,7 @@ mod credprotect;
 mod extensions;
 mod getassertion;
 mod getinfo;
+mod hmac;
 mod largeblobs;
 mod makecredential;
 mod pin;
