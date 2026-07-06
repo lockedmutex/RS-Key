@@ -360,7 +360,7 @@ firmware predates the rescue applet.
 ### 7.1 The phy record (`EF_PHY`) — **PicoForge-compatible**
 
 The phy record is the device-config TLV blob. **It is the same format PicoForge
-already writes for pico-fido**, so an existing PicoForge config path largely works
+already writes**, so an existing PicoForge config path largely works
 as-is. Source: `crates/rsk-rescue/src/phy.rs`.
 
 Wire format: a flat sequence of `TAG(1) LEN(1) VALUE(LEN)` records, any order, all
@@ -376,11 +376,11 @@ hardware).
 | `04` | LED_GPIO | 1 | data-pin GPIO `0..=29` |
 | `05` | LED_BRIGHTNESS | 1 | global channel max `0..=255` |
 | `06` | OPTS | 2 | flags (BE16): `WCID 0x1`, `DIMM 0x2`, `DISABLE_POWER_RESET 0x4`, `LED_STEADY 0x8` |
-| `08` | PRESENCE_TIMEOUT | 1 | touch-wait timeout in **seconds** (`0`/absent ⇒ firmware default 30 s). Matches pico-fido / PicoForge `PresenceTimeout`. |
+| `08` | PRESENCE_TIMEOUT | 1 | touch-wait timeout in **seconds** (`0`/absent ⇒ firmware default 30 s). Matches PicoForge `PresenceTimeout`. |
 | `09` | USB_PRODUCT | 1..33 | product string + trailing `NUL` (length **includes** the NUL) |
 | `0A` | ENABLED_CURVES | 4 | FIDO curve bitmask (BE32) |
 | `0B` | ENABLED_USB_ITF | 1 | interface mask: `CCID 0x1`, `WCID 0x2`, `HID 0x4`, `KB 0x8`, `LWIP 0x10` |
-| `0C` | LED_DRIVER | 1 | `1` = gpio, `2` = pimoroni, `3` = ws2812 (follows pico-fido/PicoForge `LedDriverType`) |
+| `0C` | LED_DRIVER | 1 | `1` = gpio, `2` = pimoroni, `3` = ws2812 (follows PicoForge `LedDriverType`) |
 | `0D` | LED_ORDER | 1 | **RS-Key extension** — WS2812 wire order: `0` = rgb, `1` = grb |
 | `0E` | LED_NUM | 1 | **RS-Key extension** — addressable LEDs actually connected (`1..=255`; `0`/absent = the build's `MAX_LEDS`). Firmware saturates a value above its compiled `MAX_LEDS` ceiling. |
 
@@ -393,7 +393,7 @@ Notes for a host implementation:
   sets how many daisy-chained addressable LEDs are lit (the binary carries a
   compile-time `MAX_LEDS` ceiling and drives the first LED_NUM of it). The rest —
   including `0x08` (PRESENCE_TIMEOUT) and `0x0D` (LED_ORDER) — is shared with
-  pico-fido / PicoForge.
+  PicoForge.
 - **`ENABLED_USB_ITF`**: absent ⇒ ALL. A mask that would disable every interface
   the firmware actually builds (`CCID | HID | KB`) is rejected and falls back to
   ALL — otherwise CCID would vanish and the rescue applet that could fix it would
@@ -488,6 +488,26 @@ Keys 3/4 are present only when a PIN is set (see gating).
 | `09` | ATT_IMPORT | `{1: blob(60), 2: DER chain}` | — | MSE + touch + PIN-token |
 | `0A` | ATT_CLEAR | — | — | MSE + touch + PIN-token |
 | `0B` | ATT_STATE | — | `{1: present, 2: sha256(chain)?}` | **ungated** |
+| `0C` | CONFIG_WRITE | `{1: target(uint), 2: blob(bstr)}` — target `0`=DEV_CONF, `1`=PHY, `2`=LED | — | touch + PIN-token; **no MSE** |
+| `0D` | CONFIG_READ | `{1: target(uint)}` — target `1`=PHY, `2`=LED | `{1: blob(bstr)}` | **ungated** |
+
+> ### Device configuration over FIDO (`CONFIG_WRITE 0x0C`)
+> The pcscd-free twin of the CCID device-config writes (§6 WRITE CONFIG and the
+> `§7`/`§8` phy/LED records): a host that cannot reach the CCID interface writes
+> the same config over CTAPHID. `target` selects the record — `0x00` = the
+> management enabled-apps TLV (`EF_DEV_CONF`, the §6 blob, `≤ 64` bytes → the same
+> `CTAP1_ERR_INVALID_LENGTH 0x03` cap); `0x01` = the phy record (`EF_PHY`, §7.1 —
+> VID/PID, USB interfaces, LED wiring, presence-timeout; the same lenient TLV parse
+> the CCID path uses, effective on the next boot); `0x02` = the LED config block
+> (`EF_LED_CONF`, §8, `CONF_LEN` bytes) — persisted and then applied **live** by the
+> firmware, which reloads the block after a `0x41` command (the LED atomics are
+> firmware-side; `CONFIG_READ 0x02` returns the current block, seeded with the build
+> defaults on first boot, so a host can read-modify-write it). No MSE channel — the
+> config is not secret. It is gated by a
+> physical touch **and**, when a PIN is set, a `pinUvAuthToken` with the `acfg`
+> permission (the MAC below): a **stronger** gate than the CCID path's
+> presence-only, because CTAPHID is reachable by any unprivileged host process.
+> The write lands in the same `EF_DEV_CONF`, so a later CCID READ CONFIG echoes it.
 
 > ### ⚠️ Seed export hands out a normally non-exportable key
 > `BACKUP_EXPORT (0x02)` returns the device's 32-byte master seed (encrypted over
@@ -570,20 +590,33 @@ SET     00 10 40 11        # P1=0x40 brightness, P2 = color 1 | status 1<<4 = 0x
 
 ## 11. Integration notes for PicoForge
 
-1. **The phy record (§7.1) is your existing pico-fido config path.** Same TLV
+1. **The phy record (§7.1) is your existing PicoForge config path.** Same TLV
    layout, same `LedDriverType` numbering. The differences to handle: the Rescue
-   **AID** is `A0 58 3F C1 9B 7E 4F 21` (not pico-fido's), the Rescue **CLA is
+   **AID** is `A0 58 3F C1 9B 7E 4F 21` (not the upstream one), the Rescue **CLA is
    `0x80`**, and tag `0x0D` (LED_ORDER) is an RS-Key extension you can skip on read
    but should preserve on a read-modify-write.
-2. **Applet enable/disable** is the Yubico-compatible Management applet (§6) —
+2. **Hardware config over FIDO (no PC/SC) is supported** — PicoForge's legacy
+   hardware-config path. Send `authenticatorConfig` (CTAP `0x0D`) with subCommand
+   `vendorPrototype` (`0xFF`) and subCommandParams `{1: vendorCommandId(u64),
+   3: value(uint)}`, gated by an `acfg` pinUvAuthToken (no touch). The supported
+   IDs — the ones PicoForge writes — set the phy record and take effect on the
+   next boot: `PhysicalVidPid 0x6fcb19b0cbe3acfa` (value `(vid<<16)|pid`),
+   `PhysicalLedGpio 0x7b392a394de9f948`, `PhysicalLedBrightness 0x76a85945985d02fd`,
+   `PhysicalOptions 0x269f3b09eceb805f` (bitmask `0x2` dimmable / `0x4`
+   disable-power-reset / `0x8` led-steady). Product name, touch-timeout, LED driver
+   and curves stay Rescue-only. RS-Key reports firmware `5.x` (< 7), so PicoForge
+   enables its legacy hardware-config path. (RS-Key's own `rsk` uses the CTAPHID
+   `0x41` `CONFIG_WRITE/READ` path instead — see §9 — which also covers those
+   extras.)
+3. **Applet enable/disable** is the Yubico-compatible Management applet (§6) —
    identical to how you'd configure a YubiKey's USB applications.
-3. **Version-gate** on the Rescue SELECT identity (`01 02 08 06 …`, §7) and the
+4. **Version-gate** on the Rescue SELECT identity (`01 02 08 06 …`, §7) and the
    Management SELECT version string. Treat unknown phy tags / `0x41` subcommands as
    skippable, not errors.
-4. **Keep the dangerous surface behind explicit confirmation** — the OTP fuse
+5. **Keep the dangerous surface behind explicit confirmation** — the OTP fuse
    burns (§7), BOOTSEL reboot (§7/§8), and seed export (§9). Consider not exposing
    the fuse burns at all in a general management UI.
-5. **Reference client:** `tools/rsk` is a complete, runnable
+6. **Reference client:** `tools/rsk` is a complete, runnable
    implementation of everything here — `ccid.py` (transport), `ctaphid.py` (CTAP),
    `hw.py` (phy), `led.py` (LED), `backup.py` (`0x41`), `status.py`/`inventory.py`
    (DeviceInfo). When in doubt, match its bytes.

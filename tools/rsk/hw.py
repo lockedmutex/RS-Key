@@ -22,6 +22,16 @@ persists in a different record — see `rsk led`.)
 import sys
 
 from . import ccid
+from .backup import (
+    CONFIG_READ,
+    CONFIG_TARGET_PHY,
+    CONFIG_WRITE,
+    _die_pin_required,
+    _die_touch_denied,
+    _gated,
+    _vendor,
+)
+from .common import add_pin_arg, connect_fido, device_has_pin, die, resolve_pin
 from .status import RESCUE_AID, rescue_read
 
 # phy TLV tags — must match crates/rsk-rescue/src/phy.rs.
@@ -29,9 +39,9 @@ TAG_LED_GPIO = 0x04
 TAG_LED_DRIVER = 0x0C
 TAG_LED_ORDER = 0x0D  # RS-Key vendor tag (PicoForge skips it as unknown)
 TAG_LED_NUM = 0x0E  # RS-Key vendor tag: addressable LED count
-TAG_PRESENCE_TIMEOUT = 0x08  # touch-wait timeout (seconds); pico-fido/PicoForge compatible
+TAG_PRESENCE_TIMEOUT = 0x08  # touch-wait timeout (seconds); PicoForge compatible
 
-# Driver numbering follows pico-fido / PicoForge's LedDriverType.
+# Driver numbering follows PicoForge's LedDriverType.
 DRIVERS = {"gpio": 1, "pimoroni": 2, "ws2812": 3}
 DRIVER_NAMES = {v: k for k, v in DRIVERS.items()}
 ORDERS = {"rgb": 0, "grb": 1}
@@ -68,7 +78,7 @@ def register(sub):
         "--touch-timeout",
         type=int,
         metavar="1-255",
-        help="touch-wait timeout in seconds (pico-fido/PicoForge compatible; firmware default 30)",
+        help="touch-wait timeout in seconds (PicoForge compatible; firmware default 30)",
     )
     p.add_argument(
         "--get", action="store_true", help="read the current phy config and exit"
@@ -78,6 +88,14 @@ def register(sub):
         action="store_true",
         help="don't reboot after writing (the change applies on the next boot)",
     )
+    p.add_argument(
+        "--transport",
+        choices=["ccid", "fido"],
+        default="ccid",
+        help="ccid (PC/SC, default) or fido (CTAPHID — when pcscd can't reach the "
+        "card; read-modify-write via CONFIG_READ/WRITE, gated by PIN + touch)",
+    )
+    add_pin_arg(p)
     p.set_defaults(func=run)
 
 
@@ -137,26 +155,20 @@ def _show(tlvs):
     print(f"  touch   {str(tmo[0]) + 's' if tmo else '(build default 30s)'}")
 
 
-def run(args):
-    conn = ccid.connect()
-    _, s1, s2 = ccid.select(conn, RESCUE_AID)
-    if (s1, s2) != ccid.SW_OK:
-        raise SystemExit(
-            f"SELECT rescue AID failed: {s1:02X}{s2:02X} (firmware too old?)"
-        )
-    tlvs = _read_phy(conn)
-
-    setting = (
+def _would_set(args):
+    """Whether any config flag was passed (vs a bare read/--get)."""
+    return (
         args.led_pin is not None
         or args.led_driver is not None
         or args.led_order is not None
         or args.led_num is not None
         or args.touch_timeout is not None
     )
-    if args.get or not setting:
-        _show(tlvs)
-        return
 
+
+def _apply_args(tlvs, args):
+    """Upsert the phy TLVs the user set on the CLI (validating ranges) — the
+    transport-agnostic read-modify-write shared by the CCID and FIDO paths."""
     if args.led_pin is not None:
         if not 0 <= args.led_pin <= 29:
             raise SystemExit("--led-pin must be 0–29 (RP2350A GPIOs)")
@@ -173,6 +185,27 @@ def run(args):
         if not 1 <= args.touch_timeout <= 255:
             raise SystemExit("--touch-timeout must be 1–255 (seconds)")
         _upsert(tlvs, TAG_PRESENCE_TIMEOUT, args.touch_timeout)
+
+
+def run(args):
+    if args.transport == "fido":
+        _run_fido(args)
+    else:
+        _run_ccid(args)
+
+
+def _run_ccid(args):
+    conn = ccid.connect()
+    _, s1, s2 = ccid.select(conn, RESCUE_AID)
+    if (s1, s2) != ccid.SW_OK:
+        raise SystemExit(
+            f"SELECT rescue AID failed: {s1:02X}{s2:02X} (firmware too old?)"
+        )
+    tlvs = _read_phy(conn)
+    if args.get or not _would_set(args):
+        _show(tlvs)
+        return
+    _apply_args(tlvs, args)
 
     blob = _serialize_tlv(tlvs)
     # The phy write is device identity, so the firmware gates it behind an
@@ -198,3 +231,42 @@ def run(args):
     else:
         print("rebooting to apply…")
         ccid.reboot(conn, bootsel=False)
+
+
+def _read_phy_fido(dev, cid):
+    """Read EF_PHY over CTAPHID (vendor CONFIG_READ, ungated) for read-modify-write."""
+    st, m = _vendor(dev, cid, {1: CONFIG_READ, 2: {1: CONFIG_TARGET_PHY}})
+    if st != 0:
+        die(
+            f"CONFIG_READ failed: {st:#x} — firmware too old for config-over-FIDO "
+            "(needs bcdDevice ≥ 0x07EF)"
+        )
+    return _parse_tlv(m[1] if m and 1 in m else b"")
+
+
+def _run_fido(args):
+    """The pcscd-free path: read-modify-write EF_PHY over CTAPHID (CONFIG_READ +
+    the PIN/touch-gated CONFIG_WRITE). Applies on the next boot — no reboot verb
+    here, so the user re-plugs to apply."""
+    dev, cid = connect_fido()
+    tlvs = _read_phy_fido(dev, cid)
+    if args.get or not _would_set(args):
+        _show(tlvs)
+        return
+    _apply_args(tlvs, args)
+
+    blob = _serialize_tlv(tlvs)
+    pin = resolve_pin(args, has_pin=device_has_pin(dev, cid))
+    print(
+        "approve on the device (touch) to write the phy config over FIDO…",
+        file=sys.stderr,
+    )
+    fields = _gated(CONFIG_WRITE, {1: CONFIG_TARGET_PHY, 2: blob}, dev, cid, pin)
+    st, _ = _vendor(dev, cid, fields)
+    _die_pin_required(st)
+    _die_touch_denied(st)
+    if st != 0:
+        die(f"CONFIG_WRITE failed: {st:#x}")
+    print("phy config written over FIDO ✓")
+    _show(tlvs)
+    print("re-plug or reboot the device to apply (the FIDO path does not reboot).")

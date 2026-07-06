@@ -5,7 +5,7 @@
 //! identity (VID/PID, product string), LED wiring and options. The rescue applet
 //! reads/writes it verbatim; at boot the firmware applies the USB identity AND the
 //! LED hardware — pin (`led_gpio`), driver (`led_driver`), brightness/steady, and
-//! the WS2812 wire order (`led_order`). The pico-fido tags below match PicoForge;
+//! the WS2812 wire order (`led_order`). The tags below match PicoForge;
 //! `led_order` (tag `0x0D`) is an RS-Key extension PicoForge skips as unknown.
 
 use rsk_fs::{Fs, Storage};
@@ -20,15 +20,15 @@ const TAG_VIDPID: u8 = 0x0;
 const TAG_LED_GPIO: u8 = 0x4;
 const TAG_LED_BRIGHTNESS: u8 = 0x5;
 const TAG_OPTS: u8 = 0x6;
-// Tag `0x08` matches pico-fido / PicoForge `PresenceTimeout`: the touch-wait
+// Tag `0x08` matches PicoForge `PresenceTimeout`: the touch-wait
 // timeout in seconds. (RS-Key once read this as a presence-button GPIO, but the
-// button is always BOOTSEL, so that was never used — realigned to pico-fido.)
+// button is always BOOTSEL, so that was never used — realigned to PicoForge.)
 const TAG_PRESENCE_TIMEOUT: u8 = 0x8;
 const TAG_USB_PRODUCT: u8 = 0x9;
 const TAG_ENABLED_CURVES: u8 = 0xA;
 const TAG_ENABLED_USB_ITF: u8 = 0xB;
 const TAG_LED_DRIVER: u8 = 0xC;
-// RS-Key vendor tag (not in pico-fido / PicoForge): WS2812 wire byte order —
+// RS-Key vendor tag (not in PicoForge): WS2812 wire byte order —
 // 0 = rgb (passthrough), 1 = grb (red/green swapped). PicoForge skips it as
 // unknown and drops it on a read-modify-write; RS-Key's own tools preserve it.
 const TAG_LED_ORDER: u8 = 0xD;
@@ -120,7 +120,7 @@ pub struct PhyData {
     pub led_gpio: Option<u8>,
     pub led_brightness: Option<u8>,
     pub opts: u16,
-    /// Touch-wait timeout in seconds (tag `0x08`, pico-fido `PresenceTimeout`);
+    /// Touch-wait timeout in seconds (tag `0x08`, PicoForge `PresenceTimeout`);
     /// `None` / `0` keeps the firmware's built-in 30 s default.
     pub presence_timeout: Option<u8>,
     pub usb_product: Option<Product>,

@@ -27,7 +27,7 @@ python -c 'import uuid; print(uuid.uuid5(uuid.NAMESPACE_URL, "https://github.com
 ```
 
 An AAGUID is **self-assigned** — no central registration is required to pick
-one. Earlier RS-Key builds inherited pico-fido's AAGUID (the bytes of
+one. Earlier RS-Key builds inherited an upstream AAGUID (the bytes of
 `SHA-256("Pico FIDO2")`), which meant the device claimed another project's model
 identity. As of firmware `bcdDevice 0x075F` it carries its own.
 

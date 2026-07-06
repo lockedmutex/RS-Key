@@ -2094,6 +2094,9 @@ dependencies = [
  "p521",
  "rsk-crypto",
  "rsk-fs",
+ "rsk-led",
+ "rsk-mgmt",
+ "rsk-rescue",
  "rsk-sdk",
  "zeroize",
 ]

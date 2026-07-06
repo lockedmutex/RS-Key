@@ -1054,3 +1054,344 @@ fn ensure_seed_does_not_regenerate_under_lock() {
     run_unlock(&mut fs, &mut rng, &mut st, &LOCK_KEY, &host, 0x27).unwrap();
     assert_eq!(st.keydev_dec, Some(seed)); // blob untouched, same seed
 }
+
+// ---- CONFIG_WRITE (0x0C): device config over the FIDO vendor channel ----
+
+/// A small, opaque device-config TLV (READ CONFIG echoes it verbatim, so its
+/// bytes are the suffix of the DeviceInfo TLV — see [`dev_conf_readback`]).
+const DEV_CONF_BLOB: &[u8] = &[0x03, 0x02, 0x02, 0x00];
+
+/// Build a `VENDOR_CONFIG_WRITE` request `{1: subcmd, 2: {1: target, 2: blob}
+/// [, 3: 2, 4: mac]}`. With `authed`, splice a PERM_ACFG pinUvAuth MAC over
+/// `0xff×32 ‖ 0x41 ‖ subcmd ‖ subCommandParams` (as `pin_gate` verifies it).
+fn config_write_req(target: u64, blob: &[u8], authed: bool, buf: &mut [u8]) -> usize {
+    use rsk_crypto::pinproto;
+
+    // subCommandParams captured verbatim — the MAC and parse() both see these bytes.
+    let mut sub = [0u8; 256];
+    let sub_len = {
+        let mut e = Encoder::new(Cursor::new(&mut sub[..]));
+        e.map(2).unwrap();
+        e.u8(1).unwrap().u64(target).unwrap();
+        e.u8(2).unwrap().bytes(blob).unwrap();
+        e.writer().position()
+    };
+
+    let mut n = 0;
+    buf[n] = 0xA0 | if authed { 4 } else { 2 }; // map(2) or map(4)
+    n += 1;
+    buf[n..n + 2].copy_from_slice(&[0x01, VENDOR_CONFIG_WRITE as u8]); // 1: subcommand
+    n += 2;
+    buf[n] = 0x02; // 2: subCommandParams
+    n += 1;
+    buf[n..n + sub_len].copy_from_slice(&sub[..sub_len]);
+    n += sub_len;
+    if authed {
+        let mut vp = [0u8; 32 + 2 + 256];
+        let vp_len = crate::state::puat_subcommand_msg(
+            &mut vp,
+            CTAP_VENDOR,
+            VENDOR_CONFIG_WRITE as u8,
+            &sub[..sub_len],
+        );
+        let mut mac = [0u8; 32];
+        let mlen =
+            pinproto::authenticate(PinProto::Two, &ACFG_TOKEN, &vp[..vp_len], &mut mac).unwrap();
+        buf[n..n + 2].copy_from_slice(&[0x03, 0x02]); // 3: protocol 2
+        n += 2;
+        buf[n..n + 3].copy_from_slice(&[0x04, 0x58, mlen as u8]); // 4: mac (byte string)
+        n += 3;
+        buf[n..n + mlen].copy_from_slice(&mac[..mlen]);
+        n += mlen;
+    }
+    n
+}
+
+/// Read the persisted device config back through the CCID READ CONFIG TLV — the
+/// FIDO write lands in the same `EF_DEV_CONF`, so the blob is the TLV's suffix.
+fn dev_conf_readback(fs: &mut Fs<RamStorage>) -> std::vec::Vec<u8> {
+    let mut out = [0u8; 128];
+    let mut res = rsk_sdk::ResBuf::new(&mut out);
+    rsk_mgmt::config_tlv(&[0u8; 4], fs, &mut res);
+    res.as_slice().to_vec()
+}
+
+#[test]
+fn config_write_persists_dev_conf_visible_to_ccid() {
+    let (mut fs, mut rng, mut st) = setup();
+    let mut req = [0u8; 96];
+    let n = config_write_req(CONFIG_TARGET_DEV_CONF, DEV_CONF_BLOB, false, &mut req);
+    let mut out = [0u8; 16];
+    // No PIN set → pin_gate is a no-op; a touch is still required (AlwaysConfirm).
+    assert_eq!(
+        call(
+            &mut fs,
+            &mut rng,
+            &mut st,
+            &mut AlwaysConfirm,
+            &req[..n],
+            &mut out
+        ),
+        Ok(0)
+    );
+    // The FIDO write is visible to the CCID READ CONFIG path — one shared EF.
+    assert!(dev_conf_readback(&mut fs).ends_with(DEV_CONF_BLOB));
+}
+
+#[test]
+fn config_write_requires_touch() {
+    let (mut fs, mut rng, mut st) = setup();
+    let mut req = [0u8; 96];
+    let n = config_write_req(CONFIG_TARGET_DEV_CONF, DEV_CONF_BLOB, false, &mut req);
+    let mut out = [0u8; 16];
+    assert_eq!(
+        call(
+            &mut fs,
+            &mut rng,
+            &mut st,
+            &mut Decline,
+            &req[..n],
+            &mut out
+        ),
+        Err(CtapError::OperationDenied)
+    );
+    assert!(!dev_conf_readback(&mut fs).ends_with(DEV_CONF_BLOB)); // declined → nothing persisted
+}
+
+#[test]
+fn config_write_rejects_oversized_blob() {
+    let (mut fs, mut rng, mut st) = setup();
+    let big = [0u8; 100]; // > EF_DEV_CONF_MAX (64)
+    let mut req = [0u8; 320];
+    let n = config_write_req(CONFIG_TARGET_DEV_CONF, &big, false, &mut req);
+    let mut out = [0u8; 16];
+    assert_eq!(
+        call(
+            &mut fs,
+            &mut rng,
+            &mut st,
+            &mut AlwaysConfirm,
+            &req[..n],
+            &mut out
+        ),
+        Err(CtapError::InvalidLength)
+    );
+}
+
+#[test]
+fn config_write_unknown_target_rejected() {
+    let (mut fs, mut rng, mut st) = setup();
+    let mut req = [0u8; 96];
+    let n = config_write_req(0x99, &[0x01], false, &mut req);
+    let mut out = [0u8; 16];
+    assert_eq!(
+        call(
+            &mut fs,
+            &mut rng,
+            &mut st,
+            &mut AlwaysConfirm,
+            &req[..n],
+            &mut out
+        ),
+        Err(CtapError::InvalidParameter)
+    );
+}
+
+#[test]
+fn config_write_with_pin_requires_token() {
+    let (mut fs, mut rng, mut st) = setup();
+    fs.put(EF_PIN, &[8, 4, 1]).unwrap(); // PIN present → a pinUvAuthToken is required
+    let mut req = [0u8; 96];
+    let n = config_write_req(CONFIG_TARGET_DEV_CONF, DEV_CONF_BLOB, false, &mut req); // no token
+    let mut out = [0u8; 16];
+    assert_eq!(
+        call(
+            &mut fs,
+            &mut rng,
+            &mut st,
+            &mut AlwaysConfirm,
+            &req[..n],
+            &mut out
+        ),
+        Err(CtapError::PuatRequired)
+    );
+}
+
+#[test]
+fn config_write_with_pin_and_token_succeeds() {
+    let (mut fs, mut rng, mut st) = setup();
+    fs.put(EF_PIN, &[8, 4, 1]).unwrap();
+    arm_acfg(&mut st);
+    let mut req = [0u8; 96];
+    let n = config_write_req(CONFIG_TARGET_DEV_CONF, DEV_CONF_BLOB, true, &mut req);
+    let mut out = [0u8; 16];
+    assert_eq!(
+        call(
+            &mut fs,
+            &mut rng,
+            &mut st,
+            &mut AlwaysConfirm,
+            &req[..n],
+            &mut out
+        ),
+        Ok(0)
+    );
+    assert!(dev_conf_readback(&mut fs).ends_with(DEV_CONF_BLOB));
+}
+
+#[test]
+fn config_write_persists_phy_over_fido() {
+    let (mut fs, mut rng, mut st) = setup();
+    // A phy record setting the touch-wait timeout (tag 0x08) — the same record
+    // the CCID rescue WRITE 0x1C persists.
+    let phy = rsk_rescue::phy::PhyData {
+        presence_timeout: Some(45),
+        ..Default::default()
+    };
+    let mut blob = [0u8; rsk_rescue::phy::PHY_MAX_SIZE];
+    let blen = phy.serialize(&mut blob).unwrap();
+    let mut req = [0u8; 128];
+    let n = config_write_req(CONFIG_TARGET_PHY, &blob[..blen], false, &mut req);
+    let mut out = [0u8; 16];
+    assert_eq!(
+        call(
+            &mut fs,
+            &mut rng,
+            &mut st,
+            &mut AlwaysConfirm,
+            &req[..n],
+            &mut out
+        ),
+        Ok(0)
+    );
+    // The FIDO write lands in EF_PHY; boot / the CCID rescue READ path sees it.
+    assert_eq!(
+        rsk_rescue::phy::load(&mut fs).unwrap().presence_timeout,
+        Some(45)
+    );
+}
+
+/// Build a `VENDOR_CONFIG_READ` request `{1: subcmd, 2: {1: target}}` (ungated).
+fn config_read_req(target: u64, buf: &mut [u8]) -> usize {
+    let mut e = Encoder::new(Cursor::new(buf));
+    e.map(2).unwrap();
+    e.u8(1).unwrap().u64(VENDOR_CONFIG_READ).unwrap();
+    e.u8(2)
+        .unwrap()
+        .map(1)
+        .unwrap()
+        .u8(1)
+        .unwrap()
+        .u64(target)
+        .unwrap();
+    e.writer().position()
+}
+
+#[test]
+fn config_read_returns_the_phy_record_ungated() {
+    let (mut fs, mut rng, mut st) = setup();
+    // Seed a phy record through the write path.
+    let phy = rsk_rescue::phy::PhyData {
+        presence_timeout: Some(30),
+        ..Default::default()
+    };
+    let mut blob = [0u8; rsk_rescue::phy::PHY_MAX_SIZE];
+    let blen = phy.serialize(&mut blob).unwrap();
+    let mut wreq = [0u8; 128];
+    let wn = config_write_req(CONFIG_TARGET_PHY, &blob[..blen], false, &mut wreq);
+    let mut wout = [0u8; 16];
+    call(
+        &mut fs,
+        &mut rng,
+        &mut st,
+        &mut AlwaysConfirm,
+        &wreq[..wn],
+        &mut wout,
+    )
+    .unwrap();
+
+    // CONFIG_READ is ungated — no PIN, no touch (Decline would refuse a gate).
+    let mut rreq = [0u8; 32];
+    let rn = config_read_req(CONFIG_TARGET_PHY, &mut rreq);
+    let mut rout = [0u8; 128];
+    let r = call(
+        &mut fs,
+        &mut rng,
+        &mut st,
+        &mut Decline,
+        &rreq[..rn],
+        &mut rout,
+    )
+    .unwrap();
+
+    // Response {1: blob}; the blob parses back to the record just written.
+    let mut d = Decoder::new(&rout[..r]);
+    assert_eq!(d.map().unwrap(), Some(1));
+    assert_eq!(d.u8().unwrap(), 1);
+    let got = d.bytes().unwrap();
+    assert_eq!(
+        rsk_rescue::phy::PhyData::parse(got).presence_timeout,
+        Some(30)
+    );
+}
+
+#[test]
+fn config_write_read_led_block_over_fido() {
+    let (mut fs, mut rng, mut st) = setup();
+    // A distinctive 17-byte block [steady, (effect, color, brightness, speed)×4].
+    let mut led = [0u8; rsk_led::CONF_LEN];
+    for (i, b) in led.iter_mut().enumerate() {
+        *b = i as u8 + 1;
+    }
+    let mut wreq = [0u8; 96];
+    let wn = config_write_req(CONFIG_TARGET_LED, &led, false, &mut wreq);
+    let mut wout = [0u8; 16];
+    call(
+        &mut fs,
+        &mut rng,
+        &mut st,
+        &mut AlwaysConfirm,
+        &wreq[..wn],
+        &mut wout,
+    )
+    .unwrap();
+
+    // Read the block back (ungated). Live-apply of the atomics is a firmware
+    // handler concern (reload after 0x41) — exercised on-device, not here.
+    let mut rreq = [0u8; 32];
+    let rn = config_read_req(CONFIG_TARGET_LED, &mut rreq);
+    let mut rout = [0u8; 64];
+    let r = call(
+        &mut fs,
+        &mut rng,
+        &mut st,
+        &mut Decline,
+        &rreq[..rn],
+        &mut rout,
+    )
+    .unwrap();
+    let mut d = Decoder::new(&rout[..r]);
+    assert_eq!(d.map().unwrap(), Some(1));
+    assert_eq!(d.u8().unwrap(), 1);
+    assert_eq!(d.bytes().unwrap(), &led[..]);
+}
+
+#[test]
+fn config_write_led_rejects_short_block() {
+    let (mut fs, mut rng, mut st) = setup();
+    let short = [0u8; 4]; // < CONF_LEN (17)
+    let mut req = [0u8; 64];
+    let n = config_write_req(CONFIG_TARGET_LED, &short, false, &mut req);
+    let mut out = [0u8; 16];
+    assert_eq!(
+        call(
+            &mut fs,
+            &mut rng,
+            &mut st,
+            &mut AlwaysConfirm,
+            &req[..n],
+            &mut out
+        ),
+        Err(CtapError::InvalidLength)
+    );
+}

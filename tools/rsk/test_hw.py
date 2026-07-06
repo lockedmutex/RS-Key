@@ -58,6 +58,40 @@ def test_upsert_appends_when_absent():
 
 
 def test_driver_and_order_maps_match_firmware():
-    # pico-fido / PicoForge LedDriverType numbering, and the RS-Key order values.
+    # PicoForge LedDriverType numbering, and the RS-Key order values.
     assert hw.DRIVERS == {"gpio": 1, "pimoroni": 2, "ws2812": 3}
     assert hw.ORDERS == {"rgb": 0, "grb": 1}
+
+
+class _Args:
+    """Minimal argparse.Namespace stand-in for _apply_args."""
+
+    def __init__(self, **kw):
+        defaults = dict(
+            led_pin=None, led_driver=None, led_order=None, led_num=None, touch_timeout=None
+        )
+        defaults.update(kw)
+        self.__dict__.update(defaults)
+
+
+def test_apply_args_upserts_only_the_set_fields_preserving_others():
+    # A record carrying USB identity (tag 0x06) + an existing touch timeout.
+    tlvs = [(0x06, b"\x10\x50\x04\x07"), (hw.TAG_PRESENCE_TIMEOUT, b"\x1e")]
+    hw._apply_args(tlvs, _Args(led_pin=22, touch_timeout=45))
+    by = {t: v for t, v in tlvs}
+    assert by[0x06] == b"\x10\x50\x04\x07"  # identity preserved
+    assert by[hw.TAG_LED_GPIO] == b"\x16"  # new pin appended
+    assert by[hw.TAG_PRESENCE_TIMEOUT] == b"\x2d"  # 30 -> 45, replaced in place
+
+
+def test_apply_args_rejects_out_of_range():
+    import pytest
+
+    for bad in (_Args(led_pin=30), _Args(touch_timeout=0), _Args(led_num=256)):
+        with pytest.raises(SystemExit):
+            hw._apply_args([], bad)
+
+
+def test_would_set_distinguishes_read_from_write():
+    assert not hw._would_set(_Args())
+    assert hw._would_set(_Args(touch_timeout=45))

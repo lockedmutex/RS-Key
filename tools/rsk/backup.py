@@ -25,6 +25,9 @@ from .common import add_pin_arg, connect_fido, device_has_pin, die, resolve_pin
 
 CTAP_VENDOR = 0x41
 VENDOR_MSE, EXPORT, LOAD, FINALIZE, STATE = 1, 2, 3, 4, 5
+# Device-config subcommands (rsk hw --transport fido); targets match rsk-fido consts.rs.
+CONFIG_WRITE, CONFIG_READ = 0x0C, 0x0D
+CONFIG_TARGET_DEV_CONF, CONFIG_TARGET_PHY, CONFIG_TARGET_LED = 0, 1, 2
 PERM_ACFG = 0x20
 ERR_OPERATION_DENIED, ERR_NOT_ALLOWED, ERR_PIN_REQUIRED = 0x27, 0x30, 0x36
 PINUV_PREFIX = b"\xff" * 32  # CTAP 2.1 pinUvAuthParam prefix; must match firmware (rsk-fido vendor.rs/config.rs)

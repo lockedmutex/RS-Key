@@ -55,11 +55,11 @@ pub fn request_cancel() {
 /// Built-in touch-wait timeout (ms) used when the phy record carries none.
 const DEFAULT_TIMEOUT_MS: u32 = 30_000;
 /// Touch-wait timeout in ms, seeded at boot from the phy record's
-/// `PRESENCE_TIMEOUT` tag (pico-fido `0x08`, seconds). Read live by the wait.
+/// `PRESENCE_TIMEOUT` tag (PicoForge `0x08`, seconds). Read live by the wait.
 pub(crate) static PRESENCE_TIMEOUT_MS: AtomicU32 = AtomicU32::new(DEFAULT_TIMEOUT_MS);
 
 /// Override the touch-wait timeout from the phy record — value in **seconds**,
-/// matching pico-fido / PicoForge's tag `0x08`. `0` (or an absent tag) keeps the
+/// matching PicoForge's tag `0x08`. `0` (or an absent tag) keeps the
 /// built-in 30 s default. Call once at boot, before any applet runs.
 pub fn set_timeout_secs(secs: u8) {
     if secs != 0 {

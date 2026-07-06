@@ -48,6 +48,16 @@ pub const VENDOR_AUDIT_CHECKPOINT: u64 = 0x08; // DEVK-signed chain checkpoint
 pub const VENDOR_ATT_IMPORT: u64 = 0x09; // install org attestation key + chain
 pub const VENDOR_ATT_CLEAR: u64 = 0x0A; // remove the org attestation
 pub const VENDOR_ATT_STATE: u64 = 0x0B; // {present, chain hash} — ungated
+pub const VENDOR_CONFIG_WRITE: u64 = 0x0C; // persist a device-config blob (PIN + touch)
+pub const VENDOR_CONFIG_READ: u64 = 0x0D; // read a device-config record (ungated, for host RMW)
+
+// Config-write targets — `subCommandParams` key 1 of `VENDOR_CONFIG_WRITE`. The
+// FIDO-transport twin of the CCID device-config writes, so a host without a
+// working pcscd can still configure the key (gated by PIN + touch, not the CCID
+// path's presence-only).
+pub const CONFIG_TARGET_DEV_CONF: u64 = 0x00; // management enabled-apps TLV (EF_DEV_CONF)
+pub const CONFIG_TARGET_PHY: u64 = 0x01; // phy record: VID/PID, USB itf, LED, presence-timeout (EF_PHY)
+pub const CONFIG_TARGET_LED: u64 = 0x02; // LED config block (EF_LED_CONF); applied live after the write
 
 // authenticatorConfig subcommands.
 pub const CONFIG_ENABLE_EA: u64 = 0x01; // enableEnterpriseAttestation
@@ -58,6 +68,15 @@ pub const CONFIG_VENDOR: u64 = 0xFF; // vendor subcommands, selected by a u64 id
 // authenticatorConfig vendor command ids — the soft-lock enable/disable pair.
 pub const CONFIG_AUT_ENABLE: u64 = 0x03e43f56b34285e2;
 pub const CONFIG_AUT_DISABLE: u64 = 0x1831a40f04a25ed9;
+
+// PicoForge physical-config vendor ids — hardware config over FIDO
+// (authenticatorConfig 0xFF, integer param at subCommandParams key 3). These are
+// the ids PicoForge's legacy hardware-config path writes, so it configures the phy
+// record over FIDO with no PC/SC. Each writes EF_PHY (effective on the next boot).
+pub const CONFIG_PHY_VIDPID: u64 = 0x6fcb19b0cbe3acfa; // param = (vid << 16) | pid
+pub const CONFIG_PHY_LED_BRIGHTNESS: u64 = 0x76a85945985d02fd; // param = brightness u8
+pub const CONFIG_PHY_LED_GPIO: u64 = 0x7b392a394de9f948; // param = gpio u8
+pub const CONFIG_PHY_OPTIONS: u64 = 0x269f3b09eceb805f; // param = opts u16 bitmask
 
 // authenticatorClientPIN subcommands compared at more than one site (the rest
 // are dispatched once as literals).
@@ -127,7 +146,7 @@ pub const FLAG_AT: u8 = 0x40; // attested credential data included
 pub const FLAG_ED: u8 = 0x80; // extension data included
 
 /// AAGUID — RS-Key's own authenticator-model identifier (UUID **v5**), so the
-/// device stops claiming pico-fido's model identity. Derived reproducibly as
+/// device stops claiming the inherited model identity. Derived reproducibly as
 /// `uuid5(NAMESPACE_URL, "https://github.com/TheMaxMur/RS-Key")`
 /// = `2479c7bf-6b30-5683-9ec8-0e8171a918b7`. Self-assigned: an AAGUID needs no
 /// central registration; FIDO MDS *listing* (a separate, certification-gated

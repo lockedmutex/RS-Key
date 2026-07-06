@@ -13,6 +13,49 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-07-06
+
+### Added
+
+- **PicoForge hardware config over FIDO.** `authenticatorConfig`'s vendorPrototype
+  (`0xFF`) arm now accepts PicoForge's physical-config command IDs (`PhysicalVidPid`,
+  `PhysicalLedGpio`, `PhysicalLedBrightness`, `PhysicalOptions`), writing the phy
+  record — so PicoForge can set VID/PID, LED and options over FIDO with no PC/SC.
+  Gated by an `acfg` pinUvAuthToken. Details in `docs/protocol.md` §11.
+- **Device configuration over FIDO (CTAPHID), PIN + touch gated.** A new
+  `authenticatorVendor 0x41` subcommand `CONFIG_WRITE (0x0C)` writes device config
+  over the FIDO HID transport — for hosts where PC/SC / pcscd can't read or write
+  the CCID interface. Targets: the management enabled-apps TLV (`EF_DEV_CONF`) and
+  the phy record (`EF_PHY` — VID/PID, USB interfaces, LED wiring, presence-timeout)
+  and the LED config block (`EF_LED_CONF`, applied **live**); each lands in the same
+  record the CCID read path echoes. Gated by a physical touch and, when a PIN is
+  set, a `pinUvAuthToken` (`acfg` permission) — stronger than the CCID path's
+  presence-only, since CTAPHID is reachable by any unprivileged host process.
+  `CONFIG_READ (0x0D)` returns the phy / LED record (ungated) so a host can
+  read-modify-write it over FIDO with no PC/SC at all; `rsk hw --transport fido`
+  and `rsk led --transport fido` use this. Wire format in `docs/protocol.md` §9.
+- **Firmware flash-size ratchet in the gate.** `check.sh` fails if the shipping
+  image grows past a ceiling that hugs the current size (well under the 2560K
+  code region) — a runaway dependency or surprise growth trips it early. Ratchet
+  it down when the image shrinks; bump `FIRMWARE_FLASH_BUDGET_KIB` for a
+  legitimate feature.
+- **Host-crate coverage floor.** `deep-checks` gained an `llvm-cov` job that
+  floors host-crate line coverage (a regression alarm; the embedded image is
+  not host-measurable).
+- **Cognitive-complexity ratchet in `deep-checks`.** `scripts/complexity_gate.sh`
+  fails if any crate-library function crosses a cognitive-complexity ceiling — a
+  daily regression alarm for new hotspots, the coverage floor's sibling. Lower
+  the ceiling as the peak falls. rust-code-analysis is pulled ad-hoc, so it
+  never joins the pinned dev shell.
+- **`scripts/metrics.sh`** — advisory refactor reconnaissance (function
+  complexity, firmware size, generic monomorphization). Not a gate; the tools
+  are pulled ad-hoc so they never join the pinned dev shell.
+
+### Changed
+
+- **`deep-checks` runs daily** rather than weekly (Miri, fuzz, Kani, repro,
+  coverage, complexity).
+
 ## [0.3.0] — 2026-07-03
 
 ### Added
@@ -990,6 +1033,7 @@ family that keeps the "enterprise" features in the open tree.
   signature of it, and a CycloneDX SBOM. See
   [docs/releases.md](docs/releases.md) to verify a download.
 
-[Unreleased]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/TheMaxMur/RS-Key/compare/v0.2.8...v0.3.0
 [0.1.0]: https://github.com/TheMaxMur/RS-Key/releases/tag/v0.1.0

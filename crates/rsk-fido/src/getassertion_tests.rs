@@ -617,6 +617,69 @@ fn no_matching_credentials() {
     );
 }
 
+#[test]
+fn out_of_order_optional_keys_rejected() {
+    // Canonical CBOR requires ascending map keys; key 6 after key 7 descends →
+    // INVALID_CBOR (the `key < expected` guard), before any credential lookup.
+    let (mut fs, mut rng) = setup();
+    let mut buf = [0u8; 128];
+    let n = {
+        let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+        e.map(4).unwrap();
+        e.u8(1).unwrap().str("example.com").unwrap();
+        e.u8(2).unwrap().bytes(&CDH).unwrap();
+        e.u8(7).unwrap().u64(1).unwrap(); // pinUvAuthProtocol
+        e.u8(6).unwrap().bytes(&[0u8; 16]).unwrap(); // pinUvAuthParam — descends
+        e.writer().position()
+    };
+    assert_eq!(
+        run_ga(&mut fs, &mut rng, &buf[..n]),
+        Err(CtapError::InvalidCbor)
+    );
+}
+
+#[test]
+fn unknown_top_level_key_ignored() {
+    // An unrecognized top-level key (0x08) is skipped, not an error: parse
+    // succeeds and the empty lookup then reports NO_CREDENTIALS.
+    let (mut fs, mut rng) = setup();
+    let mut buf = [0u8; 128];
+    let n = {
+        let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+        e.map(3).unwrap();
+        e.u8(1).unwrap().str("example.com").unwrap();
+        e.u8(2).unwrap().bytes(&CDH).unwrap();
+        e.u8(8).unwrap().u8(0).unwrap(); // unknown → skip
+        e.writer().position()
+    };
+    assert_eq!(
+        run_ga(&mut fs, &mut rng, &buf[..n]),
+        Err(CtapError::NoCredentials)
+    );
+}
+
+#[test]
+fn unknown_option_key_ignored() {
+    // An unrecognized option sub-key is skipped; the known `up` still parses.
+    // No credential registered → NO_CREDENTIALS (parse got past the option map).
+    let (mut fs, mut rng) = setup();
+    let mut buf = [0u8; 128];
+    let n = {
+        let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+        e.map(3).unwrap();
+        e.u8(1).unwrap().str("example.com").unwrap();
+        e.u8(2).unwrap().bytes(&CDH).unwrap();
+        e.u8(5).unwrap().map(2).unwrap();
+        e.str("up").unwrap().bool(true).unwrap();
+        e.str("bogus").unwrap().bool(true).unwrap();
+        e.writer().position()
+    };
+    assert_eq!(
+        run_ga(&mut fs, &mut rng, &buf[..n]),
+        Err(CtapError::NoCredentials)
+    );
+}
+
 // A resident makeCredential request with a custom user id.
 fn mc_request_user(uid: &[u8]) -> std::vec::Vec<u8> {
     let mut buf = [0u8; 512];

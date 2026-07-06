@@ -295,7 +295,7 @@ async fn main(spawner: Spawner) {
             }
         }
         usb_itf = rsk_rescue::phy::effective_usb_itf(phy);
-        // Touch-wait timeout (pico-fido phy tag 0x08, seconds; 0/absent = default).
+        // Touch-wait timeout (phy tag 0x08, seconds; 0/absent = default).
         presence::set_timeout_secs(phy.presence_timeout.unwrap_or(0));
     }
 
@@ -380,7 +380,7 @@ async fn main(spawner: Spawner) {
     config.max_power = 100;
     config.max_packet_size_0 = 64;
     // bcdDevice build counter; also surfaced on the trusted-display Firmware screen.
-    let device_release: u16 = 0x07EC;
+    let device_release: u16 = 0x07F1;
     config.device_release = device_release;
 
     let mut builder = Builder::new(

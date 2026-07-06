@@ -147,6 +147,17 @@ rsk hw --led-driver gpio                # switch to a plain on/off LED
 rsk hw --led-order grb                  # fix a red/green swap on a GRB part
 ```
 
+By default `rsk hw` speaks CCID (PC/SC). On a host where `pcscd` can't read or
+write the card, add `--transport fido` to do the same read-modify-write over the
+FIDO HID transport instead — gated by a device touch and, if a PIN is set,
+`--pin` (a `pinUvAuthToken`). `rsk led` takes the same flag. Wiring (`rsk hw`)
+applies on the next boot, so re-plug the device; colours (`rsk led`) apply live:
+
+```sh
+rsk hw  --transport fido --touch-timeout 45   # wiring; approve with a touch
+rsk led --transport fido --status idle --color blue   # colours, applied live
+```
+
 ### Reset to defaults
 
 ```sh

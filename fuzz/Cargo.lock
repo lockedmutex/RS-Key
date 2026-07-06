@@ -1323,6 +1323,9 @@ dependencies = [
  "p521",
  "rsk-crypto",
  "rsk-fs",
+ "rsk-led",
+ "rsk-mgmt",
+ "rsk-rescue",
  "rsk-sdk",
  "zeroize",
 ]
@@ -1356,6 +1359,10 @@ dependencies = [
  "rsk-usb",
  "sequential-storage",
 ]
+
+[[package]]
+name = "rsk-led"
+version = "0.1.0"
 
 [[package]]
 name = "rsk-mgmt"

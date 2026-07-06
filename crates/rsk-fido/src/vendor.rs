@@ -33,14 +33,18 @@ use rsk_crypto::mlkem::{MLKEM768_CT_LEN, MLKEM768_EK_LEN, mlkem768_encapsulate};
 use rsk_crypto::pinproto::{PinProto, ecdh_raw};
 use rsk_crypto::sha256;
 use rsk_fs::Storage;
+use rsk_led::{CONF_LEN as LED_CONF_LEN, EF_LED_CONF};
+use rsk_mgmt::{DevConfError, persist_dev_conf};
+use rsk_rescue::phy;
 
 use crate::cbordec::{cbor, def_map};
 use crate::cert;
 use crate::consts::{
-    CTAP_VENDOR, EF_ATT_CHAIN, EF_ATT_KEY, EF_BACKUP_SEALED, EF_EE_DEV, EF_KEY_DEV, EF_KEY_DEV_ENC,
-    EF_PIN, VENDOR_ATT_CLEAR, VENDOR_ATT_IMPORT, VENDOR_ATT_STATE, VENDOR_AUDIT_CHECKPOINT,
-    VENDOR_AUDIT_READ, VENDOR_BACKUP_EXPORT, VENDOR_BACKUP_FINALIZE, VENDOR_BACKUP_LOAD,
-    VENDOR_BACKUP_STATE, VENDOR_MSE, VENDOR_UNLOCK,
+    CONFIG_TARGET_DEV_CONF, CONFIG_TARGET_LED, CONFIG_TARGET_PHY, CTAP_VENDOR, EF_ATT_CHAIN,
+    EF_ATT_KEY, EF_BACKUP_SEALED, EF_EE_DEV, EF_KEY_DEV, EF_KEY_DEV_ENC, EF_PIN, VENDOR_ATT_CLEAR,
+    VENDOR_ATT_IMPORT, VENDOR_ATT_STATE, VENDOR_AUDIT_CHECKPOINT, VENDOR_AUDIT_READ,
+    VENDOR_BACKUP_EXPORT, VENDOR_BACKUP_FINALIZE, VENDOR_BACKUP_LOAD, VENDOR_BACKUP_STATE,
+    VENDOR_CONFIG_READ, VENDOR_CONFIG_WRITE, VENDOR_MSE, VENDOR_UNLOCK,
 };
 use crate::cose::cose_key_ecdh;
 use crate::ec::P256Key;
@@ -67,6 +71,8 @@ struct Req<'a> {
     blob: &'a [u8],
     /// ATT_IMPORT subCommandParams key 2: the DER cert chain, leaf first.
     chain: &'a [u8],
+    /// CONFIG_WRITE subCommandParams key 1: which device-config record to write.
+    target: u64,
     raw_subpara: &'a [u8],
     proto: u64,
     pin_uv_auth_param: Option<&'a [u8]>,
@@ -112,6 +118,12 @@ fn parse(data: &[u8]) -> Result<Req<'_>, CtapError> {
                         req.chain = cbor(d.bytes())?;
                     } else if sk == 2 && req.subcommand == VENDOR_MSE {
                         req.mlkem_ek = cbor(d.bytes())?;
+                    } else if sk == 1
+                        && matches!(req.subcommand, VENDOR_CONFIG_WRITE | VENDOR_CONFIG_READ)
+                    {
+                        req.target = cbor(d.u32())? as u64;
+                    } else if sk == 2 && req.subcommand == VENDOR_CONFIG_WRITE {
+                        req.blob = cbor(d.bytes())?;
                     } else {
                         cbor(d.skip())?;
                     }
@@ -161,8 +173,83 @@ pub fn vendor<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, data: &[u8], out: &mut [u
         VENDOR_ATT_IMPORT => att_import(ctx, &req),
         VENDOR_ATT_CLEAR => att_clear(ctx, &req),
         VENDOR_ATT_STATE => att_state(ctx, out),
+        VENDOR_CONFIG_WRITE => config_write(ctx, &req),
+        VENDOR_CONFIG_READ => config_read(ctx, &req, out),
         _ => Err(CtapError::InvalidParameter),
     }
+}
+
+/// `CONFIG_READ`: return a device-config record so a host can read-modify-write it
+/// over FIDO (the phy record has no CCID-free read otherwise). Ungated — the
+/// config is not secret, like READ CONFIG (`0x42`) and the `*_STATE` subcommands.
+/// Only the phy record: `EF_DEV_CONF` already round-trips via READ CONFIG.
+fn config_read<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [u8]) -> CtapResult {
+    match req.target {
+        CONFIG_TARGET_PHY => {
+            let mut buf = [0u8; phy::PHY_MAX_SIZE];
+            let n = ctx
+                .fs
+                .read(phy::EF_PHY, &mut buf)
+                .unwrap_or(0)
+                .min(buf.len());
+            encode(out, |e| {
+                e.map(1)?.u8(1)?.bytes(&buf[..n])?;
+                Ok(())
+            })
+        }
+        CONFIG_TARGET_LED => {
+            let mut buf = [0u8; LED_CONF_LEN];
+            let n = ctx
+                .fs
+                .read(EF_LED_CONF, &mut buf)
+                .unwrap_or(0)
+                .min(buf.len());
+            encode(out, |e| {
+                e.map(1)?.u8(1)?.bytes(&buf[..n])?;
+                Ok(())
+            })
+        }
+        _ => Err(CtapError::InvalidParameter),
+    }
+}
+
+/// `CONFIG_WRITE`: persist a device-configuration record over FIDO — the
+/// pcscd-free twin of the CCID device-config writes, for hosts that can't reach
+/// the CCID interface. Gated by a pinUvAuthToken (PERM_ACFG, when a PIN is set)
+/// AND a physical touch: a *stronger* gate than the CCID path's presence-only,
+/// because CTAPHID is reachable by any unprivileged host process. No MSE channel
+/// — the config blobs are not secret, only their authorship must be proven.
+fn config_write<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req) -> CtapResult {
+    pin_gate(ctx, req)?;
+    if !ctx.check_user_presence(crate::Confirm::titled("Write device config?")) {
+        return Err(CtapError::OperationDenied);
+    }
+    match req.target {
+        CONFIG_TARGET_DEV_CONF => persist_dev_conf(ctx.fs, req.blob).map_err(|e| match e {
+            DevConfError::TooLong => CtapError::InvalidLength,
+            DevConfError::Store => CtapError::Other,
+        })?,
+        // The phy record (VID/PID, USB interfaces, LED, presence-timeout) — the
+        // same lenient parse + save the CCID rescue WRITE 0x1C uses; takes effect
+        // on the next boot (main reads EF_PHY), like the CCID path.
+        CONFIG_TARGET_PHY => {
+            phy::save(ctx.fs, &phy::PhyData::parse(req.blob)).map_err(|_| CtapError::Other)?
+        }
+        // The LED config block; persisted here and applied *live* by the firmware
+        // CTAPHID handler, which reloads EF_LED_CONF after a 0x41 command (the LED
+        // atomics are firmware-side). The CCID SET_LED writes the same record.
+        CONFIG_TARGET_LED => {
+            if req.blob.len() < LED_CONF_LEN {
+                return Err(CtapError::InvalidLength);
+            }
+            ctx.fs
+                .put(EF_LED_CONF, &req.blob[..LED_CONF_LEN])
+                .map_err(|_| CtapError::Other)?;
+        }
+        _ => return Err(CtapError::InvalidParameter),
+    }
+    journal::append(ctx, journal::EV_CONFIG_WRITE, req.target as u8, &[]);
+    Ok(0)
 }
 
 /// `ATT_IMPORT`: install an org attestation key + DER chain (leaf first). The

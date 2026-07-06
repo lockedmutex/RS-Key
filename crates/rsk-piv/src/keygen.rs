@@ -356,6 +356,111 @@ pub(crate) fn store_retired_rsa<S: Storage>(
     .map_err(|_| Sw::MEMORY_FAILURE)
 }
 
+/// Import an RSA key from its CRT primes (tags 0x01 `p`, 0x02 `q`), fixing the
+/// public exponent at 65537; the modulus size must match the requested algo.
+fn import_rsa<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    rng: &mut dyn Rng,
+    algo: u8,
+    slot: u8,
+    data: &[u8],
+) -> Result<(), Sw> {
+    let p = find_tag(data, 0x01).filter(|v| !v.is_empty());
+    let q = find_tag(data, 0x02).filter(|v| !v.is_empty());
+    let (Some(p), Some(q)) = (p, q) else {
+        return Err(WRONG_DATA);
+    };
+    let Some(key) = rsa_from_pqe(&[0x01, 0x00, 0x01], p, q) else {
+        return Err(Sw::EXEC_ERROR);
+    };
+    let Some(want) = rsa_size_from_algo(algo) else {
+        return Err(WRONG_DATA);
+    };
+    if key.size() != want {
+        return Err(WRONG_DATA);
+    }
+    seal::store_rsa_key(dev, fs, rng, key_fid(slot), &key)
+}
+
+/// Import a NIST-curve key from its scalar (tag 0x06); rejects a zero/invalid
+/// scalar early by deriving the public point.
+fn import_ec<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    rng: &mut dyn Rng,
+    algo: u8,
+    slot: u8,
+    data: &[u8],
+) -> Result<(), Sw> {
+    let Some(scalar) = find_tag(data, 0x06).filter(|v| !v.is_empty()) else {
+        return Err(WRONG_DATA);
+    };
+    let Some(curve) = curve_for_algo(algo) else {
+        return Err(WRONG_DATA);
+    };
+    let field = if algo == ALGO_ECCP256 { 32 } else { 48 };
+    if scalar.len() > field {
+        return Err(WRONG_DATA);
+    }
+    let Some(key) = PrivKey::from_scalar(curve, scalar) else {
+        return Err(WRONG_DATA);
+    };
+    // Reject the zero/invalid scalar early: deriving the public point fails for
+    // out-of-range keys.
+    let mut pt = [0u8; MAX_EC_POINT];
+    if key.public_point(&mut pt).is_err() {
+        return Err(WRONG_DATA);
+    }
+    seal::store_ec_key(dev, fs, rng, key_fid(slot), &key)
+}
+
+/// Import an Edwards-curve key from its raw 32-byte seed/scalar (tag 0x07
+/// Ed25519, 0x08 X25519).
+fn import_edwards<S: Storage>(
+    dev: &Device,
+    fs: &mut Fs<S>,
+    rng: &mut dyn Rng,
+    algo: u8,
+    slot: u8,
+    data: &[u8],
+) -> Result<(), Sw> {
+    // yubikit tags the raw 32-byte seed/scalar 0x07 (Ed25519) / 0x08 (X25519).
+    let (tag, curve) = if algo == ALGO_ED25519 {
+        (0x07u16, Curve::Ed25519)
+    } else {
+        (0x08u16, Curve::X25519)
+    };
+    let Some(scalar) = find_tag(data, tag).filter(|v| !v.is_empty()) else {
+        return Err(WRONG_DATA);
+    };
+    if scalar.len() > 32 {
+        return Err(WRONG_DATA);
+    }
+    // ykman / yubico-piv-tool import the X25519 private key little-endian
+    // (RFC 8410 / RFC 7748); `PrivKey` keeps the scalar as a big-endian MPI
+    // (keys.rs reverses it for the curve op), so flip the imported bytes — else
+    // the slot's public key disagrees with the key's real identity and ciphertext
+    // bound to it can't be decrypted. Ed25519's tag 0x07 is a hash seed, not an
+    // integer, so it is imported verbatim.
+    let mut flipped = [0u8; 32];
+    let scalar = if algo == ALGO_X25519 {
+        let n = scalar.len();
+        for (i, &b) in scalar.iter().enumerate() {
+            flipped[n - 1 - i] = b;
+        }
+        &flipped[..n]
+    } else {
+        scalar
+    };
+    let key = PrivKey::from_scalar(curve, scalar);
+    flipped.zeroize();
+    let Some(key) = key else {
+        return Err(WRONG_DATA);
+    };
+    seal::store_ec_key(dev, fs, rng, key_fid(slot), &key)
+}
+
 /// IMPORT ASYMMETRIC KEY; gated on management-key auth.
 pub(crate) fn import<S: Storage>(
     sess: &Session,
@@ -378,89 +483,16 @@ pub(crate) fn import<S: Storage>(
     }
     let pin_policy = find_tag(data, TAG_PIN_POLICY).and_then(|v| v.first().copied());
     let touch_policy = find_tag(data, TAG_TOUCH_POLICY).and_then(|v| v.first().copied());
-    match algo {
+    let stored = match algo {
         ALGO_RSA1024 | ALGO_RSA2048 | ALGO_RSA3072 | ALGO_RSA4096 => {
-            let p = find_tag(data, 0x01).filter(|v| !v.is_empty());
-            let q = find_tag(data, 0x02).filter(|v| !v.is_empty());
-            let (Some(p), Some(q)) = (p, q) else {
-                return WRONG_DATA;
-            };
-            let Some(key) = rsa_from_pqe(&[0x01, 0x00, 0x01], p, q) else {
-                return Sw::EXEC_ERROR;
-            };
-            let Some(want) = rsa_size_from_algo(algo) else {
-                return WRONG_DATA;
-            };
-            if key.size() != want {
-                return WRONG_DATA;
-            }
-            if let Err(sw) = seal::store_rsa_key(dev, fs, rng, key_fid(slot), &key) {
-                return sw;
-            }
+            import_rsa(dev, fs, rng, algo, slot, data)
         }
-        ALGO_ECCP256 | ALGO_ECCP384 => {
-            let Some(scalar) = find_tag(data, 0x06).filter(|v| !v.is_empty()) else {
-                return WRONG_DATA;
-            };
-            let Some(curve) = curve_for_algo(algo) else {
-                return WRONG_DATA;
-            };
-            let field = if algo == ALGO_ECCP256 { 32 } else { 48 };
-            if scalar.len() > field {
-                return WRONG_DATA;
-            }
-            let Some(key) = PrivKey::from_scalar(curve, scalar) else {
-                return WRONG_DATA;
-            };
-            // Reject the zero/invalid scalar early: deriving the public point
-            // fails for out-of-range keys.
-            let mut pt = [0u8; MAX_EC_POINT];
-            if key.public_point(&mut pt).is_err() {
-                return WRONG_DATA;
-            }
-            if let Err(sw) = seal::store_ec_key(dev, fs, rng, key_fid(slot), &key) {
-                return sw;
-            }
-        }
-        ALGO_ED25519 | ALGO_X25519 => {
-            // yubikit tags the raw 32-byte seed/scalar 0x07 (Ed25519) / 0x08 (X25519).
-            let (tag, curve) = if algo == ALGO_ED25519 {
-                (0x07u16, Curve::Ed25519)
-            } else {
-                (0x08u16, Curve::X25519)
-            };
-            let Some(scalar) = find_tag(data, tag).filter(|v| !v.is_empty()) else {
-                return WRONG_DATA;
-            };
-            if scalar.len() > 32 {
-                return WRONG_DATA;
-            }
-            // ykman / yubico-piv-tool import the X25519 private key little-endian
-            // (RFC 8410 / RFC 7748); `PrivKey` keeps the scalar as a big-endian MPI
-            // (keys.rs reverses it for the curve op), so flip the imported bytes —
-            // else the slot's public key disagrees with the key's real identity and
-            // ciphertext bound to it can't be decrypted. Ed25519's tag 0x07 is a
-            // hash seed, not an integer, so it is imported verbatim.
-            let mut flipped = [0u8; 32];
-            let scalar = if algo == ALGO_X25519 {
-                let n = scalar.len();
-                for (i, &b) in scalar.iter().enumerate() {
-                    flipped[n - 1 - i] = b;
-                }
-                &flipped[..n]
-            } else {
-                scalar
-            };
-            let key = PrivKey::from_scalar(curve, scalar);
-            flipped.zeroize();
-            let Some(key) = key else {
-                return WRONG_DATA;
-            };
-            if let Err(sw) = seal::store_ec_key(dev, fs, rng, key_fid(slot), &key) {
-                return sw;
-            }
-        }
-        _ => return WRONG_DATA,
+        ALGO_ECCP256 | ALGO_ECCP384 => import_ec(dev, fs, rng, algo, slot, data),
+        ALGO_ED25519 | ALGO_X25519 => import_edwards(dev, fs, rng, algo, slot, data),
+        _ => Err(WRONG_DATA),
+    };
+    if let Err(sw) = stored {
+        return sw;
     }
     let pol = resolved_policies(slot, pin_policy, touch_policy);
     if fs

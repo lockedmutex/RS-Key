@@ -81,6 +81,13 @@ empty by design: [architecture.md](architecture.md)).
 
 ![4 MB vs 16 MB flash layout — the KV store is identical on both; only the code region and the KV origin move with FLASH_SIZE](images/flash-map-sizes.svg)
 
+At the `4M` default the code region is `2560K`; the shipping image uses roughly a
+third of it. `check.sh` enforces a *ratchet* well under that — a ceiling that
+hugs the current image, so a runaway dependency (a whole extra EC curve is
+~150 KiB) or any surprise growth trips it long before the linker's hard limit.
+Lower `FIRMWARE_FLASH_BUDGET_KIB` when the image shrinks; raise it in the same
+commit when a real feature legitimately grows it.
+
 ## Examples
 
 ```sh
@@ -117,7 +124,7 @@ reproducible**: the derivation remaps the two absolute build inputs out of
 the binary (the per-build sandbox dir and the toolchain store path — both
 land in panic-location strings in `.rodata`, plus DWARF in the `.elf`) with
 stable `--remap-path-prefix`, so one `flake.lock` yields one `firmware.uf2`
-on every machine of a platform. The weekly `repro` job in
+on every machine of a platform. The daily `repro` job in
 [deep-checks](https://github.com/TheMaxMur/RS-Key/blob/main/.github/workflows/deep-checks.yml)
 proves it — `nix build` twice, the second with `--rebuild` so nix compares
 every output byte — and publishes the canonical sha256 in its run summary.

@@ -283,3 +283,90 @@ fn set_min_pin_forces_change_when_pin_too_short() {
     assert_eq!(buf, [6, 1]); // forceChangePin set
     assert_ne!(state.paut.token, TOKEN); // token regenerated
 }
+
+// The vendor (0xFF) subCommandParams `{1: vendorCommandId, 3: int}` — the
+// PicoForge physical-config shape (integer param at key 3).
+fn subpara_vendor_int(vendor_id: u64, val: u64) -> std::vec::Vec<u8> {
+    let mut buf = [0u8; 48];
+    let n = {
+        let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+        e.map(2).unwrap();
+        e.u8(1).unwrap().u64(vendor_id).unwrap();
+        e.u8(3).unwrap().u64(val).unwrap();
+        e.writer().position()
+    };
+    buf[..n].to_vec()
+}
+
+// Wrap a vendor (0xFF) subCommandParams blob into a full authenticatorConfig
+// request. Unlike config_request it encodes subCommand 0xFF as CBOR `0x18 0xFF`
+// (a bare 0xFF byte is the CBOR break marker, not the integer 255).
+fn vendor_req(sub: &[u8], token: &[u8; 32]) -> std::vec::Vec<u8> {
+    let mut vp = std::vec![0xffu8; 32];
+    vp.push(CTAP_CONFIG);
+    vp.push(CONFIG_VENDOR as u8);
+    vp.extend_from_slice(sub);
+    let mut mac = [0u8; 32];
+    let mlen = pinproto::authenticate(PinProto::Two, token, &vp, &mut mac).unwrap();
+
+    let mut req = std::vec::Vec::new();
+    req.push(0xA4); // map(4)
+    req.extend_from_slice(&[0x01, 0x18, 0xFF]); // 1: subCommand = 0xFF
+    req.push(0x02); // 2: subCommandParams (raw)
+    req.extend_from_slice(sub);
+    req.extend_from_slice(&[0x03, 0x02]); // 3: pinUvAuthProtocol = 2
+    req.push(0x04); // 4: pinUvAuthParam
+    req.push(0x58);
+    req.push(mlen as u8);
+    req.extend_from_slice(&mac[..mlen]);
+    req
+}
+
+#[test]
+fn picoforge_config_sets_vidpid_in_phy() {
+    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut st = armed(PERM_ACFG);
+    let vidpid = (0x1050u64 << 16) | 0x0407; // Yubico
+    let sub = subpara_vendor_int(CONFIG_PHY_VIDPID, vidpid);
+    assert_eq!(run_fs(&mut fs, &mut st, &vendor_req(&sub, &TOKEN)), Ok(0));
+    assert_eq!(
+        rsk_rescue::phy::load(&mut fs).unwrap().vid_pid,
+        Some((0x1050, 0x0407))
+    );
+}
+
+#[test]
+fn picoforge_config_sets_led_gpio_and_options_in_phy() {
+    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let g = subpara_vendor_int(CONFIG_PHY_LED_GPIO, 22);
+    let mut st = armed(PERM_ACFG);
+    assert_eq!(run_fs(&mut fs, &mut st, &vendor_req(&g, &TOKEN)), Ok(0));
+    // opts 0x0A = dimmable (0x2) | led-steady (0x8); a fresh token for the 2nd write.
+    let o = subpara_vendor_int(CONFIG_PHY_OPTIONS, 0x0A);
+    let mut st2 = armed(PERM_ACFG);
+    assert_eq!(run_fs(&mut fs, &mut st2, &vendor_req(&o, &TOKEN)), Ok(0));
+    let p = rsk_rescue::phy::load(&mut fs).unwrap();
+    assert_eq!(p.led_gpio, Some(22));
+    assert_eq!(p.opts, 0x0A);
+}
+
+#[test]
+fn picoforge_config_requires_acfg_permission() {
+    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut st = armed(0); // no acfg permission
+    let sub = subpara_vendor_int(CONFIG_PHY_VIDPID, 0x1050_0407);
+    assert_eq!(
+        run_fs(&mut fs, &mut st, &vendor_req(&sub, &TOKEN)),
+        Err(CtapError::PinAuthInvalid)
+    );
+}
+
+#[test]
+fn unknown_vendor_config_id_rejected() {
+    let mut st = armed(PERM_ACFG);
+    let sub = subpara_vendor_int(0xDEAD_BEEF, 1);
+    assert_eq!(
+        run(&mut st, &vendor_req(&sub, &TOKEN)),
+        Err(CtapError::InvalidSubcommand)
+    );
+}

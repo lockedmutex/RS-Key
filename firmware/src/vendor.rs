@@ -9,6 +9,10 @@ use core::cell::RefCell;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use rsk_fs::{Fs, Storage};
+// The LED config-block FID (sticky, outside both reset scopes) is single-sourced
+// in `rsk_led` so the FIDO CONFIG_WRITE/READ LED target agrees on it. A legacy
+// 2/3-byte record is mapped onto the idle status by [`crate::led::load_block`].
+use rsk_led::EF_LED_CONF;
 use rsk_rescue::{Confirm, Presence, UserPresence};
 use rsk_sdk::{Apdu, Applet, ResBuf, Sw};
 
@@ -17,10 +21,6 @@ pub const VENDOR_AID: &[u8] = &[0xF0, 0x00, 0x00, 0x00, 0x01];
 
 /// Dynamic file holding the counter; `Fs::scan` rediscovers it after a reboot.
 const COUNTER_FID: u16 = 0xCC01;
-/// LED config block `[steady, (effect, color, brightness) × status]`; outside both reset
-/// scopes (sticky). A legacy 2/3-byte record (pre-per-status firmware) is mapped
-/// onto the idle status by [`crate::led::load_block`].
-const EF_LED_CONF: u16 = 0x1123;
 /// SET LED P2 bit that turns blinking off (solid color); the low 3 bits are the
 /// color and bits 5:4 select which status is being configured.
 const P2_STEADY: u8 = 0x08;
@@ -202,10 +202,18 @@ impl<S: Storage> Applet<Fs<S>> for VendorApplet<'_> {
 
 /// Apply the LED config persisted in `EF_LED_CONF` (called by `main` on boot).
 /// `load_block` tolerates a legacy 2/3-byte record from an older firmware.
+///
+/// On a device that has never customised the LEDs the record is absent, so the
+/// live defaults are persisted once here. That way a host `CONFIG_READ` over FIDO
+/// always gets the full block to read-modify-write (it can't know the build
+/// defaults); the stored block equals the defaults, so the LED output is unchanged.
 pub fn load_led_config<S: Storage>(fs: &mut Fs<S>) {
     let mut buf = [0u8; crate::led::CONF_LEN];
-    if let Some(n) = fs.read(EF_LED_CONF, &mut buf) {
-        crate::led::load_block(&buf[..n.min(buf.len())]);
+    match fs.read(EF_LED_CONF, &mut buf) {
+        Some(n) => crate::led::load_block(&buf[..n.min(buf.len())]),
+        None => {
+            let _ = fs.put(EF_LED_CONF, &crate::led::config_block());
+        }
     }
 }
 
