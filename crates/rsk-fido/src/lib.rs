@@ -228,3 +228,6 @@ pub fn process_cbor<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, data: &[u8], out: &
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod conformance;
