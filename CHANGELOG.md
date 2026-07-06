@@ -13,6 +13,8 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-07-06
+
 ### Added
 
 - **PicoForge hardware config over FIDO.** `authenticatorConfig`'s vendorPrototype
@@ -1031,6 +1033,7 @@ family that keeps the "enterprise" features in the open tree.
   signature of it, and a CycloneDX SBOM. See
   [docs/releases.md](docs/releases.md) to verify a download.
 
-[Unreleased]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/TheMaxMur/RS-Key/compare/v0.2.8...v0.3.0
 [0.1.0]: https://github.com/TheMaxMur/RS-Key/releases/tag/v0.1.0
