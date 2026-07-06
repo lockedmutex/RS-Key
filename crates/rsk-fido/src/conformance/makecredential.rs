@@ -45,6 +45,35 @@ fn mc_request(alg: i64) -> Vec<u8> {
     buf[..n].to_vec()
 }
 
+/// A makeCredential over `RP_ID` whose excludeList (key 5) names `cred_id`.
+fn mc_request_exclude(cred_id: &[u8]) -> Vec<u8> {
+    let mut buf = [0u8; 256];
+    let n = {
+        let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+        e.map(5).unwrap();
+        e.u8(1).unwrap().bytes(&[0xCD; 32]).unwrap();
+        e.u8(2)
+            .unwrap()
+            .map(1)
+            .unwrap()
+            .str("id")
+            .unwrap()
+            .str(RP_ID)
+            .unwrap();
+        e.u8(3).unwrap().map(2).unwrap();
+        e.str("id").unwrap().bytes(&[1, 2, 3, 4]).unwrap();
+        e.str("name").unwrap().str("alice").unwrap();
+        e.u8(4).unwrap().array(1).unwrap().map(2).unwrap();
+        e.str("alg").unwrap().i64(ALG_ES256).unwrap();
+        e.str("type").unwrap().str("public-key").unwrap();
+        e.u8(5).unwrap().array(1).unwrap().map(2).unwrap();
+        e.str("type").unwrap().str("public-key").unwrap();
+        e.str("id").unwrap().bytes(cred_id).unwrap();
+        e.writer().position()
+    };
+    buf[..n].to_vec()
+}
+
 fn make_es256() -> Resp {
     Authr::fresh().send(CTAP_MAKE_CREDENTIAL, &mc_request(ALG_ES256))
 }
@@ -130,4 +159,20 @@ fn makecred_unsupported_algorithm_rejected() {
     let r = Authr::fresh().send(CTAP_MAKE_CREDENTIAL, &mc_request(-257));
     assert_eq!(r.status, CtapError::UnsupportedAlgorithm.as_u8());
     assert!(r.body.is_empty(), "an error response carries no CBOR body");
+}
+
+#[test]
+fn makecred_exclude_list_rejects_existing() {
+    let mut a = Authr::fresh();
+    let r1 = a.send(CTAP_MAKE_CREDENTIAL, &mc_request(ALG_ES256));
+    assert_ok(&r1);
+    let cred_id = {
+        let mut d = field_at(&r1.body, 2).expect("authData (0x02) present");
+        let ad = d.bytes().unwrap();
+        let cl = u16::from_be_bytes([ad[53], ad[54]]) as usize;
+        ad[55..55 + cl].to_vec()
+    };
+    // Re-registering with that credential in excludeList → CREDENTIAL_EXCLUDED (§6.1).
+    let r2 = a.send(CTAP_MAKE_CREDENTIAL, &mc_request_exclude(&cred_id));
+    assert_eq!(r2.status, CtapError::CredentialExcluded.as_u8());
 }

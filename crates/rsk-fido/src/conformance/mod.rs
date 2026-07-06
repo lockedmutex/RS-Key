@@ -21,6 +21,7 @@ mod clientpin;
 mod config;
 mod credmgmt;
 mod credprotect;
+mod extensions;
 mod getassertion;
 mod getinfo;
 mod largeblobs;
