@@ -9,7 +9,8 @@
 
 use super::{Authr, assert_ok, field_at, pin_auth};
 use crate::consts::{
-    ALG_ES256, CRED_PROT_UV_REQUIRED, CTAP_GET_ASSERTION, CTAP_MAKE_CREDENTIAL, FLAG_ED,
+    ALG_ES256, CRED_PROT_UV_OPTIONAL, CRED_PROT_UV_OPTIONAL_WITH_LIST, CRED_PROT_UV_REQUIRED,
+    CTAP_GET_ASSERTION, CTAP_MAKE_CREDENTIAL, FLAG_ED,
 };
 use crate::error::CtapError;
 use crate::state::PERM_GA;
@@ -142,4 +143,57 @@ fn credprotect3_visible_with_uv() {
     let param = pin_auth(&token, &CDH);
     let r = a.send(CTAP_GET_ASSERTION, &ga(Some(&param)));
     assert_ok(&r);
+}
+
+/// A getAssertion over `RP_ID` naming `id` in the allowList (no UV).
+fn ga_allow(id: &[u8]) -> Vec<u8> {
+    let mut buf = [0u8; 128];
+    let n = {
+        let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+        e.map(3).unwrap();
+        e.u8(1).unwrap().str(RP_ID).unwrap();
+        e.u8(2).unwrap().bytes(&CDH).unwrap();
+        e.u8(3).unwrap().array(1).unwrap().map(2).unwrap();
+        e.str("type").unwrap().str("public-key").unwrap();
+        e.str("id").unwrap().bytes(id).unwrap();
+        e.writer().position()
+    };
+    buf[..n].to_vec()
+}
+
+/// The credential id from a makeCredential authData.
+fn cred_id(body: &[u8]) -> Vec<u8> {
+    let mut d = field_at(body, 2).expect("authData (0x02) present");
+    let ad = d.bytes().unwrap();
+    let cl = u16::from_be_bytes([ad[53], ad[54]]) as usize;
+    ad[55..55 + cl].to_vec()
+}
+
+#[test]
+fn credprotect1_always_visible() {
+    let mut a = Authr::fresh();
+    assert_ok(&a.send(
+        CTAP_MAKE_CREDENTIAL,
+        &mc_credprotect(CRED_PROT_UV_OPTIONAL, true),
+    ));
+    // Level 1 (userVerificationOptional) is returned to a no-UV discoverable assertion.
+    assert_ok(&a.send(CTAP_GET_ASSERTION, &ga(None)));
+}
+
+#[test]
+fn credprotect2_needs_list_or_uv() {
+    let mut a = Authr::fresh();
+    let r = a.send(
+        CTAP_MAKE_CREDENTIAL,
+        &mc_credprotect(CRED_PROT_UV_OPTIONAL_WITH_LIST, true),
+    );
+    assert_ok(&r);
+    let id = cred_id(&r.body);
+    // Level 2 is invisible to a no-UV discoverable assertion (§12.1)...
+    assert_eq!(
+        a.send(CTAP_GET_ASSERTION, &ga(None)).status,
+        CtapError::NoCredentials.as_u8()
+    );
+    // ...but visible when named in the allowList.
+    assert_ok(&a.send(CTAP_GET_ASSERTION, &ga_allow(&id)));
 }

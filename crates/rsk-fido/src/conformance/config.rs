@@ -7,7 +7,7 @@
 //! `0xff*32 ‖ 0x0d ‖ subCommand ‖ params` is permission-checked (PERM_ACFG).
 
 use super::{Authr, assert_ok_empty, field_at, pin_auth};
-use crate::consts::{CONFIG_ENABLE_EA, CTAP_CONFIG};
+use crate::consts::{CONFIG_ENABLE_EA, CONFIG_TOGGLE_ALWAYS_UV, CTAP_CONFIG};
 use crate::error::CtapError;
 use crate::state::{PERM_ACFG, PERM_GA, puat_subcommand_msg};
 use minicbor::Encoder;
@@ -34,15 +34,15 @@ fn acfg_param(token: &[u8; 32], subcommand: u64) -> Vec<u8> {
     pin_auth(token, &msg[..n])
 }
 
-/// Read `options.ep` from a fresh getInfo (false if absent).
-fn getinfo_ep(a: &mut Authr) -> bool {
+/// Read a boolean `options.<name>` from a fresh getInfo (false if absent).
+fn getinfo_option(a: &mut Authr, name: &str) -> bool {
     let r = a.get_info();
     let mut d = field_at(&r.body, 4).expect("options (0x04) present");
     let n = d.map().unwrap().unwrap();
     for _ in 0..n {
-        let key = d.str().unwrap() == "ep";
+        let hit = d.str().unwrap() == name;
         let val = d.bool().unwrap();
-        if key {
+        if hit {
             return val;
         }
     }
@@ -52,13 +52,32 @@ fn getinfo_ep(a: &mut Authr) -> bool {
 #[test]
 fn config_enable_enterprise_attestation_round_trips() {
     let mut a = Authr::fresh();
-    assert!(!getinfo_ep(&mut a), "options.ep starts disabled");
+    assert!(!getinfo_option(&mut a, "ep"), "options.ep starts disabled");
     let token = a.arm_token(PERM_ACFG);
     let param = acfg_param(&token, CONFIG_ENABLE_EA);
     assert_ok_empty(&a.send(CTAP_CONFIG, &config_request(CONFIG_ENABLE_EA, &param)));
     assert!(
-        getinfo_ep(&mut a),
+        getinfo_option(&mut a, "ep"),
         "options.ep must flip to true after enableEnterpriseAttestation"
+    );
+}
+
+#[test]
+fn config_toggle_always_uv_round_trips() {
+    let mut a = Authr::fresh();
+    assert!(
+        !getinfo_option(&mut a, "alwaysUv"),
+        "options.alwaysUv starts disabled"
+    );
+    let token = a.arm_token(PERM_ACFG);
+    let param = acfg_param(&token, CONFIG_TOGGLE_ALWAYS_UV);
+    assert_ok_empty(&a.send(
+        CTAP_CONFIG,
+        &config_request(CONFIG_TOGGLE_ALWAYS_UV, &param),
+    ));
+    assert!(
+        getinfo_option(&mut a, "alwaysUv"),
+        "options.alwaysUv must flip to true after toggleAlwaysUv"
     );
 }
 

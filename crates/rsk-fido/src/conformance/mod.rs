@@ -72,6 +72,8 @@ struct Authr {
     rng: SeqRng,
     /// Whether presence requests confirm (`AlwaysConfirm`) or time out (`Decline`).
     confirm: bool,
+    /// Monotonic clock (ms), advanced per command so credential timestamps differ.
+    clock: u64,
 }
 
 impl Authr {
@@ -85,6 +87,7 @@ impl Authr {
             state: FidoState::new(),
             rng,
             confirm: true,
+            clock: 0,
         }
     }
 
@@ -99,6 +102,8 @@ impl Authr {
     fn send(&mut self, cmd: u8, params: &[u8]) -> Resp {
         let mut data = vec![cmd];
         data.extend_from_slice(params);
+        self.clock += 1000;
+        let now_ms = self.clock;
         let mut out = [0u8; 2048];
         let mut yes = AlwaysConfirm;
         let mut no = Decline;
@@ -109,7 +114,7 @@ impl Authr {
                 fs: &mut self.fs,
                 rng: &mut self.rng,
                 state: &mut self.state,
-                now_ms: 0,
+                now_ms,
                 presence,
             };
             process_cbor(&mut ctx, &data, &mut out)
@@ -146,6 +151,8 @@ impl Authr {
     /// U2F answers with `(Sw, body)` rather than the CTAP2 status-byte envelope.
     fn send_u2f(&mut self, raw: &[u8]) -> (Sw, Vec<u8>) {
         let apdu = Apdu::parse(raw).unwrap();
+        self.clock += 1000;
+        let now_ms = self.clock;
         let mut out = [0u8; 1024];
         let mut yes = AlwaysConfirm;
         let mut no = Decline;
@@ -156,7 +163,7 @@ impl Authr {
                 fs: &mut self.fs,
                 rng: &mut self.rng,
                 state: &mut self.state,
-                now_ms: 0,
+                now_ms,
                 presence,
             };
             process_u2f(&mut ctx, &apdu, &mut out)
