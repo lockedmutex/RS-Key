@@ -15,11 +15,15 @@ use rsk_crypto::pinproto::PinProto;
 use rsk_fs::storage::ram::RamStorage;
 
 mod clientpin;
+mod config;
 mod credmgmt;
 mod credprotect;
 mod getassertion;
 mod getinfo;
+mod largeblobs;
 mod makecredential;
+mod reset;
+mod selection;
 
 /// Deterministic RNG (copied per test file, matching the repo convention).
 struct SeqRng(u64);
@@ -40,6 +44,14 @@ fn dev() -> Device<'static> {
     }
 }
 
+/// A user-presence backend that never confirms — a button left untouched.
+struct Decline;
+impl UserPresence for Decline {
+    fn request(&mut self, _confirm: Confirm<'_>) -> Presence {
+        Presence::Timeout
+    }
+}
+
 /// One CTAP2 reply as seen on the wire: the leading status byte and, on success,
 /// the CBOR payload that follows it.
 struct Resp {
@@ -53,7 +65,8 @@ struct Authr {
     fs: Fs<RamStorage>,
     state: FidoState,
     rng: SeqRng,
-    presence: AlwaysConfirm,
+    /// Whether presence requests confirm (`AlwaysConfirm`) or time out (`Decline`).
+    confirm: bool,
 }
 
 impl Authr {
@@ -66,8 +79,15 @@ impl Authr {
             fs,
             state: FidoState::new(),
             rng,
-            presence: AlwaysConfirm,
+            confirm: true,
         }
+    }
+
+    /// Like [`fresh`](Self::fresh) but every presence request times out.
+    fn declining() -> Self {
+        let mut a = Self::fresh();
+        a.confirm = false;
+        a
     }
 
     /// Send `command_byte ‖ params` through the dispatcher and capture the reply.
@@ -75,6 +95,9 @@ impl Authr {
         let mut data = vec![cmd];
         data.extend_from_slice(params);
         let mut out = [0u8; 2048];
+        let mut yes = AlwaysConfirm;
+        let mut no = Decline;
+        let presence: &mut dyn UserPresence = if self.confirm { &mut yes } else { &mut no };
         let n = {
             let mut ctx = Ctx {
                 dev: dev(),
@@ -82,7 +105,7 @@ impl Authr {
                 rng: &mut self.rng,
                 state: &mut self.state,
                 now_ms: 0,
-                presence: &mut self.presence,
+                presence,
             };
             process_cbor(&mut ctx, &data, &mut out)
         };
@@ -133,6 +156,16 @@ fn assert_ok(r: &Resp) {
         !r.body.is_empty(),
         "a CTAP2_OK response must carry a payload"
     );
+}
+
+/// A successful response with no CBOR payload (selection, reset, authenticatorConfig).
+fn assert_ok_empty(r: &Resp) {
+    assert_eq!(
+        r.status, CTAP2_OK,
+        "expected CTAP2_OK, got status 0x{:02x}",
+        r.status
+    );
+    assert!(r.body.is_empty(), "this command returns no CBOR payload");
 }
 
 /// Decode a definite-length map with unsigned-integer keys; assert the keys are
