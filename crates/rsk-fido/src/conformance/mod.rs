@@ -12,6 +12,8 @@
 use super::*;
 use crate::u2f::process_u2f;
 use minicbor::Decoder;
+use p256::EncodedPoint;
+use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
 use rsk_crypto::pinproto::PinProto;
 use rsk_fs::storage::ram::RamStorage;
 use rsk_sdk::apdu::Apdu;
@@ -273,4 +275,34 @@ fn bool_map_canonical(d: &mut Decoder) -> Vec<String> {
 /// bytewise.
 fn canonical_lt(a: &str, b: &str) -> bool {
     (a.len(), a.as_bytes()) < (b.len(), b.as_bytes())
+}
+
+/// Assert an ECDSA P-256 signature (`der_sig`) over `msg` verifies under the
+/// public key `(x, y)` — the cryptographic check a conformance tool performs.
+fn verify_p256(x: &[u8], y: &[u8], msg: &[u8], der_sig: &[u8]) {
+    let pt = EncodedPoint::from_affine_coordinates(x.into(), y.into(), false);
+    let vk = VerifyingKey::from_encoded_point(&pt).unwrap();
+    vk.verify(msg, &Signature::from_der(der_sig).unwrap())
+        .expect("P-256 signature verifies under the given public key");
+}
+
+/// The credential COSE public key `(x, y)` embedded in a makeCredential authData
+/// (`{1:2, 3:alg, -1:crv, -2:x, -3:y}` after the attested-credential-data header).
+fn credential_pubkey(ad: &[u8]) -> ([u8; 32], [u8; 32]) {
+    let cred_len = u16::from_be_bytes([ad[53], ad[54]]) as usize;
+    let mut d = Decoder::new(&ad[55 + cred_len..]);
+    assert_eq!(d.map().unwrap().unwrap(), 5);
+    d.u8().unwrap();
+    d.u8().unwrap(); // 1: kty
+    d.u8().unwrap();
+    d.i64().unwrap(); // 3: alg
+    d.i8().unwrap();
+    d.u8().unwrap(); // -1: crv
+    d.i8().unwrap(); // -2: x label
+    let mut x = [0u8; 32];
+    x.copy_from_slice(d.bytes().unwrap());
+    d.i8().unwrap(); // -3: y label
+    let mut y = [0u8; 32];
+    y.copy_from_slice(d.bytes().unwrap());
+    (x, y)
 }

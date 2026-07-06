@@ -99,3 +99,28 @@ fn u2f_class_and_instruction_errors() {
     let (sw, _) = a.send_u2f(&short(0x00, 0xEE, 0));
     assert_eq!(sw, Sw::INS_NOT_SUPPORTED);
 }
+
+#[test]
+fn u2f_authenticate_signature_verifies() {
+    let mut a = Authr::fresh();
+    let (sw, reg) = a.send_u2f(&ext(0x00, CTAP_REGISTER, 0, &register_data()));
+    assert_eq!(sw, Sw::OK);
+    // The registration response carries the credential public key: 0x04 ‖ x ‖ y.
+    let x = &reg[2..34];
+    let y = &reg[34..66];
+    let key_handle = reg[67..67 + KEY_HANDLE_LEN].to_vec();
+
+    let mut ad = Vec::new();
+    ad.extend_from_slice(&CHAL);
+    ad.extend_from_slice(&APP);
+    ad.push(KEY_HANDLE_LEN as u8);
+    ad.extend_from_slice(&key_handle);
+    let (sw, r) = a.send_u2f(&ext(0x00, CTAP_AUTHENTICATE, U2F_AUTH_ENFORCE, &ad));
+    assert_eq!(sw, Sw::OK);
+    // U2F authenticate signs application ‖ userPresence(1) ‖ counter(4) ‖ challenge.
+    let mut signed = Vec::new();
+    signed.extend_from_slice(&APP);
+    signed.extend_from_slice(&r[..5]);
+    signed.extend_from_slice(&CHAL);
+    super::verify_p256(x, y, &signed, &r[5..]);
+}

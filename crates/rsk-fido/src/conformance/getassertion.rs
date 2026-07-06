@@ -218,3 +218,29 @@ fn getnextassertion_walks_multiple_credentials() {
         "walk is exhausted"
     );
 }
+
+#[test]
+fn getassertion_signature_verifies() {
+    let mut a = Authr::fresh();
+    let mc = a.send(CTAP_MAKE_CREDENTIAL, &mc_rk_request());
+    assert_ok(&mc);
+    let (x, y) = {
+        let mut d = field_at(&mc.body, 2).expect("authData (0x02) present");
+        super::credential_pubkey(d.bytes().unwrap())
+    };
+
+    let g = a.send(CTAP_GET_ASSERTION, &ga_request(RP_ID));
+    assert_ok(&g);
+    let ad = {
+        let mut d = field_at(&g.body, 2).expect("authData (0x02) present");
+        d.bytes().unwrap().to_vec()
+    };
+    let sig = {
+        let mut d = field_at(&g.body, 3).expect("signature (0x03) present");
+        d.bytes().unwrap().to_vec()
+    };
+    // The assertion signs authData ‖ clientDataHash with the credential key.
+    let mut signed = ad;
+    signed.extend_from_slice(&[0xCD; 32]);
+    super::verify_p256(&x, &y, &signed, &sig);
+}

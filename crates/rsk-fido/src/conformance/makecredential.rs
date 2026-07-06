@@ -176,3 +176,25 @@ fn makecred_exclude_list_rejects_existing() {
     let r2 = a.send(CTAP_MAKE_CREDENTIAL, &mc_request_exclude(&cred_id));
     assert_eq!(r2.status, CtapError::CredentialExcluded.as_u8());
 }
+
+#[test]
+fn makecred_attestation_signature_verifies() {
+    let r = make_es256();
+    let ad = {
+        let mut d = field_at(&r.body, 2).expect("authData (0x02) present");
+        d.bytes().unwrap().to_vec()
+    };
+    let (x, y) = super::credential_pubkey(&ad);
+    let sig = {
+        let mut d = field_at(&r.body, 3).expect("attStmt (0x03) present");
+        assert_eq!(d.map().unwrap().unwrap(), 2);
+        assert_eq!(d.str().unwrap(), "alg");
+        d.i64().unwrap();
+        assert_eq!(d.str().unwrap(), "sig");
+        d.bytes().unwrap().to_vec()
+    };
+    // Packed self-attestation signs authData ‖ clientDataHash with the credential key.
+    let mut signed = ad;
+    signed.extend_from_slice(&[0xCD; 32]);
+    super::verify_p256(&x, &y, &signed, &sig);
+}
