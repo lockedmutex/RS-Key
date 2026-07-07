@@ -30,6 +30,7 @@ mod getinfo;
 mod hmac;
 mod largeblobs;
 mod makecredential;
+mod multialg;
 mod pin;
 mod reset;
 mod selection;
