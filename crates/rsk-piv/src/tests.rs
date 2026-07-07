@@ -218,6 +218,57 @@ fn touch_policy_never_skips_presence() {
 }
 
 #[test]
+fn management_auth_preserves_pin_verification() {
+    // age-plugin-yubikey first-run order: VERIFY PIN, THEN mutual-auth the 9B
+    // management key, THEN use a pin-policy=ONCE slot key. The 9B key's stored
+    // pin-policy is ALWAYS, but a mutual auth is not a key-slot operation, so it
+    // must NOT clear the session PIN state — only an is_key sign does. Before the
+    // fix the mgmt auth cleared has_pin and the slot sign failed with 6982.
+    let rng = RefCell::new(TestRng(7));
+    let pres = RefCell::new(AlwaysConfirm);
+    let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
+    let mut fs = new_fs();
+    select(&mut app, &mut fs);
+
+    verify_pin(&mut app, &mut fs); // has_pin set first…
+    auth_mgm(&mut app, &mut fs); // …then the 9B (pin-policy ALWAYS) mutual auth.
+
+    // Retired-slot key, pin-policy ONCE, touch NEVER (isolates the PIN check).
+    let tmpl = vec![
+        0xAC,
+        0x09,
+        0x80,
+        0x01,
+        ALGO_ECCP256,
+        0xAA,
+        0x01,
+        PINPOLICY_ONCE,
+        0xAB,
+        0x01,
+        TOUCHPOLICY_NEVER,
+    ];
+    let (sw, _) = run(&mut app, &mut fs, INS_ASYM_KEYGEN, 0, 0x82, &tmpl);
+    assert_eq!(sw, Sw::OK);
+
+    // pin-policy ONCE is satisfied by the earlier VERIFY — the sign must pass.
+    let mut msg = vec![0x7C, 0x24, 0x82, 0x00, 0x81, 0x20];
+    msg.extend_from_slice(&[0x42u8; 32]);
+    let (sw, _) = run(
+        &mut app,
+        &mut fs,
+        INS_AUTHENTICATE,
+        ALGO_ECCP256,
+        0x82,
+        &msg,
+    );
+    assert_eq!(
+        sw,
+        Sw::OK,
+        "mgmt mutual auth must not clear the session PIN state"
+    );
+}
+
+#[test]
 fn select_returns_apt() {
     let rng = RefCell::new(TestRng(7));
     let pres = RefCell::new(AlwaysConfirm);

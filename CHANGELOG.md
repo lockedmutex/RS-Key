@@ -15,6 +15,15 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Fixed
 
+- **A management-key mutual auth wrongly cleared the PIN verification, breaking
+  `age-plugin-yubikey`'s first-run.** The 9B management key stores pin-policy
+  ALWAYS, and a successful GENERAL AUTHENTICATE re-locked the session PIN even for
+  the management key — but that re-lock should only follow an actual key-slot sign
+  (it already gates the *check* on `is_key`). A client that verifies the PIN,
+  mutually authenticates the management key, then signs with a pin-policy=ONCE slot
+  key (age-plugin's generate order) hit `6982` on the sign. Now only an `is_key`
+  slot sign re-locks the PIN, matching a real YubiKey.
+
 - **PIV certificates over 256 bytes were invisible to `yubikey.rs`-based tools
   (e.g. `age-plugin-yubikey`).** A Case-3 `GET DATA` (command data, no `Le` — how
   `yubikey.rs` reads slot certificates) returned an oversized body whole instead
