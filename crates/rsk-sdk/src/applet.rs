@@ -309,8 +309,14 @@ impl Dispatcher {
     /// Otherwise the response (and status) pass through unchanged — so extended
     /// `Le` consumers (ykman, our APDU tests) and non-chaining applets are
     /// byte-for-byte unaffected.
+    ///
+    /// `ne == 0` is a case-3 command (data, no `Le`): ISO 7816-4 still caps its
+    /// response at the short maximum, so a larger body must chain via `61xx` too.
+    /// yubikey.rs / age-plugin read slot certs this way and drop any slot whose
+    /// cert overruns 256 bytes if we dump it whole instead of chaining.
     fn maybe_chain(&mut self, sw: Sw, ne: usize, chaining_ok: bool, res: &mut ResBuf) -> Sw {
-        if !chaining_ok || ne == 0 || !sw.is_ok() || res.len() <= ne {
+        let ne = if ne == 0 { NE_SHORT_MAX } else { ne };
+        if !chaining_ok || !sw.is_ok() || res.len() <= ne {
             return sw;
         }
         let tail_len = res.len() - ne;

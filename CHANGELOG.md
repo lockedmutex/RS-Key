@@ -13,6 +13,17 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+### Fixed
+
+- **PIV certificates over 256 bytes were invisible to `yubikey.rs`-based tools
+  (e.g. `age-plugin-yubikey`).** A Case-3 `GET DATA` (command data, no `Le` — how
+  `yubikey.rs` reads slot certificates) returned an oversized body whole instead
+  of chaining it with `61xx` / `GET RESPONSE`. Clients with a short-APDU receive
+  buffer dropped the read, so a retired-slot age identity showed as "(Empty)"
+  right after it was generated. The CCID dispatcher now caps a no-`Le` response at
+  256 and chains the remainder, matching a real YubiKey (`docs/protocol.md` §1.1).
+  `ykman` / OpenSC were unaffected (they read with an extended `Le`).
+
 ## [0.3.1] — 2026-07-06
 
 ### Added
