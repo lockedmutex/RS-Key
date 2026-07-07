@@ -1081,6 +1081,86 @@ fn cert_object_is_wrapped_and_parses() {
 }
 
 #[test]
+fn retired_slot_generate_then_cert_roundtrip() {
+    // Reproduces the age-plugin-yubikey generate flow into a retired slot (its
+    // "Slot 1" = PIV retired R1 = keyref 0x82, cert object 5FC10D). age-plugin
+    // detects slot occupancy via Key::list, which reads each retired slot's
+    // certificate — so the cert must persist and read back, else the slot shows
+    // "(Empty)" and decryption can't find the identity.
+    let rng = RefCell::new(TestRng(7));
+    let pres = RefCell::new(AlwaysConfirm);
+    let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
+    let mut fs = new_fs();
+    select(&mut app, &mut fs);
+    auth_mgm(&mut app, &mut fs);
+    verify_pin(&mut app, &mut fs);
+
+    let get_r1 = [0x5C, 0x03, 0x5F, 0xC1, 0x0D];
+    // Fresh retired slot reads empty (the pre-generate occupancy check).
+    let (sw, _) = run(&mut app, &mut fs, INS_GET_DATA, 0x3F, 0xFF, &get_r1);
+    assert_eq!(sw, Sw::FILE_NOT_FOUND);
+
+    // GENERATE into R1 (keyref 0x82).
+    let (sw, _) = run(
+        &mut app,
+        &mut fs,
+        INS_ASYM_KEYGEN,
+        0,
+        0x82,
+        &gen_template(ALGO_ECCP256),
+    );
+    assert_eq!(sw, Sw::OK, "GENERATE into retired R1 must succeed");
+
+    // Our GENERATE auto-writes a self-signed cert → the slot must read occupied.
+    let (sw, obj) = run(&mut app, &mut fs, INS_GET_DATA, 0x3F, 0xFF, &get_r1);
+    assert_eq!(
+        sw,
+        Sw::OK,
+        "retired slot cert must be readable after GENERATE"
+    );
+    assert!(find_tag(&obj, 0x53).is_some());
+
+    // age-plugin then PUT DATA its own self-signed cert (carrying the age OID).
+    // A real P-256 age cert is ~400 bytes, so the 0x70/0x53 lengths are long-form
+    // and the command is an extended-length APDU — the path a 10-byte fake misses.
+    let cert_payload = vec![0xABu8; 390];
+    let mut inner = vec![
+        0x70,
+        0x82,
+        (cert_payload.len() >> 8) as u8,
+        cert_payload.len() as u8,
+    ];
+    inner.extend_from_slice(&cert_payload);
+    inner.extend_from_slice(&[0x71, 0x01, 0x00, 0xFE, 0x00]);
+    let mut put = vec![
+        0x5C,
+        0x03,
+        0x5F,
+        0xC1,
+        0x0D,
+        0x53,
+        0x82,
+        (inner.len() >> 8) as u8,
+        inner.len() as u8,
+    ];
+    put.extend_from_slice(&inner);
+    let (sw, _) = run(&mut app, &mut fs, INS_PUT_DATA, 0x3F, 0xFF, &put);
+    assert_eq!(sw, Sw::OK, "PUT DATA of the age cert must succeed");
+
+    // The slot must still read occupied, now with the age cert.
+    let (sw, obj2) = run(&mut app, &mut fs, INS_GET_DATA, 0x3F, 0xFF, &get_r1);
+    assert_eq!(
+        sw,
+        Sw::OK,
+        "retired slot cert must read back after PUT DATA"
+    );
+    assert_eq!(
+        find_tag(&obj2, 0x53).and_then(|b| find_tag(b, 0x70)),
+        Some(&cert_payload[..])
+    );
+}
+
+#[test]
 fn attestation_chains_to_f9() {
     let rng = RefCell::new(TestRng(7));
     let pres = RefCell::new(AlwaysConfirm);
