@@ -13,6 +13,14 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+### Added
+
+- **Releases now build and publish the trusted-display flavor** as
+  `rs-key-<tag>-display.uf2` — reproducibility-gated, signed and attested like the
+  other flavors (for the Waveshare RP2350-Touch-LCD-2.8; see
+  [docs/guides/display.md](docs/guides/display.md)). CI also packages it as a
+  build-smoke `firmware-display.uf2` artifact.
+
 ### Fixed
 
 - **A management-key mutual auth wrongly cleared the PIN verification, breaking
