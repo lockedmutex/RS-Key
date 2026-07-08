@@ -211,7 +211,12 @@ def _read_block_fido(dev, cid):
             f"CONFIG_READ LED failed: {st:#x} — firmware too old for LED-over-FIDO "
             "(needs bcdDevice ≥ 0x07F0)"
         )
-    b = bytes(m[1]) if m and 1 in m else b""
+    v = m[1] if m and 1 in m else b""
+    # The device controls this value; a CBOR integer would make bytes(v) attempt a
+    # huge allocation. Require the byte string the record is supposed to be.
+    if not isinstance(v, (bytes, bytearray)):
+        die("device returned a malformed LED block (non-bytes CONFIG_READ value)")
+    b = bytes(v)
     if len(b) < CONF_LEN:
         die("device returned no LED block — update firmware, or set it once via CCID")
     return bytearray(b[:CONF_LEN])

@@ -463,6 +463,9 @@ impl<'a> Worker<'a> {
                 if let Some(len) =
                     rsk_usb::secure_pin::assemble_verify(req.apdu_template, &pin[..n], &mut apdu)
                 {
+                    // Ensure the pad VERIFY dispatches as a standalone command — a prior
+                    // host chaining segment must not concatenate the PIN onto itself.
+                    self.ccid.reset_chaining();
                     let body = self.ccid.handle_apdu(&apdu[..len]);
                     let m = body.len().min(ex.resp.len());
                     ex.resp[..m].copy_from_slice(&body[..m]);

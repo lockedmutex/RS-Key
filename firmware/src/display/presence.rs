@@ -143,7 +143,7 @@ impl TouchPresence {
     /// Cancel / Save (a tap, not a hold — registration is the lower-stakes action; the
     /// deliberate hold is reserved for the sign-in approve). Save confirms.
     fn run_add_passkey(&mut self, confirm: Confirm<'_>) -> Outcome {
-        let rp = Label::clamp(confirm.primary);
+        let rp = Label::clamp_domain(confirm.primary);
         let account = Label::clamp(confirm.secondary);
         let saved = ceremony_begin();
         let start = Instant::now();

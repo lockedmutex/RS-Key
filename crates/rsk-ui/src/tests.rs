@@ -49,6 +49,47 @@ fn clamp_exactly_max_not_truncated() {
 }
 
 #[test]
+fn clamp_domain_keeps_short_id_whole() {
+    let l = Label::clamp_domain(b"github.com");
+    assert_eq!(l.as_str(), "github.com");
+    assert!(!l.truncated);
+}
+
+#[test]
+fn clamp_domain_keeps_the_registrable_suffix_not_the_head() {
+    // The anti-phishing case: a look-alike pads the head, but the registrable domain
+    // is the rightmost part. clamp_domain must keep the tail and flag the cut, so the
+    // real domain (`attacker.com`) is never the part dropped.
+    const SUF: &[u8] = b".attacker.com";
+    let mut src = [b'a'; LABEL_MAX + SUF.len()]; // longer than LABEL_MAX → head is cut
+    src[LABEL_MAX..].copy_from_slice(SUF);
+    let l = Label::clamp_domain(&src);
+    assert!(l.truncated);
+    assert_eq!(l.as_str().len(), LABEL_MAX);
+    assert!(
+        l.as_str().ends_with(".attacker.com"),
+        "kept text must end with the registrable domain, got {:?}",
+        l.as_str()
+    );
+}
+
+#[test]
+fn clamp_domain_exactly_max_not_truncated() {
+    let src = [b'x'; LABEL_MAX];
+    let l = Label::clamp_domain(&src);
+    assert_eq!(l.as_str().len(), LABEL_MAX);
+    assert!(!l.truncated);
+}
+
+#[test]
+fn clamp_domain_sanitizes_the_kept_tail() {
+    // Control/high bytes in the kept tail still become '?'.
+    let l = Label::clamp_domain(b"ok\x1b\xff.com");
+    assert_eq!(l.as_str(), "ok??.com");
+    assert!(!l.truncated);
+}
+
+#[test]
 fn confirm_prompt_sanitizes_both_fields() {
     let p = ConfirmPrompt::new("Sign in?", b"login.example\x00", b"al\x1bice");
     assert_eq!(p.primary.as_str(), "login.example?");

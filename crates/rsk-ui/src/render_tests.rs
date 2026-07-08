@@ -318,10 +318,10 @@ fn ellipsized_force_mark_marks_a_fitting_label() {
 
 #[test]
 fn centered_clipped_marks_a_truncated_fitting_label() {
-    // #5: the Add-passkey (makeCredential) screen draws the rp/account via
-    // centered_clipped. A clamped rp id (Label.truncated) whose prefix fits the
-    // clip must not render as a complete-looking centred string — with `mark`
-    // set it routes through the left-ellipsized path so the marker appears, the
+    // #5: the Add-passkey (makeCredential) screen draws the rp via centered_clipped
+    // with `right = true` (it is a domain). A clamped rp id (Label.truncated) whose
+    // tail fits the clip must not render as a complete-looking centred string — with
+    // `mark` set it routes through the head-ellipsized path so the marker appears, the
     // same anti-phishing guarantee the Approve screen already had.
     let clip = Rect::new(0, 0, PANEL_W, 24);
     let leftmost = |d: &Rec| (0..PANEL_W).find(|&x| (0..24).any(|y| d.at(x, y) != BG));
@@ -336,6 +336,7 @@ fn centered_clipped_marks_a_truncated_fitting_label() {
         theme::TEXT,
         clip,
         false,
+        true,
     )
     .unwrap();
     let mut marked = Rec::new();
@@ -348,6 +349,7 @@ fn centered_clipped_marks_a_truncated_fitting_label() {
         theme::TEXT,
         clip,
         true,
+        true,
     )
     .unwrap();
 
@@ -356,7 +358,29 @@ fn centered_clipped_marks_a_truncated_fitting_label() {
     // aligned + ellipsized (starts at the clip edge), so the marker is shown.
     assert!(
         leftmost(&marked).unwrap() < leftmost(&plain).unwrap(),
-        "a truncated (marked) label must render left-ellipsized, not centred-complete"
+        "a truncated (marked) label must render ellipsized, not centred-complete"
+    );
+}
+
+#[test]
+fn right_ellipsized_keeps_the_suffix_unlike_left() {
+    // A domain wider than the clip: the head-ellipsis (right) variant keeps the
+    // registrable-domain suffix while the tail-ellipsis (left) variant keeps the
+    // padded prefix — so the two must render different content, and neither may
+    // overrun the clip.
+    let clip = Rect::new(0, 0, 100, 24); // narrow enough to force truncation
+    let at = EgPoint::new(0, 16);
+    let wide = "aaaaaaaaaaaaaaaaaaaaaaaa.attacker.com";
+    let mut left = Rec::new();
+    text_left_ellipsized(&mut left, wide, at, Role::Strong, theme::TEXT, clip, false).unwrap();
+    let mut right = Rec::new();
+    text_right_ellipsized(&mut right, wide, at, Role::Strong, theme::TEXT, clip, false).unwrap();
+    assert!(left.drew_anything() && right.drew_anything());
+    assert!(!left.oob && !right.oob, "ellipsized text overran the clip");
+    let differ = (0..clip.w).any(|x| (0..24).any(|y| left.at(x, y) != right.at(x, y)));
+    assert!(
+        differ,
+        "head-ellipsis (suffix kept) must differ from tail-ellipsis (prefix kept)"
     );
 }
 

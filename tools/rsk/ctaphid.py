@@ -141,6 +141,11 @@ def send_cbor(dev, cid, payload):
     data = bytearray(r[7:7 + bcnt])
     while len(data) < bcnt:
         c = read(dev)
+        # A hostile/broken device can announce a large BCNT and then stop sending
+        # continuation frames; read() returns b"" on the HID timeout, so bail rather
+        # than spin forever.
+        if not c:
+            raise IOError("device did not send the full CTAPHID response")
         data += c[5:5 + min(59, bcnt - len(data))]
     return bytes(data[:bcnt])
 

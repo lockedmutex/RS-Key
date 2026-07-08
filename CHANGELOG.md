@@ -13,6 +13,45 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+### Security
+
+- **Secure-PIN entry (trusted display): the on-pad PIN can no longer be diverted
+  into an attacker-chosen command.** The CCID `PC_to_RDR_Secure` VERIFY template's
+  class byte is now forced to `0x00` instead of copied from the host, so a host
+  cannot set the ISO 7816-4 command-chaining bit to make the dispatcher buffer the
+  typed PIN as a chain segment; the secure path also resets any incoming chaining
+  state before dispatch.
+- **Seed-moving vendor commands now name themselves on the trusted display.**
+  `BACKUP_EXPORT` / `BACKUP_LOAD` and attestation import/clear were all approved
+  behind a generic "Vendor config?" prompt; the master-seed export now reads
+  "Export secret seed to host?" so a host cannot phish the approval for a full
+  identity export behind a benign-looking touch.
+- **OpenPGP GET DATA no longer over-reads the scratch buffer** for the fingerprint,
+  CA-fingerprint and timestamp DOs: a present-but-short slot is zero-padded to its
+  fixed width, so the DO's declared length matches what was written and no stale
+  bytes from a prior command leak to an unauthenticated reader.
+- **The trusted-display sign-in and add-passkey ceremonies now keep the
+  registrable-domain suffix of an over-long relying-party id visible** instead of
+  truncating it head-first. A relying party id is kept from the tail
+  (`Label::clamp_domain`) and head-ellipsized (`...registrable.domain`), so a
+  look-alike such as `accounts.google.com.attacker.com` can no longer hide the real
+  domain behind the ellipsis while showing trusted-looking bait in the prefix.
+
+### Fixed
+
+- **A crafted phy record can no longer permanently brick USB.** The boot interface
+  guard now falls back to enabling all interfaces unless a *management-capable* one
+  (CCID or HID) survives — a keyboard-only mask previously slipped past it and
+  stranded the device with no software path to rewrite the record.
+- **The boot path no longer panics on a host-written LED pin.** A `led_gpio` from
+  the phy record that collides with a GPIO presence pin is now ignored (the build
+  default is used) instead of panicking every boot; a build whose own LED/presence
+  pins collide is caught at compile time.
+- **`rsk` no longer hangs against a hostile device** that announces an inflated
+  CTAPHID response length and then withholds the continuation frames.
+- **`rsk led --transport fido` no longer crashes** on a device that answers the
+  ungated LED `CONFIG_READ` with a non-byte-string CBOR value.
+
 ## [0.3.2] — 2026-07-08
 
 ### Added

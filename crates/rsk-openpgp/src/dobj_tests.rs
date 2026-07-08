@@ -101,3 +101,30 @@ fn discrete_do_nests_algo_pw_fp() {
     assert_eq!(out[4], 0xC0);
     assert_eq!(out[5], 10);
 }
+
+#[test]
+fn short_fingerprint_slot_does_not_leak_scratch_tail() {
+    // Regression: PUT DATA is uncapped, so a present-but-short fingerprint slot used
+    // to make the C5 DO declare 60 bytes while only writing a few — the tail slicing
+    // stale scratch from a prior command. Each slot must be zero-padded to its fixed
+    // 20-byte width so the declared length equals what was written.
+    let mut fs = fs();
+    fs.put(EF_FP_SIG, &[0xAA]).unwrap(); // 1-byte fingerprint (would over-report as 20)
+    let aid = full_aid(&[0; 4]);
+    // Pre-fill the buffer (the DoWriter's scratch here) with a sentinel standing in for
+    // prior-command residue; nothing past the real 1 byte may survive into the DO.
+    let mut out = [0x7Eu8; 128];
+    let n = {
+        let mut w = DoWriter::new(&mut out, &mut fs, &aid);
+        w.build(EF_FP)
+    };
+    // C5 60 || sig(20) || dec(20 zeros) || aut(20 zeros) = 62 bytes, fully accounted.
+    assert_eq!(out[0], (EF_FP & 0xff) as u8);
+    assert_eq!(out[1], 60);
+    assert_eq!(n, 62);
+    assert_eq!(out[2], 0xAA); // the one real fingerprint byte
+    assert!(
+        out[3..62].iter().all(|&b| b == 0),
+        "short/absent slots must be zero-padded — no sentinel/scratch leak"
+    );
+}

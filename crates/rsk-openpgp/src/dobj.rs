@@ -230,16 +230,25 @@ impl<'a, S: Storage> DoWriter<'a, S> {
         self.pos - start
     }
 
-    /// `num` consecutive fids, each `size` bytes; absent ones zero-filled.
+    /// `num` consecutive fids, each written as exactly `size` bytes. A short or
+    /// absent slot is zero-padded and an over-long stored value is truncated to
+    /// `size`, so the caller's fixed DO length byte stays honest and the response
+    /// never exposes the scratch tail past what was written (a present-but-short slot
+    /// would otherwise leak stale bytes from a prior command — cf. `emit_sec_tpl`).
     fn emit_trium(&mut self, fid: u16, num: usize, size: usize) -> usize {
         for i in 0..num {
             let f = fid + i as u16;
+            let before = self.pos;
             if self.fs.has_data(f) {
                 self.read_flash(f);
-            } else {
-                for _ in 0..size {
+            }
+            let written = self.pos - before;
+            if written < size {
+                for _ in written..size {
                     self.push(0);
                 }
+            } else {
+                self.pos = before + size;
             }
         }
         num * size

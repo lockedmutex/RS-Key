@@ -451,6 +451,50 @@ fn text_left_ellipsized<D: DrawTarget<Color = Rgb565>>(
     font::left(&mut t.clipped(&eg_rect(clip)), out, at, role, color)
 }
 
+/// Like [`text_left_ellipsized`] but keeps the **suffix** and prepends the marker:
+/// `"...registrable.domain"`. Used for relying-party / domain labels, where the
+/// security-relevant part is the rightmost registrable domain — head-truncation
+/// would let a look-alike (`accounts.google.com.attacker.com`) hide the real domain
+/// behind the ellipsis. `s` is ASCII (a [`crate::Label`]), so a byte is a char.
+fn text_right_ellipsized<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    s: &str,
+    at: EgPoint,
+    role: Role,
+    color: Rgb565,
+    clip: Rect,
+    force_mark: bool,
+) -> Result<(), D::Error> {
+    if !force_mark && font::width(s, role).unwrap_or(0) <= clip.w as u32 {
+        return font::left(&mut t.clipped(&eg_rect(clip)), s, at, role, color);
+    }
+    const ELL: &str = "...";
+    let budget = (clip.w as u32).saturating_sub(font::width(ELL, role).unwrap_or(0));
+    // Widest byte-suffix whose width still leaves room for the leading ellipsis: walk
+    // the start boundary backward from the end until `s[start..]` no longer fits.
+    let mut start = s.len();
+    let mut i = s.len();
+    while i > 0 {
+        i -= 1;
+        if s.is_char_boundary(i) {
+            if font::width(&s[i..], role).unwrap_or(u32::MAX) <= budget {
+                start = i;
+            } else {
+                break;
+            }
+        }
+    }
+    let mut buf = [0u8; 67];
+    buf[..ELL.len()].copy_from_slice(ELL.as_bytes());
+    // Keep the rightmost bytes of the fitting suffix, bounded to the buffer.
+    let suffix = &s.as_bytes()[start..];
+    let n = suffix.len().min(buf.len() - ELL.len());
+    let suffix = &suffix[suffix.len() - n..];
+    buf[ELL.len()..ELL.len() + n].copy_from_slice(suffix);
+    let out = core::str::from_utf8(&buf[..ELL.len() + n]).unwrap_or(ELL);
+    font::left(&mut t.clipped(&eg_rect(clip)), out, at, role, color)
+}
+
 /// The persistent top **status bar** (the design's framing chrome): a mono "RS-Key"
 /// wordmark at the left and the USB power indicator at the right. Faint, so it frames
 /// the screen without competing with content. This is a bus-powered device, so the power

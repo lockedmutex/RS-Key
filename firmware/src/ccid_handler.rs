@@ -129,6 +129,17 @@ impl<'a> CcidApplets<'a> {
         self.resp.zeroize();
     }
 
+    /// Drop any in-flight incoming command chain and held response remainder. Called
+    /// before the out-of-band secure-PIN VERIFY dispatch so a host-initiated chaining
+    /// latch cannot absorb the on-pad PIN as a chain segment (defence-in-depth beside
+    /// `assemble_verify` forcing CLA 0x00). Only the trusted-display build has the
+    /// on-device pad that reaches this path.
+    #[cfg(feature = "display")]
+    pub fn reset_chaining(&mut self) {
+        self.disp.clear_chaining();
+        self.disp.clear_pending();
+    }
+
     /// Dispatch one CCID APDU synchronously, returning the response APDU (body +
     /// SW1 SW2). On-card RSA keygen is run to completion inline (see module docs);
     /// everything else goes straight to the applet dispatcher.

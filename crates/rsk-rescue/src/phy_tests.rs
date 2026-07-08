@@ -53,13 +53,17 @@ fn effective_usb_itf_applies_mask_but_guards_lockout() {
     let mut phy = PhyData::default();
     // No record / no TLV → ALL.
     assert_eq!(effective_usb_itf(&phy), USB_ITF_ALL);
-    // Any mask keeping at least one supported interface applies verbatim.
+    // Any mask keeping at least one management-capable interface (CCID or HID)
+    // applies verbatim.
     phy.enabled_usb_itf = Some(USB_ITF_CCID | USB_ITF_HID);
     assert_eq!(effective_usb_itf(&phy), USB_ITF_CCID | USB_ITF_HID);
+    phy.enabled_usb_itf = Some(USB_ITF_CCID | USB_ITF_KB);
+    assert_eq!(effective_usb_itf(&phy), USB_ITF_CCID | USB_ITF_KB);
+    // A mask that leaves NO management-capable interface would strand the device
+    // with no software path to rewrite the record → falls back to ALL. A
+    // keyboard-only mask is the key case: "supported" yet management-incapable.
     phy.enabled_usb_itf = Some(USB_ITF_KB);
-    assert_eq!(effective_usb_itf(&phy), USB_ITF_KB);
-    // A mask with no supported interface (zero, or only WCID/LWIP bits we
-    // do not build) would soft-brick USB → falls back to ALL.
+    assert_eq!(effective_usb_itf(&phy), USB_ITF_ALL);
     phy.enabled_usb_itf = Some(0);
     assert_eq!(effective_usb_itf(&phy), USB_ITF_ALL);
     phy.enabled_usb_itf = Some(USB_ITF_WCID | USB_ITF_LWIP);

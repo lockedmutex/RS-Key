@@ -134,6 +134,28 @@ impl Label {
         out
     }
 
+    /// Like [`clamp`](Label::clamp) but for a **domain** (relying-party id): keep the
+    /// **tail**, not the head. A domain's security-relevant part is its registrable
+    /// suffix (`attacker.com` in `accounts.google.com.attacker.com`), which is the
+    /// rightmost labels — so an over-long id must drop the head (the subdomains a
+    /// look-alike pads with), never the suffix. Same per-byte sanitization; keeps at
+    /// most the last [`LABEL_MAX`] bytes and sets [`truncated`](Label::truncated)
+    /// when it cut. Renderers pair this with a *head* ellipsis so the suffix stays
+    /// visible. (A precise eTLD+1 needs a public-suffix list we don't ship on-device;
+    /// the fixed-size tail always contains the registrable domain.) Total function.
+    pub fn clamp_domain(src: &[u8]) -> Self {
+        let mut out = Label::default();
+        // Each source byte maps to exactly one output byte, so the last LABEL_MAX
+        // input bytes are the last LABEL_MAX sanitized bytes.
+        let start = src.len().saturating_sub(LABEL_MAX);
+        out.truncated = start > 0;
+        for &b in src[start..].iter() {
+            out.buf[out.len] = if (0x20..=0x7E).contains(&b) { b } else { b'?' };
+            out.len += 1;
+        }
+        out
+    }
+
     /// The sanitized text. Always valid UTF-8 (it is 7-bit ASCII by construction),
     /// so this never returns the error branch — but we fall back to empty rather
     /// than `unwrap` to stay panic-free even if the invariant were ever broken.
@@ -167,7 +189,10 @@ impl ConfirmPrompt {
     pub fn new(title: &'static str, primary: &[u8], secondary: &[u8]) -> Self {
         Self {
             title,
-            primary: Label::clamp(primary),
+            // The primary is the relying-party id (a domain) — keep its registrable
+            // suffix, not the head a look-alike would pad. The secondary (account
+            // name) keeps the head, like every other user-chosen label.
+            primary: Label::clamp_domain(primary),
             secondary: Label::clamp(secondary),
         }
     }
