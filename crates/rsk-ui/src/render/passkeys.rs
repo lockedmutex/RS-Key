@@ -279,7 +279,10 @@ where
     // an anti-phishing screen must never show a silently-cut look-alike identity
     // (matches the getAssertion-approve and add-passkey ceremonies).
     let clip = Rect::new(tx as u16, card.y, (card.x + card.w) - tx as u16, card.h);
-    text_left_ellipsized(
+    // The rp is attacker-chosen: head-ellipsize (leading "…") so the registrable-domain
+    // suffix stays on screen and a padded look-alike can't hide the real domain behind
+    // the cut on the very screen meant to expose it (matches the getAssertion ceremony).
+    text_right_ellipsized(
         t,
         rp.as_str(),
         EgPoint::new(tx, card.y as i32 + 16),

@@ -61,7 +61,8 @@ fn get_data_pw_status_via_process() {
     let mut app = OpenpgpApplet::new(SERIAL_ID, SERIAL_HASH, None, &rng, &presence);
     let (body, sw) = run(&mut app, &mut fs, &[0x00, consts::INS_GET_DATA, 0x00, 0xC4]);
     assert_eq!(sw, Sw::OK);
-    assert_eq!(&body, &[0x01, 127, 127, 127, 3, 3, 3]);
+    // RC retry counter (index 5) ships deactivated at 0.
+    assert_eq!(&body, &[0x01, 127, 127, 127, 3, 0, 3]);
 }
 
 #[test]

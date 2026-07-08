@@ -15,6 +15,25 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Security
 
+- **OpenPGP: the resetting code is no longer pre-set to the public default
+  `12345678`.** Initialisation seeded the reset code (`EF_RC`) to the well-known
+  admin default with an active retry counter, so an unauthenticated host could
+  `RESET RETRY COUNTER` (P1=0) with `"12345678" || new-PW1` to reset the user PIN
+  and then sign/decrypt with the victim's OpenPGP keys. The reset code now ships
+  **deactivated** (per OpenPGP Card 3.4 §4.3.4) and is enabled only when an admin
+  sets a real code via `PUT DATA 0xD3`; boot also neutralises any already-
+  provisioned card still carrying the default reset code.
+- **OATH: `VALIDATE` no longer fails open on an unreadable access code.** A stored
+  access code longer than the read buffer made `seal_read` fail and (previously)
+  unlocked the applet without the code. Reading a present-but-unreadable code now
+  keeps the applet **locked**, and `SET CODE` bounds the code length.
+- **OATH: `VERIFY CODE` now honours a credential's touch flag.** A touch-required
+  primary HOTP credential could be exercised as a presence-free code-guessing
+  oracle; `VERIFY CODE` now requests the same physical press as `CALCULATE`.
+- **U2F: a `credProtect=userVerificationRequired` credential is refused on the
+  U2F authenticate path**, which performs no user verification — only CTAP2
+  `getAssertion` (with a PIN/UV) may exercise such a credential. Level 1/2
+  credentials are unaffected.
 - **Secure-PIN entry (trusted display): the on-pad PIN can no longer be diverted
   into an attacker-chosen command.** The CCID `PC_to_RDR_Secure` VERIFY template's
   class byte is now forced to `0x00` instead of copied from the host, so a host
@@ -36,6 +55,12 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   (`Label::clamp_domain`) and head-ellipsized (`...registrable.domain`), so a
   look-alike such as `accounts.google.com.attacker.com` can no longer hide the real
   domain behind the ellipsis while showing trusted-looking bait in the prefix.
+- **The on-device passkey manager applies the same domain-suffix rule.** The
+  earlier fix reached only the host-driven ceremonies; the passkey list, service
+  detail and the destructive Confirm-Delete card still truncated the relying-party
+  id head-first. They now keep the registrable-domain suffix
+  (`Label::clamp_domain` + suffix-ellipsis), so a look-alike passkey cannot
+  impersonate a service on the screen used to review and delete credentials.
 
 ### Fixed
 

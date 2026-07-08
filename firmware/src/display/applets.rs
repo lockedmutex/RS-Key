@@ -1008,7 +1008,10 @@ impl Ui {
         let total = rsk_fido::passkeys::for_each_rp(&dev, &mut *store, |rp| {
             if idx >= offset && n < rows.len() {
                 rows[n] = RpRow {
-                    id: Label::clamp(rp.rp_id.as_bytes()),
+                    // Domain: keep the registrable-domain suffix, not the head, so a
+                    // padded look-alike rpId can't impersonate a service on the list,
+                    // service-detail title and Confirm-Delete card (matches the ceremony).
+                    id: Label::clamp_domain(rp.rp_id.as_bytes()),
                     nick: rp
                         .nickname
                         .map(|s| Label::clamp(s.as_bytes()))

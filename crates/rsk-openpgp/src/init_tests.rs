@@ -35,12 +35,16 @@ fn creates_all_default_files() {
     scan_files(&dev(), &mut fs, &mut CountRng(0)).unwrap();
 
     // DEK files are 77 bytes, format byte 0x03.
-    for fid in [EF_DEK_PW1, EF_DEK_RC, EF_DEK_PW3] {
+    for fid in [EF_DEK_PW1, EF_DEK_PW3] {
         assert_eq!(fs.size(fid.get()), Some(DEK_FILE_SIZE));
         let mut b = [0u8; 1];
         fs.read(fid.get(), &mut b);
         assert_eq!(b[0], DEK_FORMAT_V3);
     }
+    // The resetting code ships DEACTIVATED: no RC verifier and no RC-sealed DEK.
+    assert_eq!(fs.size(EF_DEK_RC.get()), None);
+    let mut rc = [0u8; 34];
+    assert!(fs.read(EF_RC, &mut rc).is_none());
     // PIN verifiers: [len, 1, verifier(32)].
     let mut rec = [0u8; 34];
     fs.read(EF_PW1, &mut rec);
@@ -53,7 +57,8 @@ fn creates_all_default_files() {
     assert_eq!(fs.size(EF_SIG_COUNT), Some(3));
     let mut pw = [0u8; 7];
     fs.read(EF_PW_PRIV, &mut pw);
-    assert_eq!(&pw, &[0x01, 127, 127, 127, 3, 3, 3]);
+    // RC retry counter (index 5) is 0: the resetting code ships deactivated.
+    assert_eq!(&pw, &[0x01, 127, 127, 127, 3, 0, 3]);
     assert!(fs.has_data(EF_KDF));
     assert!(fs.has_data(EF_SEX));
     assert!(fs.has_data(EF_PW_RETRIES));

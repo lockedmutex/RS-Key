@@ -197,3 +197,73 @@ fn credprotect2_needs_list_or_uv() {
     // ...but visible when named in the allowList.
     assert_ok(&a.send(CTAP_GET_ASSERTION, &ga_allow(&id)));
 }
+
+/// A credProtect=userVerificationRequired credential must NOT be usable over the U2F
+/// authenticate path (U2F performs no user verification); a level-1 credential still
+/// signs there. Guards the credProtect §12.1 invariant on the legacy transport.
+#[test]
+fn credprotect3_box_refused_on_u2f_but_level1_signs() {
+    use crate::consts::{CTAP_AUTHENTICATE, U2F_AUTH_ENFORCE};
+    use rsk_sdk::sw::Sw;
+
+    // Extended-length U2F APDU: cla ins p1 00 00 Lc(2) data 00 00.
+    fn ext(ins: u8, p1: u8, data: &[u8]) -> Vec<u8> {
+        let mut v = std::vec![
+            0x00,
+            ins,
+            p1,
+            0x00,
+            0x00,
+            (data.len() >> 8) as u8,
+            data.len() as u8
+        ];
+        v.extend_from_slice(data);
+        v.extend_from_slice(&[0x00, 0x00]);
+        v
+    }
+    // U2F_AUTHENTICATE body: challenge(32) ‖ application=sha256(rpId) ‖ khLen ‖ keyHandle.
+    fn auth_body(app: &[u8; 32], id: &[u8]) -> Vec<u8> {
+        let mut ad = std::vec![0xC4u8; 32];
+        ad.extend_from_slice(app);
+        ad.push(id.len() as u8);
+        ad.extend_from_slice(id);
+        ad
+    }
+    let app = rsk_crypto::sha256(RP_ID.as_bytes());
+
+    // Level 3 (UV-required), non-resident: U2F must refuse the box (no UV on U2F).
+    let mut a = Authr::fresh();
+    let r = a.send(
+        CTAP_MAKE_CREDENTIAL,
+        &mc_credprotect(CRED_PROT_UV_REQUIRED, false),
+    );
+    assert_ok(&r);
+    let id3 = cred_id(&r.body);
+    let (sw, body) = a.send_u2f(&ext(
+        CTAP_AUTHENTICATE,
+        U2F_AUTH_ENFORCE,
+        &auth_body(&app, &id3),
+    ));
+    assert_eq!(
+        sw,
+        Sw::INCORRECT_PARAMS,
+        "credProtect=3 box must be refused over U2F"
+    );
+    assert!(body.is_empty());
+
+    // Level 1 (UV-optional), non-resident: a valid CTAP2 box still signs over U2F.
+    let mut a = Authr::fresh();
+    let r = a.send(
+        CTAP_MAKE_CREDENTIAL,
+        &mc_credprotect(CRED_PROT_UV_OPTIONAL, false),
+    );
+    assert_ok(&r);
+    let id1 = cred_id(&r.body);
+    let (sw, body) = a.send_u2f(&ext(
+        CTAP_AUTHENTICATE,
+        U2F_AUTH_ENFORCE,
+        &auth_body(&app, &id1),
+    ));
+    assert_eq!(sw, Sw::OK, "credProtect=1 box authenticates over U2F");
+    assert!(!body.is_empty());
+}

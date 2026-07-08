@@ -22,14 +22,17 @@ pub const EXLEN_INFO: &[u8] = &[0x02, 0x02, 0x07, 0xff, 0x02, 0x02, 0x08, 0x00];
 pub const FEATURE_MNGMNT: &[u8] = &[0x81, 0x01, 0x20];
 
 /// Default PW status bytes written to `EF_PW_PRIV` at init: PW1 valid for
-/// several PSO:CDS (0x01), max PW lengths 127/127/127, retry counters 3/3/3.
+/// several PSO:CDS (0x01), max PW lengths 127/127/127, retry counters PW1/RC/PW3.
+/// The resetting code ships DEACTIVATED (RC counter 0) per OpenPGP Card 3.4
+/// §4.3.4 — it is enabled only when `PUT DATA 0xD3` sets a real reset code
+/// (`put_reset_code`), so `RESET RETRY P1=0` cannot run against a default RC.
 pub const PW_STATUS_DEFAULT: &[u8] = &[
     0x01,
     127,
     127,
     127,
     PW_RETRIES_DEFAULT,
-    PW_RETRIES_DEFAULT,
+    0,
     PW_RETRIES_DEFAULT,
 ];
 
