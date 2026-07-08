@@ -53,6 +53,13 @@ def select(conn, aid):
 
 ![ISO-7816 short-APDU cases — every command opens with the four-byte header CLA INS P1 P2. Case 1 is header only; Case 2 appends a one-byte Le (expected response length, 00 meaning up to 256); Case 3 appends Lc then Lc bytes of command data; Case 4 appends Lc, data, and Le. SELECT is a Case 4 command, VERIFY a Case 3 command](images/apdu-cases.svg)
 
+A success body longer than the request's `Le` — including a Case-3 command that
+carries no `Le` at all, capped at 256 — is returned with ISO-7816 **response
+chaining**: the first chunk ships with status `61 XX` (`XX` = further bytes
+available, `00` = 256+), and the host issues `GET RESPONSE` (`00 C0 00 00 <Le>`)
+until `9000`. Any `GET DATA` reading a certificate object over 256 bytes chains
+this way, so a host that sends `GET DATA` without an `Le` must still follow `61xx`.
+
 ### 1.2 CTAPHID framing
 
 64-byte HID reports. Init frame: `CID(4) | CMD(1) | BCNT_HI | BCNT_LO | data[:57]`;

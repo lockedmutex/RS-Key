@@ -133,6 +133,9 @@ impl Ui {
                     if let Some(new_nick) = self.run_rename(&nick, hash) {
                         nick = new_nick;
                     }
+                    if self.asleep {
+                        return ServiceResult::Leave(None); // slept via the power button
+                    }
                     let _ = rsk_ui::render_service(
                         &mut self.panel,
                         &title(&nick),
@@ -173,6 +176,9 @@ impl Ui {
                 }
                 if let Some(i) = rsk_ui::hit_list(p, rsk_ui::PK_LIST_TOP, n as u16) {
                     self.run_delete(&title(&nick), &accts[i as usize].name, fids[i as usize]);
+                    if self.asleep {
+                        return ServiceResult::Leave(None); // slept via the power button
+                    }
                     let r = self.load_accts(hash, &mut accts, &mut fids, page);
                     n = r.0;
                     total = r.1;

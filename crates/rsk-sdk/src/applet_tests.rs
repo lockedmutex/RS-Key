@@ -293,6 +293,76 @@ fn get_response_honours_a_smaller_le() {
 }
 
 #[test]
+fn case3_no_le_large_response_is_chained() {
+    // Regression (age-plugin-yubikey empty-slot bug): yubikey.rs sends GET DATA as
+    // a case-3 APDU (command data, NO Le) and relies on 61xx response chaining to
+    // read a slot certificate larger than 256 bytes. A no-Le command must chain,
+    // not dump the whole oversized body — the client's short-APDU receive buffer
+    // can't hold it, so it drops the slot and the identity shows as "(Empty)".
+    let mut c = Chunky {
+        body_len: 305,
+        chain: true,
+    };
+    let mut applets: [&mut dyn Applet<()>; 1] = [&mut c];
+    let mut disp = Dispatcher::new();
+    let mut out = [0u8; 512];
+    let mut res = ResBuf::new(&mut out);
+    select_chunky(&mut disp, &mut applets, &mut res);
+
+    // Case-3 GET DATA (Lc=3 data, no Le), body 305 > 256 → 256 bytes + 61 31 (49 left).
+    let sw = disp.process(
+        &[0x00, 0xCA, 0x00, 0x00, 0x03, 0x5F, 0xC1, 0x0D],
+        &mut applets,
+        &mut (),
+        &mut res,
+    );
+    assert_eq!(
+        sw,
+        Sw::new(0x61, 49),
+        "a no-Le command must chain a large body, not return it whole"
+    );
+    assert_eq!(res.len(), 256);
+    let mut got = res.as_slice().to_vec();
+
+    // GET RESPONSE drains the 49-byte tail.
+    let sw = disp.process(
+        &[0x00, 0xC0, 0x00, 0x00, 0x00],
+        &mut applets,
+        &mut (),
+        &mut res,
+    );
+    assert_eq!(sw, Sw::OK);
+    assert_eq!(res.len(), 49);
+    got.extend_from_slice(res.as_slice());
+    let want: Vec<u8> = (0..305).map(|i| (i & 0xFF) as u8).collect();
+    assert_eq!(got, want);
+}
+
+#[test]
+fn case3_no_le_small_response_is_not_chained() {
+    // The flip side: a no-Le response that fits in the short maximum is returned
+    // whole with 9000 — no needless chaining for the common small object.
+    let mut c = Chunky {
+        body_len: 40,
+        chain: true,
+    };
+    let mut applets: [&mut dyn Applet<()>; 1] = [&mut c];
+    let mut disp = Dispatcher::new();
+    let mut out = [0u8; 512];
+    let mut res = ResBuf::new(&mut out);
+    select_chunky(&mut disp, &mut applets, &mut res);
+
+    let sw = disp.process(
+        &[0x00, 0xCA, 0x00, 0x00, 0x03, 0x5F, 0xC1, 0x0D],
+        &mut applets,
+        &mut (),
+        &mut res,
+    );
+    assert_eq!(sw, Sw::OK);
+    assert_eq!(res.len(), 40);
+}
+
+#[test]
 fn extended_le_response_is_not_chained() {
     let mut c = Chunky {
         body_len: 269,

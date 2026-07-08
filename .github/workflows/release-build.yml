@@ -12,9 +12,9 @@
 # an inline `attest-build-provenance` step can prove, i.e. Build L2).
 # See https://docs.github.com/actions/security-guides/using-artifact-attestations-and-reusable-workflows-to-achieve-slsa-v1-build-level-3
 #
-# This job: builds the 8 firmware flavors reproducibly via `nix build`, GATES on
-# a bit-identical rebuild of all eight (a non-reproducible image fails the job
-# before anything is published), generates a CycloneDX SBOM, hashes everything
+# This job: builds the 5 shipped firmware flavors reproducibly via `nix build`,
+# GATES on a bit-identical rebuild of all five (a non-reproducible image fails the
+# job before anything is published), generates a CycloneDX SBOM, hashes everything
 # into SHA256SUMS, attests GitHub build provenance for every .uf2, signs the
 # checksums with keyless cosign (sigstore/Fulcio via OIDC — no private key), and
 # publishes the GitHub Release.
@@ -84,15 +84,17 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
 
-      - name: build the 4 reproducible firmware flavors
+      - name: build the 5 reproducible firmware flavors
         run: |
           tag="${{ steps.tag.outputs.tag }}"
           mkdir -p dist
-          # Only the touch-required flavors ship. The `no-touch` flavors auto-confirm
-          # user presence (test-only; see firmware/Cargo.toml "Never ship a no-touch
-          # build") and MUST NOT be published — a signed no-touch asset would remove
-          # the physical-consent gate from an end-user build.
-          for pkg in firmware firmware-pqc firmware-fips firmware-fips-pqc; do
+          # The four touch-required flavors plus the trusted-display flavor (its
+          # on-screen Approve/Deny is the physical-consent gate). The `no-touch`
+          # flavors auto-confirm user presence (test-only; see firmware/Cargo.toml
+          # "Never ship a no-touch build") and MUST NOT be published — a signed
+          # no-touch asset would remove the physical-consent gate from an end-user
+          # build.
+          for pkg in firmware firmware-pqc firmware-fips firmware-fips-pqc firmware-display; do
             echo "::group::nix build .#$pkg"
             out="$(nix build ".#$pkg" --no-link --print-out-paths)"
             label="${pkg#firmware}"; label="${label#-}"
@@ -102,17 +104,17 @@ jobs:
           done
           ls -l dist
 
-      - name: reproducibility gate — rebuild all 4, require bit-identical
+      - name: reproducibility gate — rebuild all 5, require bit-identical
         run: |
           # `nix build --rebuild` recompiles the derivation already in the store
           # and fails with a hash mismatch if the output is not bit-identical.
           # A non-reproducible flavor fails here, before the release is created.
-          for pkg in firmware firmware-pqc firmware-fips firmware-fips-pqc; do
+          for pkg in firmware firmware-pqc firmware-fips firmware-fips-pqc firmware-display; do
             echo "::group::nix build .#$pkg --rebuild"
             nix build ".#$pkg" --rebuild --no-link
             echo "::endgroup::"
           done
-          echo "all 4 flavors rebuilt bit-identical"
+          echo "all 5 flavors rebuilt bit-identical"
 
       - name: generate the CycloneDX SBOM
         run: |

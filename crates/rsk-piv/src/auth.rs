@@ -379,7 +379,13 @@ pub(crate) fn general_authenticate<S: Storage>(
 
     match sw {
         Ok(()) => {
-            if pinpol == PINPOLICY_ALWAYS {
+            // pin-policy ALWAYS re-locks the PIN after each use — but only for an
+            // actual key-slot sign, mirroring the `is_key` check that gated it
+            // above. The 9B management key also stores pin-policy ALWAYS, and its
+            // mutual auth is not a PIN-gated op, so it must not clear has_pin (else
+            // a VERIFY-then-mgmt-auth-then-sign client, e.g. age-plugin-yubikey,
+            // hits 6982 on the slot sign).
+            if pinpol == PINPOLICY_ALWAYS && is_key(key_ref) {
                 sess.has_pin = false;
             }
             Sw::OK

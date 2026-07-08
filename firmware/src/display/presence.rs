@@ -87,6 +87,12 @@ impl TouchPresence {
             let mut hold_start: Option<Instant> = None;
             let mut last_num: u16 = 0;
             loop {
+                // The power button sleeps (and auto-locks) from a host confirm prompt too;
+                // aborting the ceremony (→ Cancelled) is the safe outcome, like a decline —
+                // no signature is ever produced without the deliberate on-screen hold.
+                if u.sleep_button_pressed() {
+                    break Outcome::Cancelled;
+                }
                 match u.touch.read().and_then(rsk_ui::hit_confirm) {
                     Some(Button::Deny) => break Outcome::Declined,
                     Some(Button::Allow) => {
@@ -149,6 +155,11 @@ impl TouchPresence {
             let _ = rsk_ui::render_add_passkey(&mut u.panel, &rp, &account);
             u.shown = None;
             loop {
+                // The power button sleeps (and auto-locks) from the registration card too,
+                // abandoning it (→ Cancelled) like a lifted finger that times out.
+                if u.sleep_button_pressed() {
+                    break Outcome::Cancelled;
+                }
                 match u.touch.read().and_then(rsk_ui::hit_confirm) {
                     Some(Button::Allow) => break Outcome::Confirmed,
                     Some(Button::Deny) => break Outcome::Declined,

@@ -13,6 +13,44 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-07-08
+
+### Added
+
+- **Releases now build and publish the trusted-display flavor** as
+  `rs-key-<tag>-display.uf2` — reproducibility-gated, signed and attested like the
+  other flavors (for the Waveshare RP2350-Touch-LCD-2.8; see
+  [docs/guides/display.md](docs/guides/display.md)). CI also packages it as a
+  build-smoke `firmware-display.uf2` artifact.
+
+### Fixed
+
+- **The trusted-display power button now sleeps the device from *every* on-device
+  screen.** The PIN pad, the hold-to-confirm gestures, the "PIN blocked" notice,
+  the success pop, and the host Approve/Deny and "Save passkey?" prompts didn't
+  poll the sleep/wake button, so pressing it there did nothing (the reported case:
+  the PIN-entry screen). Every blocking on-device loop now honors the button —
+  sleeping blanks and, when a device PIN is set, auto-locks; a host ceremony
+  interrupted this way is aborted (declined/cancelled), never approved.
+
+- **A management-key mutual auth wrongly cleared the PIN verification, breaking
+  `age-plugin-yubikey`'s first-run.** The 9B management key stores pin-policy
+  ALWAYS, and a successful GENERAL AUTHENTICATE re-locked the session PIN even for
+  the management key — but that re-lock should only follow an actual key-slot sign
+  (it already gates the *check* on `is_key`). A client that verifies the PIN,
+  mutually authenticates the management key, then signs with a pin-policy=ONCE slot
+  key (age-plugin's generate order) hit `6982` on the sign. Now only an `is_key`
+  slot sign re-locks the PIN, matching a real YubiKey.
+
+- **PIV certificates over 256 bytes were invisible to `yubikey.rs`-based tools
+  (e.g. `age-plugin-yubikey`).** A Case-3 `GET DATA` (command data, no `Le` — how
+  `yubikey.rs` reads slot certificates) returned an oversized body whole instead
+  of chaining it with `61xx` / `GET RESPONSE`. Clients with a short-APDU receive
+  buffer dropped the read, so a retired-slot age identity showed as "(Empty)"
+  right after it was generated. The CCID dispatcher now caps a no-`Le` response at
+  256 and chains the remainder, matching a real YubiKey (`docs/protocol.md` §1.1).
+  `ykman` / OpenSC were unaffected (they read with an extended `Le`).
+
 ## [0.3.1] — 2026-07-06
 
 ### Added
@@ -1033,7 +1071,8 @@ family that keeps the "enterprise" features in the open tree.
   signature of it, and a CycloneDX SBOM. See
   [docs/releases.md](docs/releases.md) to verify a download.
 
-[Unreleased]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/TheMaxMur/RS-Key/compare/v0.2.8...v0.3.0
 [0.1.0]: https://github.com/TheMaxMur/RS-Key/releases/tag/v0.1.0

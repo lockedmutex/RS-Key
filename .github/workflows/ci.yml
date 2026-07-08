@@ -6,8 +6,8 @@
 #             `nix develop -c ./scripts/check.sh` (docs/testing.md, "CI parity").
 #             Green locally means green here; no CI-only logic to drift.
 #   flavors — every feature combination of the firmware (no-touch ×
-#             advertise-pqc × fips-profile), each packaged as a downloadable
-#             firmware-<flavor>.uf2 artifact.
+#             advertise-pqc × fips-profile) plus the trusted-display build, each
+#             packaged as a downloadable firmware-<flavor>.uf2 artifact.
 #   knobs   — build smokes for the compile-time env knobs (docs/build.md):
 #             all VIDPID presets, FW_VERSION, XOSC_DELAY_MULT, FAKE_* test
 #             keys, and a check that the default build bakes this project's own
@@ -79,6 +79,13 @@ jobs:
             args: "--features no-touch,fips-profile"
           - name: no-touch-fips-pqc
             args: "--features no-touch,fips-profile,advertise-pqc"
+          # The trusted-display flavor: the panel takes the addressable-LED pin
+          # (LED_KIND=none, compile-time-guarded) and the UI assets want the
+          # larger flash (docs/guides/display.md). `env` is empty for every other
+          # row, so only this one carries the extra knobs.
+          - name: display
+            args: "--features display"
+            env: "LED_KIND=none FLASH_SIZE=16M"
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -101,7 +108,7 @@ jobs:
           restore-keys: cargo-${{ runner.os }}-
 
       - name: build (${{ matrix.name }})
-        run: nix develop -c cargo build --release -p firmware ${{ matrix.args }}
+        run: nix develop -c env ${{ matrix.env }} cargo build --release -p firmware ${{ matrix.args }}
 
       - name: package firmware-${{ matrix.name }}.uf2
         run: |

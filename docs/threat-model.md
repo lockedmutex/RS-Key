@@ -31,6 +31,14 @@ bulk stream, ISO-7816 APDUs, CTAP2 CBOR. Defenses:
   while the device is plugged in and unlocked (sign, decrypt, assert). A
   security key authenticates *presence and possession*, not the intent of
   every byte the host sends. Touch requirements bound the rate.
+- **The residual gap is *intent* — the trusted-display flavor closes it.** Because
+  a standard key attests presence and possession, a malicious page can silently
+  drive an authorized key over WebUSB to phish a real sign-in ([demonstrated
+  against YubiKeys in Chrome](https://www.wired.com/story/chrome-yubikey-phishing-webusb/)).
+  The [trusted-display flavor](guides/display.md) paints the true `rpId` on the
+  device's own screen and gates each signature on a tap there, so a compromised
+  host cannot fake what you approve. [Qubes OS's CTAP proxy](https://doc.qubes-os.org/en/latest/user/security-in-qubes/ctap-proxy.html#the-qubes-approach-to-ctap)
+  tackles the same gap in software, mediating CTAP through a trusted VM.
 
 ### 2. A thief with the powered-off device (at-rest)
 

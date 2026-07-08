@@ -223,8 +223,8 @@ in
     };
     # Trusted-display flavor for the Waveshare RP2350-Touch-LCD-2.8: 16 MB flash,
     # and the ST7789 panel is the status indicator instead of an addressable LED
-    # (LED_KIND=none), which also frees GPIO16 for the backlight. Experimental and
-    # off the release matrix until the panel is HW-verified (Phase 1).
+    # (LED_KIND=none), which also frees GPIO16 for the backlight. Experimental;
+    # the panel is HW-verified (Phase 1), so it now ships in the signed release.
     firmware-display = mkFirmware {
       name = "firmware-display";
       flashSize = "16M";
