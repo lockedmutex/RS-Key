@@ -198,20 +198,24 @@ pub async fn status_task(ui: &'static RefCell<Ui>) {
                                 // through collect_pin's ambient-quiet window.
                                 u.run_unlock();
                                 note_activity();
-                                let screen = if u.locked {
-                                    Screen::Locked
-                                } else {
-                                    // Just unlocked: a host op during the lock may have
-                                    // changed the count, so refresh before painting Home.
-                                    u.refresh_home_stats();
-                                    Screen::Home(HomeView {
-                                        status: status_to_kind(led::status()),
-                                        pin_set: u.home_pin_set,
-                                        passkeys: u.home_passkeys,
-                                    })
-                                };
-                                let _ = rsk_ui::render(&mut u.panel, &screen);
-                                u.shown = Some(screen);
+                                // The power button can sleep from the unlock pad; the panel is
+                                // then blanked, so leave the repaint to the wake path.
+                                if !u.asleep {
+                                    let screen = if u.locked {
+                                        Screen::Locked
+                                    } else {
+                                        // Just unlocked: a host op during the lock may have
+                                        // changed the count, so refresh before painting Home.
+                                        u.refresh_home_stats();
+                                        Screen::Home(HomeView {
+                                            status: status_to_kind(led::status()),
+                                            pin_set: u.home_pin_set,
+                                            passkeys: u.home_passkeys,
+                                        })
+                                    };
+                                    let _ = rsk_ui::render(&mut u.panel, &screen);
+                                    u.shown = Some(screen);
+                                }
                             } else if u.onboarding {
                                 // Fresh PIN-less device: route the tap to the onboarding
                                 // buttons (Set a PIN / Continue without). Repaint at once —
@@ -221,17 +225,21 @@ pub async fn status_task(ui: &'static RefCell<Ui>) {
                                 // resolves the prompt, so the cached stats are current here.
                                 u.run_onboarding(p);
                                 note_activity();
-                                let screen = if u.onboarding {
-                                    Screen::Onboard
-                                } else {
-                                    Screen::Home(HomeView {
-                                        status: status_to_kind(led::status()),
-                                        pin_set: u.home_pin_set,
-                                        passkeys: u.home_passkeys,
-                                    })
-                                };
-                                let _ = rsk_ui::render(&mut u.panel, &screen);
-                                u.shown = Some(screen);
+                                // Setting a PIN here runs the pad, which the power button can
+                                // sleep from; skip the repaint when it did (panel blanked).
+                                if !u.asleep {
+                                    let screen = if u.onboarding {
+                                        Screen::Onboard
+                                    } else {
+                                        Screen::Home(HomeView {
+                                            status: status_to_kind(led::status()),
+                                            pin_set: u.home_pin_set,
+                                            passkeys: u.home_passkeys,
+                                        })
+                                    };
+                                    let _ = rsk_ui::render(&mut u.panel, &screen);
+                                    u.shown = Some(screen);
+                                }
                             } else {
                                 // A tap on the bottom nav opens a tab. Each tab modal returns
                                 // the next nav destination, so the user switches tab→tab
@@ -250,27 +258,32 @@ pub async fn status_task(ui: &'static RefCell<Ui>) {
                                     };
                                 }
                                 note_activity(); // a browse session just ended — restart clock
-                                // If the menu closed with the UI locked (the power button slept
-                                // + locked it from inside Settings), keep Locked as the shown
-                                // state so the menu can't linger.
-                                if u.locked {
-                                    let screen = Screen::Locked;
-                                    let _ = rsk_ui::render(&mut u.panel, &screen);
-                                    u.shown = Some(screen);
-                                } else if opened_tab && !crate::worker::host_request_pending() {
-                                    // Closing a tab back to idle repaints Home now (not next
-                                    // poll) so it feels instant. Skip if a host command is
-                                    // queued — the worker paints next (no stale flash). The
-                                    // tab modal may have added/deleted a passkey or set the
-                                    // PIN, so refresh the card facts first.
-                                    u.refresh_home_stats();
-                                    let screen = Screen::Home(HomeView {
-                                        status: status_to_kind(led::status()),
-                                        pin_set: u.home_pin_set,
-                                        passkeys: u.home_passkeys,
-                                    });
-                                    let _ = rsk_ui::render(&mut u.panel, &screen);
-                                    u.shown = Some(screen);
+                                // The power button can sleep from inside a tab modal; the panel
+                                // is then blanked (and locked if a PIN is set), so leave the
+                                // repaint to status_task's wake path and paint here only awake.
+                                if !u.asleep {
+                                    if u.locked {
+                                        // The menu closed with the UI locked (a sub-flow slept
+                                        // + locked without blanking is impossible, so this is
+                                        // unreachable today, but keeps Locked from lingering).
+                                        let screen = Screen::Locked;
+                                        let _ = rsk_ui::render(&mut u.panel, &screen);
+                                        u.shown = Some(screen);
+                                    } else if opened_tab && !crate::worker::host_request_pending() {
+                                        // Closing a tab back to idle repaints Home now (not next
+                                        // poll) so it feels instant. Skip if a host command is
+                                        // queued — the worker paints next (no stale flash). The
+                                        // tab modal may have added/deleted a passkey or set the
+                                        // PIN, so refresh the card facts first.
+                                        u.refresh_home_stats();
+                                        let screen = Screen::Home(HomeView {
+                                            status: status_to_kind(led::status()),
+                                            pin_set: u.home_pin_set,
+                                            passkeys: u.home_passkeys,
+                                        });
+                                        let _ = rsk_ui::render(&mut u.panel, &screen);
+                                        u.shown = Some(screen);
+                                    }
                                 }
                             }
                         } else {

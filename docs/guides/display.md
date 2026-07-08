@@ -38,9 +38,11 @@ nix build .#firmware-display        # → result/firmware.uf2
 ```
 
 `GPIO16` (the WS2812 pin on a standard board) drives the backlight here;
-`WAKE_PIN` (default `25`, the board's BAT_PWR button) wakes the panel from
-display sleep. See the full knob table in [build.md](../build.md) — the
-`display`-only knobs are `WAKE_PIN` / `WAKE_ACTIVE_HIGH`.
+`WAKE_PIN` (default `25`, the board's BAT_PWR button) both wakes the panel from
+display sleep and, while awake, sleeps it on demand from *any* screen — a press
+blanks the panel and (when a device PIN is set) locks the on-device UI, aborting
+any host prompt it interrupts. See the full knob table in [build.md](../build.md)
+— the `display`-only knobs are `WAKE_PIN` / `WAKE_ACTIVE_HIGH`.
 
 Flash it like any other image (BOOTSEL → `picotool load`, [hardware.md](../hardware.md)).
 Two notes:

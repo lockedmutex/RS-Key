@@ -242,6 +242,12 @@ impl Ui {
         let scroll_title = rsk_ui::pin_title_overflows(title);
         let mut last_off = u32::MAX; // != any real offset, so the first frame always draws
         let outcome = loop {
+            // The power button sleeps (and auto-locks) from the PIN pad too — abandoning the
+            // entry with `Cancelled`, the same outcome a host CTAPHID_CANCEL yields, so a host
+            // waiting on this PIN is released. Checked first, before any repaint.
+            if self.sleep_button_pressed() {
+                break rsk_fido::PinEntry::Cancelled;
+            }
             if scroll_title {
                 let ms = start.elapsed().as_millis();
                 let off = (ms.saturating_sub(MARQUEE_PAUSE_MS) / MARQUEE_MS_PER_PX) as u32;
@@ -336,6 +342,10 @@ impl Ui {
         let show = Duration::from_millis(5000);
         let t0 = Instant::now();
         loop {
+            // The power button dismisses the notice by sleeping (and auto-locking) too.
+            if self.sleep_button_pressed() {
+                break;
+            }
             if self.touch.read().is_some() {
                 self.touch.wait_release(t0, show);
                 break;
@@ -366,12 +376,28 @@ impl Ui {
         self.shown = None;
         note_activity();
         match hold_ms {
-            Some(ms) => block_for(Duration::from_millis(ms)),
+            // Auto-dismiss after `ms`, but poll the power button through the dwell so even a
+            // brief self-dismissing pop is sleepable like every other screen (no touch: this
+            // variant has no Done button). The wipe pop reboots right after, so a sleep there
+            // is harmlessly moot.
+            Some(ms) => {
+                let start = Instant::now();
+                while start.elapsed() < Duration::from_millis(ms) {
+                    if self.sleep_button_pressed() {
+                        break;
+                    }
+                    block_for(Duration::from_millis(TOUCH_POLL_MS));
+                }
+            }
             None => {
                 let idle_limit = Duration::from_millis(MENU_INACTIVITY_MS);
                 self.touch.wait_release(Instant::now(), idle_limit);
                 let mut last = Instant::now();
                 loop {
+                    // The power button sleeps (and auto-locks) instead of tapping Done.
+                    if self.sleep_button_pressed() {
+                        break;
+                    }
                     if let Some(p) = self.touch.read() {
                         if rsk_ui::hit_success_done(p) {
                             break;
@@ -432,6 +458,11 @@ impl Ui {
         let mut last_num: u16 = 0;
         let mut last = Instant::now();
         loop {
+            // The power button sleeps (and auto-locks) mid-hold; nothing has committed yet,
+            // so this abandons the confirm exactly like a lifted finger.
+            if self.sleep_button_pressed() {
+                return false;
+            }
             let mut on_hold = false;
             if let Some(p) = self.touch.read() {
                 last = Instant::now();
@@ -573,18 +604,27 @@ impl Ui {
                 // The pad already enforced the length floor; a flash error is the only
                 // realistic failure and leaves no PIN set — abandon either way. Route to the
                 // device PIN's own record or the FIDO clientPIN's by target.
-                let _ = match target {
-                    PinScope::Device => rsk_fido::passkeys::store_device_pin(
-                        &dev,
-                        &mut self.fs.borrow_mut(),
-                        &new[..n1],
-                    ),
-                    PinScope::Fido => rsk_fido::passkeys::store_local_pin(
-                        &dev,
-                        &mut self.fs.borrow_mut(),
-                        &new[..n1],
-                    ),
-                };
+                match target {
+                    PinScope::Device => {
+                        let _ = rsk_fido::passkeys::store_device_pin(
+                            &dev,
+                            &mut self.fs.borrow_mut(),
+                            &new[..n1],
+                        );
+                        // Keep the cached lock-proxy fresh: a host ceremony sleeping right
+                        // after this set reads `home_pin_set` (fs is borrowed there), so a
+                        // stale `false` would skip the auto-lock. A store failure only makes
+                        // this over-lock, which unlock-with-no-PIN harmlessly drops.
+                        self.home_pin_set = true;
+                    }
+                    PinScope::Fido => {
+                        let _ = rsk_fido::passkeys::store_local_pin(
+                            &dev,
+                            &mut self.fs.borrow_mut(),
+                            &new[..n1],
+                        );
+                    }
+                }
                 break;
             }
             // Mismatch: re-prompt from "New PIN" with the reason; the loop clears both.
@@ -643,6 +683,11 @@ impl Ui {
                 1 => self.run_change_piv_ref(rsk_piv::PinRef::Puk),
                 2 => self.run_unblock_piv_pin(),
                 _ => self.run_protect_mgm_key(),
+            }
+            // A sub-flow may have slept + locked via the power button; unwind instead of
+            // re-showing this menu over the blanked panel (status_task owns it from here).
+            if self.asleep {
+                return;
             }
             // Each sub-flow ends in a success pop or a cancel; re-show this menu afterwards.
         }

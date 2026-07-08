@@ -23,6 +23,14 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Fixed
 
+- **The trusted-display power button now sleeps the device from *every* on-device
+  screen.** The PIN pad, the hold-to-confirm gestures, the "PIN blocked" notice,
+  the success pop, and the host Approve/Deny and "Save passkey?" prompts didn't
+  poll the sleep/wake button, so pressing it there did nothing (the reported case:
+  the PIN-entry screen). Every blocking on-device loop now honors the button —
+  sleeping blanks and, when a device PIN is set, auto-locks; a host ceremony
+  interrupted this way is aborted (declined/cancelled), never approved.
+
 - **A management-key mutual auth wrongly cleared the PIN verification, breaking
   `age-plugin-yubikey`'s first-run.** The 9B management key stores pin-policy
   ALWAYS, and a successful GENERAL AUTHENTICATE re-locked the session PIN even for

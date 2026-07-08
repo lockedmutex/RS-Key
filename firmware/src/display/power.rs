@@ -60,8 +60,18 @@ impl Ui {
     /// Enter display sleep, additionally locking the on-device UI when a device PIN is
     /// set — so a walked-away device requires the PIN to browse passkeys / settings on
     /// wake. Without a PIN there is nothing to unlock with, so it only blanks.
+    ///
+    /// Called from host-ceremony screens too (the built-in-UV pad, an Approve/Deny prompt),
+    /// where the worker still holds `fs` borrowed for the whole command — so read the
+    /// PIN-set bit with `try_borrow_mut` and fall back to the cached `home_pin_set` rather
+    /// than double-borrowing. That fallback is accurate: a device PIN can't change mid-
+    /// ceremony, and it stays fresh past an on-device set (see [`Ui::run_set_pin`]).
     pub(super) fn enter_sleep(&mut self) {
-        if rsk_fido::passkeys::device_pin_is_set(&mut self.fs.borrow_mut()) {
+        let pin_set = match self.fs.try_borrow_mut() {
+            Ok(mut fs) => rsk_fido::passkeys::device_pin_is_set(&mut fs),
+            Err(_) => self.home_pin_set,
+        };
+        if pin_set {
             self.locked = true;
         }
         self.sleep();
@@ -79,11 +89,13 @@ impl Ui {
         }
     }
 
-    /// Poll the sleep/wake button from inside a browse modal: if pressed, sleep now
-    /// (auto-locking like any sleep), wait for release, and return `true` so the modal
-    /// exits to the now-asleep [`status_task`]. `status_task` polls the button itself on
-    /// Home / Locked, so calling this in the tab modals makes the power button sleep the
-    /// device from *any* on-device screen, not just Home.
+    /// Poll the sleep/wake button from inside a modal: if pressed, sleep now (auto-locking
+    /// like any sleep), wait for release, and return `true` so the caller abandons its wait
+    /// and unwinds to the now-asleep [`status_task`]. Called from every blocking on-device
+    /// loop — browse modals, the PIN pad, hold-to-confirm, and the host Approve/Deny prompts
+    /// — so the power button sleeps the device from *any* screen, not just Home. Each caller
+    /// must, after a `true`, either return itself or check `self.asleep` so the sleep
+    /// propagates up (a parent loop that keeps polling a blanked panel reads touches blind).
     pub(super) fn sleep_button_pressed(&mut self) -> bool {
         if self.wake_pressed() {
             self.enter_sleep();
