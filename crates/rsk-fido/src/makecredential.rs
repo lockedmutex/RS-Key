@@ -15,6 +15,7 @@ use minicbor::encode::write::Cursor;
 use minicbor::{Decoder, Encoder};
 use zeroize::Zeroize;
 
+use rsk_crypto::MLDSA65_PK_LEN;
 use rsk_crypto::pinproto::PinProto;
 use rsk_crypto::sha256;
 use rsk_fs::{Fs, Storage};
@@ -44,6 +45,24 @@ use crate::state::PERM_MC;
 use crate::{Ctx, Rng};
 
 const MAX_EXCLUDE: usize = MAX_CREDENTIAL_COUNT_IN_LIST as usize;
+
+/// authData fixed prefix: rpIdHash(32) ‖ flags(1) ‖ signCount(4) ‖ aaguid(16) ‖
+/// credIdLen(2).
+const AUTH_DATA_HEADER: usize = 32 + 1 + 4 + 16 + 2;
+/// Ceiling of `encode_mc_extensions`' output (its scratch buffer, below).
+const MC_EXT_MAX: usize = 192;
+/// Largest AKP COSE public key `cose_public` emits — the ML-DSA-65 case: a
+/// 3-entry map (1) with kty (1+1), alg −49 (1+2) and the 1952-byte pk wrapped as
+/// key −1 (1) + a >255-byte CBOR byte-string header (3) → 10 + pk = 1962.
+const COSE_AKP_MLDSA65_MAX: usize = 1 + (1 + 1) + (1 + 2) + (1 + 3) + MLDSA65_PK_LEN;
+/// authData scratch, sized for the ML-DSA-65 worst case (a non-resident box at
+/// `CRED_BOX_MAX` + the AKP COSE key + full extensions) plus the 32-byte
+/// clientDataHash appended in place for the attestation signature.
+const AD_BUF: usize = 3072;
+const _: () = assert!(
+    AUTH_DATA_HEADER + CRED_BOX_MAX + COSE_AKP_MLDSA65_MAX + MC_EXT_MAX + 32 <= AD_BUF,
+    "authData buffer too small for the ML-DSA-65 worst case",
+);
 
 /// Map a requested COSE alg (incl. the curve-explicit aliases) to its canonical
 /// `(alg, curve)`, or `None` if unsupported.
@@ -498,7 +517,7 @@ fn make_credential_inner<S: Storage, R: Rng>(
     };
 
     // authData extension output (credBlob / credProtect / hmac-secret / minPinLength / hmac-secret-mc).
-    let mut ext = [0u8; 192];
+    let mut ext = [0u8; MC_EXT_MAX];
     let ext_len = encode_mc_extensions(ctx.fs, req, rp_id_hash, &hs[..hs_len], &mut ext)?;
     let ed = if ext_len > 0 { FLAG_ED } else { 0 };
 
@@ -516,12 +535,12 @@ fn make_credential_inner<S: Storage, R: Rng>(
         req.user_name.as_bytes(),
     ))?;
 
-    // authData = rpIdHash | flags | counter | aaguid | credIdLen | credId | COSEpubkey | ext
-    // Sized for the ML-DSA-65 worst case: 55 header + a non-resident box
-    // (≤CRED_BOX_MAX = 640) + the ~1962-byte AKP COSE key (1952-byte pk) +
-    // extensions (≤192) + the appended 32-byte clientDataHash ≈ 2881.
+    // authData = rpIdHash | flags | counter | aaguid | credIdLen | credId | COSEpubkey | ext.
+    // Worst case (ML-DSA-65): AUTH_DATA_HEADER(55) + CRED_BOX_MAX(748) +
+    // COSE_AKP_MLDSA65_MAX(1962) + MC_EXT_MAX(192) + clientDataHash(32) = 2989,
+    // statically bounded by AD_BUF above.
     let ctr = get_sign_counter(ctx.fs);
-    let mut ad = [0u8; 3072];
+    let mut ad = [0u8; AD_BUF];
     let mut p = 0;
     ad[p..p + 32].copy_from_slice(rp_id_hash);
     p += 32;

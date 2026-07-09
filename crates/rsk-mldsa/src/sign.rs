@@ -12,7 +12,7 @@
 //! (the COSE/WebAuthn profile); a non-empty `ctx` exists for the ACVP KATs.
 
 use sha3::digest::XofReader;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::encode::{pk_decode, pk_encode, sig_decode, sig_encode, w1_encode};
 use crate::ntt::{inv_ntt_inplace, ntt_inplace};
@@ -71,6 +71,19 @@ fn hint_weight<const K: usize>(h: &[Poly; K]) -> i32 {
     h.iter().map(|p| p.0.iter().sum::<i32>()).sum()
 }
 
+/// Reduce every coefficient of a matrix-vector product into (−q, q) before the
+/// inverse NTT — the reference's `polyveck_reduce` (FIPS 204 §7.5). Â∘NTT sums L
+/// Montgomery products, so a raw lane reaches ~L·q; the inv-NTT's sum lane then
+/// grows past i32 unless the input is first brought below q. Byte-exact: invNTT
+/// is linear mod q and the tail reduces to [0, q).
+fn reduce_vec<const M: usize>(v: &mut [Poly; M]) {
+    for p in v {
+        for c in &mut p.0 {
+            *c = partial_reduce32(*c);
+        }
+    }
+}
+
 impl<const K: usize, const L: usize> ExpandedKey<K, L> {
     /// Deterministically expand the keypair from the 32-byte seed ξ (Alg 6).
     pub fn from_seed(p: &Params, xi: &[u8; SEED_LEN]) -> Self {
@@ -87,8 +100,10 @@ impl<const K: usize, const L: usize> ExpandedKey<K, L> {
 
         // (s1, s2) ← ExpandS(ρ′); t ← invNTT(Â ∘ NTT(s1)) + s2
         let (s1, s2) = expand_s::<K, L>(p.eta, &rho_prime);
+        rho_prime.zeroize(); // ExpandS seed → whole SK; not held past this point
         let s1_hat = ntt_vec(&s1);
         let mut t = matrix_mul_streaming::<K, L>(&rho, &s1_hat);
+        reduce_vec(&mut t);
         for k in 0..K {
             inv_ntt_inplace(&mut t[k]);
             for n in 0..256 {
@@ -171,9 +186,10 @@ impl<const K: usize, const L: usize> ExpandedKey<K, L> {
         let mut mu = [0u8; 64];
         shake256(&[&self.tr, &[0u8], &[ctx.len() as u8], ctx, msg]).read(&mut mu);
 
-        // ρ′′ ← H(K || rnd || µ)
-        let mut rho_pp = [0u8; 64];
-        shake256(&[&self.cap_k, rnd, &mu]).read(&mut rho_pp);
+        // ρ′′ ← H(K || rnd || µ). ExpandMask seed → wiped on every exit path
+        // (Zeroizing) since it lives across the rejection loop's mid-body return.
+        let mut rho_pp = Zeroizing::new([0u8; 64]);
+        shake256(&[&self.cap_k, rnd, &mu]).read(&mut rho_pp[..]);
 
         let ld4 = p.lambda_div4;
         let mut c_tilde = [0u8; MAX_LAMBDA_DIV4];
@@ -183,6 +199,7 @@ impl<const K: usize, const L: usize> ExpandedKey<K, L> {
             // y ← ExpandMask(ρ′′, κ); w ← invNTT(Â ∘ NTT(y))
             let y = expand_mask::<L>(p.gamma1, &rho_pp, kappa);
             let mut w = matrix_mul_streaming::<K, L>(&self.rho, &ntt_vec(&y));
+            reduce_vec(&mut w);
             for wk in &mut w {
                 inv_ntt_inplace(wk);
             }
@@ -322,6 +339,7 @@ pub fn verify<const K: usize, const L: usize>(
         }
         r
     });
+    reduce_vec(&mut wp);
     for wpk in &mut wp {
         inv_ntt_inplace(wpk);
     }
