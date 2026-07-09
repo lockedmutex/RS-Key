@@ -11,8 +11,8 @@
 //! fits the ~222 KiB main stack where the by-value `fips204` crate overflows it.
 //!
 //! `no_std`, no alloc, no `unsafe`. Byte-for-byte compatible with FIPS 204: host
-//! tests check both parameter sets against NIST ACVP KATs and differentially
-//! against `fips204` (both signing directions).
+//! tests check both parameter sets against NIST ACVP KATs (keygen/sign/verify),
+//! with Kani proofs over the reductions, rounding, and bit-packing.
 
 mod encode;
 mod ntt;

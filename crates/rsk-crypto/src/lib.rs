@@ -17,7 +17,6 @@ pub mod drbg;
 pub mod hash;
 pub mod kdf;
 pub mod mac;
-pub mod mldsa;
 pub mod mlkem;
 pub mod pinproto;
 
@@ -32,13 +31,16 @@ pub use drbg::HmacDrbg;
 pub use hash::{sha1, sha256, sha384, sha512};
 pub use kdf::{Device, PinKdf};
 pub use mac::{ct_eq, hkdf_sha256, hkdf_sha512, hmac_sha1, hmac_sha256, hmac_sha512};
-pub use mldsa::{MLDSA44_PK_LEN, MLDSA44_SEED_LEN, MLDSA44_SIG_LEN, MlDsa44, mldsa44_verify};
-// ML-DSA-65 comes from the in-tree stack-optimized `rsk-mldsa` (it streams the
-// matrix A so it fits the RP2350 stack, where fips204's -65 overflows). The -44
-// path above stays on fips204 until this new code is hardware-verified.
 pub use mlkem::{MlKem768Pair, mlkem768_encapsulate};
 pub use pinproto::PinProto;
-pub use rsk_mldsa::{MLDSA65_PK_LEN, MLDSA65_SIG_LEN, MlDsa65, mldsa65_verify};
+// ML-DSA-44 and -65 both come from the in-tree stack-optimized `rsk-mldsa`: it
+// streams the matrix A so signing fits the RP2350 stack (the by-value fips204
+// crate's -65 overflowed it). Re-exported so downstream keeps the `rsk_crypto::`
+// path.
+pub use rsk_mldsa::{
+    MLDSA44_PK_LEN, MLDSA44_SIG_LEN, MLDSA65_PK_LEN, MLDSA65_SIG_LEN, MlDsa44, MlDsa65,
+    mldsa44_verify, mldsa65_verify,
+};
 
 /// Errors from the fallible crypto operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,8 +53,7 @@ pub enum Error {
     Decrypt,
     /// ECDH failed — an out-of-range scalar or an off-curve peer point.
     Ecdh,
-    /// A PQC operation failed — a malformed ML-KEM key, or an internal
-    /// fips204 error.
+    /// A PQC operation failed — a malformed ML-KEM encapsulation key.
     Pqc,
 }
 

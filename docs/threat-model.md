@@ -220,14 +220,14 @@ library-internal, not wipeable without forking the crates.
 
 ## Post-quantum notes
 
-ML-DSA-44 (FIPS 204, `fips204` crate) and ML-DSA-65 (COSE −49, the in-tree
-`rsk-mldsa` crate) FIDO2 credentials with hedged signing (32 fresh DRBG bytes
+ML-DSA-44 (COSE −48) and ML-DSA-65 (COSE −49) FIDO2 credentials — both the
+in-tree `rsk-mldsa` crate — with hedged signing (32 fresh DRBG bytes
 per signature; the hedge and expanded keys are zeroized). `rsk-mldsa` streams
 the FIPS 204 matrix A on the fly so ML-DSA-65's keygen+sign fit the RP2350
 stack — a hand-written implementation, so its constant-time posture is a
 source-level claim (branch-free reductions, masked norm checks, no secret
 division), not proven at machine code; it is checked byte-for-byte against
-NIST ACVP KATs and differentially against `fips204`. ML-DSA-87 (−50) is out of
+NIST ACVP KATs, with Kani proofs over the reductions and rounding. ML-DSA-87 (−50) is out of
 reach on this chip (keygen overflows the stack; its makeCredential response
 also overruns the CTAPHID message ceiling). ML-KEM-768 is compiled in as
 scaffolding but nothing calls it until a CTAP PQC PIN/UV protocol exists.

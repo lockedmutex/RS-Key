@@ -4,7 +4,7 @@
 //! Pseudorandom sampling from SHAKE (FIPS 204 §7.3, Alg 29–34) plus the
 //! streaming matrix-vector product that is the crate's whole reason to exist.
 //!
-//! Constant-time notes, matching the reference and the shipped `fips204` path:
+//! Constant-time notes, matching the pq-crystals reference implementation:
 //! - `coeff_from_half_byte`'s `mod 5` uses a Barrett multiply, never a hardware
 //!   divide — the Cortex-M33 `UDIV` is variable-latency, and this value is
 //!   secret-derived (this is the class of bug behind RUSTSEC-2025-0144).

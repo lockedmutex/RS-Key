@@ -9,8 +9,8 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use rsk_crypto::mldsa::{MLDSA44_PK_LEN, MLDSA44_SIG_LEN};
 use rsk_crypto::mlkem::{MLKEM768_CT_LEN, MLKEM768_EK_LEN, MLKEM768_SEED_LEN};
+use rsk_crypto::{MLDSA44_PK_LEN, MLDSA44_SIG_LEN};
 use rsk_crypto::{MlKem768Pair, mldsa44_verify, mlkem768_encapsulate};
 
 fuzz_target!(|data: &[u8]| {

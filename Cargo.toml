@@ -41,8 +41,8 @@ rsk-bip39 = { path = "crates/rsk-bip39" }
 # On-device SLIP-39 (Shamir) share encode for the trusted-display recovery screen
 # (display-gated). Mirrors the host `shamir_mnemonic` exactly so `rsk backup restore` recombines.
 rsk-slip39 = { path = "crates/rsk-slip39" }
-# Stack-optimized ML-DSA (FIPS 204) — streams the matrix A so ML-DSA-65 fits the
-# RP2350 main stack. Host-tested against ACVP KATs + differentially vs fips204.
+# Stack-optimized ML-DSA (FIPS 204) for ML-DSA-44 and -65 — streams the matrix A
+# so -65 fits the RP2350 main stack. Host-tested against NIST ACVP KATs + Kani.
 rsk-mldsa = { path = "crates/rsk-mldsa" }
 # Trusted-display driver stack — compiled ONLY into the `display` firmware flavor
 # (and rsk-ui's host tests), never the standard key (all `dep:`-gated). embedded-
@@ -73,11 +73,9 @@ ed25519-dalek = { version = "2", default-features = false, features = ["zeroize"
 # ed25519-dalek, so no version split. The bare `x25519()` needs no extra feature.
 x25519-dalek = { version = "2", default-features = false }
 
-# PQC. fips204 = ML-DSA (FIPS 204) signatures; only the ML-DSA-44 parameter
-# set is enabled (the primary COSE -48 target — smallest signatures, lowest stack).
-# ml-kem = ML-KEM (FIPS 203) encapsulation, scaffolding for a future PQC PIN/UV
-# protocol. Both no_std, no alloc, pure Rust.
-fips204 = { version = "0.4.6", default-features = false, features = ["ml-dsa-44"] }
+# PQC. ml-kem = ML-KEM (FIPS 203) encapsulation, scaffolding for a future PQC
+# PIN/UV protocol. no_std, no alloc, pure Rust. (ML-DSA signatures are the
+# in-tree `rsk-mldsa` crate above.)
 ml-kem = { version = "0.3.2", default-features = false, features = ["zeroize"] }
 
 # RustCrypto (no_std). Pinned together; bump as a set.

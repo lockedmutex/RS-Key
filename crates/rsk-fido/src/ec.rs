@@ -134,19 +134,15 @@ pub enum CredKey {
     P521(p521::NonZeroScalar),
     K256(k256::ecdsa::SigningKey),
     Ed25519(ed25519_dalek::SigningKey),
-    // ~17 KB of fips204 NTT-form keys — HEAP-BOXED, not inline. ML-DSA-44
-    // signing (`getAssertion`) drives fips204's rejection-sampling loop, whose
-    // stack high-water (~well over 100 KiB on thumbv8m) nearly fills the
-    // RP2350's ~222 KiB worker stack on its own. Holding the key inline put
-    // those 17 KB on the same frame, right below that call, and tipped it into
-    // overflow → a hard wedge (panic-halt, FIDO dark until replug). Boxing moves
-    // the key to the firmware heap — idle during a FIDO request, since applet
-    // keys are reconstructed per-op — freeing that headroom. fips204 zeroizes
-    // the keys on drop; the `Box` adds no `Drop` of its own.
+    // ML-DSA-44's ~13 KB expanded key (the in-tree `rsk-mldsa`, which streams the
+    // matrix A so signing fits the RP2350 stack). HEAP-BOXED, not inline: signing
+    // (`getAssertion`) nearly fills the RP2350's ~222 KiB worker stack on its own,
+    // so the key inline on that frame tipped it into overflow → a hard wedge
+    // (panic-halt, FIDO dark until replug). The heap is idle during a FIDO request
+    // (applet keys are reconstructed per-op); `rsk-mldsa` zeroizes on drop and the
+    // `Box` adds no `Drop` of its own.
     MlDsa44(Box<rsk_crypto::MlDsa44>),
-    // ML-DSA-65's ~23 KB expanded key (the in-tree `rsk-mldsa`, which streams the
-    // matrix A so signing fits the RP2350 stack). Boxed for the same reason as
-    // -44: keep the key off the worker stack, below the stack-heavy `sign`.
+    // ML-DSA-65's ~23 KB expanded key, same crate and boxing rationale as -44.
     MlDsa65(Box<rsk_crypto::MlDsa65>),
 }
 
@@ -211,7 +207,7 @@ impl CredKey {
                 // The ratchet's first 32 bytes are the FIPS 204 keygen seed ξ;
                 // expansion is deterministic, so the same credential id always
                 // rebuilds the same lattice keypair (as the EC schemes do).
-                // Boxed onto the heap so the ~17 KB keypair is off the worker
+                // Boxed onto the heap so the ~13 KB keypair is off the worker
                 // stack before the stack-heavy `sign` runs (see the variant doc).
                 let mut xi = [0u8; 32];
                 xi.copy_from_slice(raw.get(..32)?);

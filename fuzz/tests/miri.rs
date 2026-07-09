@@ -896,8 +896,8 @@ fn miri_drbg() {
 
 #[test]
 fn miri_pqc() {
-    use rsk_crypto::mldsa::{MLDSA44_PK_LEN, MLDSA44_SIG_LEN};
     use rsk_crypto::mlkem::{MLKEM768_CT_LEN, MLKEM768_EK_LEN, MLKEM768_SEED_LEN};
+    use rsk_crypto::{MLDSA44_PK_LEN, MLDSA44_SIG_LEN};
 
     for data in [&[0u8; 16], &[0x42u8; 16]] {
         let mut pk = [0u8; MLDSA44_PK_LEN];

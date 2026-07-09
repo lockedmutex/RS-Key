@@ -698,18 +698,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9844ddc3a6e533d62bba727eb6c28b5d360921d5175e9ff0f1e621a5c590a4d5"
 
 [[package]]
-name = "fips204"
-version = "0.4.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c9fb5a367b9846933e271a3c2a992930743f82ae5e8cb7faa780715a80fa0b15"
-dependencies = [
- "rand_core 0.6.4",
- "sha2",
- "sha3 0.10.9",
- "zeroize",
-]
-
-[[package]]
 name = "fixedbitset"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1741,7 +1729,6 @@ dependencies = [
  "cfb-mode",
  "chacha20poly1305",
  "des",
- "fips204",
  "hkdf",
  "hmac",
  "ml-kem",

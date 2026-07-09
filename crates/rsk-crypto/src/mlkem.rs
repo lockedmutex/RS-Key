@@ -3,7 +3,7 @@
 
 //! ML-KEM-768 (FIPS 203) key encapsulation over `ml-kem` — scaffolding for a
 //! future PQC PIN/UV-auth protocol; nothing in the applet layer calls it yet.
-//! As in [`crate::mldsa`], all randomness is passed in (the 64-byte keygen seed
+//! Like the ML-DSA wrappers, all randomness is passed in (the 64-byte keygen seed
 //! `d‖z`, the 32-byte encapsulation randomness `m`) for deterministic tests.
 
 use ml_kem::{Decapsulate, DecapsulationKey, EncapsulationKey, KeyExport, MlKem768};

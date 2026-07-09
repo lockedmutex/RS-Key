@@ -2,9 +2,9 @@
 // Copyright (C) 2026 RS-Key contributors
 
 //! NIST ACVP Known-Answer-Test vectors for ML-DSA-44 and ML-DSA-65 — the
-//! independent ground truth (not "matches fips204") for the host tests: key
-//! generation, deterministic signing, and verification (accept + each
-//! tamper-reject reason). All fields are hex.
+//! independent ground truth for the host tests: key generation, deterministic
+//! signing, and verification (accept + each tamper-reject reason). All fields
+//! are hex.
 //!
 //! Source: NIST usnistgov/ACVP-Server gen-val ML-DSA-{keyGen,sigGen,sigVer}-
 //! FIPS204 internalProjection.json (commit 15c0f3d, RELEASE v1.1.0.40, 2025-06),

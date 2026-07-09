@@ -23,11 +23,12 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   **streams the FIPS 204 matrix A** on the fly instead of materializing it, so
   keygen+signing fit the RP2350's ~222 KiB main stack (~84 KiB host floor) where
   the by-value `fips204` crate's -65 (~192 KiB) overflowed it — the reason -65
-  was previously dropped. The ML-DSA-44 credential path stays on `fips204` until
-  the new code is hardware-verified. The implementation is checked byte-for-byte
-  against NIST ACVP KATs and differentially against `fips204` for both parameter
-  sets. ML-DSA-87 (`-50`) remains unsupported (its response overruns
-  `maxMsgSize`). Firmware `bcdDevice` → `0x07F9`.
+  was previously dropped. ML-DSA-44 signing runs on the same crate too, and the
+  `fips204` dependency has been dropped from the tree entirely. The
+  implementation is checked byte-for-byte against NIST ACVP KATs (both parameter
+  sets) with Kani proofs over the reductions and rounding. ML-DSA-87 (`-50`)
+  remains unsupported (its response overruns `maxMsgSize`). Firmware
+  `bcdDevice` → `0x07FB`.
 
 ### Security
 

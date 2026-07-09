@@ -7,8 +7,8 @@
 //! the rejection loop reuses its k-/l-sized scratch across iterations.
 //!
 //! The message representative follows the pure (non-prehash) profile,
-//! `mu = H(tr || 0x00 || |ctx| || ctx || M)` — byte-identical to `fips204`'s
-//! `try_sign_with_seed(rnd, M, ctx)`. The firmware always passes an empty `ctx`
+//! `mu = H(tr || 0x00 || |ctx| || ctx || M)` — the FIPS 204 hedged pure-signing
+//! profile (`ExternalMu=false`). The firmware always passes an empty `ctx`
 //! (the COSE/WebAuthn profile); a non-empty `ctx` exists for the ACVP KATs.
 
 use sha3::digest::XofReader;
