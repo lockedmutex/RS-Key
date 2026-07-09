@@ -113,8 +113,9 @@ pub const ALG_ED25519: i64 = -19; // EdDSA Ed25519
 pub const ALG_ESP384: i64 = -51; // ECDSA-SHA384 P-384
 pub const ALG_ESP512: i64 = -52; // ECDSA-SHA512 P-521
 
-// ML-DSA (FIPS 204) COSE identifiers, from draft-ietf-cose-dilithium. Only
-// ML-DSA-44 has an enabled backend; -49/-50 are recognized but unsupported.
+// ML-DSA (FIPS 204) COSE identifiers, from draft-ietf-cose-dilithium. ML-DSA-44
+// (-48) and ML-DSA-65 (-49) have enabled in-tree backends; ML-DSA-87 (-50)
+// overflows the RP2350 stack and is recognized but unsupported.
 pub const ALG_MLDSA44: i64 = -48;
 pub const ALG_MLDSA65: i64 = -49;
 pub const ALG_MLDSA87: i64 = -50;

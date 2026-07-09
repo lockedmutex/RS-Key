@@ -406,6 +406,12 @@ pub fn change_pin<S: Storage>(
     if p1 != 0x00 {
         return Sw::WRONG_P1P2;
     }
+    // Reject an unsupported P2 before any verifier write. P2=0x82 maps via
+    // pw_fid to EF_RC; letting put_verifier rewrite it before the trailing
+    // `match p2` rejected desynced the RC verifier from its EF_DEK_RC seal.
+    if p2 != PW1_MODE81 && p2 != PW3_MODE83 {
+        return Sw::WRONG_P1P2;
+    }
     let fid = pw_fid(p2);
     let mut rec = [0u8; 64];
     let old_len = match fs.read(fid, &mut rec) {

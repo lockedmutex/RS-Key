@@ -298,6 +298,50 @@ fn change_pw1_then_new_pin_works_and_dek_survives() {
 }
 
 #[test]
+fn change_pin_rejects_unsupported_p2_without_touching_rc() {
+    // Regression (audit run-14): CHANGE REFERENCE DATA with P2=0x82 (RC) must be
+    // rejected up front. The old flow verified the current RC and then wrote the
+    // EF_RC verifier before the trailing `match p2` rejected — desyncing the RC
+    // verifier from its EF_DEK_RC seal.
+    let mut fs = setup();
+    let mut sess = Session::new();
+    let d = dev();
+    let mut rng = CountRng(21);
+
+    // Provision a resetting code under admin (PW3), then snapshot EF_RC.
+    verify(
+        &d,
+        &mut fs,
+        &mut sess,
+        &mut rng,
+        0x00,
+        PW3_MODE83,
+        PW3_DEFAULT,
+    );
+    assert_eq!(
+        put_reset_code(&d, &mut fs, &mut sess, &mut rng, b"resetcode"),
+        Sw::OK
+    );
+    let mut rc_before = [0u8; 64];
+    let n_before = fs.read(EF_RC, &mut rc_before).expect("RC provisioned");
+
+    // CHANGE with P2=0x82 and the *correct* current RC: pre-fix this passed
+    // check_pin and rewrote EF_RC before returning WRONG_P1P2.
+    let mut data = Vec::new();
+    data.extend_from_slice(b"resetcode");
+    data.extend_from_slice(b"654321");
+    assert_eq!(
+        change_pin(&d, &mut fs, &mut sess, &mut rng, 0x00, PW1_MODE82, &data),
+        Sw::WRONG_P1P2
+    );
+
+    // EF_RC is byte-identical: no stray verifier write happened.
+    let mut rc_after = [0u8; 64];
+    let n_after = fs.read(EF_RC, &mut rc_after).expect("RC still present");
+    assert_eq!(rc_before[..n_before], rc_after[..n_after]);
+}
+
+#[test]
 fn reset_retry_via_pw3_unblocks_pw1() {
     let mut fs = setup();
     let mut sess = Session::new();

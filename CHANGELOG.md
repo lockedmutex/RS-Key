@@ -32,6 +32,18 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Security
 
+- **CHANGE REFERENCE DATA no longer half-writes the OpenPGP reset code, and
+  CTAPHID drops short reads (audit run-14 hardening).** `INS 0x24` with
+  `P2=0x82` (the resetting code) verified the current RC and rewrote its verifier
+  *before* the command's own `P2` check rejected it, desyncing the RC verifier
+  from the `EF_DEK_RC` seal it unlocks — a self-inflicted, admin-recoverable
+  state (the caller already needs the current RC), now closed by rejecting the
+  unsupported `P2` before any write. Separately, the CTAPHID frame loop now
+  requires a full 64-byte report instead of accepting `≥5`-byte short reads,
+  whose stale buffer tail would otherwise be parsed as payload. Neither was
+  exploitable; both were non-findings the run-14 audit flagged for hardening.
+  Firmware `bcdDevice` → `0x07FC`.
+
 - **Host tools neutralise terminal escapes from a counterfeit device on every
   path.** The earlier escape hardening reached only `rsk-tui --once`, and even
   there stripped only C0/C1 controls. The Python `rsk` CLI had no sanitizer at
