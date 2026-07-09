@@ -21,6 +21,12 @@ rsk-oath = { path = "../crates/rsk-oath" }
 rsk-otp = { path = "../crates/rsk-otp" }
 rsk-piv = { path = "../crates/rsk-piv" }
 rsk-rescue = { path = "../crates/rsk-rescue" }
+# rsk-ui is the host-testable trusted-display logic; display_label fuzzes its
+# Label sanitizer + the confirm-screen renderer, which needs the DrawTarget trait.
+rsk-ui = { path = "../crates/rsk-ui" }
+embedded-graphics = { version = "0.8", default-features = false }
+# fido_cred_pqc drives CredKey::cose_public, which encodes into a minicbor Encoder.
+minicbor = { version = "2.2", default-features = false }
 # The piv_apdu seed runs the AES-192 management-key auth dance host-side.
 aes = { version = "0.8", default-features = false }
 # power_cut: the real on-device storage stack (pinned to the firmware's
@@ -207,6 +213,34 @@ bench = false
 [[bin]]
 name = "pqc"
 path = "fuzz_targets/pqc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mldsa_verify"
+path = "fuzz_targets/mldsa_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mldsa_roundtrip"
+path = "fuzz_targets/mldsa_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fido_cred_pqc"
+path = "fuzz_targets/fido_cred_pqc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "display_label"
+path = "fuzz_targets/display_label.rs"
 test = false
 doc = false
 bench = false
