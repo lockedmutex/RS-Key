@@ -120,17 +120,21 @@ supported algorithm a site offers, so put your preferred curve first in the list
 
 ## Post-quantum credentials
 
-The device also implements **ML-DSA-44** (FIPS 204, COSE `-48`) makeCredential /
-getAssertion, and — by deliberate exception — *prefers* it whenever a site lists
-it, even after a classic algorithm. Nothing mainstream requests it yet; a client
-that does (e.g. a `python-fido2` script offering `-48`) gets a PQC credential
-today.
+The device implements **ML-DSA-44** (FIPS 204, COSE `-48`) and **ML-DSA-65**
+(COSE `-49`) makeCredential / getAssertion, and — by deliberate exception —
+*prefers* a PQC scheme whenever a site lists one, even after a classic
+algorithm; ML-DSA-65 outranks ML-DSA-44. Nothing mainstream requests them yet; a
+client that does (e.g. a `python-fido2` script offering `-49`) gets a PQC
+credential today. ML-DSA-65's larger key and signature come from an in-tree,
+stack-optimized implementation (`rsk-mldsa`) that streams the FIPS 204 matrix so
+signing fits the RP2350 stack.
 
 The getInfo advertisement is build-gated behind `advertise-pqc`
 ([build.md](../build.md)) because shipped Firefoxes (authenticator-rs before
 2026-06-02) hard-fail the whole getInfo parse on an unknown COSE id. The
-*capability* is always on; only the advertisement is opt-in. ML-DSA-65/-87
-(`-49`/`-50`) are recognised but have no enabled backend.
+*capability* is always on; only the advertisement is opt-in. ML-DSA-87 (`-50`)
+is recognised but unsupported: its makeCredential response overruns the CTAPHID
+message ceiling.
 
 ## Extensions supported
 

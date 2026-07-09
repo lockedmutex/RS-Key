@@ -1,0 +1,33 @@
+[package]
+name = "rsk-mldsa"
+version = "0.1.0"
+license = "AGPL-3.0-only"
+edition = "2024"
+publish = false
+
+# Stack-optimized ML-DSA (FIPS 204, Dilithium) signatures for the RP2350. A
+# faithful port of the reference arithmetic (reduction, NTT, sampling, packing,
+# encodings) with the top-level keygen/sign/verify restructured to STREAM the
+# public matrix A on the fly (one polynomial resident instead of the full k×l)
+# and transform in place — so ML-DSA-65 fits the ~222 KiB main stack where the
+# by-value `fips204` crate (~290 KiB) overflows it. `no_std`, no alloc, no unsafe.
+# The leaf math is byte-for-byte checked against NIST ACVP KATs and, in host
+# tests, differentially against `fips204` (both parameter sets, both directions).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
+[dependencies]
+# SHAKE128/256 XOF (the FIPS 204 H/G functions and the samplers). Already in the
+# dependency tree via fips204/ml-kem; pinned here to the same 0.10 line.
+sha3 = { version = "0.10", default-features = false }
+# Wipe secret polynomials (s1/s2/y/z, the expanded key) on drop. `derive` for the
+# `Zeroize`/`ZeroizeOnDrop` proc-macros (already in the tree via fips204/p256), so
+# the crate builds standalone rather than relying on workspace feature unification.
+zeroize = { workspace = true, features = ["derive"] }
+
+# Host-only oracle for the differential tests: the same standard, an independent
+# codebase, both parameter sets. Deterministic (seed + fixed rnd) so signatures
+# byte-match. Not part of the firmware graph — dev-dependency features do not
+# unify into the `-p firmware` build (resolver v2).
+[dev-dependencies]
+fips204 = { version = "0.4.6", default-features = false, features = ["ml-dsa-44", "ml-dsa-65"] }

@@ -19,16 +19,16 @@ use zeroize::Zeroize;
 
 use crate::Rng;
 use crate::consts::{
-    ALG_EDDSA, ALG_ES256, ALG_ES256K, ALG_ES384, ALG_ES512, ALG_MLDSA44, CURVE_ED25519,
-    CURVE_MLDSA44, CURVE_P256, CURVE_P256K1, CURVE_P384, CURVE_P521,
+    ALG_EDDSA, ALG_ES256, ALG_ES256K, ALG_ES384, ALG_ES512, ALG_MLDSA44, ALG_MLDSA65,
+    CURVE_ED25519, CURVE_MLDSA44, CURVE_MLDSA65, CURVE_P256, CURVE_P256K1, CURVE_P384, CURVE_P521,
 };
 use crate::cose::{cose_key_akp, cose_key_ec2_var, cose_key_okp_var};
 
 /// Maximum DER-encoded P-256 ECDSA signature length.
 pub const MAX_DER_SIG: usize = 72;
-/// Max signature length across all credential schemes — an ML-DSA-44
-/// signature; the EC curves top out at 141 (P-521 DER ECDSA).
-pub const MAX_SIG_LEN: usize = rsk_crypto::MLDSA44_SIG_LEN; // 2420
+/// Max signature length across all credential schemes — an ML-DSA-65
+/// signature; ML-DSA-44 is 2420 and the EC curves top out at 141 (P-521 DER).
+pub const MAX_SIG_LEN: usize = rsk_crypto::MLDSA65_SIG_LEN; // 3309
 /// Bytes the key-derivation ratchet must produce — a P-521 scalar is 66 bytes
 /// (the ML-DSA-44 seed needs only the first 32).
 pub const RATCHET_LEN: usize = 66;
@@ -144,6 +144,10 @@ pub enum CredKey {
     // keys are reconstructed per-op — freeing that headroom. fips204 zeroizes
     // the keys on drop; the `Box` adds no `Drop` of its own.
     MlDsa44(Box<rsk_crypto::MlDsa44>),
+    // ML-DSA-65's ~23 KB expanded key (the in-tree `rsk-mldsa`, which streams the
+    // matrix A so signing fits the RP2350 stack). Boxed for the same reason as
+    // -44: keep the key off the worker stack, below the stack-heavy `sign`.
+    MlDsa65(Box<rsk_crypto::MlDsa65>),
 }
 
 // The SigningKey variants zeroize themselves on drop; the bare P-521 scalar
@@ -215,6 +219,15 @@ impl CredKey {
                 xi.zeroize();
                 Some(Self::MlDsa44(key))
             }
+            c if c == CURVE_MLDSA65 as i64 => {
+                // Same 32-byte-seed derivation as -44, the ML-DSA-65 parameter
+                // set. Boxed off the worker stack (see the variant doc).
+                let mut xi = [0u8; 32];
+                xi.copy_from_slice(raw.get(..32)?);
+                let key = Box::new(rsk_crypto::MlDsa65::from_seed(&xi));
+                xi.zeroize();
+                Some(Self::MlDsa65(key))
+            }
             _ => None,
         }
     }
@@ -228,6 +241,7 @@ impl CredKey {
             Self::K256(_) => ALG_ES256K,
             Self::Ed25519(_) => ALG_EDDSA,
             Self::MlDsa44(_) => ALG_MLDSA44,
+            Self::MlDsa65(_) => ALG_MLDSA65,
         }
     }
 
@@ -297,6 +311,13 @@ impl CredKey {
                 rnd.zeroize();
                 n
             }
+            Self::MlDsa65(k) => {
+                let mut rnd = [0u8; 32];
+                rng.fill(&mut rnd);
+                let n = k.sign(msg, &rnd, out).unwrap_or(0);
+                rnd.zeroize();
+                n
+            }
         }
     }
 
@@ -350,6 +371,7 @@ impl CredKey {
                 cose_key_okp_var(enc, ALG_EDDSA, CURVE_ED25519, &pk)
             }
             Self::MlDsa44(k) => cose_key_akp(enc, ALG_MLDSA44, &k.public_key()),
+            Self::MlDsa65(k) => cose_key_akp(enc, ALG_MLDSA65, &k.public_key()),
         }
     }
 }

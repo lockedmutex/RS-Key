@@ -31,7 +31,7 @@ compiled into the image.
 
 | Area | Default build | `fips-profile` build | Gate |
 |---|---|---|---|
-| FIDO algorithms | ES256, EdDSA, ES384, ES512, ES256K, (ML-DSA-44) | drops **ES256K** (secp256k1 — never NIST-approved) from both the advertised list and credential negotiation | `getinfo.rs`, `makecredential.rs` |
+| FIDO algorithms | ES256, EdDSA, ES384, ES512, ES256K, (ML-DSA-44/-65) | drops **ES256K** (secp256k1 — never NIST-approved) from both the advertised list and credential negotiation | `getinfo.rs`, `makecredential.rs` |
 | FIDO minimum PIN | 4 | **6** (and `setMinPINLength` can only raise it, never lower it) | `consts.rs`, `config.rs` |
 | Seed backup | one-time export window | **export refused** — non-exportable key material; restore (`BACKUP_LOAD`) still works, so keys may migrate *into* a profile device, never out | `vendor.rs` |
 | PIV management key | 3DES or AES | **no new 3DES keys** (SP 800-131A); an existing 3DES key still authenticates so a reflashed device can migrate itself to AES | `piv/lib.rs` |
@@ -55,8 +55,8 @@ Two things worth reading carefully:
   `ssh ed25519-sk` keeps working, and so do Ed25519/cv25519 OpenPGP keys.
 - **NIST P-256 / P-384 / P-521** FIDO and PIV keys — the whole point of the
   profile is to keep these and drop the curve that was never on the list.
-- **ML-DSA-44** — FIPS 204. The post-quantum path is the *point*, not an
-  extra; the profile does not touch it. (Whether it is *advertised* in
+- **ML-DSA-44 / ML-DSA-65** — FIPS 204. The post-quantum path is the *point*,
+  not an extra; the profile does not touch it. (Whether they are *advertised* in
   `getInfo` is the separate `advertise-pqc` flag — capability is on either
   way; see [build.md](../build.md).)
 - **HMAC-SHA-1 in OATH HOTP/TOTP** — RFC 4226 mandates it, and HMAC-SHA-1

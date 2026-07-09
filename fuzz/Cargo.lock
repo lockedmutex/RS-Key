@@ -1306,6 +1306,7 @@ dependencies = [
  "hmac",
  "ml-kem",
  "p256",
+ "rsk-mldsa",
  "sha1",
  "sha2",
  "zeroize",
@@ -1370,6 +1371,14 @@ version = "0.1.0"
 dependencies = [
  "rsk-fs",
  "rsk-sdk",
+]
+
+[[package]]
+name = "rsk-mldsa"
+version = "0.1.0"
+dependencies = [
+ "sha3 0.10.9",
+ "zeroize",
 ]
 
 [[package]]

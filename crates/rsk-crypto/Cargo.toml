@@ -26,3 +26,6 @@ p256 = { workspace = true }
 zeroize = { workspace = true }
 fips204 = { workspace = true }
 ml-kem = { workspace = true }
+# Stack-optimized ML-DSA-65 (the -44 path stays on fips204 until the new code is
+# hardware-verified); re-exported below alongside the fips204 ML-DSA-44 wrapper.
+rsk-mldsa = { workspace = true }

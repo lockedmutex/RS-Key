@@ -138,6 +138,9 @@ pub const CURVE_P256K1: u8 = 8;
 /// selects on `curve`, so the lattice scheme gets a private id well clear of
 /// the registered EC ids (0x2C = 44).
 pub const CURVE_MLDSA44: u8 = 0x2C;
+/// Internal key-slot id for ML-DSA-65 credentials (0x2D = 45), the sibling of
+/// [`CURVE_MLDSA44`] for the higher-security parameter set.
+pub const CURVE_MLDSA65: u8 = 0x2D;
 
 // authenticatorData flag bits.
 pub const FLAG_UP: u8 = 0x01; // user present

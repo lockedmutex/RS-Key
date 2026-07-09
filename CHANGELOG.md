@@ -13,6 +13,22 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+### Added
+
+- **ML-DSA-65 (FIPS 204, COSE `-49`) FIDO credentials.** A second post-quantum
+  signature set alongside ML-DSA-44, negotiable via `pubKeyCredParams` and — like
+  -44 — advertised in getInfo only under the `advertise-pqc` build; under
+  `PREFER_PQC` it outranks -44. It is backed by a new in-tree, stack-optimized
+  ML-DSA implementation (`crates/rsk-mldsa`, `no_std`/no-alloc, no `unsafe`) that
+  **streams the FIPS 204 matrix A** on the fly instead of materializing it, so
+  keygen+signing fit the RP2350's ~222 KiB main stack (~84 KiB host floor) where
+  the by-value `fips204` crate's -65 (~192 KiB) overflowed it — the reason -65
+  was previously dropped. The ML-DSA-44 credential path stays on `fips204` until
+  the new code is hardware-verified. The implementation is checked byte-for-byte
+  against NIST ACVP KATs and differentially against `fips204` for both parameter
+  sets. ML-DSA-87 (`-50`) remains unsupported (its response overruns
+  `maxMsgSize`). Firmware `bcdDevice` → `0x07F9`.
+
 ### Security
 
 - **Host tools neutralise terminal escapes from a counterfeit device on every

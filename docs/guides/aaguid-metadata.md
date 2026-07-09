@@ -69,10 +69,10 @@ hand; it is not in the hardware gate.
 
 ### Two caveats baked into the statement
 
-- **ML-DSA-44 is not expressible.** RS-Key implements a post-quantum credential
-  type (COSE `-48`), but the FIDO Metadata Statement registry has **no enum
-  value** for ML-DSA/Dilithium, so it cannot appear in
-  `authenticationAlgorithms`. It is visible only inside the embedded
+- **ML-DSA is not expressible.** RS-Key implements post-quantum credential types
+  (COSE `-48` / `-49`, ML-DSA-44 / ML-DSA-65), but the FIDO Metadata Statement
+  registry has **no enum value** for ML-DSA/Dilithium, so they cannot appear in
+  `authenticationAlgorithms`. They are visible only inside the embedded
   `authenticatorGetInfo` (and only on the `advertise-pqc` build). A strict MDS
   consumer will simply not see the PQC capability.
 - **One profile per statement.** The build features `advertise-pqc` (adds COSE
