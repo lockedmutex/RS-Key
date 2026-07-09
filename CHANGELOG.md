@@ -15,6 +15,17 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Security
 
+- **`rsk` / `rsk-tui` can no longer be hung or crashed by a hostile device.** The
+  earlier host-tooling hardening bounded only the withheld-continuation-frame case;
+  a malicious device could still (a) stream `CTAPHID_KEEPALIVE` frames forever to
+  hang `rsk` and freeze the synchronous TUI, (b) send short continuation frames that
+  made no progress, (c) return over-nested or non-UTF-8 CBOR to crash the decoder,
+  (d) answer `rsk hw --transport fido`'s `CONFIG_READ` with a non-byte value to
+  crash it, and (e) embed terminal escape sequences in getInfo/identity text that
+  `rsk-tui --once` printed raw. The keepalive waits are now deadline-bounded, the
+  CBOR decoder is depth- and UTF-8-hardened, the PHY `CONFIG_READ` path validates
+  the value type (matching the LED path), and `--once` strips control bytes from
+  device-controlled strings. (`tools/rsk` 0.3.6, `tools/tui` 0.2.6)
 - **OpenPGP: the resetting code is no longer pre-set to the public default
   `12345678`.** Initialisation seeded the reset code (`EF_RC`) to the well-known
   admin default with an active retry counter, so an unauthenticated host could
