@@ -11,6 +11,7 @@ import json
 
 from . import ccid, ctaphid
 from .backup import CTAP_VENDOR, STATE as VENDOR_STATE
+from .common import sanitize
 
 RESCUE_AID = [0xA0, 0x58, 0x3F, 0xC1, 0x9B, 0x7E, 0x4F, 0x21]
 INS_RESCUE_READ = 0x1E
@@ -105,7 +106,7 @@ def run(args):
         print("FIDO HID   : not found")
     else:
         print(f"FIDO HID   : present  fw {f.get('fw')}  aaguid {f.get('aaguid', '')[:16]}…")
-        print(f"  versions : {', '.join(f.get('versions') or [])}")
+        print(f"  versions : {sanitize(', '.join(f.get('versions') or []))}")
         print(f"  clientPin: {f.get('clientPin')}")
         b = f.get("backup")
         if b:

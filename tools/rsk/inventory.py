@@ -25,7 +25,7 @@ import sys
 from . import ccid, ctaphid
 from .audit import AUDIT_CHECKPOINT, _fingerprint, verify_checkpoint
 from .backup import ERR_NOT_ALLOWED, _die_pin_required, _die_touch_denied, _gated, _vendor
-from .common import add_pin_arg, connect_fido, device_has_pin, die, resolve_pin
+from .common import add_pin_arg, connect_fido, device_has_pin, die, resolve_pin, sanitize
 from .fido import ATT_STATE  # vendor: org-attestation state (ungated)
 from .status import RESCUE_AID, VENDOR_STATE, _fw, rescue_read, rescue_serial
 
@@ -140,7 +140,7 @@ def gather():
 # --- list ---------------------------------------------------------------------
 
 def _print_record(rec):
-    name = rec.get("serial") or rec.get("product") or "?"
+    name = sanitize(rec.get("serial") or rec.get("product") or "?")
     print(f"device {name}  ({rec['transport']})")
     if rec.get("error"):
         print(f"  error      : {rec['error']}")
@@ -156,7 +156,7 @@ def _print_record(rec):
     if fl:
         print(f"  flash      : {fl['used']}/{fl['kv_total']} B used, {fl['files']} files")
     if rec.get("versions") is not None:
-        print(f"  fido       : {', '.join(rec['versions'])}  clientPin={rec.get('client_pin')}")
+        print(f"  fido       : {sanitize(', '.join(rec['versions']))}  clientPin={rec.get('client_pin')}")
     b, lk = rec.get("backup"), rec.get("lock")
     if b:
         lock = ("LOCKED" if lk["locked"] else "off") if lk else "n/a"

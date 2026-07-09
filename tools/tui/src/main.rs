@@ -152,10 +152,19 @@ fn print_help() {
 /// Strip terminal control bytes from a device-controlled string before printing it raw.
 /// The `--once` path bypasses ratatui (whose cell grid neutralizes escapes), so a hostile
 /// device could otherwise embed ANSI/OSC sequences in getInfo/identity text to manipulate or
-/// spoof the operator's terminal. Any C0/C1 control (incl. ESC) becomes U+FFFD.
+/// spoof the operator's terminal. Any C0/C1 control (incl. ESC) — and the Cf bidi/format
+/// overrides that `char::is_control()` misses (Trojan-Source reordering) — becomes U+FFFD.
 fn sanitize(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+        .map(|c| {
+            let bidi = matches!(c,
+                '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
+            if c.is_control() || bidi {
+                '\u{fffd}'
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
@@ -238,3 +247,7 @@ fn print_once(s: &model::DeviceSnapshot) {
         println!("note       : {e}");
     }
 }
+
+#[cfg(test)]
+#[path = "main_tests.rs"]
+mod tests;

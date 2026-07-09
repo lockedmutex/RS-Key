@@ -15,6 +15,20 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Security
 
+- **Host tools neutralise terminal escapes from a counterfeit device on every
+  path.** The earlier escape hardening reached only `rsk-tui --once`, and even
+  there stripped only C0/C1 controls. The Python `rsk` CLI had no sanitizer at
+  all, so a hostile device's USB product descriptor, getInfo `versions`, or a
+  resident credential's rpId / `user.name` could inject ANSI/OSC sequences
+  (screen repaint to forge a "genuine device" banner, `OSC 0` window-title,
+  `OSC 52` clipboard write) into the operator's terminal on `rsk inventory` /
+  `rsk status` / `rsk fido list-passkeys`. And the TUI's `char::is_control()`
+  filter let Unicode bidi/format overrides (U+202E and the isolates) through,
+  leaving a Trojan-Source reordering of the printed identity line. Both tools now
+  route every device-controlled string through a shared sanitizer that maps C0/C1
+  controls **and** Cf bidi/format characters to U+FFFD. Terminal-display integrity
+  only — no device secret, PIN, or presence is involved. (`tools/rsk` 0.3.7,
+  `tools/tui` 0.2.7)
 - **Trusted display: the passkey manager keeps the registrable-domain suffix on
   every screen.** The earlier anti-phishing fix reached only the getAssertion/
   add-passkey ceremonies and the Confirm-Delete card; the passkey **list** row and

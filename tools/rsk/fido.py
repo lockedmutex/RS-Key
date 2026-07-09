@@ -9,7 +9,7 @@ list-passkeys: list discoverable credentials via credentialManagement (needs PIN
 import sys
 from getpass import getpass
 
-from .common import add_pin_arg, device_has_pin, die, resolve_pin
+from .common import add_pin_arg, device_has_pin, die, resolve_pin, sanitize
 
 try:
     from fido2.hid import CtapHidDevice
@@ -99,12 +99,12 @@ def list_passkeys(args):
         return
     for rp in cm.enumerate_rps():
         rp_id = rp[CM.RESULT.RP].get("id")
-        print(f"\nRP: {rp_id}")
+        print(f"\nRP: {sanitize(rp_id)}")
         for cred in cm.enumerate_creds(rp[CM.RESULT.RP_ID_HASH]):
             user = cred[CM.RESULT.USER]
             cid = cred[CM.RESULT.CREDENTIAL_ID]["id"]
             name = user.get("name") or user.get("displayName") or user.get("id")
-            print(f"   user={name}  credId={cid.hex()[:24]}…")
+            print(f"   user={sanitize(name)}  credId={cid.hex()[:24]}…")
 
 
 # --- org attestation (vendor 0x41 subcommands 0x09-0x0B) ---------------------

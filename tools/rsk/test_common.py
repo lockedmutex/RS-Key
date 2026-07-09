@@ -95,3 +95,27 @@ def test_non_tty_required_dies(monkeypatch):
     _stub_tty(monkeypatch, tty=False)
     with pytest.raises(SystemExit):
         common.resolve_pin(_args(), has_pin=True, required=True)
+
+
+# --- sanitize: a counterfeit device must not inject terminal escapes ----------
+# inventory/status/fido print device-controlled strings (USB descriptor, getInfo
+# versions, resident-cred rpId/user.name) raw; sanitize is the one chokepoint.
+
+def test_sanitize_strips_ansi_osc_escapes():
+    # ESC (0x1b) + BEL (0x07) drive OSC/CSI: window-title set, screen clear, OSC-52.
+    out = common.sanitize("\x1b]0;pwn\x07\x1b[2Jok\x1b]52;c;AAAA\x07")
+    assert "\x1b" not in out and "\x07" not in out
+    assert out.endswith("ok�]52;c;AAAA�")
+
+
+def test_sanitize_strips_bidi_override():
+    # U+202E RIGHT-TO-LEFT OVERRIDE — Trojan-Source visual reordering (Cf).
+    assert "‮" not in common.sanitize("alice‮0.2_ODIF")
+
+
+def test_sanitize_preserves_benign_text():
+    assert common.sanitize("FIDO_2_0, U2F_V2") == "FIDO_2_0, U2F_V2"
+
+
+def test_sanitize_coerces_non_str():
+    assert common.sanitize(None) == "None"
