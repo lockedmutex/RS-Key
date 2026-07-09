@@ -238,7 +238,7 @@ fn service_detail_paints_accounts_and_back_affordance() {
     ];
     let title = Label::clamp(b"github.com");
     let mut d = Rec::new();
-    render_service(&mut d, &title, &accounts, 0, 2).unwrap();
+    render_service(&mut d, &title, true, &accounts, 0, 2).unwrap();
     assert!(!d.oob, "detail drew outside the panel");
     // The back chevron paints in TITLE_BACK_RECT — where hit_title_back maps a tap.
     assert!(
@@ -265,11 +265,68 @@ fn service_title_clips_a_wide_nickname_in_panel() {
     }];
     let wide = Label::clamp(&[b'W'; 24]);
     let mut d = Rec::new();
-    render_service(&mut d, &wide, &accounts, 0, 1).unwrap();
+    render_service(&mut d, &wide, false, &accounts, 0, 1).unwrap();
     assert!(!d.oob, "wide service title drew outside the panel");
     // The pencil's region still gets its glyph (the title didn't paint over it... the
     // clip ends before it).
     assert!(d.any_non_bg_in(crate::TITLE_EDIT_RECT));
+}
+
+#[test]
+fn passkey_manager_keeps_the_registrable_domain_suffix() {
+    // A wide attacker-chosen rpId whose registrable domain is the tail: the passkey list row
+    // and the service-detail title must keep the suffix (head-ellipsis, title_is_rp=true / no
+    // nickname) rather than head-first-cut it (as a user-chosen nickname would). Rendering the
+    // domain path vs the head-keep path must therefore paint different title/row pixels — the
+    // suffix-hiding regression this guards would render them identically.
+    let mut src = [b'a'; 60]; // > LABEL_MAX, so clamp_domain drops the head, keeps the tail
+    src[47..].copy_from_slice(b".attacker.com");
+    let rp = Label::clamp_domain(&src);
+    assert!(rp.truncated && rp.as_str().ends_with(".attacker.com"));
+    let accounts = [AccountRow {
+        name: Label::clamp(b"victim@corp.example"),
+        protected: false,
+    }];
+
+    // Service-detail title: domain (suffix-kept) must differ from the head-kept rendering.
+    let mut dom = Rec::new();
+    render_service(&mut dom, &rp, true, &accounts, 0, 1).unwrap();
+    let mut head = Rec::new();
+    render_service(&mut head, &rp, false, &accounts, 0, 1).unwrap();
+    assert!(!dom.oob && !head.oob, "wide rpId title overran the panel");
+    let title_differs = (0..PANEL_W).any(|x| (24..48).any(|y| dom.at(x, y) != head.at(x, y)));
+    assert!(
+        title_differs,
+        "service-detail title must keep the registrable-domain suffix (head-ellipsis), not head-cut it"
+    );
+
+    // Passkey list row: a row showing the rpId (no nickname) must likewise differ from one
+    // whose identical text is treated as a head-keep nickname.
+    let rp_row = RpRow {
+        id: rp,
+        nick: Label::default(),
+        accounts: 1,
+    };
+    let nick_row = RpRow {
+        id: Label::default(),
+        nick: rp,
+        accounts: 1,
+    };
+    let mut list_rp = Rec::new();
+    render_passkeys_list(&mut list_rp, &[rp_row], 0, 1).unwrap();
+    let mut list_nick = Rec::new();
+    render_passkeys_list(&mut list_nick, &[nick_row], 0, 1).unwrap();
+    assert!(
+        !list_rp.oob && !list_nick.oob,
+        "wide rpId row overran the panel"
+    );
+    let row = crate::row_rect(PK_LIST_TOP, 0);
+    let row_differs = (0..PANEL_W)
+        .any(|x| (row.y..row.y + row.h).any(|y| list_rp.at(x, y) != list_nick.at(x, y)));
+    assert!(
+        row_differs,
+        "passkey list row must keep the registrable-domain suffix for an rpId, not head-cut it"
+    );
 }
 
 #[test]

@@ -15,6 +15,15 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Security
 
+- **Trusted display: the passkey manager keeps the registrable-domain suffix on
+  every screen.** The earlier anti-phishing fix reached only the getAssertion/
+  add-passkey ceremonies and the Confirm-Delete card; the passkey **list** row and
+  the **service-detail title** still head-truncated an over-long relying-party id,
+  hiding the real domain behind the ellipsis on the very screens used to review and
+  delete credentials. They now head-ellipsize (`...registrable.domain`) when showing
+  the rpId — a look-alike such as `accounts.google.com.attacker.com` can no longer
+  read as a legitimate Google passkey. A user-set device-local nickname still keeps
+  its head. bcdDevice `0x07F7` → `0x07F8`.
 - **`rsk` / `rsk-tui` can no longer be hung or crashed by a hostile device.** The
   earlier host-tooling hardening bounded only the withheld-continuation-frame case;
   a malicious device could still (a) stream `CTAPHID_KEEPALIVE` frames forever to

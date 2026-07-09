@@ -43,7 +43,10 @@ where
             };
             let trailing = fmt_count(r.accounts as u16, unit, &mut buf);
             let name = r.shown();
-            row_body(
+            // When the row shows the attacker-chosen rpId (no device-local nickname), keep the
+            // registrable-domain suffix (head-ellipsis) so a padded look-alike can't hide the
+            // real domain on the review list; a user-set nickname keeps the head like any label.
+            row_body_side(
                 t,
                 crate::row_rect(PK_LIST_TOP, i as u16),
                 service_glyph(name),
@@ -51,6 +54,7 @@ where
                 Some((trailing, MUTED)),
                 true,
                 true,
+                r.nick.is_empty(),
             )?;
         }
         list_tail(t, page, total, "item", "items")?;
@@ -67,6 +71,7 @@ where
 pub fn render_service<D>(
     t: &mut D,
     title: &Label,
+    title_is_rp: bool,
     accounts: &[AccountRow],
     page: u16,
     total: u16,
@@ -76,7 +81,14 @@ where
 {
     t.clear(BG)?;
     status_bar(t)?;
-    title_bar(t, title.as_str(), theme::ACCENT, true)?;
+    // The title is the attacker-chosen rpId unless the user set a device-local nickname; when
+    // it is the rpId, head-ellipsize so the registrable-domain suffix stays visible (matches
+    // the list row and the Confirm-Delete card).
+    if title_is_rp {
+        title_bar_domain(t, title.as_str(), theme::ACCENT, true)?;
+    } else {
+        title_bar(t, title.as_str(), theme::ACCENT, true)?;
+    }
     glyph_centered(t, Glyph::Edit, TITLE_EDIT_RECT, 18, theme::ACCENT)?;
     group_card(t, PK_LIST_TOP, accounts.len() as u16)?;
     for (i, a) in accounts.iter().enumerate() {

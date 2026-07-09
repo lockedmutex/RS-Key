@@ -112,7 +112,14 @@ impl Ui {
         let mut nick = *nick0;
         let title = |nick: &Label| if nick.is_empty() { *rp_id } else { *nick };
         let (mut n, mut total) = self.load_accts(hash, &mut accts, &mut fids, page);
-        let _ = rsk_ui::render_service(&mut self.panel, &title(&nick), &accts[..n], page, total);
+        let _ = rsk_ui::render_service(
+            &mut self.panel,
+            &title(&nick),
+            nick.is_empty(),
+            &accts[..n],
+            page,
+            total,
+        );
         self.shown = None;
         self.touch.wait_release(Instant::now(), idle_limit);
 
@@ -139,6 +146,7 @@ impl Ui {
                     let _ = rsk_ui::render_service(
                         &mut self.panel,
                         &title(&nick),
+                        nick.is_empty(),
                         &accts[..n],
                         page,
                         total,
@@ -165,6 +173,7 @@ impl Ui {
                     let _ = rsk_ui::render_service(
                         &mut self.panel,
                         &title(&nick),
+                        nick.is_empty(),
                         &accts[..n],
                         page,
                         total,
@@ -196,6 +205,7 @@ impl Ui {
                     let _ = rsk_ui::render_service(
                         &mut self.panel,
                         &title(&nick),
+                        nick.is_empty(),
                         &accts[..n],
                         page,
                         total,
