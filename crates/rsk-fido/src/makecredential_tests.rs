@@ -1122,20 +1122,24 @@ fn selected_alg(algs: &[i64]) -> Result<i64, CtapError> {
 #[test]
 fn pqc_priority_selection() {
     use crate::consts::{ALG_MLDSA44, ALG_MLDSA65, ALG_MLDSA87};
-    // PREFER_PQC: ML-DSA-44 wins even when listed after a classic alg —
+    // PREFER_PQC: an ML-DSA set wins even when listed after a classic alg —
     // and, trivially, when listed first.
     assert_eq!(selected_alg(&[ALG_ES256, ALG_MLDSA44]), Ok(ALG_MLDSA44));
     assert_eq!(selected_alg(&[ALG_MLDSA44, ALG_ES256]), Ok(ALG_MLDSA44));
+    assert_eq!(selected_alg(&[ALG_ES256, ALG_MLDSA65]), Ok(ALG_MLDSA65));
+    // ML-DSA-65 outranks ML-DSA-44 regardless of list order.
+    assert_eq!(selected_alg(&[ALG_MLDSA44, ALG_MLDSA65]), Ok(ALG_MLDSA65));
+    assert_eq!(selected_alg(&[ALG_MLDSA65, ALG_MLDSA44]), Ok(ALG_MLDSA65));
     // No PQC offered → the first supported entry.
     assert_eq!(selected_alg(&[ALG_ES256]), Ok(ALG_ES256));
     assert_eq!(
         selected_alg(&[crate::consts::ALG_ES384, ALG_ES256]),
         Ok(crate::consts::ALG_ES384)
     );
-    // -49/-50 are recognized ids without a backend: alone they are
+    // -50 (ML-DSA-87) is a recognized id without a backend: alone it is
     // unsupported; alongside a classic alg the classic one is selected.
     assert_eq!(
-        selected_alg(&[ALG_MLDSA65]),
+        selected_alg(&[ALG_MLDSA87]),
         Err(CtapError::UnsupportedAlgorithm)
     );
     assert_eq!(selected_alg(&[ALG_MLDSA87, ALG_ES256]), Ok(ALG_ES256));

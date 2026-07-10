@@ -230,7 +230,10 @@ needs only the identifiers above. RS-Key implements:
 - **FIDO2 / CTAP 2.1** — getInfo, makeCredential, getAssertion, getNextAssertion,
   clientPIN, reset, selection, credentialManagement, authenticatorConfig,
   largeBlobs. `maxMsgSize` = `7609`. Supported COSE algorithms:
-  ES256 `-7`, ES384 `-35`, ES512 `-36`, ES256K `-47`, EdDSA `-8`, ML-DSA-44 `-48`.
+  ES256 `-7`, ES384 `-35`, ES512 `-36`, ES256K `-47`, EdDSA `-8`,
+  ML-DSA-44 `-48`, ML-DSA-65 `-49` (both negotiable via `pubKeyCredParams`;
+  advertised in getInfo only under the `advertise-pqc` build). ML-DSA-87 `-50`
+  is recognised but unsupported — its response overruns `maxMsgSize`.
   (`crates/rsk-fido/src/consts.rs`.)
 - **CTAP1 / U2F 1.1/1.2.**
 - **PIV** — NIST SP 800-73 (Yubico PIV extensions for metadata).

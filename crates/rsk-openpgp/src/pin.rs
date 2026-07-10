@@ -135,6 +135,21 @@ fn pin_reset_retries<S: Storage>(fs: &mut Fs<S>, fid: u16, force: bool) -> Resul
     fs.put(EF_PW_PRIV, &pw[..n]).map_err(|_| Sw::MEMORY_FAILURE)
 }
 
+/// Set PIN `fid`'s retry counter in EF_PW_PRIV to an explicit value. Used to
+/// deactivate the resetting code (counter 0) when it is cleared.
+fn set_pin_retry_counter<S: Storage>(fs: &mut Fs<S>, fid: u16, value: u8) -> Result<(), Sw> {
+    let mut pw = [0u8; 8];
+    let n = fs
+        .read(EF_PW_PRIV, &mut pw)
+        .ok_or(Sw::REFERENCE_NOT_FOUND)?;
+    let idx = pw_retry_idx(fid);
+    if idx >= n {
+        return Err(Sw::MEMORY_FAILURE);
+    }
+    pw[idx] = value;
+    fs.put(EF_PW_PRIV, &pw[..n]).map_err(|_| Sw::MEMORY_FAILURE)
+}
+
 /// Verify `data` against the stored verifier of PIN `fid`. On success resets
 /// the retry counter and sets the matching `has_pw*` flag + session key; on
 /// failure decrements the counter and returns `63 Cx` / blocked.
@@ -391,6 +406,12 @@ pub fn change_pin<S: Storage>(
     if p1 != 0x00 {
         return Sw::WRONG_P1P2;
     }
+    // Reject an unsupported P2 before any verifier write. P2=0x82 maps via
+    // pw_fid to EF_RC; letting put_verifier rewrite it before the trailing
+    // `match p2` rejected desynced the RC verifier from its EF_DEK_RC seal.
+    if p2 != PW1_MODE81 && p2 != PW3_MODE83 {
+        return Sw::WRONG_P1P2;
+    }
     let fid = pw_fid(p2);
     let mut rec = [0u8; 64];
     let old_len = match fs.read(fid, &mut rec) {
@@ -523,6 +544,7 @@ pub fn put_reset_code<S: Storage>(
     if data.is_empty() {
         let _ = fs.delete(EF_RC);
         let _ = fs.delete_key(EF_DEK_RC);
+        let _ = set_pin_retry_counter(fs, EF_RC, 0);
         sess.has_rc = false;
         return Sw::OK;
     }
@@ -534,6 +556,9 @@ pub fn put_reset_code<S: Storage>(
     let result = (|| {
         put_verifier(dev, fs, EF_RC, data)?;
         rewrap_dek(dev, fs, rng, EF_DEK_RC, data, &dek)?;
+        // Activate the resetting code: it ships deactivated (counter 0), so
+        // enable its retry counter now that a real RC exists.
+        pin_reset_retries(fs, EF_RC, true)?;
         Ok::<(), Sw>(())
     })();
     dek.zeroize();

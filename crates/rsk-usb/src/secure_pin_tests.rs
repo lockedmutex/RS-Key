@@ -95,6 +95,25 @@ fn assemble_rejects_non_verify_ins() {
 }
 
 #[test]
+fn assemble_forces_class_zero_ignoring_host_cla() {
+    // A host CLA with the ISO 7816-4 command-chaining bit (0x10) must not survive
+    // into the assembled APDU — else the dispatcher would buffer the on-pad PIN as a
+    // chain segment instead of running VERIFY. The class is always forced to 0x00.
+    let mut out = [0u8; 64];
+    let n = assemble_verify(&[0x10, 0x20, 0x00, 0x81], b"123456", &mut out).unwrap();
+    assert_eq!(
+        out[0], 0x00,
+        "class byte must be forced to 0x00, not the host 0x10"
+    );
+    assert_eq!(
+        &out[..n],
+        &[
+            0x00, 0x20, 0x00, 0x81, 0x06, b'1', b'2', b'3', b'4', b'5', b'6'
+        ]
+    );
+}
+
+#[test]
 fn assemble_rejects_short_template_and_buffer() {
     let mut out = [0u8; 64];
     assert!(assemble_verify(&[0x00, 0x20, 0x00], b"123456", &mut out).is_none());

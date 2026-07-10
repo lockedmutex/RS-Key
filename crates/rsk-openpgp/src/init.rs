@@ -76,12 +76,12 @@ pub fn scan_files<S: Storage>(
         fs.put_key(EF_DEK_PW1, Sealed::wrap(&def))
             .map_err(|_| Error::Storage)?;
 
-        // RC and PW3 share one blob sealed under the PW3 session.
+        // PW3's DEK copy, sealed under the PW3 session. No `EF_DEK_RC` is created:
+        // the resetting code is deactivated until `PUT DATA 0xD3` (put_reset_code)
+        // seals its own copy under the admin-chosen RC.
         rng.fill(&mut nonce);
         dev.encrypt_with_aad(&session_pw3, &random_dek, PinKdf::V2, &nonce, &mut def[1..])
             .map_err(|_| Error::Crypto)?;
-        fs.put_key(EF_DEK_RC, Sealed::wrap(&def))
-            .map_err(|_| Error::Storage)?;
         fs.put_key(EF_DEK_PW3, Sealed::wrap(&def))
             .map_err(|_| Error::Storage)?;
 
@@ -95,9 +95,9 @@ pub fn scan_files<S: Storage>(
     if reset_dek || !fs.has_data(EF_PW1) {
         put_pin_verifier(fs, dev, EF_PW1, PW1_DEFAULT)?;
     }
-    if reset_dek || !fs.has_data(EF_RC) {
-        put_pin_verifier(fs, dev, EF_RC, PW3_DEFAULT)?;
-    }
+    // No EF_RC verifier at init: the resetting code stays unset until an admin
+    // sets it via PUT DATA 0xD3. (Seeding it to PW3_DEFAULT made RESET RETRY P1=0
+    // an unauthenticated PW1-reset backdoor.)
     if reset_dek || !fs.has_data(EF_PW3) {
         put_pin_verifier(fs, dev, EF_PW3, PW3_DEFAULT)?;
     }
@@ -121,6 +121,40 @@ pub fn scan_files<S: Storage>(
     }
     if !fs.has_data(EF_PW_RETRIES) {
         put(fs, EF_PW_RETRIES, PW_RETRIES_INIT)?;
+    }
+    neutralize_default_reset_code(dev, fs)?;
+    Ok(())
+}
+
+/// SECURITY: firmware through bcdDevice 0x07F6 seeded the resetting code to the
+/// public admin default "12345678" with an active retry counter, making
+/// `RESET RETRY P1=0` an unauthenticated PW1-reset backdoor. Neutralise any
+/// already-provisioned card still carrying that default RC — delete the RC
+/// verifier and its DEK copy and zero the RC retry counter — restoring the spec's
+/// "reset code deactivated until PUT DATA 0xD3" state. A real admin-set RC (a
+/// different verifier) is left untouched.
+fn neutralize_default_reset_code<S: Storage>(dev: &Device, fs: &mut Fs<S>) -> Result<(), Error> {
+    let mut rec = [0u8; 64];
+    // RC verifier record is [len, 0x01, verifier(32)].
+    let stored = match fs.read(EF_RC, &mut rec) {
+        Some(n) if n >= 34 && rec[0] != 0 => &rec[2..34],
+        _ => return Ok(()),
+    };
+    let is_default = rsk_crypto::ct_eq(stored, &dev.pin_derive_verifier(PW3_DEFAULT))
+        || (dev.otp_key.is_some()
+            && rsk_crypto::ct_eq(stored, &dev.without_otp().pin_derive_verifier(PW3_DEFAULT)));
+    if !is_default {
+        return Ok(());
+    }
+    let _ = fs.delete(EF_RC);
+    let _ = fs.delete_key(EF_DEK_RC);
+    let mut pw = [0u8; 8];
+    if let Some(pn) = fs.read(EF_PW_PRIV, &mut pw) {
+        let idx = pw_retry_idx(EF_RC);
+        if idx < pn {
+            pw[idx] = 0;
+            let _ = fs.put(EF_PW_PRIV, &pw[..pn]);
+        }
     }
     Ok(())
 }

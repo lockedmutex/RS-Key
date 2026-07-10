@@ -429,7 +429,7 @@ impl<'d, D: Driver<'d>, H: MsgHandler> CtapHid<'d, D, H> {
                 )
                 .await
                 {
-                    Either::First(Ok(n)) if n >= 5 => self.on_frame(&frame).await,
+                    Either::First(Ok(n)) if n == HID_RPT_SIZE => self.on_frame(&frame).await,
                     Either::First(_) => {}
                     Either::Second(_) => {
                         let cid = self.asm.current_cid();
@@ -439,8 +439,11 @@ impl<'d, D: Driver<'d>, H: MsgHandler> CtapHid<'d, D, H> {
                     }
                 }
             } else {
+                // Only a full 64-byte report is a valid CTAPHID frame; a short
+                // read would leave stale bytes in the buffer's tail, which
+                // `feed` (a `&[u8; 64]`) would otherwise parse as payload.
                 match self.reader.read(&mut frame).await {
-                    Ok(n) if n >= 5 => self.on_frame(&frame).await,
+                    Ok(n) if n == HID_RPT_SIZE => self.on_frame(&frame).await,
                     _ => {}
                 }
             }

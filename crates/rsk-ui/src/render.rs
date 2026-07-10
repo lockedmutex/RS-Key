@@ -451,6 +451,50 @@ fn text_left_ellipsized<D: DrawTarget<Color = Rgb565>>(
     font::left(&mut t.clipped(&eg_rect(clip)), out, at, role, color)
 }
 
+/// Like [`text_left_ellipsized`] but keeps the **suffix** and prepends the marker:
+/// `"...registrable.domain"`. Used for relying-party / domain labels, where the
+/// security-relevant part is the rightmost registrable domain — head-truncation
+/// would let a look-alike (`accounts.google.com.attacker.com`) hide the real domain
+/// behind the ellipsis. `s` is ASCII (a [`crate::Label`]), so a byte is a char.
+fn text_right_ellipsized<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    s: &str,
+    at: EgPoint,
+    role: Role,
+    color: Rgb565,
+    clip: Rect,
+    force_mark: bool,
+) -> Result<(), D::Error> {
+    if !force_mark && font::width(s, role).unwrap_or(0) <= clip.w as u32 {
+        return font::left(&mut t.clipped(&eg_rect(clip)), s, at, role, color);
+    }
+    const ELL: &str = "...";
+    let budget = (clip.w as u32).saturating_sub(font::width(ELL, role).unwrap_or(0));
+    // Widest byte-suffix whose width still leaves room for the leading ellipsis: walk
+    // the start boundary backward from the end until `s[start..]` no longer fits.
+    let mut start = s.len();
+    let mut i = s.len();
+    while i > 0 {
+        i -= 1;
+        if s.is_char_boundary(i) {
+            if font::width(&s[i..], role).unwrap_or(u32::MAX) <= budget {
+                start = i;
+            } else {
+                break;
+            }
+        }
+    }
+    let mut buf = [0u8; 67];
+    buf[..ELL.len()].copy_from_slice(ELL.as_bytes());
+    // Keep the rightmost bytes of the fitting suffix, bounded to the buffer.
+    let suffix = &s.as_bytes()[start..];
+    let n = suffix.len().min(buf.len() - ELL.len());
+    let suffix = &suffix[suffix.len() - n..];
+    buf[ELL.len()..ELL.len() + n].copy_from_slice(suffix);
+    let out = core::str::from_utf8(&buf[..ELL.len() + n]).unwrap_or(ELL);
+    font::left(&mut t.clipped(&eg_rect(clip)), out, at, role, color)
+}
+
 /// The persistent top **status bar** (the design's framing chrome): a mono "RS-Key"
 /// wordmark at the left and the USB power indicator at the right. Faint, so it frames
 /// the screen without competing with content. This is a bus-powered device, so the power
@@ -497,7 +541,34 @@ pub fn title_bar<D: DrawTarget<Color = Rgb565>>(
     back: bool,
 ) -> Result<(), D::Error> {
     // Default: leave the right edge for the [`render_service`] edit pencil.
-    title_bar_to(t, title, color, back, TITLE_EDIT_RECT.x.saturating_sub(4))
+    title_bar_to(
+        t,
+        title,
+        color,
+        back,
+        TITLE_EDIT_RECT.x.saturating_sub(4),
+        false,
+    )
+}
+
+/// A [`title_bar`] whose title is an **attacker-chosen domain** (a relying-party id): it
+/// head-ellipsizes (`...registrable.domain`) so the security-relevant suffix stays on
+/// screen, instead of the tail-cut a padded look-alike could hide the real domain behind.
+/// Same right-edge as [`title_bar`] (reserves the [`render_service`] edit pencil).
+pub fn title_bar_domain<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    title: &str,
+    color: Rgb565,
+    back: bool,
+) -> Result<(), D::Error> {
+    title_bar_to(
+        t,
+        title,
+        color,
+        back,
+        TITLE_EDIT_RECT.x.saturating_sub(4),
+        true,
+    )
 }
 
 /// A [`title_bar`] for screens that draw **no** right-edge affordance (the applet
@@ -509,17 +580,20 @@ fn title_bar_wide<D: DrawTarget<Color = Rgb565>>(
     color: Rgb565,
     back: bool,
 ) -> Result<(), D::Error> {
-    title_bar_to(t, title, color, back, PANEL_W - 13)
+    title_bar_to(t, title, color, back, PANEL_W - 13, false)
 }
 
 /// Shared title-bar paint: an optional back chevron, then the title clipped to end at
 /// `right` (a single px past which nothing paints), so paint and the back hit-test agree.
+/// `domain` keeps the suffix (head-ellipsis) for an attacker-chosen relying-party id; the
+/// default keeps the head (tail-ellipsis) for a static / user-chosen title.
 fn title_bar_to<D: DrawTarget<Color = Rgb565>>(
     t: &mut D,
     title: &str,
     color: Rgb565,
     back: bool,
     right: u16,
+    domain: bool,
 ) -> Result<(), D::Error> {
     let cy = STATUS_BAR_H as i32 + TITLE_BAR_H as i32 / 2;
     let tx = if back {
@@ -534,15 +608,12 @@ fn title_bar_to<D: DrawTarget<Color = Rgb565>>(
         right.saturating_sub(tx as u16),
         TITLE_BAR_H,
     );
-    text_left_ellipsized(
-        t,
-        title,
-        EgPoint::new(tx, cy),
-        Role::Heading,
-        color,
-        clip,
-        false,
-    )
+    let at = EgPoint::new(tx, cy);
+    if domain {
+        text_right_ellipsized(t, title, at, Role::Heading, color, clip, false)
+    } else {
+        text_left_ellipsized(t, title, at, Role::Heading, color, clip, false)
+    }
 }
 
 /// The top header strip: a title (accent or muted) at the left, an optional status
@@ -608,7 +679,6 @@ pub fn render_row<D: DrawTarget<Color = Rgb565>>(
 /// an optional trailing coloured status/value, and an optional drill-in chevron — *without*
 /// the card behind it. [`render_row`] adds the card for a standalone row; [`group_card`]
 /// backs a whole grouped list, then each row's content is drawn with this.
-#[allow(clippy::too_many_arguments)]
 fn row_body<D: DrawTarget<Color = Rgb565>>(
     t: &mut D,
     rect: Rect,
@@ -617,6 +687,25 @@ fn row_body<D: DrawTarget<Color = Rgb565>>(
     trailing: Option<(&str, Rgb565)>,
     chevron: bool,
     chip: bool,
+) -> Result<(), D::Error> {
+    // Default: keep the head (tail-ellipsis) — the label is static or a user-chosen name.
+    row_body_side(t, rect, icon, label, trailing, chevron, chip, false)
+}
+
+/// [`row_body`] with an explicit ellipsis side: `domain = true` keeps the registrable-domain
+/// **suffix** (head-ellipsis) for an attacker-chosen relying-party id, so a padded look-alike
+/// can't hide the real domain behind the cut on the passkey list. Every other row keeps the
+/// head like [`row_body`].
+#[allow(clippy::too_many_arguments)]
+fn row_body_side<D: DrawTarget<Color = Rgb565>>(
+    t: &mut D,
+    rect: Rect,
+    icon: Glyph,
+    label: &str,
+    trailing: Option<(&str, Rgb565)>,
+    chevron: bool,
+    chip: bool,
+    domain: bool,
 ) -> Result<(), D::Error> {
     let cy = rect.y as i32 + rect.h as i32 / 2;
     // A service row carries the design's icon chip — a small rounded tile behind the glyph;
@@ -670,15 +759,12 @@ fn row_body<D: DrawTarget<Color = Rgb565>>(
         (label_right - label_x).max(0) as u16,
         rect.h,
     );
-    text_left_ellipsized(
-        t,
-        label,
-        EgPoint::new(label_x, cy),
-        Role::Body,
-        theme::TEXT,
-        clip,
-        false,
-    )
+    let at = EgPoint::new(label_x, cy);
+    if domain {
+        text_right_ellipsized(t, label, at, Role::Body, theme::TEXT, clip, false)
+    } else {
+        text_left_ellipsized(t, label, at, Role::Body, theme::TEXT, clip, false)
+    }
 }
 
 /// Paint one grouped surface behind list rows `0..n` (each at `row_rect(y0, i)`), with a

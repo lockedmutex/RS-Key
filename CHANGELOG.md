@@ -13,6 +13,135 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+## [0.3.3] — 2026-07-10
+
+### Added
+
+- **ML-DSA-65 (FIPS 204, COSE `-49`) FIDO credentials.** A second post-quantum
+  signature set alongside ML-DSA-44, negotiable via `pubKeyCredParams` and — like
+  -44 — advertised in getInfo only under the `advertise-pqc` build; under
+  `PREFER_PQC` it outranks -44. It is backed by a new in-tree, stack-optimized
+  ML-DSA implementation (`crates/rsk-mldsa`, `no_std`/no-alloc, no `unsafe`) that
+  **streams the FIPS 204 matrix A** on the fly instead of materializing it, so
+  keygen+signing fit the RP2350's ~222 KiB main stack (~84 KiB host floor) where
+  the by-value `fips204` crate's -65 (~192 KiB) overflowed it — the reason -65
+  was previously dropped. ML-DSA-44 signing runs on the same crate too, and the
+  `fips204` dependency has been dropped from the tree entirely. The
+  implementation is checked byte-for-byte against NIST ACVP KATs (both parameter
+  sets) with Kani proofs over the reductions and rounding. ML-DSA-87 (`-50`)
+  remains unsupported (its response overruns `maxMsgSize`). Firmware
+  `bcdDevice` → `0x07FB`.
+
+### Security
+
+- **CHANGE REFERENCE DATA no longer half-writes the OpenPGP reset code, and
+  CTAPHID drops short reads (audit run-14 hardening).** `INS 0x24` with
+  `P2=0x82` (the resetting code) verified the current RC and rewrote its verifier
+  *before* the command's own `P2` check rejected it, desyncing the RC verifier
+  from the `EF_DEK_RC` seal it unlocks — a self-inflicted, admin-recoverable
+  state (the caller already needs the current RC), now closed by rejecting the
+  unsupported `P2` before any write. Separately, the CTAPHID frame loop now
+  requires a full 64-byte report instead of accepting `≥5`-byte short reads,
+  whose stale buffer tail would otherwise be parsed as payload. Neither was
+  exploitable; both were non-findings the run-14 audit flagged for hardening.
+  Firmware `bcdDevice` → `0x07FC`.
+
+- **Host tools neutralise terminal escapes from a counterfeit device on every
+  path.** The earlier escape hardening reached only `rsk-tui --once`, and even
+  there stripped only C0/C1 controls. The Python `rsk` CLI had no sanitizer at
+  all, so a hostile device's USB product descriptor, getInfo `versions`, or a
+  resident credential's rpId / `user.name` could inject ANSI/OSC sequences
+  (screen repaint to forge a "genuine device" banner, `OSC 0` window-title,
+  `OSC 52` clipboard write) into the operator's terminal on `rsk inventory` /
+  `rsk status` / `rsk fido list-passkeys`. And the TUI's `char::is_control()`
+  filter let Unicode bidi/format overrides (U+202E and the isolates) through,
+  leaving a Trojan-Source reordering of the printed identity line. Both tools now
+  route every device-controlled string through a shared sanitizer that maps C0/C1
+  controls **and** Cf bidi/format characters to U+FFFD. Terminal-display integrity
+  only — no device secret, PIN, or presence is involved. (`tools/rsk` 0.3.7,
+  `tools/tui` 0.2.7)
+- **Trusted display: the passkey manager keeps the registrable-domain suffix on
+  every screen.** The earlier anti-phishing fix reached only the getAssertion/
+  add-passkey ceremonies and the Confirm-Delete card; the passkey **list** row and
+  the **service-detail title** still head-truncated an over-long relying-party id,
+  hiding the real domain behind the ellipsis on the very screens used to review and
+  delete credentials. They now head-ellipsize (`...registrable.domain`) when showing
+  the rpId — a look-alike such as `accounts.google.com.attacker.com` can no longer
+  read as a legitimate Google passkey. A user-set device-local nickname still keeps
+  its head. bcdDevice `0x07F7` → `0x07F8`.
+- **`rsk` / `rsk-tui` can no longer be hung or crashed by a hostile device.** The
+  earlier host-tooling hardening bounded only the withheld-continuation-frame case;
+  a malicious device could still (a) stream `CTAPHID_KEEPALIVE` frames forever to
+  hang `rsk` and freeze the synchronous TUI, (b) send short continuation frames that
+  made no progress, (c) return over-nested or non-UTF-8 CBOR to crash the decoder,
+  (d) answer `rsk hw --transport fido`'s `CONFIG_READ` with a non-byte value to
+  crash it, and (e) embed terminal escape sequences in getInfo/identity text that
+  `rsk-tui --once` printed raw. The keepalive waits are now deadline-bounded, the
+  CBOR decoder is depth- and UTF-8-hardened, the PHY `CONFIG_READ` path validates
+  the value type (matching the LED path), and `--once` strips control bytes from
+  device-controlled strings. (`tools/rsk` 0.3.6, `tools/tui` 0.2.6)
+- **OpenPGP: the resetting code is no longer pre-set to the public default
+  `12345678`.** Initialisation seeded the reset code (`EF_RC`) to the well-known
+  admin default with an active retry counter, so an unauthenticated host could
+  `RESET RETRY COUNTER` (P1=0) with `"12345678" || new-PW1` to reset the user PIN
+  and then sign/decrypt with the victim's OpenPGP keys. The reset code now ships
+  **deactivated** (per OpenPGP Card 3.4 §4.3.4) and is enabled only when an admin
+  sets a real code via `PUT DATA 0xD3`; boot also neutralises any already-
+  provisioned card still carrying the default reset code.
+- **OATH: `VALIDATE` no longer fails open on an unreadable access code.** A stored
+  access code longer than the read buffer made `seal_read` fail and (previously)
+  unlocked the applet without the code. Reading a present-but-unreadable code now
+  keeps the applet **locked**, and `SET CODE` bounds the code length.
+- **OATH: `VERIFY CODE` now honours a credential's touch flag.** A touch-required
+  primary HOTP credential could be exercised as a presence-free code-guessing
+  oracle; `VERIFY CODE` now requests the same physical press as `CALCULATE`.
+- **U2F: a `credProtect=userVerificationRequired` credential is refused on the
+  U2F authenticate path**, which performs no user verification — only CTAP2
+  `getAssertion` (with a PIN/UV) may exercise such a credential. Level 1/2
+  credentials are unaffected.
+- **Secure-PIN entry (trusted display): the on-pad PIN can no longer be diverted
+  into an attacker-chosen command.** The CCID `PC_to_RDR_Secure` VERIFY template's
+  class byte is now forced to `0x00` instead of copied from the host, so a host
+  cannot set the ISO 7816-4 command-chaining bit to make the dispatcher buffer the
+  typed PIN as a chain segment; the secure path also resets any incoming chaining
+  state before dispatch.
+- **Seed-moving vendor commands now name themselves on the trusted display.**
+  `BACKUP_EXPORT` / `BACKUP_LOAD` and attestation import/clear were all approved
+  behind a generic "Vendor config?" prompt; the master-seed export now reads
+  "Export secret seed to host?" so a host cannot phish the approval for a full
+  identity export behind a benign-looking touch.
+- **OpenPGP GET DATA no longer over-reads the scratch buffer** for the fingerprint,
+  CA-fingerprint and timestamp DOs: a present-but-short slot is zero-padded to its
+  fixed width, so the DO's declared length matches what was written and no stale
+  bytes from a prior command leak to an unauthenticated reader.
+- **The trusted-display sign-in and add-passkey ceremonies now keep the
+  registrable-domain suffix of an over-long relying-party id visible** instead of
+  truncating it head-first. A relying party id is kept from the tail
+  (`Label::clamp_domain`) and head-ellipsized (`...registrable.domain`), so a
+  look-alike such as `accounts.google.com.attacker.com` can no longer hide the real
+  domain behind the ellipsis while showing trusted-looking bait in the prefix.
+- **The on-device passkey manager applies the same domain-suffix rule.** The
+  earlier fix reached only the host-driven ceremonies; the passkey list, service
+  detail and the destructive Confirm-Delete card still truncated the relying-party
+  id head-first. They now keep the registrable-domain suffix
+  (`Label::clamp_domain` + suffix-ellipsis), so a look-alike passkey cannot
+  impersonate a service on the screen used to review and delete credentials.
+
+### Fixed
+
+- **A crafted phy record can no longer permanently brick USB.** The boot interface
+  guard now falls back to enabling all interfaces unless a *management-capable* one
+  (CCID or HID) survives — a keyboard-only mask previously slipped past it and
+  stranded the device with no software path to rewrite the record.
+- **The boot path no longer panics on a host-written LED pin.** A `led_gpio` from
+  the phy record that collides with a GPIO presence pin is now ignored (the build
+  default is used) instead of panicking every boot; a build whose own LED/presence
+  pins collide is caught at compile time.
+- **`rsk` no longer hangs against a hostile device** that announces an inflated
+  CTAPHID response length and then withholds the continuation frames.
+- **`rsk led --transport fido` no longer crashes** on a device that answers the
+  ungated LED `CONFIG_READ` with a non-byte-string CBOR value.
+
 ## [0.3.2] — 2026-07-08
 
 ### Added
@@ -1071,7 +1200,8 @@ family that keeps the "enterprise" features in the open tree.
   signature of it, and a CycloneDX SBOM. See
   [docs/releases.md](docs/releases.md) to verify a download.
 
-[Unreleased]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/TheMaxMur/RS-Key/compare/v0.2.8...v0.3.0

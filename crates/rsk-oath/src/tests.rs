@@ -1178,6 +1178,66 @@ fn verify_code_checks_hotp_slot0() {
 }
 
 #[test]
+fn verify_code_touch_cred_requires_press() {
+    let mut fs = new_fs();
+    let rng = RefCell::new(CountRng(7));
+    // Slot 0 = touch-flagged HOTP credential; a denied press must block VERIFY CODE
+    // so it can't be a presence-free guessing oracle on the current OTP.
+    let deny = RefCell::new(StubPresence(Presence::Timeout, 0));
+    let mut app = OathApplet::new(SERIAL, [0x22; 32], None, &rng, &deny);
+    put(
+        &mut app,
+        &mut fs,
+        &put_data(b"h", 0x11, 6, SECRET_SHA1, true, None),
+    );
+    let mut d = tlv(TAG_NAME, b"h");
+    d.extend(tlv(TAG_RESPONSE, &755224u32.to_be_bytes()));
+    let (sw, _) = run(&mut app, &mut fs, &apdu(INS_VERIFY_CODE, 0, 0, &d));
+    assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
+    assert_eq!(deny.borrow().1, 1);
+    // A confirmed press lets the correct code verify.
+    let confirm = RefCell::new(StubPresence(Presence::Confirmed, 0));
+    let mut app = OathApplet::new(SERIAL, [0x22; 32], None, &rng, &confirm);
+    let mut d = tlv(TAG_NAME, b"h");
+    d.extend(tlv(TAG_RESPONSE, &755224u32.to_be_bytes()));
+    let (sw, _) = run(&mut app, &mut fs, &apdu(INS_VERIFY_CODE, 0, 0, &d));
+    assert_eq!(sw, Sw::OK);
+    assert_eq!(confirm.borrow().1, 1);
+}
+
+#[test]
+fn validate_fails_closed_on_unreadable_code() {
+    let mut fs = new_fs();
+    let rng = RefCell::new(CountRng(7));
+    let touch = RefCell::new(AlwaysConfirm);
+    let mut app = OathApplet::new(SERIAL, [0x22; 32], None, &rng, &touch);
+    // Plant a present-but-oversized (unreadable) access code directly, bypassing the
+    // SET CODE bound, and lock the applet as a fresh SELECT would with a code present.
+    let dev = Device {
+        serial_hash: &[0x22; 32],
+        serial_id: &SERIAL,
+        otp_key: None,
+    };
+    let big = [0x21u8; OATH_CODE_MAX + 8];
+    assert!(seal::seal_put(
+        &dev,
+        &mut fs,
+        &mut CountRng(1),
+        EF_OATH_CODE,
+        &big
+    ));
+    app.validated = false;
+    // VALIDATE must NOT unlock: the code cannot be read, so fail closed.
+    let mut d = tlv(TAG_CHALLENGE, &[0u8; 8]);
+    d.extend(tlv(TAG_RESPONSE, &[0u8; 20]));
+    let (sw, _) = run(&mut app, &mut fs, &apdu(INS_VALIDATE, 0, 0, &d));
+    assert_eq!(sw, Sw::DATA_INVALID);
+    assert!(!app.validated);
+    let (sw, _) = run(&mut app, &mut fs, &apdu(INS_LIST, 0, 0, &[]));
+    assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
+}
+
+#[test]
 fn get_credential_returns_pws_fields() {
     let mut fs = new_fs();
     let rng = RefCell::new(CountRng(7));

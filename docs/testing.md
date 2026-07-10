@@ -59,8 +59,13 @@ credMgmt, U2F, extensions, large blobs, the vendor backup/lock commands —
 half that corpus runs soft-locked), OpenPGP dispatch + the EC/RSA crypto
 parsers, OATH/OTP/PIV/management/rescue dispatch, the keyboard frame codec,
 the phy TLV codec (parse∘serialize round-trip is an asserted invariant), the
-PIN protocols, AEADs, the DRBG, ML-DSA/ML-KEM decoding, and the seed-blob
-format/migration state machine.
+PIN protocols, AEADs, the DRBG, ML-DSA (both parameter sets: attacker-shaped
+verify decode, plus a keygen→sign→verify property that a one-bit tamper must
+break) / ML-KEM decoding, the FIDO post-quantum credential path (the
+`(alg, curve)` box codec + `CredKey` dispatch → sign / COSE-AKP encode), the
+trusted-display `Label` sanitizer (attacker rpId / account text must stay
+printable ASCII — no bidi / homoglyph escape — and the confirm screen must
+render without panic), and the seed-blob format/migration state machine.
 
 Most targets drive one applet from a fresh state. Four are **stateful** —
 they replay an attacker-chosen *sequence* against persistent state, hunting

@@ -36,6 +36,11 @@ use crate::model::*;
 const REPORT_LEN: usize = 64;
 const CTAPHID_INIT: u8 = 0x86;
 const CTAPHID_CBOR: u8 = 0x90;
+const CTAPHID_KEEPALIVE: u8 = 0xBB; // device-still-processing status frame
+/// Ceiling on the keepalive wait: a hostile device can stream keepalives forever (each read
+/// returns before the per-frame timeout, so that timeout never fires), which would freeze the
+/// synchronous TUI. Bail past any legitimate ceremony (30s presence window + slack) instead.
+const KEEPALIVE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 const FIDO_USAGE_PAGE: u16 = 0xF1D0;
 const CTAP_VENDOR: u8 = 0x41;
 const CTAP2_ERR_PIN_REQUIRED: u8 = 0x36;
@@ -260,8 +265,14 @@ fn send_cbor(dev: &hidapi::HidDevice, cid: [u8; 4], payload: &[u8], ms: i32) -> 
         seq = seq.wrapping_add(1);
     }
     let mut r = hid_read(dev, ms);
-    while r.len() >= 5 && r[4] == 0xBB {
-        r = hid_read(dev, ms); // CTAPHID_KEEPALIVE (UP wait)
+    let deadline = std::time::Instant::now() + KEEPALIVE_DEADLINE;
+    while r.len() >= 5 && r[4] == CTAPHID_KEEPALIVE {
+        // UP wait — but a hostile device can stream keepalives forever; give up rather
+        // than freeze the synchronous TUI event loop.
+        if std::time::Instant::now() > deadline {
+            return Vec::new();
+        }
+        r = hid_read(dev, ms);
     }
     if r.len() < 7 {
         return Vec::new();

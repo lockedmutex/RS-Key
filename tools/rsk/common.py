@@ -4,12 +4,23 @@
 """Shared helpers: error exit, PIN resolution, picotool runner, FIDO HID connect."""
 import subprocess
 import sys
+import unicodedata
 from getpass import getpass
 
 
 def die(msg):
     print(f"error: {msg}", file=sys.stderr)
     sys.exit(1)
+
+
+def sanitize(text):
+    """Map C0/C1 controls (incl. ESC) and Cf bidi/format chars in device-controlled
+    text to U+FFFD, so a counterfeit device can't inject ANSI/OSC escapes or a
+    Trojan-Source bidi override into the operator's terminal when we print it raw."""
+    return "".join(
+        "�" if unicodedata.category(ch) in ("Cc", "Cf") else ch
+        for ch in str(text)
+    )
 
 
 def confirm(token):

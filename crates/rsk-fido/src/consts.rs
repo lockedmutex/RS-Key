@@ -113,8 +113,9 @@ pub const ALG_ED25519: i64 = -19; // EdDSA Ed25519
 pub const ALG_ESP384: i64 = -51; // ECDSA-SHA384 P-384
 pub const ALG_ESP512: i64 = -52; // ECDSA-SHA512 P-521
 
-// ML-DSA (FIPS 204) COSE identifiers, from draft-ietf-cose-dilithium. Only
-// ML-DSA-44 has an enabled backend; -49/-50 are recognized but unsupported.
+// ML-DSA (FIPS 204) COSE identifiers, from draft-ietf-cose-dilithium. ML-DSA-44
+// (-48) and ML-DSA-65 (-49) have enabled in-tree backends; ML-DSA-87 (-50)
+// overflows the RP2350 stack and is recognized but unsupported.
 pub const ALG_MLDSA44: i64 = -48;
 pub const ALG_MLDSA65: i64 = -49;
 pub const ALG_MLDSA87: i64 = -50;
@@ -138,6 +139,9 @@ pub const CURVE_P256K1: u8 = 8;
 /// selects on `curve`, so the lattice scheme gets a private id well clear of
 /// the registered EC ids (0x2C = 44).
 pub const CURVE_MLDSA44: u8 = 0x2C;
+/// Internal key-slot id for ML-DSA-65 credentials (0x2D = 45), the sibling of
+/// [`CURVE_MLDSA44`] for the higher-security parameter set.
+pub const CURVE_MLDSA65: u8 = 0x2D;
 
 // authenticatorData flag bits.
 pub const FLAG_UP: u8 = 0x01; // user present

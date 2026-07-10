@@ -15,6 +15,7 @@ use minicbor::encode::write::Cursor;
 use minicbor::{Decoder, Encoder};
 use zeroize::Zeroize;
 
+use rsk_crypto::MLDSA65_PK_LEN;
 use rsk_crypto::pinproto::PinProto;
 use rsk_crypto::sha256;
 use rsk_fs::{Fs, Storage};
@@ -23,10 +24,11 @@ use crate::cbordec::{cbor, def_arr, def_map};
 use crate::cert;
 use crate::consts::{
     AAGUID, ALG_ED25519, ALG_EDDSA, ALG_ES256, ALG_ES256K, ALG_ES384, ALG_ES512, ALG_ESP256,
-    ALG_ESP384, ALG_ESP512, ALG_MLDSA44, CRED_PROT_UV_REQUIRED, CURVE_ED25519, CURVE_MLDSA44,
-    CURVE_P256, CURVE_P256K1, CURVE_P384, CURVE_P521, EF_ALWAYS_UV, EF_ATT_CHAIN, EF_EA_ENABLED,
-    EF_EE_DEV, EF_MINPINLEN, EF_PIN, FLAG_AT, FLAG_ED, FLAG_UP, FLAG_UV, MAX_CREDBLOB_LENGTH,
-    MAX_CREDENTIAL_COUNT_IN_LIST, MAX_MIN_PIN_RPIDS, MAX_RESIDENT_CREDENTIALS, PREFER_PQC,
+    ALG_ESP384, ALG_ESP512, ALG_MLDSA44, ALG_MLDSA65, CRED_PROT_UV_REQUIRED, CURVE_ED25519,
+    CURVE_MLDSA44, CURVE_MLDSA65, CURVE_P256, CURVE_P256K1, CURVE_P384, CURVE_P521, EF_ALWAYS_UV,
+    EF_ATT_CHAIN, EF_EA_ENABLED, EF_EE_DEV, EF_MINPINLEN, EF_PIN, FLAG_AT, FLAG_ED, FLAG_UP,
+    FLAG_UV, MAX_CREDBLOB_LENGTH, MAX_CREDENTIAL_COUNT_IN_LIST, MAX_MIN_PIN_RPIDS,
+    MAX_RESIDENT_CREDENTIALS, PREFER_PQC,
 };
 use crate::credential::{
     CRED_BOX_MAX, CRED_REC_MAX, CRED_RESIDENT_LEN, CredExt, CredInput, Credential, RECORD_PREFIX,
@@ -44,6 +46,24 @@ use crate::{Ctx, Rng};
 
 const MAX_EXCLUDE: usize = MAX_CREDENTIAL_COUNT_IN_LIST as usize;
 
+/// authData fixed prefix: rpIdHash(32) ‖ flags(1) ‖ signCount(4) ‖ aaguid(16) ‖
+/// credIdLen(2).
+const AUTH_DATA_HEADER: usize = 32 + 1 + 4 + 16 + 2;
+/// Ceiling of `encode_mc_extensions`' output (its scratch buffer, below).
+const MC_EXT_MAX: usize = 192;
+/// Largest AKP COSE public key `cose_public` emits — the ML-DSA-65 case: a
+/// 3-entry map (1) with kty (1+1), alg −49 (1+2) and the 1952-byte pk wrapped as
+/// key −1 (1) + a >255-byte CBOR byte-string header (3) → 10 + pk = 1962.
+const COSE_AKP_MLDSA65_MAX: usize = 1 + (1 + 1) + (1 + 2) + (1 + 3) + MLDSA65_PK_LEN;
+/// authData scratch, sized for the ML-DSA-65 worst case (a non-resident box at
+/// `CRED_BOX_MAX` + the AKP COSE key + full extensions) plus the 32-byte
+/// clientDataHash appended in place for the attestation signature.
+const AD_BUF: usize = 3072;
+const _: () = assert!(
+    AUTH_DATA_HEADER + CRED_BOX_MAX + COSE_AKP_MLDSA65_MAX + MC_EXT_MAX + 32 <= AD_BUF,
+    "authData buffer too small for the ML-DSA-65 worst case",
+);
+
 /// Map a requested COSE alg (incl. the curve-explicit aliases) to its canonical
 /// `(alg, curve)`, or `None` if unsupported.
 fn alg_to_curve(alg: i64) -> Option<(i64, u8)> {
@@ -55,9 +75,21 @@ fn alg_to_curve(alg: i64) -> Option<(i64, u8)> {
         // (existing K1 credentials still assert — creation is the policy gate).
         ALG_ES256K if cfg!(not(feature = "fips-profile")) => Some((ALG_ES256K, CURVE_P256K1)),
         ALG_EDDSA | ALG_ED25519 => Some((ALG_EDDSA, CURVE_ED25519)),
-        // ML-DSA-44 only — -49/-50 fall through as unsupported (no enabled backend).
+        // ML-DSA-44 and -65 are backed; -50 (ML-DSA-87) falls through — its
+        // response overruns the CTAPHID message ceiling.
         ALG_MLDSA44 => Some((ALG_MLDSA44, CURVE_MLDSA44)),
+        ALG_MLDSA65 => Some((ALG_MLDSA65, CURVE_MLDSA65)),
         _ => None,
+    }
+}
+
+/// PQC-preference rank for the `pubKeyCredParams` selection under `PREFER_PQC`:
+/// ML-DSA-65 outranks ML-DSA-44, which outranks the classical schemes.
+fn alg_rank(alg: i64) -> u8 {
+    match alg {
+        ALG_MLDSA65 => 2,
+        ALG_MLDSA44 => 1,
+        _ => 0,
     }
 }
 
@@ -210,7 +242,7 @@ fn parse_pubkey_params(d: &mut Decoder<'_>, req: &mut Request<'_>) -> Result<(),
         if ty == "public-key"
             && let Some((ca, cv)) = alg_to_curve(alg)
         {
-            let upgrade = PREFER_PQC && ca == ALG_MLDSA44 && req.sel_alg != ALG_MLDSA44;
+            let upgrade = PREFER_PQC && alg_rank(ca) > alg_rank(req.sel_alg);
             if req.sel_alg == 0 || upgrade {
                 req.sel_alg = ca;
                 req.sel_curve = cv as i64;
@@ -485,7 +517,7 @@ fn make_credential_inner<S: Storage, R: Rng>(
     };
 
     // authData extension output (credBlob / credProtect / hmac-secret / minPinLength / hmac-secret-mc).
-    let mut ext = [0u8; 192];
+    let mut ext = [0u8; MC_EXT_MAX];
     let ext_len = encode_mc_extensions(ctx.fs, req, rp_id_hash, &hs[..hs_len], &mut ext)?;
     let ed = if ext_len > 0 { FLAG_ED } else { 0 };
 
@@ -503,12 +535,12 @@ fn make_credential_inner<S: Storage, R: Rng>(
         req.user_name.as_bytes(),
     ))?;
 
-    // authData = rpIdHash | flags | counter | aaguid | credIdLen | credId | COSEpubkey | ext
-    // Sized for the ML-DSA-44 worst case: 55 header + a non-resident box
-    // (≤CRED_BOX_MAX = 640) + the 1342-byte AKP COSE key + extensions (≤192)
-    // + the appended 32-byte clientDataHash.
+    // authData = rpIdHash | flags | counter | aaguid | credIdLen | credId | COSEpubkey | ext.
+    // Worst case (ML-DSA-65): AUTH_DATA_HEADER(55) + CRED_BOX_MAX(748) +
+    // COSE_AKP_MLDSA65_MAX(1962) + MC_EXT_MAX(192) + clientDataHash(32) = 2989,
+    // statically bounded by AD_BUF above.
     let ctr = get_sign_counter(ctx.fs);
-    let mut ad = [0u8; 2304];
+    let mut ad = [0u8; AD_BUF];
     let mut p = 0;
     ad[p..p + 32].copy_from_slice(rp_id_hash);
     p += 32;

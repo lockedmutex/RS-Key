@@ -106,10 +106,11 @@ def main():
         assert status == 0x00
         algs = [e["alg"] for e in gi[10]]
         # Advertised set/order: ES256, ES384, ES512, then EdDSA (-8); advertise-pqc
-        # prepends ML-DSA-44 (-48). ES256K (-47) is implemented but never advertised.
+        # prepends ML-DSA-65 (-49) then ML-DSA-44 (-48). ES256K (-47) is
+        # implemented but never advertised.
         if -48 in algs:
-            assert algs == [-48, -7, -35, -36, -8], f"algorithms list changed: {algs}"
-            print("getInfo: ML-DSA-44 advertised (advertise-pqc build)")
+            assert algs == [-49, -48, -7, -35, -36, -8], f"algorithms list changed: {algs}"
+            print("getInfo: ML-DSA-65 (-49) + ML-DSA-44 (-48) advertised (advertise-pqc build)")
         else:
             assert algs == [-7, -35, -36, -8], f"classic algorithms list changed: {algs}"
             print("getInfo: classic algorithms only (Firefox-safe default build)")

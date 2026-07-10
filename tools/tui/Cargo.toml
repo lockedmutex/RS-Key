@@ -2,7 +2,7 @@
 # table below detaches it from the parent so it builds for the host, not thumbv8m).
 [package]
 name = "rsk-tui"
-version = "0.2.5"
+version = "0.2.7"
 license = "AGPL-3.0-only"
 edition = "2024"
 description = "rs-key device dashboard — a self-contained ratatui cockpit"
@@ -33,7 +33,7 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 zeroize = "1"
 # SLIP-39 share encoding for seed export — the in-tree crate, so the shares the
 # cockpit shows are bit-compatible with `rsk backup restore --scheme slip39`.
-# It pulls rsk-crypto (hence ml-kem/fips204) transitively; accepted for the host tool.
+# It pulls rsk-crypto (hence ml-kem/rsk-mldsa) transitively; accepted for the host tool.
 rsk-slip39 = { path = "../../crates/rsk-slip39" }
 
 [workspace]

@@ -13,7 +13,7 @@ which builds every artifact reproducibly, hashes it, and signs the manifest.
   | flavor | flags | use |
   |---|---|---|
   | `default` | touch | the normal build — start here |
-  | `pqc` | + advertise-pqc | advertises ML-DSA-44 in getInfo (breaks old Firefox) |
+  | `pqc` | + advertise-pqc | advertises ML-DSA-65 and ML-DSA-44 in getInfo (breaks old Firefox) |
   | `fips` | + fips-profile | the locked FIPS-style policy ([guides/fips.md](guides/fips.md)) |
   | `fips-pqc` | + both | |
   | `no-touch` | presence off | **test builds** — the automated suites can't press a button |

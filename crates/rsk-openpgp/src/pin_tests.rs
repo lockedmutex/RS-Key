@@ -298,6 +298,50 @@ fn change_pw1_then_new_pin_works_and_dek_survives() {
 }
 
 #[test]
+fn change_pin_rejects_unsupported_p2_without_touching_rc() {
+    // Regression (audit run-14): CHANGE REFERENCE DATA with P2=0x82 (RC) must be
+    // rejected up front. The old flow verified the current RC and then wrote the
+    // EF_RC verifier before the trailing `match p2` rejected — desyncing the RC
+    // verifier from its EF_DEK_RC seal.
+    let mut fs = setup();
+    let mut sess = Session::new();
+    let d = dev();
+    let mut rng = CountRng(21);
+
+    // Provision a resetting code under admin (PW3), then snapshot EF_RC.
+    verify(
+        &d,
+        &mut fs,
+        &mut sess,
+        &mut rng,
+        0x00,
+        PW3_MODE83,
+        PW3_DEFAULT,
+    );
+    assert_eq!(
+        put_reset_code(&d, &mut fs, &mut sess, &mut rng, b"resetcode"),
+        Sw::OK
+    );
+    let mut rc_before = [0u8; 64];
+    let n_before = fs.read(EF_RC, &mut rc_before).expect("RC provisioned");
+
+    // CHANGE with P2=0x82 and the *correct* current RC: pre-fix this passed
+    // check_pin and rewrote EF_RC before returning WRONG_P1P2.
+    let mut data = Vec::new();
+    data.extend_from_slice(b"resetcode");
+    data.extend_from_slice(b"654321");
+    assert_eq!(
+        change_pin(&d, &mut fs, &mut sess, &mut rng, 0x00, PW1_MODE82, &data),
+        Sw::WRONG_P1P2
+    );
+
+    // EF_RC is byte-identical: no stray verifier write happened.
+    let mut rc_after = [0u8; 64];
+    let n_after = fs.read(EF_RC, &mut rc_after).expect("RC still present");
+    assert_eq!(rc_before[..n_before], rc_after[..n_after]);
+}
+
+#[test]
 fn reset_retry_via_pw3_unblocks_pw1() {
     let mut fs = setup();
     let mut sess = Session::new();
@@ -378,25 +422,102 @@ fn reset_retry_via_pw3_needs_pw3() {
 }
 
 #[test]
-fn reset_retry_via_rc_resets_pw1() {
+fn reset_retry_via_default_rc_is_rejected() {
     let mut fs = setup();
     let mut sess = Session::new();
     let d = dev();
     let mut rng = CountRng(7);
-    // The default reset code equals the admin PIN (12345678). RESET RETRY P1=0
-    // with `RC || new-PW1` resets PW1 without needing an admin session.
+    // The resetting code ships DEACTIVATED (no EF_RC): RESET RETRY P1=0 with the
+    // old default "12345678" || new-PW1 must NOT reset PW1 — this was an
+    // unauthenticated PW1-reset backdoor.
     let mut data = [0u8; 14];
     data[..8].copy_from_slice(PW3_DEFAULT);
     data[8..].copy_from_slice(b"111111");
     assert_eq!(
         reset_retry(&d, &mut fs, &mut sess, &mut rng, 0x00, PW1_MODE81, &data),
+        Sw::REFERENCE_NOT_FOUND
+    );
+    // PW1 is unchanged: the original default still verifies, the attacker value does not.
+    sess.reset();
+    assert_eq!(
+        verify(
+            &d,
+            &mut fs,
+            &mut sess,
+            &mut rng,
+            0x00,
+            PW1_MODE81,
+            PW1_DEFAULT
+        ),
         Sw::OK
     );
     sess.reset();
-    // PW1 now verifies with the new value and the DEK is recoverable.
-    assert_eq!(
+    assert_ne!(
         verify(
             &d, &mut fs, &mut sess, &mut rng, 0x00, PW1_MODE81, b"111111"
+        ),
+        Sw::OK
+    );
+}
+
+#[test]
+fn scan_files_neutralizes_a_legacy_default_reset_code() {
+    let d = dev();
+    let mut fs = setup();
+    // Recreate the legacy-vulnerable state: RC verifier = default admin PIN with
+    // an enabled retry counter (what firmware <= 0x07F6 wrote at init).
+    put_verifier(&d, &mut fs, EF_RC, PW3_DEFAULT).unwrap();
+    set_pin_retry_counter(&mut fs, EF_RC, PW_RETRIES_DEFAULT).unwrap();
+    // Re-run init (reboot): the migration must delete the default RC.
+    scan_files(&d, &mut fs, &mut CountRng(0)).unwrap();
+    let mut rec = [0u8; 64];
+    assert!(fs.read(EF_RC, &mut rec).is_none());
+    // And the reset path is closed.
+    let mut sess = Session::new();
+    let mut rng = CountRng(7);
+    let mut data = [0u8; 14];
+    data[..8].copy_from_slice(PW3_DEFAULT);
+    data[8..].copy_from_slice(b"111111");
+    assert_ne!(
+        reset_retry(&d, &mut fs, &mut sess, &mut rng, 0x00, PW1_MODE81, &data),
+        Sw::OK
+    );
+}
+
+#[test]
+fn scan_files_preserves_a_custom_reset_code() {
+    let d = dev();
+    let mut fs = setup();
+    let mut sess = Session::new();
+    let mut rng = CountRng(7);
+    verify(
+        &d,
+        &mut fs,
+        &mut sess,
+        &mut rng,
+        0x00,
+        PW3_MODE83,
+        PW3_DEFAULT,
+    );
+    assert_eq!(
+        put_reset_code(&d, &mut fs, &mut sess, &mut rng, b"resetme0"),
+        Sw::OK
+    );
+    // Reboot: a real admin-set RC (verifier != default) must survive the migration.
+    scan_files(&d, &mut fs, &mut CountRng(0)).unwrap();
+    sess.reset();
+    let mut data = [0u8; 14];
+    data[..8].copy_from_slice(b"resetme0");
+    data[8..].copy_from_slice(b"222222");
+    assert_eq!(
+        reset_retry(&d, &mut fs, &mut sess, &mut rng, 0x00, PW1_MODE81, &data),
+        Sw::OK
+    );
+    sess.reset();
+    // The new PW1 works and its DEK is recoverable.
+    assert_eq!(
+        verify(
+            &d, &mut fs, &mut sess, &mut rng, 0x00, PW1_MODE81, b"222222"
         ),
         Sw::OK
     );

@@ -261,7 +261,7 @@ fn config_write<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req) -> CtapResul
 fn att_import<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req) -> CtapResult {
     let mut packed = [0u8; cert::ATT_CHAIN_REC_MAX];
     let plen = cert::att_chain_pack(req.chain, &mut packed).ok_or(CtapError::InvalidParameter)?;
-    gate(ctx, req)?;
+    gate(ctx, req, "Import attestation key?")?;
     let mut scalar = open_channel_key(ctx, req.blob)?;
     if P256Key::from_scalar(&scalar).is_none() {
         scalar.zeroize();
@@ -279,7 +279,7 @@ fn att_import<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req) -> CtapResult 
 
 /// `ATT_CLEAR`: drop the org attestation (same gate as the import).
 fn att_clear<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req) -> CtapResult {
-    gate(ctx, req)?;
+    gate(ctx, req, "Clear attestation key?")?;
     let _ = ctx.fs.delete_key(EF_ATT_KEY);
     let _ = ctx.fs.delete(EF_ATT_CHAIN);
     journal::append(ctx, journal::EV_ATT_CLEAR, 0, &[]);
@@ -498,12 +498,21 @@ fn mlkem_leg<R: Rng>(
 /// Common gate for the seed-moving commands: an established MSE channel, physical
 /// presence (touch), and — when a PIN is configured — a pinUvAuthToken with the
 /// `acfg` permission over `0xff×32 ‖ 0x41 ‖ subcommand ‖ rawSubCommandParams`.
-fn gate<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req) -> Result<(), CtapError> {
+///
+/// `title` is the trusted-display consent line: each caller names the *specific*
+/// operation (e.g. exporting the master seed) so the on-screen prompt matches the
+/// stakes — a generic "Vendor config?" for a seed export would let a host phish an
+/// approval for the most catastrophic op behind a benign-looking touch.
+fn gate<S: Storage, R: Rng>(
+    ctx: &mut Ctx<S, R>,
+    req: &Req,
+    title: &'static str,
+) -> Result<(), CtapError> {
     if !ctx.state.mse_active {
         return Err(CtapError::NotAllowed);
     }
     pin_gate(ctx, req)?;
-    if !ctx.check_user_presence(crate::Confirm::titled("Vendor config?")) {
+    if !ctx.check_user_presence(crate::Confirm::titled(title)) {
         return Err(CtapError::OperationDenied);
     }
     Ok(())
@@ -545,7 +554,9 @@ fn backup_export<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [
     if ctx.fs.has_data(EF_BACKUP_SEALED) {
         return Err(CtapError::NotAllowed);
     }
-    gate(ctx, req)?;
+    // Name the operation explicitly: this hands the master seed to the host. A generic
+    // prompt here would let a host phish the approval for a full identity export.
+    gate(ctx, req, "Export secret seed to host?")?;
     let mut seed = ctx.load_keydev().ok_or(CtapError::NotAllowed)?;
     let mut nonce = [0u8; 12];
     ctx.rng.fill(&mut nonce);
@@ -581,7 +592,7 @@ fn backup_load<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req) -> CtapResult
     if lock_engaged(ctx.fs) {
         return Err(CtapError::NotAllowed);
     }
-    gate(ctx, req)?;
+    gate(ctx, req, "Restore seed from host?")?;
     let mut nonce = [0u8; 12];
     nonce.copy_from_slice(&req.blob[..12]);
     let mut tag = [0u8; 16];

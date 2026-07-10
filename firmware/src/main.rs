@@ -380,7 +380,7 @@ async fn main(spawner: Spawner) {
     config.max_power = 100;
     config.max_packet_size_0 = 64;
     // bcdDevice build counter; also surfaced on the trusted-display Firmware screen.
-    let device_release: u16 = 0x07F4;
+    let device_release: u16 = 0x07FC;
     config.device_release = device_release;
 
     let mut builder = Builder::new(
@@ -479,18 +479,23 @@ async fn main(spawner: Spawner) {
         use embassy_rp::gpio::{Level, Output};
         use embassy_rp::pwm::Pwm;
 
-        // PHY led_gpio overrides the build LED_PIN; an out-of-range pin is ignored.
+        // A build whose default LED pin collides with a GPIO presence pin is a
+        // configuration error — reject it at compile time, never at runtime on the
+        // boot path (a host-written phy record must not be able to reach a panic).
+        const _: () = assert!(
+            !(BUILD_PRESENCE_IS_GPIO && BUILD_PRESENCE_PIN == BUILD_LED_PIN),
+            "PK_PRESENCE_PIN must not equal PK_LED_PIN on a GPIO-presence build"
+        );
+        // PHY led_gpio overrides the build LED_PIN; an out-of-range pin is ignored,
+        // and a host-written pin that collides with the GPIO presence pin is dropped
+        // (they would fight over one pin) so it falls back to the build default rather
+        // than bricking the boot into a panic loop.
         let led_gpio = phy
             .as_ref()
             .and_then(|p| p.led_gpio)
             .filter(|&g| g <= 29)
+            .filter(|&g| !(BUILD_PRESENCE_IS_GPIO && g == BUILD_PRESENCE_PIN))
             .unwrap_or(BUILD_LED_PIN);
-        if BUILD_PRESENCE_IS_GPIO && BUILD_PRESENCE_PIN == led_gpio {
-            panic!(
-                "PRESENCE_PIN={} conflicts with active LED pin",
-                BUILD_PRESENCE_PIN
-            );
-        }
         // PHY led_driver (1=gpio, 2=pimoroni, 3=ws2812) overrides the build kind;
         // anything else (unset, or the N/A esp32 value) keeps the build default.
         let led_driver = match phy.as_ref().and_then(|p| p.led_driver) {

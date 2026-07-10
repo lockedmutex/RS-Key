@@ -52,12 +52,14 @@ covers the security boundary, this page covers feature and hardware gaps.
 - **ML-KEM is scaffolding** — compiled, tested, unused: no CTAP PIN/UV
   protocol number for PQC key agreement exists yet to implement.
   *Status: waiting on standards.*
-- **PQC interop is limited by client support** — ML-DSA-44 credentials work and
-  verify on-device, but no browser or mainstream WebAuthn library consumes
-  COSE −48 against security keys yet, and released Firefox versions abort
-  getInfo if the algorithm is *advertised* (hence the `advertise-pqc` build
-  flag, default off — capability stays on regardless). This is the ML-DSA-44
-  scheme, not a FIPS-validated module.
+- **PQC interop is limited by client support** — ML-DSA-44 (COSE −48) and
+  ML-DSA-65 (−49) credentials work and verify on-device (their signatures
+  verify under OpenSSL and Yubico's python-fido2, but no browser or mainstream
+  WebAuthn library *negotiates* these COSE ids against security keys yet), and
+  released Firefox versions abort getInfo if the algorithm is *advertised*
+  (hence the `advertise-pqc` build flag, default off — capability stays on
+  regardless). ML-DSA-87 (−50) does not fit the RP2350 (stack + CTAPHID message
+  size). These are the ML-DSA schemes, not a FIPS-validated module.
 
 ## Backup & migration
 

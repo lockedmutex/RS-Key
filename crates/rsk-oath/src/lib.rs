@@ -60,6 +60,10 @@ impl UserPresence for AlwaysConfirm {
 // FIDs.
 const EF_OATH_CRED: u16 = 0xBA00; // 255 cred slots, 0xBA00..=0xBAFE (each a sealed KeyFid)
 const EF_OATH_CODE: KeyFid = KeyFid::new(0xBAFF); // SET CODE validation key, sealed
+/// Max stored access-code length. Bounds SET CODE so the code always fits the
+/// VALIDATE read buffer — otherwise an over-long code makes `seal_read` fail and
+/// (pre-fix) VALIDATE unlocked the applet without the code.
+const OATH_CODE_MAX: usize = 128;
 const EF_OTP_PIN: u16 = 0x10A0;
 
 const MAX_OATH_CRED: u16 = 255;
@@ -309,6 +313,11 @@ impl<'a> OathApplet<'a> {
             self.validated = true;
             return Sw::OK;
         }
+        // The code must fit the VALIDATE read buffer, else it becomes unreadable
+        // and (pre-fix) unlocked the applet without the code.
+        if key.len() > OATH_CODE_MAX {
+            return Sw::WRONG_LENGTH;
+        }
         let Some(chal) = find_tag(data, TAG_CHALLENGE as u16) else {
             return Sw::INCORRECT_PARAMS;
         };
@@ -407,15 +416,20 @@ impl<'a> OathApplet<'a> {
         let Some(resp) = find_tag(data, TAG_RESPONSE as u16) else {
             return Sw::INCORRECT_PARAMS;
         };
-        let mut code = [0u8; 128];
+        let mut code = [0u8; OATH_CODE_MAX];
         let dev = self.device();
+        // A present-but-unreadable code (over-long or corrupt) must keep the applet
+        // LOCKED — a fail-open here unlocked it without the access code. A truly
+        // absent code leaves the applet as select() set it (unlocked, no code).
         let Some(n) = seal::seal_read(&dev, fs, EF_OATH_CODE, &mut code) else {
-            self.validated = true;
+            if fs.has_key(EF_OATH_CODE) {
+                self.validated = false;
+            }
             return Sw::DATA_INVALID;
         };
-        let code = &code[..n.min(128)];
+        let code = &code[..n.min(OATH_CODE_MAX)];
         if code.is_empty() {
-            self.validated = true;
+            self.validated = false;
             return Sw::DATA_INVALID;
         }
         let mut mac = [0u8; 64];
@@ -603,6 +617,20 @@ impl<'a> OathApplet<'a> {
         }
         if key[0] & OATH_TYPE_MASK != OATH_TYPE_HOTP {
             return Sw::DATA_INVALID;
+        }
+        // A touch-flagged credential is exercised only after a confirmed press —
+        // else VERIFY CODE is a presence-free guessing oracle on its current OTP,
+        // the same reason cmd_calculate gates here.
+        if find_tag(blob, TAG_PROPERTY as u16)
+            .and_then(|v| v.first())
+            .is_some_and(|p| p & PROP_TOUCH != 0)
+            && self
+                .presence
+                .borrow_mut()
+                .request(Confirm::titled("Verify OATH code?"))
+                != Presence::Confirmed
+        {
+            return Sw::SECURITY_STATUS_NOT_SATISFIED;
         }
         let Some(imf) = find_tag(blob, TAG_IMF as u16) else {
             return Sw::INCORRECT_PARAMS;

@@ -75,13 +75,13 @@ pub fn parse_secure(abdata: &[u8]) -> Option<SecurePinReq<'_>> {
     })
 }
 
-/// Build a plaintext VERIFY APDU from the secure-PIN `template` (its `CLA INS P1
-/// P2`) and the ASCII digits the user typed on the panel. PIV (`P2 == 0x80`) is
+/// Build a plaintext VERIFY APDU from the secure-PIN `template` (its `INS P1 P2`;
+/// the class byte is forced to `0x00`, never taken from the host template) and the
+/// ASCII digits the user typed on the panel. PIV (`P2 == 0x80`) is
 /// `0xFF`-padded to 8 bytes; OpenPGP (`P2` in `0x81..=0x83`, and any other
 /// reference) is variable-length. Returns the assembled APDU length in `out`, or
 /// `None` for a non-VERIFY template, an over-length PIV PIN, or a short buffer.
 pub fn assemble_verify(template: &[u8], pin: &[u8], out: &mut [u8]) -> Option<usize> {
-    let cla = *template.first()?;
     let ins = *template.get(1)?;
     let p1 = *template.get(2)?;
     let p2 = *template.get(3)?;
@@ -93,7 +93,12 @@ pub fn assemble_verify(template: &[u8], pin: &[u8], out: &mut [u8]) -> Option<us
     if pin.len() > body_len || body_len > MAX_PIN || 5 + body_len > out.len() {
         return None;
     }
-    out[0] = cla;
+    // Force the canonical VERIFY class byte; never honour the host template's CLA.
+    // Copying it verbatim would let a host set the ISO 7816-4 command-chaining bit
+    // (0x10), so the dispatcher would buffer the on-pad PIN as a chain segment
+    // instead of running VERIFY — diverting the trusted secret into a host-chosen
+    // command. VERIFY is CLA 0x00 for both PIV and OpenPGP.
+    out[0] = 0x00;
     out[1] = ins;
     out[2] = p1;
     out[3] = p2;

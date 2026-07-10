@@ -255,18 +255,17 @@ fn p256_credkey_matches_p256key() {
 
 #[test]
 fn credkey_stays_compact_so_mldsa_key_is_off_the_stack() {
-    // The ML-DSA-44 keypair is ~17 KB of fips204 NTT-form keys. Held inline in
-    // `CredKey` it rode the worker stack into `sign`, whose fips204
-    // rejection-sampling loop already nearly fills the RP2350's ~222 KiB
-    // stack — the 17 KB tipped getAssertion into overflow → a hard device
-    // wedge. It MUST stay `Box`-ed (heap, idle during a FIDO request). This
-    // guard fails loudly if the key regresses back inline: the boxed enum is a
-    // few hundred bytes (largest inline variant is Ed25519's expanded
-    // `SigningKey`), an inline keypair would be ~16.6 KB.
+    // The ML-DSA-44 keypair is ~13 KB of `rsk-mldsa` expanded-key state. Held
+    // inline in `CredKey` it rode the worker stack into `sign`, which already
+    // nearly fills the RP2350's ~222 KiB stack — the 13 KB tipped getAssertion
+    // into overflow → a hard device wedge. It MUST stay `Box`-ed (heap, idle
+    // during a FIDO request). This guard fails loudly if the key regresses back
+    // inline: the boxed enum is a few hundred bytes (largest inline variant is
+    // Ed25519's expanded `SigningKey`), an inline keypair would be ~13 KB.
     let size = core::mem::size_of::<CredKey>();
     assert!(
         size <= 512,
         "CredKey is {size} bytes — is the ML-DSA-44 keypair still Box-ed? \
-         An inline fips204 keypair (~16.6 KB) overflows the worker stack in sign()."
+         An inline rsk-mldsa keypair (~13 KB) overflows the worker stack in sign()."
     );
 }

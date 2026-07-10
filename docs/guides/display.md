@@ -79,9 +79,13 @@ operation and the **real relying party**, and waits for a deliberate action:
 
 Because the device only knows the relying-party *string* (and its hash), it
 shows that string verbatim — never a host-supplied brand logo. A relying-party id
-too long for the box is **clipped with a truncation marker** on both the approve
-and the enrollment screens, so a look-alike id whose prefix fits the box cannot
-masquerade as the real one.
+too long for the box is **clipped with a truncation marker**, and the clip keeps
+the **registrable-domain suffix** (a leading `…` ellipsis) rather than the head —
+so a padded look-alike such as `accounts.google.com.attacker.com` can never hide
+its real domain (`…attacker.com`) behind the cut. This holds on every screen that
+shows an attacker-chosen `rpId`: the approve and enrollment prompts and the
+Passkeys manager's list, service-detail title and Confirm-Delete card. A
+device-local nickname (which you set, not the host) keeps its head instead.
 
 ## Entering a PIN on the trusted screen
 

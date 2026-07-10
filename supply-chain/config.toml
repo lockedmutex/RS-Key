@@ -436,10 +436,6 @@ criteria = "safe-to-deploy"
 version = "0.1.9"
 criteria = "safe-to-deploy"
 
-[[exemptions.fips204]]
-version = "0.4.6"
-criteria = "safe-to-deploy"
-
 [[exemptions.fixed]]
 version = "1.29.0"
 criteria = "safe-to-deploy"

@@ -29,6 +29,9 @@ const CEREMONY_PLATE_H: u16 = 46;
 // A low-level text-draw primitive: target, string, x, y, role, colour, clip and the
 // truncation flag are all irreducible draw inputs — a bundling struct would only
 // obscure the call sites.
+/// `right` selects the ellipsis side when the text overflows: `false` keeps the head
+/// (account / user-chosen labels), `true` keeps the suffix (domain / relying-party
+/// ids, so the registrable domain stays visible).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn centered_clipped<D: DrawTarget<Color = Rgb565>>(
     t: &mut D,
@@ -39,10 +42,21 @@ pub(super) fn centered_clipped<D: DrawTarget<Color = Rgb565>>(
     color: Rgb565,
     clip: Rect,
     mark: bool,
+    right: bool,
 ) -> Result<(), D::Error> {
     let w = font::width(s, role).unwrap_or(clip.w as u32);
     if w <= clip.w as u32 && !mark {
         text(t, s, EgPoint::new(cx, y), role, color)
+    } else if right {
+        text_right_ellipsized(
+            t,
+            s,
+            EgPoint::new(clip.x as i32, y),
+            role,
+            color,
+            clip,
+            mark,
+        )
     } else {
         text_left_ellipsized(
             t,
@@ -80,11 +94,12 @@ fn service_head<D: DrawTarget<Color = Rgb565>>(
     )?;
     let tx = chip.x as i32 + chip.w as i32 + 11;
     let clip = Rect::new(tx as u16, y as u16, PANEL_W - 14 - tx as u16, 38);
-    // The relying party is attacker-chosen text: ellipsize (never hard-cut) and force
-    // the marker when the label was already clamped, so a padded look-alike id can't
-    // present a complete-looking prefix on the very screen meant to expose it.
+    // The relying party is attacker-chosen text: head-ellipsize (never hard-cut) so the
+    // registrable-domain *suffix* stays on screen, and force the marker when the label
+    // was already clamped, so a padded look-alike id can't hide the real domain behind
+    // the cut on the very screen meant to expose it.
     if account.as_str().is_empty() {
-        text_left_ellipsized(
+        text_right_ellipsized(
             t,
             rp.as_str(),
             EgPoint::new(tx, y + 19),
@@ -94,7 +109,7 @@ fn service_head<D: DrawTarget<Color = Rgb565>>(
             rp.truncated,
         )
     } else {
-        text_left_ellipsized(
+        text_right_ellipsized(
             t,
             rp.as_str(),
             EgPoint::new(tx, y + 12),
@@ -269,6 +284,7 @@ where
         theme::TEXT,
         Rect::new(6, (rp_y - 11) as u16, PANEL_W - 12, 22),
         rp.truncated,
+        true, // rp is a domain — keep the registrable-domain suffix visible
     )?;
     if !account.as_str().is_empty() {
         centered_clipped(
@@ -280,6 +296,7 @@ where
             theme::GREY,
             Rect::new(6, (acct_y - 11) as u16, PANEL_W - 12, 22),
             account.truncated,
+            false, // account is a user-chosen label — keep the head
         )?;
     }
     text(

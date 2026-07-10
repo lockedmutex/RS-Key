@@ -123,7 +123,8 @@ fn put_pw_status_updates_flag_in_place() {
     let n = fs.read(EF_PW_PRIV, &mut pw).unwrap();
     assert_eq!(n, 7);
     assert_eq!(pw[0], 0x00);
-    assert_eq!(&pw[4..7], &[3, 3, 3], "retry counters preserved");
+    // RC (index 5) ships deactivated at 0; PW1/PW3 counters at 3.
+    assert_eq!(&pw[4..7], &[3, 0, 3], "retry counters preserved");
 }
 
 #[test]

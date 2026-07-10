@@ -896,8 +896,8 @@ fn miri_drbg() {
 
 #[test]
 fn miri_pqc() {
-    use rsk_crypto::mldsa::{MLDSA44_PK_LEN, MLDSA44_SIG_LEN};
     use rsk_crypto::mlkem::{MLKEM768_CT_LEN, MLKEM768_EK_LEN, MLKEM768_SEED_LEN};
+    use rsk_crypto::{MLDSA44_PK_LEN, MLDSA44_SIG_LEN};
 
     for data in [&[0u8; 16], &[0x42u8; 16]] {
         let mut pk = [0u8; MLDSA44_PK_LEN];
@@ -1766,4 +1766,174 @@ fn miri_power_cut() {
     assert!(buf[..n] == old || buf[..n] == new, "torn put: garbage");
     assert_eq!(fs.read(0xC000, &mut buf), Some(4));
     assert_eq!(&buf[..4], &[1, 2, 3, 4]);
+}
+
+// =========================================================================
+// mldsa_verify
+// =========================================================================
+
+#[test]
+fn miri_mldsa_verify() {
+    use rsk_crypto::{
+        MLDSA44_PK_LEN, MLDSA44_SIG_LEN, MLDSA65_PK_LEN, MLDSA65_SIG_LEN, mldsa65_verify,
+    };
+    // One input: the decoders (both param sets) reject early on garbage, so this
+    // is the parse-path UB check, not the arithmetic (Miri interprets every byte).
+    for data in [&[0x42u8; 8][..]] {
+        let mut pk44 = [0u8; MLDSA44_PK_LEN];
+        let mut sig44 = [0u8; MLDSA44_SIG_LEN];
+        let mut pk65 = [0u8; MLDSA65_PK_LEN];
+        let mut sig65 = [0u8; MLDSA65_SIG_LEN];
+        for (i, b) in pk44.iter_mut().enumerate() {
+            *b = data[i % data.len()];
+        }
+        for (i, b) in sig44.iter_mut().enumerate() {
+            *b = data[(i + 1) % data.len()];
+        }
+        for (i, b) in pk65.iter_mut().enumerate() {
+            *b = data[(i + 2) % data.len()];
+        }
+        for (i, b) in sig65.iter_mut().enumerate() {
+            *b = data[(i + 3) % data.len()];
+        }
+        assert!(!mldsa44_verify(&pk44, data, &sig44));
+        assert!(!mldsa65_verify(&pk65, data, &sig65));
+    }
+}
+
+// =========================================================================
+// mldsa_roundtrip
+// =========================================================================
+
+#[test]
+fn miri_mldsa_roundtrip() {
+    use rsk_crypto::{MLDSA44_SIG_LEN, MlDsa44, MlDsa65};
+    // ML-DSA keygen + the rejection-loop sign are far too slow under Miri (each
+    // keygen streams matrix A via SHAKE; a full sign runs the loop several times).
+    // `rsk-mldsa` is `no unsafe`, so Miri adds nothing the fuzzer's ASAN/UBSAN
+    // does not already cover on this exact path. Keep the body compiled by the
+    // gate's `cargo check --tests`, but do not execute it under the interpreter.
+    if cfg!(miri) {
+        return;
+    }
+    let seed = [0x42u8; 32];
+    let rnd = [0x11u8; 32];
+    let msg = b"miri roundtrip";
+
+    // Full -44 sign + verify + tamper (the sign→verify property), plus -65 keygen.
+    let k44 = MlDsa44::from_seed(&seed);
+    let pk44 = k44.public_key();
+    let mut small = [0u8; MLDSA44_SIG_LEN - 1];
+    assert!(k44.sign(msg, &rnd, &mut small).is_err());
+    let mut sig44 = [0u8; MLDSA44_SIG_LEN];
+    assert_eq!(k44.sign(msg, &rnd, &mut sig44).unwrap(), MLDSA44_SIG_LEN);
+    assert!(mldsa44_verify(&pk44, msg, &sig44));
+    sig44[0] ^= 1;
+    assert!(!mldsa44_verify(&pk44, msg, &sig44));
+    let _ = MlDsa65::from_seed(&seed).public_key();
+}
+
+// =========================================================================
+// fido_cred_pqc
+// =========================================================================
+
+#[test]
+fn miri_fido_cred_pqc() {
+    use rsk_crypto::sha256;
+    use rsk_fido::consts::{ALG_MLDSA44, ALG_MLDSA65, CURVE_MLDSA44, CURVE_MLDSA65};
+    use rsk_fido::credential::{CredExt, CredInput, credential_create, credential_load};
+    use rsk_fido::ec::CredKey;
+
+    let d = dev();
+    let seed = [0x42u8; 32];
+    let rp_hash = sha256(b"example.com");
+    let iv = [0x11u8; 12];
+    let input = CredInput {
+        rp_id: "example.com",
+        user_id: &[1, 2, 3, 4],
+        user_name: "u",
+        user_display_name: "d",
+        use_sign_count: true,
+        rk: false,
+        created_ms: 0,
+        alg: ALG_MLDSA65,
+        curve: CURVE_MLDSA65 as i64,
+        ext: CredExt {
+            cred_protect: 0,
+            cred_blob: &[],
+            hmac_secret: false,
+            large_blob_key: false,
+            third_party_payment: false,
+        },
+    };
+    // Box round-trip for -65 (metadata alg/curve codec only — cheap under miri).
+    let mut out = [0u8; 2048];
+    if let Ok(len) = credential_create(&seed, &d, &input, &rp_hash, &iv, &mut out) {
+        let mut scratch = [0u8; 2048];
+        let c = credential_load(&seed, &out[..len], &rp_hash, &mut scratch).expect("loads");
+        assert_eq!(c.alg, ALG_MLDSA65);
+        assert_eq!(c.curve, CURVE_MLDSA65 as i64);
+    }
+    // from_raw(-44) + cose_public exercises an ML-DSA keygen + the AKP-encode;
+    // skip it under Miri (keygen is far too slow there, `rsk-mldsa` is `no unsafe`
+    // and the fuzzer covers this), but keep it compiled by `cargo check --tests`.
+    if !cfg!(miri) {
+        let raw = [0x33u8; 66];
+        if let Some(key) = CredKey::from_raw(CURVE_MLDSA44 as i64, &raw) {
+            assert_eq!(key.alg(), ALG_MLDSA44);
+            let mut cbor = [0u8; 4096];
+            let mut enc =
+                minicbor::Encoder::new(minicbor::encode::write::Cursor::new(&mut cbor[..]));
+            let _ = key.cose_public(&mut enc);
+        }
+    }
+}
+
+// =========================================================================
+// display_label
+// =========================================================================
+
+#[test]
+fn miri_display_label() {
+    use embedded_graphics::{
+        Pixel,
+        draw_target::DrawTarget,
+        geometry::{OriginDimensions, Size},
+        pixelcolor::Rgb565,
+    };
+    use rsk_ui::{ConfirmPrompt, LABEL_MAX, Label, PANEL_H, PANEL_W, Screen};
+
+    struct Sink;
+    impl OriginDimensions for Sink {
+        fn size(&self) -> Size {
+            Size::new(PANEL_W as u32, PANEL_H as u32)
+        }
+    }
+    impl DrawTarget for Sink {
+        type Color = Rgb565;
+        type Error = core::convert::Infallible;
+        fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+        where
+            I: IntoIterator<Item = Pixel<Self::Color>>,
+        {
+            for _ in pixels {}
+            Ok(())
+        }
+    }
+
+    for data in [
+        &b""[..],
+        b"example.com",
+        &[0xE2, 0x80, 0xAE, b'a'][..], // a bidi override + text
+        &[0x1b; 60],                   // 60 ESC bytes → truncated + all '?'
+    ] {
+        let (primary, secondary) = data.split_at(data.len() / 2);
+        for l in [Label::clamp(primary), Label::clamp_domain(primary)] {
+            assert!(l.as_str().bytes().all(|b| (0x20..=0x7E).contains(&b)));
+            assert!(l.as_str().len() <= LABEL_MAX);
+        }
+        let prompt = ConfirmPrompt::new("Approve?", primary, secondary);
+        let mut sink = Sink;
+        let _ = rsk_ui::render::render(&mut sink, &Screen::Confirm(prompt));
+    }
 }

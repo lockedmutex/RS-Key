@@ -241,7 +241,13 @@ def _read_phy_fido(dev, cid):
             f"CONFIG_READ failed: {st:#x} — firmware too old for config-over-FIDO "
             "(needs bcdDevice ≥ 0x07EF)"
         )
-    return _parse_tlv(m[1] if m and 1 in m else b"")
+    v = m[1] if m and 1 in m else b""
+    # The device controls this value; a non-bytes CBOR value (e.g. an integer) would make
+    # _parse_tlv's len(data) raise. Require the byte string the record is supposed to be
+    # (matches led.py's CONFIG_READ guard).
+    if not isinstance(v, (bytes, bytearray)):
+        die("device returned a malformed PHY block (non-bytes CONFIG_READ value)")
+    return _parse_tlv(bytes(v))
 
 
 def _run_fido(args):

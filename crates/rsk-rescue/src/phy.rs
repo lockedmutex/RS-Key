@@ -54,13 +54,21 @@ pub const USB_ITF_ALL: u8 = USB_ITF_CCID | USB_ITF_WCID | USB_ITF_HID | USB_ITF_
 /// The interfaces this firmware can instantiate (WCID/LWIP are not built).
 pub const USB_ITF_SUPPORTED: u8 = USB_ITF_CCID | USB_ITF_HID | USB_ITF_KB;
 
-/// The boot-effective interface mask. A stored mask that disables every
-/// interface we have would leave the device USB-dead — and with CCID gone the
-/// rescue applet that could rewrite the record is unreachable, so the only way
-/// back would be a full flash wipe. Such a mask falls back to ALL.
+/// The interfaces over which the phy record can be rewritten — CCID (rescue applet)
+/// and HID (FIDO vendor `0x41` config). If a stored mask leaves *neither* enabled,
+/// no software path can undo it, so the device would be permanently bricked
+/// (BOOTSEL reflash only) — even when a "supported" but management-incapable
+/// interface like the OTP keyboard survives.
+const USB_ITF_MANAGEABLE: u8 = USB_ITF_CCID | USB_ITF_HID;
+
+/// The boot-effective interface mask. A stored mask that leaves no
+/// management-capable interface (CCID or HID) would strand the device with no way
+/// to rewrite the record — so the only way back would be a full flash reflash. Such
+/// a mask falls back to ALL. (Checking `USB_ITF_SUPPORTED` here is not enough: a
+/// keyboard-only mask is "supported" yet cannot manage the device.)
 pub fn effective_usb_itf(phy: &PhyData) -> u8 {
     let mask = phy.enabled_usb_itf.unwrap_or(USB_ITF_ALL);
-    if mask & USB_ITF_SUPPORTED == 0 {
+    if mask & USB_ITF_MANAGEABLE == 0 {
         USB_ITF_ALL
     } else {
         mask

@@ -13,8 +13,8 @@ use rsk_sdk::apdu::Apdu;
 use rsk_sdk::sw::Sw;
 
 use crate::consts::{
-    CTAP_AUTHENTICATE, CTAP_REGISTER, CTAP_VERSION, EF_ATT_CHAIN, EF_EE_DEV, U2F_AUTH_CHECK_ONLY,
-    U2F_AUTH_ENFORCE, U2F_AUTH_FLAG_TUP, U2F_REGISTER_ID,
+    CRED_PROT_UV_REQUIRED, CTAP_AUTHENTICATE, CTAP_REGISTER, CTAP_VERSION, EF_ATT_CHAIN, EF_EE_DEV,
+    U2F_AUTH_CHECK_ONLY, U2F_AUTH_ENFORCE, U2F_AUTH_FLAG_TUP, U2F_REGISTER_ID,
 };
 use crate::credential::{CRED_REC_MAX, credential_load};
 use crate::ec::{MAX_DER_SIG, P256Key};
@@ -191,20 +191,29 @@ fn cmd_authenticate<S: Storage, R: Rng>(
     // scalar (verify_key, which fido_load_key would clobber by rewriting path[0]).
     // U2F is P-256 only, so take the leading 32 bytes of the ratchet as the scalar.
     let mut scratch = [0u8; CRED_REC_MAX];
-    let scalar: Option<[u8; 32]> =
-        match credential_load(&seed, key_handle, &app, &mut scratch).map(|c| c.u2f) {
-            Some(false) => fido_load_key(&seed, key_handle).map(|raw| {
-                let mut s = [0u8; 32];
-                s.copy_from_slice(&raw[..32]);
-                s
-            }),
-            Some(true) => {
-                let mut kh = [0u8; KEY_HANDLE_LEN];
-                kh.copy_from_slice(&key_handle[..KEY_HANDLE_LEN]);
-                verify_key(&seed, &app, &kh)
+    let scalar: Option<[u8; 32]> = match credential_load(&seed, key_handle, &app, &mut scratch) {
+        // A CTAP2 credential box. credProtect=userVerificationRequired (L3) must
+        // NOT be usable over U2F, which performs no user verification — only CTAP2
+        // getAssertion (with a PIN/UV) may exercise it. L1/L2 stay usable: the RP
+        // explicitly presents this credentialId as the key handle (like an allowList).
+        Some(c) if !c.u2f => {
+            if c.ext.cred_protect == CRED_PROT_UV_REQUIRED {
+                None
+            } else {
+                fido_load_key(&seed, key_handle).map(|raw| {
+                    let mut s = [0u8; 32];
+                    s.copy_from_slice(&raw[..32]);
+                    s
+                })
             }
-            None => None,
-        };
+        }
+        Some(_) => {
+            let mut kh = [0u8; KEY_HANDLE_LEN];
+            kh.copy_from_slice(&key_handle[..KEY_HANDLE_LEN]);
+            verify_key(&seed, &app, &kh)
+        }
+        None => None,
+    };
     seed.zeroize();
     let mut scalar = match scalar {
         Some(s) => s,

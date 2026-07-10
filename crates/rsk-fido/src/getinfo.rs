@@ -20,7 +20,7 @@ use minicbor::Encoder;
 use minicbor::encode::{Error, Write};
 
 use crate::consts::{
-    AAGUID, ALG_EDDSA, ALG_ES256, ALG_ES384, ALG_ES512, ALG_MLDSA44, FIRMWARE_VERSION,
+    AAGUID, ALG_EDDSA, ALG_ES256, ALG_ES384, ALG_ES512, ALG_MLDSA44, ALG_MLDSA65, FIRMWARE_VERSION,
     MAX_CRED_ID_LENGTH, MAX_CREDBLOB_LENGTH, MAX_CREDENTIAL_COUNT_IN_LIST, MAX_LARGE_BLOB_SIZE,
     MAX_MIN_PIN_RPIDS, MAX_MSG_SIZE,
 };
@@ -177,8 +177,12 @@ fn write_info<W: Write>(
     // the `fido-conformance` build.
     let pqc = cfg!(feature = "advertise-pqc");
     let eddsa = cfg!(not(feature = "fido-conformance"));
-    enc.u8(0x0A)?.array(3 + u64::from(pqc) + u64::from(eddsa))?;
+    // Under `advertise-pqc` both ML-DSA sets are advertised, -65 (-49) before -44
+    // (-48) so a relying party that ranks by list order prefers the stronger set.
+    enc.u8(0x0A)?
+        .array(3 + 2 * u64::from(pqc) + u64::from(eddsa))?;
     if pqc {
+        cose_public_key(enc, ALG_MLDSA65)?;
         cose_public_key(enc, ALG_MLDSA44)?;
     }
     cose_public_key(enc, ALG_ES256)?;

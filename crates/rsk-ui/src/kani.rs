@@ -25,6 +25,33 @@ fn clamp_sanitizes_and_bounds() {
     assert!(label.len == LABEL_MAX);
 }
 
+/// `clamp_domain` is total and bounded like [`clamp_sanitizes_and_bounds`], but keeps
+/// the **tail**: over a symbolic source one byte past the cap it drops the head byte
+/// and the kept bytes are exactly the sanitized `src[1..]`, so a domain's registrable
+/// suffix is never the part cut.
+#[kani::proof]
+fn clamp_domain_sanitizes_bounds_and_keeps_tail() {
+    let src: [u8; LABEL_MAX + 1] = kani::any();
+    let label = Label::clamp_domain(&src);
+    assert!(label.len <= LABEL_MAX);
+    let mut i = 0;
+    while i < label.len {
+        assert!((0x20..=0x7E).contains(&label.buf[i]));
+        i += 1;
+    }
+    // A source past the cap is flagged and cut to exactly the cap.
+    assert!(label.truncated);
+    assert!(label.len == LABEL_MAX);
+    // The kept bytes are the tail: buf[j] is the sanitized src[j + 1] (src[0] dropped).
+    let mut j = 0;
+    while j < LABEL_MAX {
+        let s = src[j + 1];
+        let expect = if (0x20..=0x7E).contains(&s) { s } else { b'?' };
+        assert!(label.buf[j] == expect);
+        j += 1;
+    }
+}
+
 /// The Allow and Deny hit regions are disjoint, so no tap can select both.
 #[kani::proof]
 fn confirm_buttons_disjoint() {

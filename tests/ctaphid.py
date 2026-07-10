@@ -8,6 +8,7 @@ and PIN/UV-auth protocol two (`Protocol2`). Needs `hidapi` + `cryptography`.
 """
 import os
 import sys
+import time
 
 try:
     import hid
@@ -22,7 +23,12 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 REPORT_LEN = 64
 CTAPHID_INIT = 0x86
 CTAPHID_CBOR = 0x90
+CTAPHID_KEEPALIVE = 0xBB  # device-still-processing status frame
 CTAP_CLIENT_PIN = 0x06  # CTAP2 authenticatorClientPIN (naming mirrors tools/rsk/ctaphid.py)
+# Bound the keepalive wait and CBOR recursion so a broken/hostile device cannot hang or
+# crash the test runner (mirrors tools/rsk/ctaphid.py).
+KEEPALIVE_DEADLINE_S = 120
+CBOR_MAX_DEPTH = 32
 
 
 def _hdr(major, n):
@@ -54,7 +60,9 @@ def enc(v):
     raise TypeError(type(v))
 
 
-def _dec(b, i):
+def _dec(b, i, depth=0):
+    if depth > CBOR_MAX_DEPTH:
+        raise ValueError("CBOR nesting too deep")
     ib = b[i]
     major, info = ib >> 5, ib & 0x1F
     i += 1
@@ -76,18 +84,18 @@ def _dec(b, i):
         return -1 - val, i
     if major in (2, 3):
         s = b[i:i + val]
-        return (s if major == 2 else s.decode()), i + val
+        return (s if major == 2 else s.decode("utf-8", "replace")), i + val
     if major == 4:
         out = []
         for _ in range(val):
-            x, i = _dec(b, i)
+            x, i = _dec(b, i, depth + 1)
             out.append(x)
         return out, i
     if major == 5:
         out = {}
         for _ in range(val):
-            k, i = _dec(b, i)
-            x, i = _dec(b, i)
+            k, i = _dec(b, i, depth + 1)
+            x, i = _dec(b, i, depth + 1)
             out[k] = x
         return out, i
     if major == 7:
@@ -132,7 +140,10 @@ def send_cbor(dev, cid, payload):
         write(dev, cid + bytes([seq]) + payload[off:off + 59])
         off, seq = off + 59, seq + 1
     r = read(dev)
-    while len(r) >= 5 and r[4] == 0xBB:  # CTAPHID_KEEPALIVE: still processing
+    deadline = time.monotonic() + KEEPALIVE_DEADLINE_S
+    while len(r) >= 5 and r[4] == CTAPHID_KEEPALIVE:  # still processing
+        if time.monotonic() > deadline:
+            raise IOError("device kept sending CTAPHID keepalives past the deadline")
         r = read(dev)
     assert len(r) >= 5, "empty HID read (device timed out / dropped report)"
     assert r[4] == CTAPHID_CBOR, f"cmd {r[4]:#x}"
@@ -140,6 +151,10 @@ def send_cbor(dev, cid, payload):
     data = bytearray(r[7:7 + bcnt])
     while len(data) < bcnt:
         c = read(dev)
+        if not c:
+            raise IOError("device did not send the full CTAPHID response")
+        if len(c) < 6:
+            raise IOError("short CTAPHID continuation frame")
         data += c[5:5 + min(59, bcnt - len(data))]
     return bytes(data[:bcnt])
 

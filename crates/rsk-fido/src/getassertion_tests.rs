@@ -1837,6 +1837,51 @@ fn mldsa44_register_then_login_verifies() {
     );
 }
 
+fn mldsa65_verify(pk: &[u8], msg: &[u8], sig: &[u8]) -> bool {
+    let pk: [u8; rsk_crypto::MLDSA65_PK_LEN] = pk.try_into().expect("AKP pk length");
+    let sig: [u8; rsk_crypto::MLDSA65_SIG_LEN] = sig.try_into().expect("ML-DSA sig length");
+    rsk_crypto::mldsa65_verify(&pk, msg, &sig)
+}
+
+#[test]
+fn mldsa65_register_then_login_verifies() {
+    use crate::consts::ALG_MLDSA65;
+    let (mut fs, mut rng) = setup();
+
+    // Register: the self-attestation must verify under the AKP COSE key.
+    let mc = call(&mut fs, &mut rng, 10, |ctx, out| {
+        make_credential(ctx, &mc_request_alg(ALG_MLDSA65), out)
+    })
+    .unwrap();
+    let (cred_id, alg, pk) = parse_mc_akp(&mc);
+    assert_eq!(alg, ALG_MLDSA65);
+    assert_eq!(pk.len(), rsk_crypto::MLDSA65_PK_LEN);
+    let (att_alg, att_sig, ad) = mc_att(&mc);
+    assert_eq!(att_alg, ALG_MLDSA65);
+    let mut signed = ad;
+    signed.extend_from_slice(&CDH);
+    assert!(
+        mldsa65_verify(&pk, &signed, &att_sig),
+        "ML-DSA-65 self-attestation verifies"
+    );
+
+    // Login with the returned credential id; the assertion signature must
+    // verify under the same key.
+    let ga = call(&mut fs, &mut rng, 20, |ctx, out| {
+        get_assertion(ctx, &ga_request(Some(&cred_id)), out)
+    })
+    .unwrap();
+    let ad = assertion_auth_data(&ga);
+    let sig = assertion_sig(&ga);
+    assert_eq!(sig.len(), rsk_crypto::MLDSA65_SIG_LEN);
+    let mut signed = ad;
+    signed.extend_from_slice(&CDH);
+    assert!(
+        mldsa65_verify(&pk, &signed, &sig),
+        "ML-DSA-65 assertion verifies under the credential key"
+    );
+}
+
 // rk makeCredential with an explicit algorithm and user id (the upgrade flow).
 fn mc_request_alg_rk(alg: i64, uid: &[u8]) -> std::vec::Vec<u8> {
     let mut buf = [0u8; 512];

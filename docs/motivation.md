@@ -85,8 +85,8 @@ NDA. That is the right side of this story, and RS-Key intends to stay on it.
   included.
   There is no CLA; contributors keep their copyright. That is not a promise of
   good behaviour; it is how the licensing is built.
-- **Post-quantum in the open tree.** ML-DSA-44 credentials work today, for
-  free, with the source in front of you.
+- **Post-quantum in the open tree.** ML-DSA-44 and ML-DSA-65 credentials work
+  today, for free, with the source in front of you.
 - **The "enterprise" features live in the public tree.** Attestation, secure
   boot, backup, audit — the things usually kept behind a paywall land in the
   open repository.
