@@ -1990,6 +1990,35 @@ fn move_and_delete_key() {
 }
 
 #[test]
+fn move_key_same_slot_rejected() {
+    // MOVE KEY onto its own slot (p1 == p2) must be rejected before any write:
+    // the source-delete would otherwise erase the very slot just rewritten,
+    // silently destroying the (possibly only) key while returning success.
+    let rng = RefCell::new(TestRng(7));
+    let pres = RefCell::new(AlwaysConfirm);
+    let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
+    let mut fs = new_fs();
+    select(&mut app, &mut fs);
+    auth_mgm(&mut app, &mut fs);
+    verify_pin(&mut app, &mut fs);
+    let (sw, _) = run(
+        &mut app,
+        &mut fs,
+        INS_ASYM_KEYGEN,
+        0,
+        0x9A,
+        &gen_template(ALGO_ECCP256),
+    );
+    assert_eq!(sw, Sw::OK);
+    let (sw, _) = run(&mut app, &mut fs, INS_MOVE_KEY, 0x9A, 0x9A, &[]);
+    assert_eq!(sw, Sw::INCORRECT_P1P2);
+    // The key survives the rejected self-move.
+    let (sw, md) = run(&mut app, &mut fs, INS_GET_METADATA, 0, 0x9A, &[]);
+    assert_eq!(sw, Sw::OK);
+    assert_eq!(find_tag(&md, 0x01).unwrap(), &[ALGO_ECCP256]);
+}
+
+#[test]
 fn set_retries_and_reset_card() {
     let rng = RefCell::new(TestRng(7));
     let pres = RefCell::new(AlwaysConfirm);

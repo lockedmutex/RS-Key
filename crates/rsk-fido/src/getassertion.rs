@@ -342,6 +342,12 @@ fn enforce_pin<S: Storage, R: Rng>(
             {
                 return Err(CtapError::PinAuthInvalid);
             }
+            // Bind an unscoped token to this rpId on first use (CTAP 2.1 §6.2.2),
+            // as makeCredential does — else it stays reusable across RPs.
+            if !ctx.state.paut.has_rp_id {
+                ctx.state.paut.rp_id_hash = *rp_id_hash;
+                ctx.state.paut.has_rp_id = true;
+            }
             Ok(true)
         }
         // alwaysUv forces user verification (CTAP 2.1 alwaysUv); otherwise an
@@ -694,8 +700,11 @@ fn get_assertion_inner<S: Storage, R: Rng>(
         }
     }
     if multi {
+        // Clamp to what the getNextAssertion queue can actually serve
+        // (MAX_ASSERTION_CREDS): over-reporting strands the excess credentials
+        // behind a premature NOT_ALLOWED.
         enc.u8(5)
-            .and_then(|e| e.u32(best.found))
+            .and_then(|e| e.u32(best.found.min(MAX_ASSERTION_CREDS as u32)))
             .map_err(|_| CtapError::Other)?;
     }
     if let Some(lbk) = large_blob_key {

@@ -13,6 +13,69 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+### Fixed
+
+- **A `put` past the dynamic-file cap no longer strands its value on flash.** A
+  new runtime file (e.g. a resident credential) written once the dynamic set is
+  full committed its bytes to flash *before* the cap check rejected it, so the
+  caller saw `NoMemory` while the value stayed on flash — readable yet
+  unregistered, and re-dropped by every reboot rescan at the same cap. The cap
+  is now enforced before the write, so an over-cap `put` fails atomically and
+  leaves no trace. Latent (it needs 256 dynamic files to trigger); no wire or
+  on-flash format change. Firmware `bcdDevice` → `0x07FD`.
+- **OpenPGP `PUT DATA` for the PW-status DO (`C4`) can no longer overwrite the
+  PIN retry counters.** `put_pw_status` capped the copy at the full 7-byte
+  record, so a ≥5-byte field wrote host bytes over the live PW1/RC/PW3 retry
+  counters — its own doc comment says they are preserved; they were not. A host
+  (malicious or a buggy 7-byte read-modify-write) could zero them and block
+  every PIN across a power cycle, recoverable only by a key-destroying
+  `TERMINATE DF`. The copy is now capped at the writable prefix (flag + the
+  three max-length bytes); the retry counters are read-only. PW3-gated, so no
+  privilege change. Firmware `bcdDevice` → `0x07FE`.
+- **PIV `MOVE KEY` onto a key's own slot (`p1 == p2`) no longer destroys it.**
+  A self-move wrote the sealed key/cert/metadata back into the slot and then
+  unconditionally deleted the *source* — the same slot — leaving it empty while
+  returning `0x9000`, silently erasing the (possibly only) key. Same-slot moves
+  are now rejected with `INCORRECT_P1P2` before any write, matching real
+  hardware. Management-key-gated, so no privilege change. Firmware `bcdDevice`
+  → `0x07FF`.
+- **OpenPGP empty-data `VERIFY` in PW2 mode (`P2=0x82`) reports PW1's retries
+  again.** The `EF_RC → EF_PW1` remap was gated on a non-empty data field, so a
+  status query (`00 20 00 82 00`) probed the reset-code EF instead of the shared
+  PW1 verifier — answering `6A88`, or a spurious `PIN_BLOCKED` when a reset code
+  was configured and blocked. The remap now applies to the status query too.
+  Firmware `bcdDevice` → `0x0800`.
+- **FIDO `getAssertion` no longer over-reports `numberOfCredentials`.** With more
+  than `MAX_ASSERTION_CREDS` (16) discoverable credentials for one RP, the count
+  reported the full match total while the `getNextAssertion` queue caps at 16, so
+  a platform was told to fetch more than the device could serve and hit a
+  premature `NOT_ALLOWED`. The count is now clamped to the servable queue size.
+  Firmware `bcdDevice` → `0x0801`.
+- **FIDO `getAssertion` binds an unscoped `pinUvAuthToken` to the request rpId on
+  first use (CTAP 2.1 §6.2.2).** A token minted without an rpId (legacy
+  `getPinToken`, or `0x09` with `ga` permission and no rpId) was reusable across
+  arbitrary RPs for its whole lifetime — `makeCredential` bound it but
+  `getAssertion` did not. It now binds on first use, so a later cross-RP
+  assertion fails `PinAuthInvalid`. Firmware `bcdDevice` → `0x0802`.
+- **CCID `XfrBlock` responses can no longer be silently truncated.** The applet
+  response buffer (`RESP_CAP`) was sized to the full 2048-byte CCID message
+  rather than its 2038-byte payload budget (message − 10-byte header), so a large
+  response (e.g. a long OATH `LIST`) overran one frame and `run_xfr` dropped the
+  trailing bytes including the status word. The buffer now matches the frame
+  payload budget. Firmware `bcdDevice` → `0x0803`.
+- **RSA keygen ignores a stale core1 prime when it did not engage the second
+  core.** When the core1 entry gate timed out (`engaged=false`), the search still
+  drained core1's find slots, which could hold a prime from the *previous*
+  (possibly different-size) keygen — combining it would yield a malformed modulus
+  with a weak factor. The search now consumes core1's finds only when it actually
+  engaged core1 this keygen; stale finds are scrubbed at wind-down. Astronomically
+  rare, but a real undefended race. Firmware `bcdDevice` → `0x0804`.
+- **LED breathing effect no longer flickers dark at its peak.** `effect_vapor`
+  divided the falling ramp by `period/2` (floor) over `half+1` steps, so for an
+  odd `speed` the brightness could exceed `peak` at the apex and wrap to a dark
+  value through the `u8` cast. The value is clamped to `peak` before the cast.
+  Firmware `bcdDevice` → `0x0805`.
+
 ## [0.3.3] — 2026-07-10
 
 ### Added

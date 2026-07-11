@@ -825,6 +825,11 @@ impl PivApplet<'_> {
         if (!is_key(to) && to != 0xFF) || !is_key(from) {
             return Sw::INCORRECT_P1P2;
         }
+        // A self-move would write the key back then delete the source — the same
+        // slot — destroying it; reject before any write, as real hardware does.
+        if to == from {
+            return Sw::INCORRECT_P1P2;
+        }
         if is_retired(from) && is_active(to) {
             return Sw::INCORRECT_P1P2;
         }

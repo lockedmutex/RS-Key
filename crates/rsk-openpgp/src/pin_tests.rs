@@ -40,6 +40,25 @@ fn otp_dev() -> Device<'static> {
 }
 
 #[test]
+fn pw2_status_query_reports_pw1_retries() {
+    // An empty-data VERIFY in PW2 mode (p2 = 0x82) is a status query. PW2 shares
+    // the PW1 verifier and its retry counter, so it must report PW1's retries,
+    // not probe the (absent) reset-code EF and answer REFERENCE_NOT_FOUND.
+    let mut fs = setup();
+    let mut sess = Session::new();
+    let sw = verify(
+        &dev(),
+        &mut fs,
+        &mut sess,
+        &mut CountRng(0),
+        0x00,
+        PW1_MODE82,
+        &[],
+    );
+    assert_eq!(sw, Sw::retries(PW_RETRIES_DEFAULT));
+}
+
+#[test]
 fn pin_and_dek_migrate_to_otp_kbase_at_verify() {
     // State written by a pre-OTP firmware…
     let mut fs = setup();

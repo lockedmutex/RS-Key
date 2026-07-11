@@ -326,8 +326,10 @@ pub fn verify<S: Storage>(
         return Sw::WRONG_P1P2;
     }
     let mut fid = pw_fid(p2);
-    if fid == EF_RC && !data.is_empty() {
-        fid = EF_PW1; // PW2 (p2 = 0x82) verifies against the PW1 verifier
+    if fid == EF_RC {
+        // PW2 (p2 = 0x82) shares the PW1 verifier and its retry counter — for a
+        // status query too, else an empty-data probe reads the (absent) EF_RC.
+        fid = EF_PW1;
     }
     let mut rec = [0u8; 64];
     let size = match fs.read(fid, &mut rec) {

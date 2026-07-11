@@ -207,6 +207,119 @@ fn assertion_with_pin_sets_uv_flag() {
     assert_eq!(ad[32] & FLAG_UV, FLAG_UV, "UV flag must be set");
 }
 
+#[test]
+fn unscoped_pin_token_binds_rpid_on_first_getassertion() {
+    // A GA-capable token minted without an rpId (legacy getPinToken) must bind
+    // to the request's rpId on first use (CTAP 2.1 §6.2.2), so it can't be
+    // replayed across RPs for its whole lifetime.
+    let (mut fs, mut rng) = setup();
+    let mut state = crate::FidoState::new();
+    let mut out = [0u8; 1024];
+    let cred_id = {
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 10,
+        };
+        let n = make_credential(&mut ctx, &mc_request(true), &mut out).unwrap();
+        parse_mc(&out[..n]).0
+    };
+    let token = arm_pin(&mut fs, &mut state);
+    assert!(!state.paut.has_rp_id, "token starts unscoped");
+    let mut param = [0u8; 32];
+    let plen = rsk_crypto::pinproto::authenticate(PinProto::Two, &token, &CDH, &mut param).unwrap();
+    {
+        let req = ga_request_pin(&cred_id, &param[..plen], 2);
+        let mut o = [0u8; 1024];
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 20,
+        };
+        get_assertion(&mut ctx, &req, &mut o).unwrap();
+    }
+    assert!(
+        state.paut.has_rp_id,
+        "unscoped token must bind on first use"
+    );
+    // A second GA for a DIFFERENT rpId is rejected before credential lookup.
+    let mut buf = [0u8; 512];
+    let m = {
+        let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+        e.map(4).unwrap();
+        e.u8(1).unwrap().str("other.example").unwrap();
+        e.u8(2).unwrap().bytes(&CDH).unwrap();
+        e.u8(6).unwrap().bytes(&param[..plen]).unwrap();
+        e.u8(7).unwrap().u64(2).unwrap();
+        e.writer().position()
+    };
+    let mut o = [0u8; 1024];
+    let mut presence = crate::AlwaysConfirm;
+    let mut ctx = Ctx {
+        presence: &mut presence,
+        dev: dev(),
+        fs: &mut fs,
+        rng: &mut rng,
+        state: &mut state,
+        now_ms: 30,
+    };
+    assert_eq!(
+        get_assertion(&mut ctx, &buf[..m], &mut o).unwrap_err(),
+        CtapError::PinAuthInvalid,
+        "a token bound to example.com must reject other.example"
+    );
+}
+
+#[test]
+fn numberofcredentials_clamped_to_queue_capacity() {
+    // With more resident creds for one rp than the getNextAssertion queue holds
+    // (MAX_ASSERTION_CREDS), numberOfCredentials must be clamped to what is
+    // servable, not over-report and strand the excess behind a NOT_ALLOWED.
+    let (mut fs, mut rng) = setup();
+    let mut state = crate::FidoState::new();
+    let mut out = [0u8; 1024];
+    for i in 0..(crate::state::MAX_ASSERTION_CREDS + 1) {
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 10,
+        };
+        make_credential(&mut ctx, &mc_request_user(&[i as u8; 16]), &mut out).unwrap();
+    }
+    let req = ga_request(None); // discovery, no allowList
+    let mut o = [0u8; 1024];
+    let n = {
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 20,
+        };
+        get_assertion(&mut ctx, &req, &mut o).unwrap()
+    };
+    let (_user, count) = user_and_count(&o[..n]);
+    assert_eq!(
+        count,
+        Some(crate::state::MAX_ASSERTION_CREDS as u32),
+        "count clamped to what the queue can serve"
+    );
+}
+
 fn ga_request(allow: Option<&[u8]>) -> std::vec::Vec<u8> {
     let mut buf = [0u8; 512];
     let n = {
