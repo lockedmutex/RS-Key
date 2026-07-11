@@ -493,7 +493,7 @@ Keys 3/4 are present only when a PIN is set (see gating).
 | `04` | BACKUP_FINALIZE | — | — | touch |
 | `05` | BACKUP_STATE | — | `{1: sealed, 2: has_seed, 3: locked, 4: unlocked}` | **ungated** |
 | `06` | UNLOCK | `{1: blob(60)}` | — | MSE (the lock key *is* the auth) |
-| `07` | AUDIT_READ | — | journal window | PIN-token |
+| `07` | AUDIT_READ | — | journal window | PIN-token; **touch** if no PIN |
 | `08` | AUDIT_CHECKPOINT | `{1: nonce ≤32}` | DEVK signature over chain head ‖ nonce | PIN-token + touch |
 | `09` | ATT_IMPORT | `{1: blob(60), 2: DER chain}` | — | MSE + touch + PIN-token |
 | `0A` | ATT_CLEAR | — | — | MSE + touch + PIN-token |

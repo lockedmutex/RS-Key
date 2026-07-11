@@ -11,16 +11,18 @@ rsk audit verify --expect-key <hex>   # also pin the enrolled attestation key
 ```
 
 `log` is a plain read — it pretty-prints the live window and the recomputed
-chain head, no touch, no signature. `verify` does the same read *and* asks the
-device to sign the head, so it is the command that actually proves the log is
-real. Use `log` for a quick glance, `verify` when the answer matters.
+chain head, no signature. It takes `--pin` on a device with a PIN, and a touch
+on one with none (the read is never fully open). `verify` does the same read
+*and* asks the device to sign the head, so it is the command that actually
+proves the log is real. Use `log` for a quick glance, `verify` when the answer
+matters.
 
 ## What it records
 
 | event | detail |
 |---|---|
 | `BOOT` | first journal touch of each power cycle |
-| `MAKE_CREDENTIAL` / `GET_ASSERTION` / `U2F_REGISTER` / `U2F_AUTH` | first 8 bytes of the rpIdHash (pseudonymous) |
+| `MAKE_CREDENTIAL` / `GET_ASSERTION` / `U2F_REGISTER` / `U2F_AUTH` | first 8 bytes of the rpIdHash (only *weakly* pseudonymous — see [Gating](#gating)) |
 | `RESET` | factory reset (survives it — see below) |
 | `PIN_SET` / `PIN_CHANGE` / `PIN_LOCKOUT` | lockout aux: 0 = retries exhausted, 1 = per-boot block |
 | `CFG_MIN_PIN` | aux = new minimum; detail[0] = forceChangePin |
@@ -134,13 +136,15 @@ checkpoint key, which is DEVK-derived) continue uninterrupted across resets, so
 
 | command | open device | PIN set |
 |---|---|---|
-| `audit log` / `AUDIT_READ` | open | pinUvAuthToken with the `acfg` permission |
+| `audit log` / `AUDIT_READ` | touch | pinUvAuthToken with the `acfg` permission |
 | `audit verify` / `AUDIT_CHECKPOINT` | touch | touch **+** `acfg` pinUvAuthToken |
 
-- **`AUDIT_READ` (export).** Open when no PIN is set; otherwise it needs a
-  pinUvAuthToken carrying the `acfg` (authenticator-config) permission. Entries
-  are pseudonymous either way — rpIdHash prefixes, never RP names or user
-  handles — so even an open read leaks no browsing history.
+- **`AUDIT_READ` (export).** With a PIN set it needs a pinUvAuthToken carrying
+  the `acfg` (authenticator-config) permission; with no PIN it needs a physical
+  touch. The entries are only *weakly* pseudonymous — a `detail` is a 64-bit
+  rpIdHash prefix, never an RP name or user handle, but short enough to be
+  dictionary-matched back to a domain — so the touch is what stops a silent host
+  from harvesting a no-PIN device's RP-usage history.
 - **`AUDIT_CHECKPOINT`.** The same PIN gate **plus a physical touch**, and it
   refuses entirely without a provisioned OTP DEVK — an attestation that anyone
   could re-derive would be theatre. The signing step is what the touch protects;

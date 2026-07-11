@@ -88,6 +88,26 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   credentials from older firmware carry an implicit v1 marker and keep deriving
   from the box, so an already-provisioned device is unaffected. No box or
   on-flash format change. Firmware `bcdDevice` → `0x0806`.
+- **PIV `SET PIN RETRIES` (INS `0xFA`) now requires the PIN, not just the
+  management key.** The handler gated only on the management key, then reset the
+  PIN and PUK to their public defaults ("123456" / "12345678"). Because the
+  default management key is public and the `9B` slot is touch-`NEVER`, a host
+  that authenticated it could reset an *unknown* cardholder PIN without knowing
+  it — locking the legitimate user out, and (for a touch-`NEVER` key slot) using
+  their PIN-protected keys after verifying the now-default PIN. It now demands
+  the current PIN as well, matching YubiKey's `set-pin-retries`. Reachable only
+  by an already-management-authenticated caller, so no new privilege for a
+  legitimate admin. Firmware `bcdDevice` → `0x0807`.
+- **FIDO vendor `AUDIT_READ` (`0x41 / 0x07`) now requires a touch on a device
+  with no PIN.** With no clientPIN the PIN gate is a no-op, so any local process
+  could export the tamper-evident journal, whose per-entry `detail` is a 64-bit
+  `rpIdHash` prefix — short enough to dictionary-match back to the relying
+  parties a no-PIN device had been used with (the entries are only weakly
+  pseudonymous, not anonymous). A physical touch is now required in that case,
+  matching the sibling `AUDIT_CHECKPOINT`; a PIN-backed device is unchanged.
+  Privacy hardening — no key material is exposed. The `rsk` CLI (`0.3.9`) and TUI
+  (`0.2.9`) clients now prompt for that touch and map its denial. Firmware
+  `bcdDevice` → `0x0808`.
 
 ### Changed
 

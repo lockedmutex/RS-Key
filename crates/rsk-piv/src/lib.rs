@@ -424,10 +424,11 @@ impl PivApplet<'_> {
         unblock_pin_with_puk(dev, fs, &apdu.data[..puk_len], &apdu.data[puk_len..])
     }
 
-    /// SET RETRIES (INS 0xFA, management-gated): resets both references to
-    /// their defaults with the new totals.
+    /// SET RETRIES (INS 0xFA): resets both references to their defaults with the
+    /// new totals. Requires the management key **and** the current PIN — it wipes
+    /// PIN/PUK, so mgmt alone must not reset an unknown PIN (matches YubiKey).
     fn set_retries<S: Storage>(&mut self, dev: &Device, fs: &mut Fs<S>, apdu: &Apdu) -> Sw {
-        if !self.sess.has_mgm {
+        if !self.sess.has_mgm || !self.sess.has_pin {
             return Sw::SECURITY_STATUS_NOT_SATISFIED;
         }
         if apdu.p1 == 0 || apdu.p2 == 0 {

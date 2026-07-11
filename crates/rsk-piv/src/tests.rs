@@ -2066,6 +2066,27 @@ fn set_retries_and_reset_card() {
 }
 
 #[test]
+fn set_retries_requires_pin_not_just_mgmt() {
+    let rng = RefCell::new(TestRng(7));
+    let pres = RefCell::new(AlwaysConfirm);
+    let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
+    let mut fs = new_fs();
+    select(&mut app, &mut fs);
+    // Management alone (the public default key) must NOT reset the PIN: INS 0xFA
+    // wipes PIN/PUK to defaults, so it also requires the current PIN (YubiKey).
+    auth_mgm(&mut app, &mut fs);
+    let (sw, _) = run(&mut app, &mut fs, INS_SET_RETRIES, 5, 4, &[]);
+    assert_eq!(sw, Sw::SECURITY_STATUS_NOT_SATISFIED);
+    // With the PIN also verified it proceeds and applies the new totals.
+    verify_pin(&mut app, &mut fs);
+    let (sw, _) = run(&mut app, &mut fs, INS_SET_RETRIES, 5, 4, &[]);
+    assert_eq!(sw, Sw::OK);
+    let (sw, md) = run(&mut app, &mut fs, INS_GET_METADATA, 0, 0x80, &[]);
+    assert_eq!(sw, Sw::OK);
+    assert_eq!(find_tag(&md, 0x06).unwrap(), &[5, 5]);
+}
+
+#[test]
 fn management_gates() {
     let rng = RefCell::new(TestRng(7));
     let pres = RefCell::new(AlwaysConfirm);
