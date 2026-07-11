@@ -119,3 +119,26 @@ def test_sanitize_preserves_benign_text():
 
 def test_sanitize_coerces_non_str():
     assert common.sanitize(None) == "None"
+
+
+# --- sanitize_join: a hostile getInfo `versions` must not crash the CLI --------
+# status/inventory join device-controlled `versions` for display; a counterfeit
+# device can answer with non-strings, a scalar, or None instead of a str list.
+
+def test_sanitize_join_normal_list():
+    assert common.sanitize_join(["FIDO_2_0", "U2F_V2"]) == "FIDO_2_0, U2F_V2"
+
+
+def test_sanitize_join_non_string_elements():
+    # CBOR ints instead of text: must coerce, not raise TypeError.
+    assert common.sanitize_join([1, 2]) == "1, 2"
+
+
+def test_sanitize_join_scalar_and_none():
+    # A bare int / None where a list is expected: no "not iterable" crash.
+    assert common.sanitize_join(5) == "5"
+    assert common.sanitize_join(None) == ""
+
+
+def test_sanitize_join_strips_escapes_in_elements():
+    assert "\x1b" not in common.sanitize_join(["ok", "\x1b]0;pwn\x07"])

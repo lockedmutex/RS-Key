@@ -76,6 +76,19 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   value through the `u8` cast. The value is clamped to `peak` before the cast.
   Firmware `bcdDevice` → `0x0805`.
 
+### Changed
+
+- **`rsk` CLI and `rsk-tui` harden their handling of device-controlled data.** A
+  counterfeit or malfunctioning USB device that returned non-string/absent
+  getInfo fields (`versions`, `aaguid`, `clientPin`) or a malformed soft-lock
+  state could crash `rsk status` / `rsk inventory list` / `rsk lock` with an
+  uncaught `TypeError`, or inject ANSI/OSC/bidi escapes into the operator's
+  terminal via unsanitized `clientPin`/lock-state strings; `rsk-tui --json` left
+  DEL/C1/bidi bytes unescaped. All device-controlled display values now route
+  through the shared sanitizer or a type-guarded join, bool-coerced where
+  appropriate, and the TUI `--json` writer escapes every control and non-ASCII
+  char. Host-only (`rsk` `0.3.8`, `rsk-tui` `0.2.8`); no firmware change.
+
 ## [0.3.3] — 2026-07-10
 
 ### Added

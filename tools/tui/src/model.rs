@@ -758,7 +758,22 @@ fn json_str(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            // Escape every control and non-ASCII char to \uXXXX (like the Python
+            // CLI's ensure_ascii): keeps output valid JSON while neutralizing a
+            // hostile device's DEL/C1/bidi bytes in a raw --json terminal view.
+            c if c.is_control() || !c.is_ascii() => {
+                let u = c as u32;
+                if u > 0xFFFF {
+                    let v = u - 0x10000;
+                    out.push_str(&format!(
+                        "\\u{:04x}\\u{:04x}",
+                        0xD800 + (v >> 10),
+                        0xDC00 + (v & 0x3FF)
+                    ));
+                } else {
+                    out.push_str(&format!("\\u{u:04x}"));
+                }
+            }
             c => out.push(c),
         }
     }

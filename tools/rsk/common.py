@@ -23,6 +23,20 @@ def sanitize(text):
     )
 
 
+def sanitize_join(seq, sep=", "):
+    """Join a device-controlled sequence for display. A hostile/old device may
+    send a scalar, None, or non-string elements where a list of strings is
+    expected — coerce to a list and sanitize each element so neither a
+    TypeError nor an injected terminal escape reaches the operator."""
+    if isinstance(seq, (list, tuple)):
+        items = seq
+    elif seq is None:
+        items = []
+    else:
+        items = [seq]
+    return sep.join(sanitize(v) for v in items)
+
+
 def confirm(token):
     """Interactive typed confirmation for an irreversible action."""
     print(f"\nThis is irreversible. Type exactly  {token}  to proceed.")

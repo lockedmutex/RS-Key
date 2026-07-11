@@ -16,6 +16,16 @@ fn json_escapes_and_nulls() {
 }
 
 #[test]
+fn json_str_escapes_controls_bidi_and_non_ascii() {
+    // A hostile device product/version string must not smuggle DEL, an 8-bit C1
+    // introducer, or a bidi override into a raw --json terminal view; every
+    // control and non-ASCII char escapes to \u (astral chars as a surrogate pair).
+    let out = json_str("a\u{7f}\u{9b}b\u{202e}c\u{1f600}");
+    assert!(!out.contains('\u{7f}') && !out.contains('\u{9b}') && !out.contains('\u{202e}'));
+    assert_eq!(out, "\"a\\u007f\\u009bb\\u202ec\\ud83d\\ude00\"");
+}
+
+#[test]
 fn summary_without_device() {
     let s = DeviceSnapshot::default();
     assert_eq!(s.summary(), "no device detected");
