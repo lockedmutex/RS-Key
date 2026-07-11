@@ -456,11 +456,13 @@ fn enumerate_emits_extension_fields() {
     }
     assert_eq!(cp, Some(3), "credProtect");
     assert_eq!(tpp, Some(false), "thirdPartyPayment always emitted");
-    // 0x0B is the derived largeBlobKey of the stored credential.
+    // 0x0B is the derived largeBlobKey of the stored credential. A v2 resident
+    // credential keys it off the stable resident id (rec[32..RECORD_PREFIX]), not
+    // the box, so that prefix is the expected derivation input.
     let mut rec = [0u8; 1024];
-    let m = fs.read(EF_CRED, &mut rec).unwrap();
+    let _m = fs.read(EF_CRED, &mut rec).unwrap();
     let seed = crate::seed::load_keydev(&dev(), &mut fs).unwrap();
-    let expected = derive_large_blob_key(&seed, &rec[RECORD_PREFIX..m]);
+    let expected = derive_large_blob_key(&seed, &rec[32..RECORD_PREFIX]);
     assert_eq!(lbk.as_deref(), Some(&expected[..]));
 }
 
@@ -1127,4 +1129,203 @@ fn update_user_reseals_maximal_box() {
     )
     .unwrap();
     assert_eq!(cred_user_name(&out[..n]), new_name);
+}
+
+// A getAssertion over allowList=[id] must sign authData‖clientDataHash under the
+// ECDSA public key (x, y). Proves the signing key is the one makeCredential
+// issued — used before AND after an updateUserInformation reseal.
+fn assert_ga_signs_under(fs: &mut Fs<RamStorage>, id: &[u8], x: &[u8; 32], y: &[u8; 32]) {
+    use p256::EncodedPoint;
+    use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
+    let mut buf = [0u8; 256];
+    let req = {
+        let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+        e.map(3).unwrap();
+        e.u8(1).unwrap().str("example.com").unwrap();
+        e.u8(2).unwrap().bytes(&CDH).unwrap();
+        e.u8(3).unwrap().array(1).unwrap().map(2).unwrap();
+        e.str("type").unwrap().str("public-key").unwrap();
+        e.str("id").unwrap().bytes(id).unwrap();
+        e.writer().position()
+    };
+    let mut out = [0u8; 1024];
+    let mut st = FidoState::new();
+    let mut rng = SeqRng(7);
+    let n = {
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs,
+            rng: &mut rng,
+            state: &mut st,
+            now_ms: 20,
+        };
+        crate::getassertion::get_assertion(&mut ctx, &buf[..req], &mut out).unwrap()
+    };
+    let mut d = Decoder::new(&out[..n]);
+    d.map().unwrap();
+    assert_eq!(d.u8().unwrap(), 1);
+    d.skip().unwrap(); // {id, type}
+    assert_eq!(d.u8().unwrap(), 2);
+    let ad = d.bytes().unwrap().to_vec();
+    assert_eq!(d.u8().unwrap(), 3);
+    let sig = d.bytes().unwrap().to_vec();
+    let pt = EncodedPoint::from_affine_coordinates(x.into(), y.into(), false);
+    let vk = VerifyingKey::from_encoded_point(&pt).unwrap();
+    let mut signed = ad;
+    signed.extend_from_slice(&CDH);
+    vk.verify(&signed, &Signature::from_der(&sig).unwrap())
+        .expect("assertion verifies under the original credential key");
+}
+
+// The largeBlobKey (enumerate field 0x0B) of an enumerateCredentials response.
+fn enum_largeblobkey(resp: &[u8]) -> Option<std::vec::Vec<u8>> {
+    let mut d = Decoder::new(resp);
+    let fields = d.map().unwrap().unwrap();
+    let mut lbk = None;
+    for _ in 0..fields {
+        if d.u8().unwrap() == 0x0B {
+            lbk = Some(d.bytes().unwrap().to_vec());
+        } else {
+            d.skip().unwrap();
+        }
+    }
+    lbk
+}
+
+// #3 end to end: updateUserInformation used to reseal the box and rotate its
+// box-derived signing key, so the RP's stored pubkey stopped verifying. v2
+// credentials key off the stable resident id — makeCredential's pubkey,
+// enumerateCredentials' pubkey and getAssertion's signing key all stay put across
+// the reseal.
+#[test]
+fn update_preserves_signing_key_end_to_end() {
+    let (mut fs, mut rng) = setup();
+    let (id, x, y) = register(&mut fs, &mut rng, "example.com", &[1, 1], "alice");
+    assert_eq!(id[8], 1, "new resident credential carries the v2 marker");
+    let rp_hash = sha256(b"example.com");
+
+    // Before the update, getAssertion already signs under the registered key.
+    assert_ga_signs_under(&mut fs, &id, &x, &y);
+
+    // updateUserInformation reseals the box (fresh IV → new box).
+    let mut state = armed(PERM_CM);
+    let mut out = [0u8; 512];
+    run(
+        &mut fs,
+        &mut state,
+        &cm_request(
+            0x07,
+            Some(&subpara_update(&id, &[1, 1], "alice2", "Alice Two")),
+            &TOKEN,
+        ),
+        &mut out,
+    )
+    .unwrap();
+
+    // enumerateCredentials reports the SAME pubkey after the reseal.
+    let n = run(
+        &mut fs,
+        &mut state,
+        &cm_request(0x04, Some(&subpara_rpidhash(&rp_hash)), &TOKEN),
+        &mut out,
+    )
+    .unwrap();
+    let (_uid, x2, y2, _t) = parse_cred(&out[..n], true);
+    assert_eq!((x2, y2), (x, y), "enumerate pubkey stable across update");
+
+    // And getAssertion STILL signs under the original key (the actual fix).
+    assert_ga_signs_under(&mut fs, &id, &x, &y);
+}
+
+// The largeBlobKey likewise survives the reseal (v2 keys off the stable id).
+#[test]
+fn update_preserves_largeblobkey() {
+    let (mut fs, mut rng) = setup();
+    let rp_hash = sha256(b"example.com");
+    // register() offers no extensions, so build a resident cred with largeBlobKey.
+    let mut buf = [0u8; 512];
+    let req = {
+        let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+        e.map(6).unwrap();
+        e.u8(1).unwrap().bytes(&CDH).unwrap();
+        e.u8(2)
+            .unwrap()
+            .map(1)
+            .unwrap()
+            .str("id")
+            .unwrap()
+            .str("example.com")
+            .unwrap();
+        e.u8(3).unwrap().map(2).unwrap();
+        e.str("id").unwrap().bytes(&[8, 8]).unwrap();
+        e.str("name").unwrap().str("a").unwrap();
+        e.u8(4).unwrap().array(1).unwrap().map(2).unwrap();
+        e.str("alg").unwrap().i64(ALG_ES256).unwrap();
+        e.str("type").unwrap().str("public-key").unwrap();
+        e.u8(6).unwrap().map(1).unwrap();
+        e.str("largeBlobKey").unwrap().bool(true).unwrap();
+        e.u8(7)
+            .unwrap()
+            .map(1)
+            .unwrap()
+            .str("rk")
+            .unwrap()
+            .bool(true)
+            .unwrap();
+        e.writer().position()
+    };
+    let mut out = [0u8; 1024];
+    {
+        let mut state = FidoState::new();
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 10,
+        };
+        make_credential(&mut ctx, &buf[..req], &mut out).unwrap();
+    }
+    let mut state = armed(PERM_CM);
+
+    // enumerate → capture id + largeBlobKey (0x0B).
+    let n = run(
+        &mut fs,
+        &mut state,
+        &cm_request(0x04, Some(&subpara_rpidhash(&rp_hash)), &TOKEN),
+        &mut out,
+    )
+    .unwrap();
+    let id = enumerated_cred_id(&out[..n]);
+    let lbk0 = enum_largeblobkey(&out[..n]);
+    assert!(lbk0.is_some(), "largeBlobKey present");
+
+    // updateUserInformation, then re-enumerate: same largeBlobKey.
+    run(
+        &mut fs,
+        &mut state,
+        &cm_request(
+            0x07,
+            Some(&subpara_update(&id, &[8, 8], "a2", "A Two")),
+            &TOKEN,
+        ),
+        &mut out,
+    )
+    .unwrap();
+    let n = run(
+        &mut fs,
+        &mut state,
+        &cm_request(0x04, Some(&subpara_rpidhash(&rp_hash)), &TOKEN),
+        &mut out,
+    )
+    .unwrap();
+    let lbk1 = enum_largeblobkey(&out[..n]);
+    assert_eq!(
+        lbk0, lbk1,
+        "largeBlobKey stable across updateUserInformation"
+    );
 }

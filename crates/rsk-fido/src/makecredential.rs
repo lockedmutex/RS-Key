@@ -33,7 +33,8 @@ use crate::consts::{
 use crate::credential::{
     CRED_BOX_MAX, CRED_REC_MAX, CRED_RESIDENT_LEN, CredExt, CredInput, Credential, RECORD_PREFIX,
     RP_ID_MAX, USER_ID_MAX, USER_NAME_MAX, credential_create, credential_load, credential_store,
-    derive_large_blob_key, derive_resident, is_resident, slot_map, truncate_utf8,
+    derive_large_blob_key, derive_resident, is_resident, resident_key_input, slot_map,
+    truncate_utf8,
 };
 use crate::ec::{CredKey, MAX_SIG_LEN, P256Key};
 use crate::error::{CtapError, CtapResult};
@@ -494,8 +495,19 @@ fn make_credential_inner<S: Storage, R: Rng>(
     let box_len = credential_create(seed, &ctx.dev, &input, rp_id_hash, &iv, &mut cred_box)
         .map_err(|_| CtapError::Other)?;
 
-    // Derive the credential keypair from the box for the selected curve.
-    let mut raw = fido_load_key(seed, &cred_box[..box_len]).ok_or(CtapError::Other)?;
+    // Compute the resident id up front (resident keys only): the signing key,
+    // hmac-secret and largeBlobKey all derive from `key_input` — the STABLE
+    // resident id for a resident credential, the box for a non-resident one — so
+    // they survive an updateUserInformation reseal (see `resident_key_input`). It
+    // must be the same input the assertion / enumeration paths use, and the same
+    // id echoed into authData below.
+    let resident = req
+        .rk
+        .then(|| derive_resident(&cred_box[..box_len], &ctx.dev));
+    let key_input = resident_key_input(&cred_box[..box_len], resident.as_ref().map(|r| &r[..]));
+
+    // Derive the credential keypair for the selected curve.
+    let mut raw = fido_load_key(seed, key_input).ok_or(CtapError::Other)?;
     let key = CredKey::from_raw(req.sel_curve, &raw).ok_or(CtapError::Other)?;
     raw.zeroize();
 
@@ -507,7 +519,7 @@ fn make_credential_inner<S: Storage, R: Rng>(
             &req.hmac_secret_mc,
             &ephemeral,
             seed,
-            &cred_box[..box_len],
+            key_input,
             uv,
             ctx.rng,
             &mut hs,
@@ -550,11 +562,10 @@ fn make_credential_inner<S: Storage, R: Rng>(
     p += 4;
     ad[p..p + 16].copy_from_slice(&AAGUID);
     p += 16;
-    if req.rk {
-        let rid = derive_resident(&cred_box[..box_len], &ctx.dev);
+    if let Some(rid) = &resident {
         ad[p..p + 2].copy_from_slice(&(rid.len() as u16).to_be_bytes());
         p += 2;
-        ad[p..p + rid.len()].copy_from_slice(&rid);
+        ad[p..p + rid.len()].copy_from_slice(rid);
         p += rid.len();
     } else {
         ad[p..p + 2].copy_from_slice(&(box_len as u16).to_be_bytes());
@@ -598,7 +609,7 @@ fn make_credential_inner<S: Storage, R: Rng>(
 
     // largeBlobKey response field (0x05) — resident credentials only.
     let large_blob_key = if req.ext_large_blob_key == Some(true) && req.rk {
-        Some(derive_large_blob_key(seed, &cred_box[..box_len]))
+        Some(derive_large_blob_key(seed, key_input))
     } else {
         None
     };

@@ -168,7 +168,89 @@ fn resident_id_format_and_determinism() {
     assert_eq!(r1, r2);
     assert_eq!(r1.len(), CRED_RESIDENT_LEN);
     assert_eq!(&r1[4..8], CRED_PROTO_RESIDENT);
+    // New resident ids are stamped v2 (byte 8), in the header before the chain.
+    assert_eq!(r1[RESIDENT_VERSION_IDX], RESIDENT_VERSION_V2);
+    assert_eq!(r1[9], 0);
     assert!(is_resident(&r1));
+}
+
+// The v2 marker sits OUTSIDE the [10..42] hash chain, so flipping it does not
+// perturb the id's entropy: an id built with a v1 marker (0) shares the [10..42]
+// tail with the v2 id for the same box. This is what makes the flip forward-safe
+// for already-stored v1 ids.
+#[test]
+fn resident_version_marker_is_outside_the_hash_chain() {
+    let d = dev();
+    let cred_id = [0x55u8; 80];
+    let v2 = derive_resident(&cred_id, &d);
+    let mut v1 = v2;
+    v1[RESIDENT_VERSION_IDX] = 0;
+    assert_eq!(
+        v1[CRED_RESIDENT_HEADER_LEN..],
+        v2[CRED_RESIDENT_HEADER_LEN..],
+        "marker byte must not change the [10..42] chain"
+    );
+}
+
+// The reseal-stability fix at the derivation level: a v2 resident id is the key
+// input regardless of the (resealed) box, so the signing / hmac-secret /
+// largeBlobKey derivations are identical across an updateUserInformation box
+// swap; a v1 id (older firmware) still follows the box; a non-resident box has no
+// id. Also pins per-credential key uniqueness.
+#[test]
+fn resident_key_input_v2_is_reseal_stable_v1_follows_box() {
+    use crate::keyderiv::fido_load_key;
+    let d = dev();
+    // Two DIFFERENT boxes, as an updateUserInformation reseal (fresh IV) yields.
+    let box1 = [0x55u8; 80];
+    let box2 = [0xAAu8; 80];
+
+    let rid = derive_resident(&box1, &d);
+    assert_eq!(rid[RESIDENT_VERSION_IDX], RESIDENT_VERSION_V2);
+
+    // v2: the key input is the STABLE id, independent of the box.
+    assert_eq!(resident_key_input(&box1, Some(&rid[..])), &rid[..]);
+    assert_eq!(resident_key_input(&box2, Some(&rid[..])), &rid[..]);
+    let (ki1, ki2) = (
+        resident_key_input(&box1, Some(&rid[..])),
+        resident_key_input(&box2, Some(&rid[..])),
+    );
+    assert_eq!(
+        fido_load_key(&SEED, ki1),
+        fido_load_key(&SEED, ki2),
+        "signing key stable across reseal"
+    );
+    assert_eq!(
+        derive_hmac_key(&SEED, ki1),
+        derive_hmac_key(&SEED, ki2),
+        "hmac-secret stable across reseal"
+    );
+    assert_eq!(
+        derive_large_blob_key(&SEED, ki1),
+        derive_large_blob_key(&SEED, ki2),
+        "largeBlobKey stable across reseal"
+    );
+
+    // v1 (marker 0): the key input is the box, so the RP's box-derived pubkey
+    // keeps verifying — no rotation, no regression for older credentials.
+    let mut rid_v1 = rid;
+    rid_v1[RESIDENT_VERSION_IDX] = 0;
+    assert_eq!(resident_key_input(&box1, Some(&rid_v1[..])), &box1[..]);
+    assert_eq!(resident_key_input(&box2, Some(&rid_v1[..])), &box2[..]);
+
+    // Non-resident credential: no resident id → the box.
+    assert_eq!(resident_key_input(&box1, None), &box1[..]);
+
+    // Uniqueness: two distinct credentials get distinct v2 ids → distinct keys.
+    let rid_other = derive_resident(&box2, &d);
+    assert_ne!(
+        rid[CRED_RESIDENT_HEADER_LEN..],
+        rid_other[CRED_RESIDENT_HEADER_LEN..]
+    );
+    assert_ne!(
+        fido_load_key(&SEED, &rid[..]),
+        fido_load_key(&SEED, &rid_other[..])
+    );
 }
 
 #[test]

@@ -75,6 +75,19 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   odd `speed` the brightness could exceed `peak` at the apex and wrap to a dark
   value through the `u8` cast. The value is clamped to `peak` before the cast.
   Firmware `bcdDevice` → `0x0805`.
+- **`updateUserInformation` no longer breaks a passkey by rotating its keys.**
+  Editing a resident credential's user name (CTAP2.1 `authenticatorCredential
+  Management` 0x07) reseals the credential box with a fresh IV. The signing key,
+  hmac-secret and largeBlobKey were all derived from that box, so they rotated on
+  every update — the relying party's stored public key stopped verifying and the
+  passkey was effectively bricked. New resident credentials now stamp a **v2
+  version byte** into their 42-byte resident id (a reserved header byte, outside
+  the id's HMAC chain) and derive those three keys from the **stable** id instead
+  of the box, so they survive the reseal. The credential id itself was already
+  preserved; this extends that stability to the keys. Forward-compatible: resident
+  credentials from older firmware carry an implicit v1 marker and keep deriving
+  from the box, so an already-provisioned device is unaffected. No box or
+  on-flash format change. Firmware `bcdDevice` → `0x0806`.
 
 ### Changed
 

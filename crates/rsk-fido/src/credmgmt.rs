@@ -25,8 +25,8 @@ use crate::consts::{
 };
 use crate::credential::{
     CRED_BOX_MAX, CRED_REC_MAX, CRED_RESIDENT_LEN, CredInput, RECORD_PREFIX, RP_PREFIX, RP_REC_MAX,
-    USER_NAME_MAX, credential_create, credential_load, derive_large_blob_key, slot_map,
-    truncate_utf8, unseal_rp_id,
+    USER_NAME_MAX, credential_create, credential_load, derive_large_blob_key, resident_key_input,
+    slot_map, truncate_utf8, unseal_rp_id,
 };
 use crate::ec::CredKey;
 use crate::error::{CtapError, CtapResult};
@@ -412,12 +412,15 @@ fn enumerate_creds_response(
 ) -> CtapResult {
     let resident_id = &rec[32..RECORD_PREFIX];
     let cred_box = &rec[RECORD_PREFIX..];
+    // The enumerated pubkey must be the one getAssertion signs with: a v2
+    // credential keys off its stable resident id, so both agree across a reseal.
+    let key_input = resident_key_input(cred_box, Some(resident_id));
 
     let mut scratch = [0u8; CRED_REC_MAX];
     let cred =
         credential_load(seed, cred_box, rp_id_hash, &mut scratch).ok_or(CtapError::NotAllowed)?;
 
-    let mut raw = fido_load_key(seed, cred_box).ok_or(CtapError::NotAllowed)?;
+    let mut raw = fido_load_key(seed, key_input).ok_or(CtapError::NotAllowed)?;
     let key = CredKey::from_raw(cred.curve, &raw).ok_or(CtapError::NotAllowed)?;
     raw.zeroize();
 
@@ -429,7 +432,7 @@ fn enumerate_creds_response(
     // 0x0B largeBlobKey (derived, when the credential opted in), 0x0C
     // thirdPartyPayment (always).
     let large_blob_key = if cred.ext.large_blob_key {
-        Some(derive_large_blob_key(seed, cred_box))
+        Some(derive_large_blob_key(seed, key_input))
     } else {
         None
     };
@@ -571,8 +574,9 @@ pub(crate) fn decrement_rp<S: Storage>(
 /// 0x07 updateUserInformation: reseal the credential with a new user name /
 /// display name (same rp + user id). Replies with only the status byte.
 ///
-/// Quirk: resealing draws a fresh IV, so the credential box — and hence its
-/// derived resident id — changes, staling the platform's stored credentialId.
+/// The stored resident id (the platform's credentialId) and — for a v2
+/// credential — the signing / hmac-secret / largeBlobKey keys all stay stable
+/// across the reseal; see [`reseal_user`].
 fn update_user<S: Storage, R: Rng>(
     ctx: &mut Ctx<S, R>,
     cred_id: &[u8],
@@ -622,10 +626,13 @@ fn update_user<S: Storage, R: Rng>(
 /// platform's recorded id misses the (rotated) stored id → NO_CREDENTIALS
 /// (conformance CredMgmt-UpdateAndDelete P-2).
 ///
-/// Known limitation: the signing key, hmac-secret and largeBlobKey are all
-/// derived from the (now changed) box, so they DO rotate on an update. Keeping
-/// them stable too needs a per-credential nonce decoupled from the IV — a
-/// deferred, box-format-changing refactor — and is not required for conformance.
+/// The credential's signing key, hmac-secret and largeBlobKey stay stable too:
+/// v2 credentials derive them from the preserved resident id
+/// ([`credential::resident_key_input`]), not the box, so the RP's stored pubkey
+/// keeps verifying after an update. Legacy v1 credentials (created before that
+/// marker) still key off the box and so DO rotate on an update — the id derived
+/// from a v1 box is not re-issued, so this only affects passkeys made by older
+/// firmware, not any created since.
 #[allow(clippy::too_many_arguments)]
 fn reseal_user<S: Storage, R: Rng>(
     ctx: &mut Ctx<S, R>,

@@ -1549,8 +1549,10 @@ fn hmac_secret_assertion_end_to_end() {
     rsk_crypto::pinproto::decrypt(PinProto::Two, &shared[..slen], hmac_out, &mut dec).unwrap();
 
     // It must equal HMAC(CredRandomWithoutUV, salt) for the stored credential.
-    let (cred_box, seed) = stored_box_and_seed(&mut fs);
-    let cr = crate::credential::derive_hmac_key(&seed, &cred_box);
+    // A v2 resident credential keys hmac-secret off the stable resident id, not
+    // the box, so the reseal-stable id is the expected derivation input.
+    let (_cred_box, seed) = stored_box_and_seed(&mut fs);
+    let cr = crate::credential::derive_hmac_key(&seed, &resident_id[..]);
     assert_eq!(&dec[..], &rsk_crypto::hmac_sha256(&cr[..32], &salt)[..]);
 }
 
@@ -1626,8 +1628,9 @@ fn large_blob_key_in_assertion() {
             d.skip().unwrap();
         }
     }
-    let (cred_box, seed) = stored_box_and_seed(&mut fs);
-    let expected = crate::credential::derive_large_blob_key(&seed, &cred_box);
+    // v2 resident: largeBlobKey keys off the stable resident id, not the box.
+    let (_cred_box, seed) = stored_box_and_seed(&mut fs);
+    let expected = crate::credential::derive_large_blob_key(&seed, &resident_id[..]);
     assert_eq!(lbk.as_deref(), Some(&expected[..]));
 }
 
@@ -2290,4 +2293,82 @@ fn overlong_rpid_or_userid_rejected() {
             Err(CtapError::InvalidLength)
         );
     }
+}
+
+// Resident discovery + getNextAssertion must each sign with the credential's OWN
+// key. For v2 credentials that key derives from the stable resident id, so this
+// pins that BOTH signing sites (get_assertion and get_next_assertion) use it and
+// agree with makeCredential's pubkey — get_next_assertion had no such
+// signature-verify coverage before.
+#[test]
+fn discovery_and_getnext_sign_with_credential_keys() {
+    let (mut fs, mut rng) = setup();
+    let mut state = crate::FidoState::new();
+
+    // Register two resident creds for the same rp; capture each (uid, pubkey).
+    let mut keys: std::vec::Vec<([u8; 4], [u8; 32], [u8; 32])> = std::vec::Vec::new();
+    for (uid, t) in [(&[9u8, 8, 7, 6][..], 10u64), (&[1u8, 1, 1, 1][..], 20u64)] {
+        let mut out = [0u8; 1024];
+        let n = {
+            let mut presence = crate::AlwaysConfirm;
+            let mut ctx = Ctx {
+                presence: &mut presence,
+                dev: dev(),
+                fs: &mut fs,
+                rng: &mut rng,
+                state: &mut state,
+                now_ms: t,
+            };
+            make_credential(&mut ctx, &mc_request_user(uid), &mut out).unwrap()
+        };
+        let (_id, x, y) = parse_mc(&out[..n]);
+        let mut u = [0u8; 4];
+        u.copy_from_slice(uid);
+        keys.push((u, x, y));
+    }
+    let pick = |uid: &[u8]| -> ([u8; 32], [u8; 32]) {
+        for (u, x, y) in &keys {
+            if &u[..] == uid {
+                return (*x, *y);
+            }
+        }
+        panic!("uid not registered");
+    };
+
+    // Discovery getAssertion → newest credential; verify under its key.
+    let mut o1 = [0u8; 1024];
+    let n1 = {
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 30,
+        };
+        get_assertion(&mut ctx, &ga_request(None), &mut o1).unwrap()
+    };
+    let (u1, _c1) = user_and_count(&o1[..n1]);
+    let (x1, y1) = pick(&u1);
+    verify_assertion(&o1[..n1], &x1, &y1);
+
+    // getNextAssertion → the older credential; verify under ITS key.
+    let mut o2 = [0u8; 1024];
+    let n2 = {
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 31,
+        };
+        get_next_assertion(&mut ctx, &mut o2).unwrap()
+    };
+    let (u2, _c2) = user_and_count(&o2[..n2]);
+    assert_ne!(u1, u2, "two different credentials");
+    let (x2, y2) = pick(&u2);
+    verify_assertion(&o2[..n2], &x2, &y2);
 }

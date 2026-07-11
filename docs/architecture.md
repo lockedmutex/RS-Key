@@ -129,6 +129,16 @@ the opaque credential ID a relying party stores, so its size caps the reported
 
 ![FIDO credential box — proto(4) iv(12) then a variable CBOR body, poly1305 tag(16) and silent tag(16); the four framing pieces are 48 bytes and the whole box is at most 748. Below it, the 42-byte resident id returned to the relying party](images/cred-box.svg)
 
+The 42-byte resident id carries a **version byte** at offset 8 — a reserved
+header byte outside the `[10..42]` HMAC chain, so it never changes the id's
+entropy. It is `1` (v2) for every resident credential created since RS-Key
+`0x0806`: a v2 credential derives its signing key, hmac-secret and largeBlobKey
+from this **stable** id, so an `updateUserInformation` reseal (which draws a
+fresh box IV) no longer rotates them and the relying party's stored public key
+keeps verifying. Resident credentials from older firmware carry an implicit `0`
+(v1) and keep deriving from the box, so an already-provisioned device stays
+compatible across the upgrade.
+
 ## Capacity — why the flash is mostly empty
 
 The KV store is a fixed 1.5 MB whatever the `FLASH_SIZE` ([build.md](build.md));

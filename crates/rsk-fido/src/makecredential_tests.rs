@@ -952,10 +952,12 @@ fn large_blob_key_in_make_credential() {
         }
     }
     let mut rec = [0u8; 1024];
-    let n = fs.read(crate::consts::EF_CRED, &mut rec).unwrap();
+    let _n = fs.read(crate::consts::EF_CRED, &mut rec).unwrap();
     let seed = crate::seed::load_keydev(&dev(), &mut fs).unwrap();
-    let cred_box = &rec[crate::credential::RECORD_PREFIX..n];
-    let expected = crate::credential::derive_large_blob_key(&seed, cred_box);
+    // v2 resident: largeBlobKey keys off the stable resident id (rec[32..74]),
+    // not the box.
+    let resident_id = &rec[32..crate::credential::RECORD_PREFIX];
+    let expected = crate::credential::derive_large_blob_key(&seed, resident_id);
     assert_eq!(lbk.as_deref(), Some(&expected[..]));
 }
 

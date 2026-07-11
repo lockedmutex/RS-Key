@@ -115,6 +115,20 @@ pub(crate) const NICK_BOX_MAX: usize = IV_LEN + RP_NICK_MAX_LEN + TAG_LEN;
 pub const CRED_RESIDENT_LEN: usize = 42;
 const CRED_RESIDENT_HEADER_LEN: usize = 10;
 
+/// Offset of the resident-id format marker — a reserved header byte that sits
+/// OUTSIDE the `[10..42]` HMAC chain [`derive_resident`] fills, so it carries a
+/// version tag the RP treats as opaque without perturbing the id's entropy.
+/// It selects the key-derivation input (box vs. stable resident id) for the
+/// credential's signing / hmac-secret / largeBlobKey keys — see
+/// [`resident_key_input`].
+const RESIDENT_VERSION_IDX: usize = 8;
+/// v2 marker: the signing / hmac-secret / largeBlobKey keys derive from the
+/// STABLE resident id, so they survive an updateUserInformation reseal (CTAP2.1
+/// §6.8). Every newly created resident credential is v2; older stored credentials
+/// carry the implicit v1 marker (0) and keep deriving from the box, so an
+/// already-provisioned device stays byte-for-byte compatible across the upgrade.
+const RESIDENT_VERSION_V2: u8 = 1;
+
 /// Credential extensions sealed into the box. `minPinLength` is not stored —
 /// it is a request-only flag that gates the authData `minPINLength` output.
 #[derive(Clone, Copy, Default)]
@@ -428,14 +442,19 @@ fn parse_body(cbor: &[u8]) -> Option<Credential<'_>> {
 }
 
 /// The 42-byte resident id returned to the RP for a resident credential.
-/// Header = `serial-derived(4) ‖ proto23(4) ‖ 00 00`, then a 32-byte HMAC
-/// chain over the box.
+/// Header = `serial-derived(4) ‖ proto23(4) ‖ version(1) ‖ 00`, then a 32-byte
+/// HMAC chain over the box. The version byte ([`RESIDENT_VERSION_IDX`]) is not
+/// part of the chain (which spans `[10..42]`), so setting it leaves the id's
+/// entropy — and every already-stored v1 id's `[10..42]` — unchanged. New
+/// resident credentials are stamped v2 so their keys derive from this stable id
+/// (see [`resident_key_input`]); it is written only at create time and never
+/// re-derived for a lookup, so the flip cannot strand older stored ids.
 pub fn derive_resident(cred_id: &[u8], dev: &Device) -> [u8; CRED_RESIDENT_LEN] {
     let mut outk = [0u8; CRED_RESIDENT_LEN];
     let h0 = hmac_sha256(&[0u8; 32], dev.serial_id);
     outk[..32].copy_from_slice(&h0);
     outk[4..8].copy_from_slice(CRED_PROTO_RESIDENT);
-    outk[8] = 0;
+    outk[RESIDENT_VERSION_IDX] = RESIDENT_VERSION_V2;
     outk[9] = 0;
 
     let mut cred_idr = [0u8; 32];
@@ -470,6 +489,35 @@ pub fn derive_large_blob_key(seed: &[u8; 32], cred_id: &[u8]) -> [u8; 32] {
     k = hmac_sha256(&k, b"largeBlobKey");
     k = hmac_sha256(&k, cred_id);
     k
+}
+
+/// The key-derivation input for a credential's signing key ([`fido_load_key`]),
+/// hmac-secret ([`derive_hmac_key`]) and largeBlobKey ([`derive_large_blob_key`]).
+///
+/// A **v2 resident** credential (its stored `resident_id` carries the
+/// [`RESIDENT_VERSION_V2`] marker) keys off that STABLE id, so the keys survive an
+/// updateUserInformation reseal — which draws a fresh IV and thus a new box
+/// ([`crate::credmgmt`], CTAP2.1 §6.8). Every other case keys off the box exactly
+/// as before: a **v1** resident credential (older, marker 0) so the RP's stored
+/// pubkey still verifies, and a **non-resident** credential (`resident_id` is
+/// `None`) which has no stable id and cannot be resealed anyway.
+///
+/// Callers MUST route ALL THREE derivations through this so the pubkey issued at
+/// makeCredential and the key used at every assertion / enumeration path agree —
+/// a single site left on the box would make v2 passkeys fail to verify.
+pub(crate) fn resident_key_input<'a>(
+    cred_box: &'a [u8],
+    resident_id: Option<&'a [u8]>,
+) -> &'a [u8] {
+    match resident_id {
+        Some(rid)
+            if rid.len() == CRED_RESIDENT_LEN
+                && rid[RESIDENT_VERSION_IDX] == RESIDENT_VERSION_V2 =>
+        {
+            rid
+        }
+        _ => cred_box,
+    }
 }
 
 /// A resident record is `rp_id_hash(32) ‖ resident_id(42) ‖ full_cred_id`.
