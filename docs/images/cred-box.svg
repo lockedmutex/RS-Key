@@ -92,7 +92,7 @@
     </g>
     <text class="cellsm" x="98"  y="398" text-anchor="middle">serial-derived</text>
     <text class="cellsm" x="214" y="398" text-anchor="middle">proto f1d00203</text>
-    <text class="cellsm" x="306" y="398" text-anchor="middle">00 00</text>
+    <text class="cellsm" x="306" y="398" text-anchor="middle">01 · 00</text>
     <text class="cell"   x="538" y="398" text-anchor="middle">HMAC-SHA256 chain over the box</text>
   </g>
   <g text-anchor="middle">
