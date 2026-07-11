@@ -174,21 +174,35 @@ fn resident_id_format_and_determinism() {
     assert!(is_resident(&r1));
 }
 
-// The v2 marker sits OUTSIDE the [10..42] hash chain, so flipping it does not
-// perturb the id's entropy: an id built with a v1 marker (0) shares the [10..42]
-// tail with the v2 id for the same box. This is what makes the flip forward-safe
-// for already-stored v1 ids.
+// The v2 marker sits OUTSIDE the [10..42] HMAC chain, so it never feeds the id's
+// entropy. Prove it by recomputing the chain independently from ONLY its documented
+// inputs — the serial-derived header tail and the box — with the version byte
+// nowhere in the seed. If a refactor ever folded offset 8 into the chain, the real
+// id would diverge from this recomputation. (Flipping byte 8 on a COPY of the output
+// and comparing the tail proves nothing — the tail is below the mutated index by
+// construction, so it is equal for any array.)
 #[test]
 fn resident_version_marker_is_outside_the_hash_chain() {
     let d = dev();
     let cred_id = [0x55u8; 80];
-    let v2 = derive_resident(&cred_id, &d);
-    let mut v1 = v2;
-    v1[RESIDENT_VERSION_IDX] = 0;
+    let id = derive_resident(&cred_id, &d);
+    assert_eq!(id[RESIDENT_VERSION_IDX], RESIDENT_VERSION_V2);
+
+    // Seed = the pre-chain contents of outk[10..42]: the serial HMAC's tail
+    // (h0[10..32]) then zeroes. The version byte at offset 8 is not part of it.
+    let h0 = hmac_sha256(&[0u8; 32], d.serial_id);
+    let mut seed = [0u8; CRED_RESIDENT_LEN - CRED_RESIDENT_HEADER_LEN];
+    let tail = &h0[CRED_RESIDENT_HEADER_LEN..];
+    seed[..tail.len()].copy_from_slice(tail);
+
+    let mut chain = hmac_sha256(&seed, b"SLIP-0022");
+    chain = hmac_sha256(&chain, &cred_id[..PROTO_LEN]);
+    chain = hmac_sha256(&chain, b"resident");
+    chain = hmac_sha256(&chain, &cred_id);
     assert_eq!(
-        v1[CRED_RESIDENT_HEADER_LEN..],
-        v2[CRED_RESIDENT_HEADER_LEN..],
-        "marker byte must not change the [10..42] chain"
+        &id[CRED_RESIDENT_HEADER_LEN..],
+        &chain[..],
+        "the [10..42] chain must not read the version byte at offset 8"
     );
 }
 
