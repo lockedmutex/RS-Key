@@ -420,11 +420,14 @@ fn enforce_pin<S: Storage, R: Rng>(
     let pin_set = ctx.fs.has_data(EF_PIN);
     match req.pin_uv_auth_param {
         // Zero-length probe: a selection gesture — wait for a touch, then report
-        // the PIN state. With no button configured this confirms instantly.
+        // the PIN state. With no button configured this confirms instantly. CTAP 2.1
+        // §6.1.2 step 1 fixes the codes: PIN set → PIN_INVALID, unset → PIN_NOT_SET.
+        // A platform managing device selection (e.g. Chrome) advances from this
+        // touch to PIN entry off PIN_INVALID; PIN_AUTH_INVALID strands the ceremony.
         Some(&[]) => {
             ctx.require_presence(crate::Confirm::titled("Use this key?"))?;
             Err(if pin_set {
-                CtapError::PinAuthInvalid
+                CtapError::PinInvalid
             } else {
                 CtapError::PinNotSet
             })

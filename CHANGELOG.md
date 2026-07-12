@@ -13,6 +13,20 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+### Fixed
+
+- **New passkey registration no longer hangs on the touch after a PIN is set.**
+  A zero-length `pinUvAuthParam` is the CTAP 2.1 §6.1.2 / §6.2.2 step-1 selection
+  probe: the authenticator takes a device-selection touch and then reports the PIN
+  state through the returned error. With a PIN configured it must return
+  `CTAP2_ERR_PIN_INVALID` (0x31) — the code a platform managing device selection
+  (Chrome) reads to advance from that touch to PIN entry. `makeCredential` and
+  `getAssertion` returned `CTAP2_ERR_PIN_AUTH_INVALID` (0x33) instead, so once a
+  PIN was set a fresh registration showed "press the button" and the press never
+  advanced (the no-PIN `PIN_NOT_SET` code was already correct, which is why
+  registering *before* setting a PIN worked). Both now return `PIN_INVALID`.
+  Firmware `bcdDevice` `0x080B` → `0x080C`.
+
 ## [0.3.4] — 2026-07-12
 
 ### Fixed
