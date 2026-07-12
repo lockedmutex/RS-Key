@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 RS-Key contributors
 
-//! `authenticatorMakeCredential`: packed **self-attestation** (no x5c) by
-//! default. Resident keys (rk) are stored; non-resident credentials carry the
-//! full box in authData. A configured PIN requires a verified `pinUvAuthParam`
+//! `authenticatorMakeCredential`: ships `fmt:"none"` by default — self-attestation
+//! conveys no trust beyond "none" (WebAuthn §6.5.2) and a packed EdDSA self-
+//! attestation is mishandled by the Windows WebAuthn API, breaking `ed25519-sk`
+//! enrollment on OpenSSH 10 (issue #26). The `fido-conformance` profile emits
+//! packed **self-attestation** (no x5c) so the conformance tool can verify it.
+//! Resident keys (rk) are stored; non-resident credentials carry the full box in
+//! authData. A configured PIN requires a verified `pinUvAuthParam`
 //! ([`enforce_pin`]), which sets the `uv` flag. Request extensions are sealed
 //! into the box and echoed in the authData extension output (ED flag);
 //! excludeList is credProtect-aware. Enterprise attestation (request field
@@ -586,10 +590,7 @@ fn make_credential_inner<S: Storage, R: Rng>(
     p += ext_len;
     let ad_len = p;
 
-    // Attestation over authData ‖ clientDataHash. Self-attestation (the default)
-    // signs with the credential key; enterprise level 2 produces a full ("basic")
-    // attestation signed by the device key, carrying its x5c cert and the `ep`
-    // response flag.
+    // Attestation over authData ‖ clientDataHash.
     ad[ad_len..ad_len + 32].copy_from_slice(req.client_data_hash);
     // `ea_performed` — platform-managed (type 2), or vendor-facilitated (type 1)
     // for an RP on the built-in enterprise list (empty in shipping firmware) —
@@ -599,16 +600,28 @@ fn make_credential_inner<S: Storage, R: Rng>(
     let ea_performed = req.enterprise_attestation == 2
         || (req.enterprise_attestation == 1 && rp_eligible_for_vendor_ea(req.rp_id));
     let full_attestation = req.enterprise_attestation > 0;
+    // Ship `fmt:"none"` by default: self-attestation conveys no trust beyond "none"
+    // (WebAuthn §6.5.2), and a packed EdDSA self-attestation is mishandled by the
+    // Windows WebAuthn API — it fails OpenSSH 10.0's fido_cred_verify_self and breaks
+    // `ssh-keygen -t ed25519-sk` enrollment (issue #26). An explicitly-requested
+    // enterprise attestation still emits its full x5c statement; the `fido-conformance`
+    // profile keeps packed self-attestation (the conformance MakeCredential tests
+    // cryptographically verify it).
+    let none_attestation = !full_attestation && cfg!(not(feature = "fido-conformance"));
     let mut att = AttBufs::new();
-    let (att_alg, sig_len, chain_len, certs) = make_attestation(
-        ctx,
-        seed,
-        &key,
-        &ad[..ad_len + 32],
-        ea_performed,
-        full_attestation,
-        &mut att,
-    )?;
+    let (att_alg, sig_len, chain_len, certs) = if none_attestation {
+        (0, 0, 0, 0)
+    } else {
+        make_attestation(
+            ctx,
+            seed,
+            &key,
+            &ad[..ad_len + 32],
+            ea_performed,
+            full_attestation,
+            &mut att,
+        )?
+    };
 
     // largeBlobKey response field (0x05) — resident credentials only.
     let large_blob_key = if req.ext_large_blob_key == Some(true) && req.rk {
@@ -617,25 +630,36 @@ fn make_credential_inner<S: Storage, R: Rng>(
         None
     };
 
-    // Response: { 1: "packed", 2: authData, 3: attStmt [, 4: ep] [, 5: largeBlobKey] }.
-    // attStmt = { alg, sig } for self-attestation, + x5c for any basic_full /
-    // enterprise attestation. `ep` (field 4) only when EA was actually performed.
+    // Response: { 1: fmt, 2: authData, 3: attStmt [, 4: ep] [, 5: largeBlobKey] }.
+    // Default: fmt "none" with an empty attStmt. Otherwise fmt "packed": attStmt
+    // = { alg, sig } for self-attestation, + x5c for any basic_full / enterprise
+    // attestation. `ep` (field 4) only when EA was actually performed.
     let resp_len = {
         let mut enc = Encoder::new(Cursor::new(&mut *out));
         enc.map(3 + u64::from(ea_performed) + u64::from(large_blob_key.is_some()))
-            .and_then(|e| e.u8(1)?.str("packed"))
+            .and_then(|e| {
+                e.u8(1)?
+                    .str(if none_attestation { "none" } else { "packed" })
+            })
             .and_then(|e| e.u8(2)?.bytes(&ad[..ad_len]))
-            .and_then(|e| e.u8(3)?.map(2 + u64::from(full_attestation)))
-            .and_then(|e| e.str("alg")?.i64(att_alg))
-            .and_then(|e| e.str("sig")?.bytes(&att.sig[..sig_len]))
+            .and_then(|e| e.u8(3))
             .map_err(|_| CtapError::Other)?;
-        if full_attestation {
-            enc.str("x5c")
-                .and_then(|e| e.array(u64::from(certs)))
+        if none_attestation {
+            enc.map(0).map_err(|_| CtapError::Other)?;
+        } else {
+            enc.map(2 + u64::from(full_attestation))
+                .and_then(|e| e.str("alg")?.i64(att_alg))
+                .and_then(|e| e.str("sig")?.bytes(&att.sig[..sig_len]))
                 .map_err(|_| CtapError::Other)?;
-            for i in 0..certs {
-                let c = cert::att_chain_cert(&att.chain[..chain_len], i).ok_or(CtapError::Other)?;
-                enc.bytes(c).map_err(|_| CtapError::Other)?;
+            if full_attestation {
+                enc.str("x5c")
+                    .and_then(|e| e.array(u64::from(certs)))
+                    .map_err(|_| CtapError::Other)?;
+                for i in 0..certs {
+                    let c =
+                        cert::att_chain_cert(&att.chain[..chain_len], i).ok_or(CtapError::Other)?;
+                    enc.bytes(c).map_err(|_| CtapError::Other)?;
+                }
             }
         }
         if ea_performed {

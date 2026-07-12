@@ -20,6 +20,14 @@ impl Rng for SeqRng {
     }
 }
 
+// makeCredential ships `fmt:"none"` by default and `fmt:"packed"` under
+// `fido-conformance` (or for an enterprise attestation).
+const ATT_FMT: &str = if cfg!(feature = "fido-conformance") {
+    "packed"
+} else {
+    "none"
+};
+
 fn build_request(rk: bool) -> std::vec::Vec<u8> {
     let mut buf = [0u8; 512];
     let n = {
@@ -297,27 +305,37 @@ fn makecred_cancel_maps_keepalive_cancel() {
     );
 }
 
-// Parse the response, pull out authData + sig, and check the attestation
-// signature verifies under the credential public key embedded in authData.
+// Parse the response and pull out authData. Under `fido-conformance` the
+// attStmt is the packed self-attestation `{alg, sig}`, whose signature is
+// checked against the credential public key embedded in authData; by default
+// the attStmt is empty (fmt "none"), so only that shape is asserted (guarding
+// the issue #26 regression — no fragile EdDSA self-attestation).
 fn verify_response(resp: &[u8], client_data_hash: &[u8; 32]) -> std::vec::Vec<u8> {
     let mut d = Decoder::new(resp);
     // 3 base fields ({1,2,3}); a largeBlobKey credential adds field 0x05.
     assert!(d.map().unwrap().unwrap() >= 3);
     assert_eq!(d.u8().unwrap(), 1);
-    assert_eq!(d.str().unwrap(), "packed");
+    assert_eq!(d.str().unwrap(), ATT_FMT);
     assert_eq!(d.u8().unwrap(), 2);
     let auth_data = d.bytes().unwrap().to_vec();
     assert_eq!(d.u8().unwrap(), 3);
+
+    // authData layout: rpIdHash(32) flags(1) ctr(4) aaguid(16) credLen(2) credId COSEkey
+    assert_eq!(&auth_data[..32], &sha256(b"example.com")[..]);
+    // AT + UP always set; UV may also be set when a pinUvAuthParam was verified.
+    assert_eq!(auth_data[32] & (FLAG_AT | FLAG_UP), FLAG_AT | FLAG_UP);
+
+    if !cfg!(feature = "fido-conformance") {
+        assert_eq!(d.map().unwrap().unwrap(), 0, "default attStmt is empty");
+        return auth_data;
+    }
+
     assert_eq!(d.map().unwrap().unwrap(), 2);
     assert_eq!(d.str().unwrap(), "alg");
     assert_eq!(d.i64().unwrap(), ALG_ES256);
     assert_eq!(d.str().unwrap(), "sig");
     let sig = d.bytes().unwrap().to_vec();
 
-    // authData layout: rpIdHash(32) flags(1) ctr(4) aaguid(16) credLen(2) credId COSEkey
-    assert_eq!(&auth_data[..32], &sha256(b"example.com")[..]);
-    // AT + UP always set; UV may also be set when a pinUvAuthParam was verified.
-    assert_eq!(auth_data[32] & (FLAG_AT | FLAG_UP), FLAG_AT | FLAG_UP);
     let cred_len = u16::from_be_bytes([auth_data[37 + 16], auth_data[38 + 16]]) as usize;
     let cose_off = 39 + 16 + cred_len;
 
@@ -1067,7 +1085,9 @@ fn make_credential_bad_pin_auth_rejected() {
 
 // ---- PQC algorithm selection ----
 
-// makeCredential with a multi-entry pubKeyCredParams; returns the attStmt alg.
+// makeCredential with a multi-entry pubKeyCredParams; returns the alg of the
+// credential key selected (COSE label 3 in authData — present in both profiles,
+// unlike the attStmt alg which the default "none" fmt omits).
 fn selected_alg(algs: &[i64]) -> Result<i64, CtapError> {
     let mut buf = [0u8; 512];
     let n = {
@@ -1108,17 +1128,28 @@ fn selected_alg(algs: &[i64]) -> Result<i64, CtapError> {
     };
     let len = make_credential(&mut ctx, &buf[..n], &mut out)?;
 
+    // Pull authData (field 2), then read the COSE key alg (label 3) from it.
     let mut d = Decoder::new(&out[..len]);
     let fields = d.map().unwrap().unwrap();
+    let mut ad = None;
     for _ in 0..fields {
-        if d.u8().unwrap() == 3 {
-            d.map().unwrap();
-            assert_eq!(d.str().unwrap(), "alg");
-            return Ok(d.i64().unwrap());
+        if d.u8().unwrap() == 2 {
+            ad = Some(d.bytes().unwrap().to_vec());
+        } else {
+            d.skip().unwrap();
         }
-        d.skip().unwrap();
     }
-    panic!("attStmt missing");
+    let ad = ad.expect("authData present");
+    let cred_len = u16::from_be_bytes([ad[53], ad[54]]) as usize;
+    let mut cd = Decoder::new(&ad[55 + cred_len..]);
+    let entries = cd.map().unwrap().unwrap();
+    for _ in 0..entries {
+        if cd.i64().unwrap() == 3 {
+            return Ok(cd.i64().unwrap());
+        }
+        cd.skip().unwrap();
+    }
+    panic!("COSE key alg (label 3) missing");
 }
 
 #[test]

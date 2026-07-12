@@ -13,6 +13,23 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+### Changed
+
+- **`makeCredential` now ships `fmt:"none"` attestation by default**, fixing
+  `ssh-keygen -t ed25519-sk` enrollment on Windows / OpenSSH 10.0p2 (issue #26).
+  RS-Key previously returned packed **self**-attestation, so an Ed25519 credential
+  carried an Ed25519 self-attestation signature. OpenSSH 10.0 added
+  `fido_cred_verify_self`, and the Windows WebAuthn API does not round-trip that
+  EdDSA signature faithfully, so the verify failed with `FIDO_ERR_INVALID_SIG` and
+  the enroll aborted with "Key enrollment failed: invalid format" (ES256 self-att
+  round-trips fine, so `ecdsa-sk` worked; a genuine YubiKey uses basic ES256 x5c
+  attestation and never hits the path). Self-attestation conveys no trust beyond
+  "none" (WebAuthn §6.5.2), so shipping "none" loses nothing and is more private.
+  An explicitly-requested **enterprise** attestation still emits its full x5c
+  statement, and the `fido-conformance` profile keeps packed self-attestation (its
+  MakeCredential tests cryptographically verify it). `getInfo.attestationFormats`
+  is now `["none","packed"]`. Firmware `bcdDevice` `0x080C` → `0x080D`.
+
 ### Fixed
 
 - **New passkey registration no longer hangs on the touch after a PIN is set.**

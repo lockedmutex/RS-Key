@@ -24,6 +24,14 @@ impl Rng for SeqRng {
 
 const CDH: [u8; 32] = [0xCD; 32];
 
+// makeCredential ships `fmt:"none"` by default and `fmt:"packed"` under
+// `fido-conformance` (or for an enterprise attestation).
+const ATT_FMT: &str = if cfg!(feature = "fido-conformance") {
+    "packed"
+} else {
+    "none"
+};
+
 fn dev() -> Device<'static> {
     Device {
         serial_hash: &[0xAB; 32],
@@ -73,7 +81,7 @@ fn parse_mc(resp: &[u8]) -> (std::vec::Vec<u8>, [u8; 32], [u8; 32]) {
     // 3 base fields; a largeBlobKey credential adds field 0x05 (read 1 & 2 only).
     assert!(d.map().unwrap().unwrap() >= 3);
     assert_eq!(d.u8().unwrap(), 1);
-    assert_eq!(d.str().unwrap(), "packed");
+    assert_eq!(d.str().unwrap(), ATT_FMT);
     assert_eq!(d.u8().unwrap(), 2);
     let ad = d.bytes().unwrap();
     let cred_len = u16::from_be_bytes([ad[53], ad[54]]) as usize;
@@ -1850,7 +1858,7 @@ fn parse_mc_ec2(resp: &[u8]) -> (std::vec::Vec<u8>, std::vec::Vec<u8>, std::vec:
     let mut d = Decoder::new(resp);
     assert!(d.map().unwrap().unwrap() >= 3);
     assert_eq!(d.u8().unwrap(), 1);
-    assert_eq!(d.str().unwrap(), "packed");
+    assert_eq!(d.str().unwrap(), ATT_FMT);
     assert_eq!(d.u8().unwrap(), 2);
     let ad = d.bytes().unwrap();
     let cred_len = u16::from_be_bytes([ad[53], ad[54]]) as usize;
@@ -1944,7 +1952,7 @@ fn parse_mc_okp(resp: &[u8]) -> (std::vec::Vec<u8>, [u8; 32]) {
     let mut d = Decoder::new(resp);
     assert!(d.map().unwrap().unwrap() >= 3);
     assert_eq!(d.u8().unwrap(), 1);
-    assert_eq!(d.str().unwrap(), "packed");
+    assert_eq!(d.str().unwrap(), ATT_FMT);
     assert_eq!(d.u8().unwrap(), 2);
     let ad = d.bytes().unwrap();
     let cred_len = u16::from_be_bytes([ad[53], ad[54]]) as usize;
@@ -2058,7 +2066,7 @@ fn parse_mc_akp(resp: &[u8]) -> (std::vec::Vec<u8>, i64, std::vec::Vec<u8>) {
     let mut d = Decoder::new(resp);
     assert!(d.map().unwrap().unwrap() >= 3);
     assert_eq!(d.u8().unwrap(), 1);
-    assert_eq!(d.str().unwrap(), "packed");
+    assert_eq!(d.str().unwrap(), ATT_FMT);
     assert_eq!(d.u8().unwrap(), 2);
     let ad = d.bytes().unwrap();
     let cred_len = u16::from_be_bytes([ad[53], ad[54]]) as usize;
@@ -2100,6 +2108,29 @@ fn mc_att(resp: &[u8]) -> (i64, std::vec::Vec<u8>, std::vec::Vec<u8>) {
     (alg, sig, ad)
 }
 
+// Assert the default-profile makeCredential shape: fmt "none" (field 1) with an
+// empty attStmt map (field 3).
+fn assert_none_att_stmt(resp: &[u8]) {
+    let mut d = Decoder::new(resp);
+    let fields = d.map().unwrap().unwrap();
+    let mut saw_fmt = false;
+    let mut saw_empty_stmt = false;
+    for _ in 0..fields {
+        match d.u8().unwrap() {
+            1 => {
+                assert_eq!(d.str().unwrap(), "none");
+                saw_fmt = true;
+            }
+            3 => {
+                assert_eq!(d.map().unwrap().unwrap(), 0, "default attStmt is empty");
+                saw_empty_stmt = true;
+            }
+            _ => d.skip().unwrap(),
+        }
+    }
+    assert!(saw_fmt && saw_empty_stmt);
+}
+
 fn mldsa_verify(pk: &[u8], msg: &[u8], sig: &[u8]) -> bool {
     let pk: [u8; rsk_crypto::MLDSA44_PK_LEN] = pk.try_into().expect("AKP pk length");
     let sig: [u8; rsk_crypto::MLDSA44_SIG_LEN] = sig.try_into().expect("ML-DSA sig length");
@@ -2119,14 +2150,20 @@ fn mldsa44_register_then_login_verifies() {
     let (cred_id, alg, pk) = parse_mc_akp(&mc);
     assert_eq!(alg, ALG_MLDSA44);
     assert_eq!(pk.len(), rsk_crypto::MLDSA44_PK_LEN);
-    let (att_alg, att_sig, ad) = mc_att(&mc);
-    assert_eq!(att_alg, ALG_MLDSA44);
-    let mut signed = ad;
-    signed.extend_from_slice(&CDH);
-    assert!(
-        mldsa_verify(&pk, &signed, &att_sig),
-        "ML-DSA-44 self-attestation verifies"
-    );
+    // Default ships fmt "none" with an empty attStmt; only the conformance
+    // profile emits (and lets us verify) the packed self-attestation.
+    if cfg!(feature = "fido-conformance") {
+        let (att_alg, att_sig, ad) = mc_att(&mc);
+        assert_eq!(att_alg, ALG_MLDSA44);
+        let mut signed = ad;
+        signed.extend_from_slice(&CDH);
+        assert!(
+            mldsa_verify(&pk, &signed, &att_sig),
+            "ML-DSA-44 self-attestation verifies"
+        );
+    } else {
+        assert_none_att_stmt(&mc);
+    }
 
     // Login with the returned credential id; the assertion signature must
     // verify under the same key.
@@ -2164,14 +2201,20 @@ fn mldsa65_register_then_login_verifies() {
     let (cred_id, alg, pk) = parse_mc_akp(&mc);
     assert_eq!(alg, ALG_MLDSA65);
     assert_eq!(pk.len(), rsk_crypto::MLDSA65_PK_LEN);
-    let (att_alg, att_sig, ad) = mc_att(&mc);
-    assert_eq!(att_alg, ALG_MLDSA65);
-    let mut signed = ad;
-    signed.extend_from_slice(&CDH);
-    assert!(
-        mldsa65_verify(&pk, &signed, &att_sig),
-        "ML-DSA-65 self-attestation verifies"
-    );
+    // Default ships fmt "none" with an empty attStmt; only the conformance
+    // profile emits (and lets us verify) the packed self-attestation.
+    if cfg!(feature = "fido-conformance") {
+        let (att_alg, att_sig, ad) = mc_att(&mc);
+        assert_eq!(att_alg, ALG_MLDSA65);
+        let mut signed = ad;
+        signed.extend_from_slice(&CDH);
+        assert!(
+            mldsa65_verify(&pk, &signed, &att_sig),
+            "ML-DSA-65 self-attestation verifies"
+        );
+    } else {
+        assert_none_att_stmt(&mc);
+    }
 
     // Login with the returned credential id; the assertion signature must
     // verify under the same key.

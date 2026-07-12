@@ -1,9 +1,12 @@
 # Enterprise attestation (org provisioning)
 
-Out of the box ordinary `makeCredential` stays packed self-attestation with no
-certificate at all. RS-Key does carry a per-device self-signed certificate
-(a P-256 X.509 leaf with CN `RSK FIDO2`, built over the seed at first boot), but
-it presents that only on U2F registration and EA-level-2 requests. An
+Out of the box ordinary `makeCredential` returns `fmt:"none"` attestation (self-
+attestation conveys no trust beyond "none" per WebAuthn §6.5.2, and a packed EdDSA
+self-attestation breaks `ed25519-sk` enrollment on Windows / OpenSSH 10 — issue
+#26; the `fido-conformance` build keeps packed self-attestation for the conformance
+suite). RS-Key does carry a per-device self-signed certificate (a P-256 X.509 leaf
+with CN `RSK FIDO2`, built over the seed at first boot), but it presents that only
+on U2F registration and EA-level-2 requests. An
 organization can replace that device cert with its **own attestation key and
 certificate chain**, so its relying parties can verify "this credential was
 created on one of *our* keys" — the CTAP 2.1 enterprise-attestation (EA) feature.
@@ -77,8 +80,8 @@ rsk fido attestation clear [--pin …]
 - **U2F / CTAP1 registration** attests with the chain's **leaf** instead of the
   self-signed device cert (classic batch attestation — a U2F response carries
   exactly one certificate, so only the leaf travels).
-- **Ordinary makeCredential is untouched** — packed self-attestation, no chain,
-  no cross-site trackable identifier. EA fires only when the platform sets the
+- **Ordinary makeCredential is untouched** — `fmt:"none"`, no chain, no cross-site
+  trackable identifier. EA fires only when the platform sets the
   `enterpriseAttestation` request field *and* `enableEnterpriseAttestation` is
   on (below).
 
@@ -89,7 +92,7 @@ spec:
 
 | EA level | Without org key | With org key |
 |---|---|---|
-| (absent / 0) | self-attestation | self-attestation |
+| (absent / 0) | none | none |
 | 1 — vendor-facilitated | self-attestation | full org attestation |
 | 2 — platform-managed | full attestation by the **device key** + self-signed `RSK FIDO2` cert | full org attestation |
 
@@ -168,7 +171,7 @@ and chain is the explicit, gated `attestation clear` — nothing else clears the
 A shared org chain makes credentials linkable *to the organization* across its
 relying parties — that is the entire point of EA, and why the spec gates it
 behind both an explicit per-request field and a device-wide enable. Ordinary
-(non-EA) makeCredential stays self-attested and unlinkable; the org chain is
+(non-EA) makeCredential returns `fmt:"none"` and is unlinkable; the org chain is
 served only on explicit EA requests.
 
 ## Troubleshooting

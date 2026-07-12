@@ -15,9 +15,11 @@ Flash the no-touch build (firmware-test.uf2) — this tool cannot press the butt
                                      strict-parser compat); advertise-pqc build:
                                      -48 leads; maxMsgSize 7609 either way
   3. makeCredential [-7, -48]     -> PQC preferred over the earlier classic entry:
-                                     AKP COSE key {1:7, 3:-48, -1:pub(1312)}; the
-                                     packed self-attestation (2420-byte sig)
-                                     verifies under dilithium-py
+                                     AKP COSE key {1:7, 3:-48, -1:pub(1312)}; under
+                                     a --features fido-conformance build the packed
+                                     self-attestation (2420-byte sig) verifies under
+                                     dilithium-py (shipping firmware sends fmt=none,
+                                     empty attStmt — the attStmt check is skipped)
   4. getAssertion (allowList)     -> assertion verifies; sign counter grows
   5. rk -7 then rk [-7,-48], same rp/user -> the resident slot upgrades to
                                      ML-DSA-44; discovery asserts with it
@@ -49,12 +51,12 @@ def ctap(dev, cid, cmd, fields=None):
 
 
 def parse_make_credential(resp):
-    """-> (credId, alg, pk, authData, attStmt) from a packed mc response."""
+    """-> (credId, alg, pk, authData, fmt, attStmt) from an mc response."""
     auth_data = resp[2]
     cred_len = int.from_bytes(auth_data[53:55], "big")
     cred_id = auth_data[55:55 + cred_len]
     cose = decode(auth_data[55 + cred_len:])
-    return cred_id, cose[3], cose.get(-1), auth_data, resp[3]
+    return cred_id, cose[3], cose.get(-1), auth_data, resp[1], resp[3]
 
 
 def make_credential(dev, cid, algs, uid=b"\x01\x02\x03\x04", rk=False):
@@ -117,11 +119,17 @@ def main():
         assert gi[5] == 7609, f"maxMsgSize {gi[5]}, want 7609"
 
         # 3. PQC-preferred registration: -48 wins despite -7 listed first.
-        (cred_id, alg, pk, auth_data, att), dt_mc = make_credential(dev, cid, [-7, -48])
+        (cred_id, alg, pk, auth_data, fmt, att), dt_mc = make_credential(dev, cid, [-7, -48])
         assert alg == -48, f"selected alg {alg}, want -48 (PQC priority)"
-        assert len(pk) == PK_LEN and att["alg"] == -48
-        assert len(att["sig"]) == SIG_LEN
-        assert ML_DSA_44.verify(pk, auth_data + CDH, att["sig"]), "attestation sig"
+        assert len(pk) == PK_LEN
+        if fmt == "none":
+            assert att == {}, f"fmt=none must carry an empty attStmt, got {att!r}"
+            print("SKIP: self-attestation verify needs a --features fido-conformance "
+                  "firmware (shipping firmware sends fmt=none)")
+        else:  # packed self-attestation
+            assert att["alg"] == -48
+            assert len(att["sig"]) == SIG_LEN
+            assert ML_DSA_44.verify(pk, auth_data + CDH, att["sig"]), "attestation sig"
 
         # 4. Assertion under the same credential; counter must grow.
         ad1, sig1, dt_ga = get_assertion(dev, cid, cred_id)
@@ -136,7 +144,7 @@ def main():
         # 5. Classic -> PQC resident upgrade for one rp/user.
         uid = b"\x42\x42"
         make_credential(dev, cid, [-7], uid=uid, rk=True)
-        (_, alg, pk2, _, _), _ = make_credential(dev, cid, [-7, -48], uid=uid, rk=True)
+        (_, alg, pk2, _, _, _), _ = make_credential(dev, cid, [-7, -48], uid=uid, rk=True)
         assert alg == -48
         ad3, sig3, _ = get_assertion(dev, cid)  # discovery, no allowList
         assert len(sig3) == SIG_LEN, "upgraded resident credential signs ML-DSA"
