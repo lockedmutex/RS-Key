@@ -1364,6 +1364,82 @@ fn ed25519_generate_sign_and_self_signed_cert() {
     .unwrap();
 }
 
+/// A key slot whose metadata is shorter than the [algo, pin, touch] header
+/// (unreachable via normal writers — a defense-in-depth backstop) is rejected
+/// by GENERAL AUTHENTICATE rather than reading policy from the zero-fill, which
+/// would silently drop the touch gate.
+#[test]
+fn general_auth_rejects_short_meta() {
+    let rng = RefCell::new(TestRng(7));
+    let pres = RefCell::new(AlwaysConfirm);
+    let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
+    let mut fs = new_fs();
+    select(&mut app, &mut fs);
+    auth_mgm(&mut app, &mut fs);
+    verify_pin(&mut app, &mut fs);
+    let (sw, _) = run(
+        &mut app,
+        &mut fs,
+        INS_ASYM_KEYGEN,
+        0,
+        0x9A,
+        &gen_template(ALGO_ED25519),
+    );
+    assert_eq!(sw, Sw::OK);
+    // Control: with the normal (4-byte) meta the sign succeeds.
+    let message = [0x42u8; 32];
+    let mut msg = vec![0x7C, 0x24, 0x82, 0x00, 0x81, 0x20];
+    msg.extend_from_slice(&message);
+    let (sw, _) = run(
+        &mut app,
+        &mut fs,
+        INS_AUTHENTICATE,
+        ALGO_ED25519,
+        0x9A,
+        &msg,
+    );
+    assert_eq!(sw, Sw::OK);
+    // Truncate the slot meta below the 3-byte [algo, pin, touch] header and
+    // repeat: the guard fires (without it the missing bytes read as the zero-fill
+    // and the sign would succeed, silently dropping the touch gate). Both 1- and
+    // 2-byte records must be rejected — this pins the threshold at 3, not 2.
+    for short in [&[ALGO_ED25519][..], &[ALGO_ED25519, PINPOLICY_ONCE][..]] {
+        fs.meta_delete(key_fid(0x9A).get()).unwrap();
+        fs.meta_add(key_fid(0x9A).get(), short).unwrap();
+        let (sw, _) = run(
+            &mut app,
+            &mut fs,
+            INS_AUTHENTICATE,
+            ALGO_ED25519,
+            0x9A,
+            &msg,
+        );
+        assert_eq!(
+            sw,
+            Sw::REFERENCE_NOT_FOUND,
+            "meta length {} must be rejected",
+            short.len()
+        );
+    }
+    // Exactly the 3-byte header is accepted (threshold is 3, not 4): a minimal
+    // [algo, pin, touch] meta signs again.
+    fs.meta_delete(key_fid(0x9A).get()).unwrap();
+    fs.meta_add(
+        key_fid(0x9A).get(),
+        &[ALGO_ED25519, PINPOLICY_ONCE, TOUCHPOLICY_NEVER],
+    )
+    .unwrap();
+    let (sw, _) = run(
+        &mut app,
+        &mut fs,
+        INS_AUTHENTICATE,
+        ALGO_ED25519,
+        0x9A,
+        &msg,
+    );
+    assert_eq!(sw, Sw::OK);
+}
+
 /// Generate an X25519 key: it gets no self-signed certificate (it can't sign),
 /// and GENERAL AUTHENTICATE exponentiation (`ykman calculate-secret`) agrees a
 /// shared secret that matches the host side.

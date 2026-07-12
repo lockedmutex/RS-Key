@@ -321,10 +321,16 @@ pub(crate) fn general_authenticate<S: Storage>(
     }
 
     let mut meta = [0u8; 8];
-    let Some(_meta_len) = fs.meta_find(key_fid(key_ref).get(), &mut meta) else {
-        mgm_key.zeroize();
-        return Sw::REFERENCE_NOT_FOUND;
-    };
+    // A key/mgmt slot's meta is [algo, pin_policy, touch_policy, (origin)] — every
+    // writer emits >= 3 bytes; reject a short record rather than read policy from
+    // the zero-fill (matches info::read_slot's n >= 3 guard).
+    match fs.meta_find(key_fid(key_ref).get(), &mut meta) {
+        Some(n) if n >= 3 => {}
+        _ => {
+            mgm_key.zeroize();
+            return Sw::REFERENCE_NOT_FOUND;
+        }
+    }
     let mut pinpol = meta[1];
     if pinpol == PINPOLICY_DEFAULT {
         pinpol = if key_ref == SLOT_SIGNATURE {

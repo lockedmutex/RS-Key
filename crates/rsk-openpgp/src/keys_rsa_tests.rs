@@ -170,6 +170,37 @@ fn keygen_bpsw_split_matches_library() {
 }
 
 #[test]
+fn keygen_pool_le_rejects_wrong_size_prime() {
+    // Belt-and-suspenders: a wrong-length byte-transport find (a stale prime from
+    // a prior different-size job) must be dropped and scrubbed, leaving the pool
+    // intact — feeding it would corrupt the modulus.
+    let mut kg = RsaKeygen::new(2048); // half = 128 bytes
+    assert_eq!(kg.half_bytes(), 128);
+    let mut under = hex(P_HEX);
+    under.truncate(64); // 64 < 128: an under-size stale prime
+    assert!(matches!(kg.offer_le(&mut under), RsaStep::More));
+    assert!(
+        under.iter().all(|&b| b == 0),
+        "rejected buffer not scrubbed"
+    );
+    // …and an over-size stale prime — pins the guard at `!=`, not `<`.
+    let mut over = hex(P_HEX);
+    over.extend_from_slice(&hex(Q_HEX)[..64]); // 192 > 128
+    assert!(matches!(kg.offer_le(&mut over), RsaStep::More));
+    assert!(over.iter().all(|&b| b == 0), "rejected buffer not scrubbed");
+    // Pool untouched: a correct-size pair still assembles the exact modulus. (Were
+    // either wrong prime pooled, this first offer would already return Done.)
+    let (mut p_le, mut q_le) = (hex(P_HEX), hex(Q_HEX));
+    p_le.reverse();
+    q_le.reverse();
+    assert!(matches!(kg.offer_le(&mut p_le), RsaStep::More));
+    match kg.offer_le(&mut q_le) {
+        RsaStep::Done(k) => assert_eq!(k.n().to_bytes_be(), hex(N_HEX)),
+        _ => panic!("correct-size primes must complete the key after a reject"),
+    }
+}
+
+#[test]
 fn keygen_pool_rejects_duplicate_prime() {
     let p = BigUint::from_bytes_be(&hex(P_HEX));
     let mut kg = RsaKeygen::new(2048);

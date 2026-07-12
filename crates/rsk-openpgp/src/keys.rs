@@ -939,6 +939,13 @@ impl RsaKeygen {
     /// [`offer`](RsaKeygen::offer) from little-endian bytes (the inter-core
     /// transport format); scrubs `bytes` after the conversion.
     pub fn offer_le(&mut self, bytes: &mut [u8]) -> RsaStep {
+        // Belt-and-suspenders: a byte-transport find must be exactly this key's
+        // half size — a wrong length is a stale prime from a prior different-size
+        // job (mailbox scrubbed on engage, so never fires today); pooling corrupts n.
+        if bytes.len() != self.half_bytes {
+            bytes.zeroize();
+            return RsaStep::More;
+        }
         let cand = BigUint::from_bytes_le(bytes);
         bytes.zeroize();
         self.offer(cand)

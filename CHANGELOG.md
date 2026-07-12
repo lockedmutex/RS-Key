@@ -121,6 +121,26 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   (`0.2.9`) clients now prompt for that touch and map its denial. Firmware
   `bcdDevice` → `0x0808`.
 
+### Security
+
+- **Dual-core RSA keygen rejects a wrong-size prime at the inter-core handoff.**
+  `RsaKeygen::offer_le` — the byte-transport entry the core0 drain feeds core1's
+  finds through — converted whatever length it was handed, so a stale prime from
+  a prior different-size keygen would have corrupted the assembled modulus. The
+  mailbox is scrubbed on engage and keygens are serialized on the worker, so this
+  never fires today; the length check is a belt-and-suspenders backstop that fails
+  a mismatched find closed even if a future refactor reopened the handoff window.
+  Defense-in-depth (found in the run-16 audit); no wire or on-flash format change.
+  Firmware `bcdDevice` → `0x080B`.
+- **PIV `GENERAL AUTHENTICATE` rejects a key slot with a truncated metadata
+  record.** The handler read the PIN- and touch-policy bytes without checking the
+  meta record was at least the 3-byte `[algo, pin, touch]` header, unlike
+  `info::read_slot`; a sub-header record would have read policy from the zero-fill
+  and skipped the touch gate. Every metadata writer emits ≥ 3 bytes, so no slot
+  can reach this state — the guard is a defense-in-depth backstop (found in the
+  run-16 audit) matching the sibling reader. No wire or on-flash format change.
+  Firmware `bcdDevice` → `0x080A`.
+
 ### Changed
 
 - **`rsk` CLI and `rsk-tui` harden their handling of device-controlled data.** A
