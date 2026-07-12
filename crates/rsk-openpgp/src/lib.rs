@@ -486,3 +486,11 @@ impl<S: Storage> Applet<Fs<S>> for OpenpgpApplet<'_> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "serial_identity_tests.rs"]
+mod serial_identity_tests;
+
+#[cfg(test)]
+#[path = "dispatch_getdata_tests.rs"]
+mod dispatch_getdata_tests;

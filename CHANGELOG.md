@@ -13,6 +13,149 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+## [0.3.4] — 2026-07-12
+
+### Fixed
+
+- **OpenPGP decrypt no longer breaks after a `VERIFY` of both PW1 modes (issue
+  #25).** `gpg`/`scdaemon` verifies one PIN entry into both PW1 modes
+  back-to-back — mode `82` (DECIPHER/INTERNAL AUTH) then mode `81` (signing) —
+  before a decrypt. `check_pin` cleared **both** PW1 latches on every successful
+  verify and re-raised only the current one, so the trailing mode-`81` verify
+  silently dropped the mode-`82` authorization the next `PSO:DECIPHER` needs,
+  which then returned `6982` and surfaced to the user as `Bad PIN` with the
+  correct PIN (typically after a replug, once `scdaemon` re-ran the full verify
+  sequence). PW1.81, PW1.82 and PW3 are now treated as the independent access
+  latches the card spec requires — a successful `VERIFY` raises only its own.
+  Session-only state; no wire or on-flash format change. Firmware `bcdDevice`
+  → `0x0809`.
+- **A `put` past the dynamic-file cap no longer strands its value on flash.** A
+  new runtime file (e.g. a resident credential) written once the dynamic set is
+  full committed its bytes to flash *before* the cap check rejected it, so the
+  caller saw `NoMemory` while the value stayed on flash — readable yet
+  unregistered, and re-dropped by every reboot rescan at the same cap. The cap
+  is now enforced before the write, so an over-cap `put` fails atomically and
+  leaves no trace. Latent (it needs 256 dynamic files to trigger); no wire or
+  on-flash format change. Firmware `bcdDevice` → `0x07FD`.
+- **OpenPGP `PUT DATA` for the PW-status DO (`C4`) can no longer overwrite the
+  PIN retry counters.** `put_pw_status` capped the copy at the full 7-byte
+  record, so a ≥5-byte field wrote host bytes over the live PW1/RC/PW3 retry
+  counters — its own doc comment says they are preserved; they were not. A host
+  (malicious or a buggy 7-byte read-modify-write) could zero them and block
+  every PIN across a power cycle, recoverable only by a key-destroying
+  `TERMINATE DF`. The copy is now capped at the writable prefix (flag + the
+  three max-length bytes); the retry counters are read-only. PW3-gated, so no
+  privilege change. Firmware `bcdDevice` → `0x07FE`.
+- **PIV `MOVE KEY` onto a key's own slot (`p1 == p2`) no longer destroys it.**
+  A self-move wrote the sealed key/cert/metadata back into the slot and then
+  unconditionally deleted the *source* — the same slot — leaving it empty while
+  returning `0x9000`, silently erasing the (possibly only) key. Same-slot moves
+  are now rejected with `INCORRECT_P1P2` before any write, matching real
+  hardware. Management-key-gated, so no privilege change. Firmware `bcdDevice`
+  → `0x07FF`.
+- **OpenPGP empty-data `VERIFY` in PW2 mode (`P2=0x82`) reports PW1's retries
+  again.** The `EF_RC → EF_PW1` remap was gated on a non-empty data field, so a
+  status query (`00 20 00 82 00`) probed the reset-code EF instead of the shared
+  PW1 verifier — answering `6A88`, or a spurious `PIN_BLOCKED` when a reset code
+  was configured and blocked. The remap now applies to the status query too.
+  Firmware `bcdDevice` → `0x0800`.
+- **FIDO `getAssertion` no longer over-reports `numberOfCredentials`.** With more
+  than `MAX_ASSERTION_CREDS` (16) discoverable credentials for one RP, the count
+  reported the full match total while the `getNextAssertion` queue caps at 16, so
+  a platform was told to fetch more than the device could serve and hit a
+  premature `NOT_ALLOWED`. The count is now clamped to the servable queue size.
+  Firmware `bcdDevice` → `0x0801`.
+- **FIDO `getAssertion` binds an unscoped `pinUvAuthToken` to the request rpId on
+  first use (CTAP 2.1 §6.2.2).** A token minted without an rpId (legacy
+  `getPinToken`, or `0x09` with `ga` permission and no rpId) was reusable across
+  arbitrary RPs for its whole lifetime — `makeCredential` bound it but
+  `getAssertion` did not. It now binds on first use, so a later cross-RP
+  assertion fails `PinAuthInvalid`. Firmware `bcdDevice` → `0x0802`.
+- **CCID `XfrBlock` responses can no longer be silently truncated.** The applet
+  response buffer (`RESP_CAP`) was sized to the full 2048-byte CCID message
+  rather than its 2038-byte payload budget (message − 10-byte header), so a large
+  response (e.g. a long OATH `LIST`) overran one frame and `run_xfr` dropped the
+  trailing bytes including the status word. The buffer now matches the frame
+  payload budget. Firmware `bcdDevice` → `0x0803`.
+- **RSA keygen ignores a stale core1 prime when it did not engage the second
+  core.** When the core1 entry gate timed out (`engaged=false`), the search still
+  drained core1's find slots, which could hold a prime from the *previous*
+  (possibly different-size) keygen — combining it would yield a malformed modulus
+  with a weak factor. The search now consumes core1's finds only when it actually
+  engaged core1 this keygen; stale finds are scrubbed at wind-down. Astronomically
+  rare, but a real undefended race. Firmware `bcdDevice` → `0x0804`.
+- **LED breathing effect no longer flickers dark at its peak.** `effect_vapor`
+  divided the falling ramp by `period/2` (floor) over `half+1` steps, so for an
+  odd `speed` the brightness could exceed `peak` at the apex and wrap to a dark
+  value through the `u8` cast. The value is clamped to `peak` before the cast.
+  Firmware `bcdDevice` → `0x0805`.
+- **`updateUserInformation` no longer breaks a passkey by rotating its keys.**
+  Editing a resident credential's user name (CTAP2.1 `authenticatorCredential
+  Management` 0x07) reseals the credential box with a fresh IV. The signing key,
+  hmac-secret and largeBlobKey were all derived from that box, so they rotated on
+  every update — the relying party's stored public key stopped verifying and the
+  passkey was effectively bricked. New resident credentials now stamp a **v2
+  version byte** into their 42-byte resident id (a reserved header byte, outside
+  the id's HMAC chain) and derive those three keys from the **stable** id instead
+  of the box, so they survive the reseal. The credential id itself was already
+  preserved; this extends that stability to the keys. Forward-compatible: resident
+  credentials from older firmware carry an implicit v1 marker and keep deriving
+  from the box, so an already-provisioned device is unaffected. No box or
+  on-flash format change. Firmware `bcdDevice` → `0x0806`.
+- **PIV `SET PIN RETRIES` (INS `0xFA`) now requires the PIN, not just the
+  management key.** The handler gated only on the management key, then reset the
+  PIN and PUK to their public defaults ("123456" / "12345678"). Because the
+  default management key is public and the `9B` slot is touch-`NEVER`, a host
+  that authenticated it could reset an *unknown* cardholder PIN without knowing
+  it — locking the legitimate user out, and (for a touch-`NEVER` key slot) using
+  their PIN-protected keys after verifying the now-default PIN. It now demands
+  the current PIN as well, matching YubiKey's `set-pin-retries`. Reachable only
+  by an already-management-authenticated caller, so no new privilege for a
+  legitimate admin. Firmware `bcdDevice` → `0x0807`.
+- **FIDO vendor `AUDIT_READ` (`0x41 / 0x07`) now requires a touch on a device
+  with no PIN.** With no clientPIN the PIN gate is a no-op, so any local process
+  could export the tamper-evident journal, whose per-entry `detail` is a 64-bit
+  `rpIdHash` prefix — short enough to dictionary-match back to the relying
+  parties a no-PIN device had been used with (the entries are only weakly
+  pseudonymous, not anonymous). A physical touch is now required in that case,
+  matching the sibling `AUDIT_CHECKPOINT`; a PIN-backed device is unchanged.
+  Privacy hardening — no key material is exposed. The `rsk` CLI (`0.3.9`) and TUI
+  (`0.2.9`) clients now prompt for that touch and map its denial. Firmware
+  `bcdDevice` → `0x0808`.
+
+### Security
+
+- **Dual-core RSA keygen rejects a wrong-size prime at the inter-core handoff.**
+  `RsaKeygen::offer_le` — the byte-transport entry the core0 drain feeds core1's
+  finds through — converted whatever length it was handed, so a stale prime from
+  a prior different-size keygen would have corrupted the assembled modulus. The
+  mailbox is scrubbed on engage and keygens are serialized on the worker, so this
+  never fires today; the length check is a belt-and-suspenders backstop that fails
+  a mismatched find closed even if a future refactor reopened the handoff window.
+  Defense-in-depth (found in the run-16 audit); no wire or on-flash format change.
+  Firmware `bcdDevice` → `0x080B`.
+- **PIV `GENERAL AUTHENTICATE` rejects a key slot with a truncated metadata
+  record.** The handler read the PIN- and touch-policy bytes without checking the
+  meta record was at least the 3-byte `[algo, pin, touch]` header, unlike
+  `info::read_slot`; a sub-header record would have read policy from the zero-fill
+  and skipped the touch gate. Every metadata writer emits ≥ 3 bytes, so no slot
+  can reach this state — the guard is a defense-in-depth backstop (found in the
+  run-16 audit) matching the sibling reader. No wire or on-flash format change.
+  Firmware `bcdDevice` → `0x080A`.
+
+### Changed
+
+- **`rsk` CLI and `rsk-tui` harden their handling of device-controlled data.** A
+  counterfeit or malfunctioning USB device that returned non-string/absent
+  getInfo fields (`versions`, `aaguid`, `clientPin`) or a malformed soft-lock
+  state could crash `rsk status` / `rsk inventory list` / `rsk lock` with an
+  uncaught `TypeError`, or inject ANSI/OSC/bidi escapes into the operator's
+  terminal via unsanitized `clientPin`/lock-state strings; `rsk-tui --json` left
+  DEL/C1/bidi bytes unescaped. All device-controlled display values now route
+  through the shared sanitizer or a type-guarded join, bool-coerced where
+  appropriate, and the TUI `--json` writer escapes every control and non-ASCII
+  char. Host-only (`rsk` `0.3.8`, `rsk-tui` `0.2.8`); no firmware change.
+
 ## [0.3.3] — 2026-07-10
 
 ### Added
@@ -1200,7 +1343,8 @@ family that keeps the "enterprise" features in the open tree.
   signature of it, and a CycloneDX SBOM. See
   [docs/releases.md](docs/releases.md) to verify a download.
 
-[Unreleased]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.4...HEAD
+[0.3.4]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.0...v0.3.1

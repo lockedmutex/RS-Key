@@ -387,7 +387,10 @@ fn effect_vapor(status: usize, tick: u32) -> [RGB8; MAX_LEDS] {
         (period - phase) * peak as u32 / half
     };
 
-    let c = color_rgb(color_idx, breathe as u8);
+    // Clamp before the u8 cast: for an odd period the falling ramp divides by
+    // `half` (floor) over `half+1` steps, so `breathe` can exceed `peak` at the
+    // apex and wrap to a dark value instead of the brightest.
+    let c = color_rgb(color_idx, breathe.min(peak as u32) as u8);
     let n = runtime_leds() as usize;
     let mut buf = [RGB8::default(); MAX_LEDS];
     for led in buf[..n].iter_mut() {

@@ -11,7 +11,7 @@ import json
 
 from . import ccid, ctaphid
 from .backup import CTAP_VENDOR, STATE as VENDOR_STATE
-from .common import sanitize
+from .common import sanitize, sanitize_join
 
 RESCUE_AID = [0xA0, 0x58, 0x3F, 0xC1, 0x9B, 0x7E, 0x4F, 0x21]
 INS_RESCUE_READ = 0x1E
@@ -49,7 +49,7 @@ def _fido():
             out["aaguid"] = gi.get(3).hex() if gi.get(3) else None
             out["fw"] = _fw(gi.get(14))
             opts = gi.get(4) or {}
-            out["clientPin"] = opts.get("clientPin")
+            out["clientPin"] = bool(opts.get("clientPin"))
             out["options"] = sorted(k for k, v in opts.items() if v)
         rb = ctaphid.send_cbor(dev, cid, bytes([CTAP_VENDOR]) + ctaphid.enc({1: VENDOR_STATE}))
         if rb[0] == 0:
@@ -105,8 +105,8 @@ def run(args):
     if not f.get("present"):
         print("FIDO HID   : not found")
     else:
-        print(f"FIDO HID   : present  fw {f.get('fw')}  aaguid {f.get('aaguid', '')[:16]}…")
-        print(f"  versions : {sanitize(', '.join(f.get('versions') or []))}")
+        print(f"FIDO HID   : present  fw {f.get('fw')}  aaguid {(f.get('aaguid') or '')[:16]}…")
+        print(f"  versions : {sanitize_join(f.get('versions'))}")
         print(f"  clientPin: {f.get('clientPin')}")
         b = f.get("backup")
         if b:

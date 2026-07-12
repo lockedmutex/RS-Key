@@ -196,8 +196,10 @@ pub fn check_pin<S: Storage>(
     if let Err(sw) = pin_reset_retries(fs, fid, false) {
         return sw;
     }
-    sess.has_pw1 = false;
-    sess.has_pw2 = false;
+    // PW1.81 (PSO:CDS), PW1.82 (DECIPHER/INTERNAL AUTH) and PW3 are INDEPENDENT
+    // access latches: a successful VERIFY raises only its own, never clears a
+    // sibling. gpg/scdaemon verifies one PIN entry into both PW1 modes (82 then
+    // 81); clearing here dropped PW1.82 and bricked the next DECIPHER with 6982 (#25).
     if fid == EF_PW1 {
         if p2 == PW1_MODE81 {
             sess.has_pw1 = true;
@@ -326,8 +328,10 @@ pub fn verify<S: Storage>(
         return Sw::WRONG_P1P2;
     }
     let mut fid = pw_fid(p2);
-    if fid == EF_RC && !data.is_empty() {
-        fid = EF_PW1; // PW2 (p2 = 0x82) verifies against the PW1 verifier
+    if fid == EF_RC {
+        // PW2 (p2 = 0x82) shares the PW1 verifier and its retry counter — for a
+        // status query too, else an empty-data probe reads the (absent) EF_RC.
+        fid = EF_PW1;
     }
     let mut rec = [0u8; 64];
     let size = match fs.read(fid, &mut rec) {

@@ -20,7 +20,11 @@ use rsk_sdk::{Apdu, Applet, Dispatcher, ResBuf, Sw};
 use crate::handler::{FidoRng, Store};
 use crate::vendor::VendorApplet;
 
-const RESP_CAP: usize = 2048;
+// A CCID XfrBlock frame carries MAX_CCID_MSG (2048) minus the 10-byte CCID
+// header = 2038 payload bytes. The applet response (body + 2-byte SW) must fit
+// one frame; sizing this to the full message let a large response (e.g. a long
+// OATH LIST) overrun the frame, and `run_xfr` silently dropped the tail incl. SW.
+const RESP_CAP: usize = 2038;
 
 /// Registration-order indices of the applets whose RSA keygen is fast-pathed.
 const IDX_OPENPGP: usize = 1;

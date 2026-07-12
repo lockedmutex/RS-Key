@@ -170,6 +170,9 @@ impl<S: Storage> Fs<S> {
             }
             let is_static = table.iter().any(|d| d.fid == fid);
             if !is_static && !dynamic.contains(&fid) {
+                // `put`/`new_file` reject a dynamic file past the cap before it
+                // reaches flash, so the store can never hold more than fit here.
+                debug_assert!(!dynamic.is_full(), "dynamic overflow on rescan");
                 let _ = dynamic.push(fid);
             }
         });
@@ -294,10 +297,18 @@ impl<S: Storage> Fs<S> {
 
     /// Store file contents, registering a dynamic file if new.
     pub fn put(&mut self, fid: u16, data: &[u8]) -> Result<()> {
+        // A new dynamic file that would overflow the set is rejected *before* the
+        // flash write: registering only after committing would strand the value
+        // on flash — readable yet unregistered — and leave `scan` to re-drop it
+        // at the same cap on every reboot.
+        let register = !self.is_static(fid) && !self.dynamic.contains(&fid);
+        if register && self.dynamic.is_full() {
+            return Err(Error::NoMemory);
+        }
         self.storage.write(fid, data)?;
         self.mark_present(fid);
-        if !self.is_static(fid) && !self.dynamic.contains(&fid) {
-            self.dynamic.push(fid).map_err(|_| Error::NoMemory)?;
+        if register {
+            let _ = self.dynamic.push(fid); // cap checked above — cannot fail
         }
         Ok(())
     }

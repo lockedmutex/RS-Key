@@ -180,7 +180,7 @@ and a provisioned OTP DEVK — without the DEVK it says
 hash-chained sequence of events (`BOOT`, `MAKE_CREDENTIAL`, `GET_ASSERTION`,
 `PIN_SET`, `BACKUP_EXPORT`, `CHECKPOINT`, …) folded into an epoch, with the
 running chain `head`. It is read-only — the device never lets the host rewrite
-it — and asks for the FIDO2 PIN if one is set. The full cross-check against the
+it — and asks for the FIDO2 PIN if one is set, or a physical touch if not. The full cross-check against the
 signed head lives in `rsk audit verify`.
 
 **LED** reads the four LED states the firmware drives — `idle`, `processing`,

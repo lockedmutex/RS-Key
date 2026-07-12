@@ -1395,3 +1395,35 @@ fn config_write_led_rejects_short_block() {
         Err(CtapError::InvalidLength)
     );
 }
+
+#[test]
+fn audit_read_without_pin_requires_touch() {
+    let (mut fs, mut rng, mut st) = setup(); // no PIN configured → pin_gate is a no-op
+    let mut req = [0u8; 16];
+    let n = one_byte_req(&mut req, VENDOR_AUDIT_READ);
+    let mut out = [0u8; 3072];
+    // A silent host on a no-PIN device must not be able to harvest the journal.
+    assert_eq!(
+        call(
+            &mut fs,
+            &mut rng,
+            &mut st,
+            &mut Decline,
+            &req[..n],
+            &mut out
+        ),
+        Err(CtapError::OperationDenied)
+    );
+    // The user's physical touch unlocks the same read.
+    assert!(
+        call(
+            &mut fs,
+            &mut rng,
+            &mut st,
+            &mut AlwaysConfirm,
+            &req[..n],
+            &mut out
+        )
+        .is_ok()
+    );
+}

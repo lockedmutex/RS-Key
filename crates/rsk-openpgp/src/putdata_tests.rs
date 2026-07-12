@@ -128,6 +128,29 @@ fn put_pw_status_updates_flag_in_place() {
 }
 
 #[test]
+fn put_pw_status_cannot_overwrite_retry_counters() {
+    // A >=5-byte C4 field must update only the flag + 3 max-length bytes; the
+    // three retry counters that follow are read-only. A host writing a full
+    // 7-byte record must never zero them — that would block every PIN across a
+    // power cycle, recoverable only by a key-destroying TERMINATE DF.
+    let (mut fs, mut sess) = setup();
+    admin(&mut fs, &mut sess);
+    assert_eq!(
+        put_pw_status(&mut fs, &sess, &[0x01, 0x7F, 0x7F, 0x7F, 0, 0, 0]),
+        Sw::OK
+    );
+    let mut pw = [0u8; 7];
+    let n = fs.read(EF_PW_PRIV, &mut pw).unwrap();
+    assert_eq!(n, 7);
+    assert_eq!(
+        &pw[0..4],
+        &[0x01, 0x7F, 0x7F, 0x7F],
+        "flag + max-lengths written"
+    );
+    assert_eq!(&pw[4..7], &[3, 0, 3], "retry counters must be read-only");
+}
+
+#[test]
 fn generic_put_data_does_not_handle_specials() {
     // The reset code / PW status are routed away from the generic DO write.
     let (mut fs, mut sess) = setup();

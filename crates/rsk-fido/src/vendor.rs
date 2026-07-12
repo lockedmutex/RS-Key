@@ -304,10 +304,17 @@ fn att_state<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, out: &mut [u8]) -> CtapRes
 }
 
 /// `AUDIT_READ`: export the journal window (`journal::vendor_read`). Gated on a
-/// PIN token (when a PIN is set) only — the entries are pseudonymous and no key
-/// material moves, so no MSE channel and no touch.
+/// PIN token when a PIN is set; a touch otherwise — with no PIN `pin_gate` is a
+/// no-op, and the per-entry detail is a reversible 64-bit rpId-hash prefix (not
+/// truly pseudonymous), so an ungated read lets a silent host harvest the
+/// RP-usage history. No MSE channel: no key material moves.
 fn audit_read<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req, out: &mut [u8]) -> CtapResult {
     pin_gate(ctx, req)?;
+    if !ctx.fs.has_data(EF_PIN)
+        && !ctx.check_user_presence(crate::Confirm::titled("Read audit log?"))
+    {
+        return Err(CtapError::OperationDenied);
+    }
     journal::vendor_read(ctx, out)
 }
 

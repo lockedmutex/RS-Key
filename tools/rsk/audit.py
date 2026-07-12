@@ -9,7 +9,8 @@ hash-chained from an "epoch" accumulator that absorbs evicted history. The
 device signs the chain head with an ECDSA P-256 key derived from the OTP DEVK
 (vendor AUDIT_CHECKPOINT), so the log is verifiable end-to-end:
 
-  log     export and pretty-print the journal      (--pin if a PIN is set)
+  log     export and pretty-print the journal      (--pin if a PIN is set,
+                                                     else a touch)
   verify  log + signed checkpoint over a fresh
           challenge; checks the chain and the
           signature                                 (touch; --pin if a PIN is set)
@@ -106,8 +107,12 @@ def verify_checkpoint(m, challenge, distrust, badsig):
 
 def read_journal(dev, cid, pin):
     """AUDIT_READ → (start, seq_next, epoch, entries bytes)."""
+    if pin is None:
+        # No PIN backs the gate, so the firmware requires a touch instead.
+        print("touch the device (BOOTSEL) to read the journal…", file=sys.stderr)
     st, m = _vendor(dev, cid, _gated(AUDIT_READ, None, dev, cid, pin))
     _die_pin_required(st)
+    _die_touch_denied(st)
     if st != 0:
         die(f"audit read failed: {st:#x}")
     start, seq_next, epoch, entries = m[1], m[2], m[3], m[4]

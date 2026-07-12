@@ -25,7 +25,8 @@ import sys
 from . import ccid, ctaphid
 from .audit import AUDIT_CHECKPOINT, _fingerprint, verify_checkpoint
 from .backup import ERR_NOT_ALLOWED, _die_pin_required, _die_touch_denied, _gated, _vendor
-from .common import add_pin_arg, connect_fido, device_has_pin, die, resolve_pin, sanitize
+from .common import (add_pin_arg, connect_fido, device_has_pin, die,
+                     resolve_pin, sanitize, sanitize_join)
 from .fido import ATT_STATE  # vendor: org-attestation state (ungated)
 from .status import RESCUE_AID, VENDOR_STATE, _fw, rescue_read, rescue_serial
 
@@ -107,7 +108,7 @@ def _hid_records():
                 rec["fw"] = _fw(gi.get(14))
                 rec["versions"] = gi.get(1)
                 rec["aaguid"] = gi.get(3).hex() if gi.get(3) else None
-                rec["client_pin"] = (gi.get(4) or {}).get("clientPin")
+                rec["client_pin"] = bool((gi.get(4) or {}).get("clientPin"))
             st, m = _vendor(dev, cid, {1: VENDOR_STATE})
             if st == 0:
                 rec["backup"] = {"sealed": bool(m.get(1)), "has_seed": bool(m.get(2))}
@@ -156,7 +157,7 @@ def _print_record(rec):
     if fl:
         print(f"  flash      : {fl['used']}/{fl['kv_total']} B used, {fl['files']} files")
     if rec.get("versions") is not None:
-        print(f"  fido       : {sanitize(', '.join(rec['versions']))}  clientPin={rec.get('client_pin')}")
+        print(f"  fido       : {sanitize_join(rec['versions'])}  clientPin={rec.get('client_pin')}")
     b, lk = rec.get("backup"), rec.get("lock")
     if b:
         lock = ("LOCKED" if lk["locked"] else "off") if lk else "n/a"

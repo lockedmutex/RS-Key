@@ -56,7 +56,11 @@ pub fn put_pw_status<S: Storage>(fs: &mut Fs<S>, sess: &Session, data: &[u8]) ->
         Some(n) => n,
         None => return Sw::REFERENCE_NOT_FOUND,
     };
-    let m = data.len().min(n);
+    // Only the leading bytes (flag + 3 max-length bytes) are writable via PUT
+    // DATA; the retry counters that follow (indices PW1_RETRY_IDX..) are
+    // read-only. Capping at the first counter stops a long field from zeroing
+    // them and blocking every PIN across a power cycle.
+    let m = data.len().min(n).min(PW1_RETRY_IDX);
     pw[..m].copy_from_slice(&data[..m]);
     if fs.put(EF_PW_PRIV, &pw[..n]).is_err() {
         return Sw::MEMORY_FAILURE;

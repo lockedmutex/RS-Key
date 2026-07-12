@@ -69,10 +69,14 @@ def _state(dev, cid):
     st, m = _vendor(dev, cid, {1: VENDOR_STATE})
     if st != 0:
         die(f"state read failed: {st:#x}")
-    # Firmware without soft-lock support answers with only {1: sealed, 2: has_seed}.
-    if 3 not in m:
+    # A hostile/old device may answer with a non-map or without the soft-lock
+    # fields; require the map and key 3 (the isinstance guard also stops a scalar
+    # reply from raising on `3 not in m`), then coerce to bool so a spoofed
+    # string value can't reach the terminal or a downstream check raw.
+    if not isinstance(m, dict) or 3 not in m:
         die("firmware too old — no soft-lock support (need bcdDevice >= 0x0742)")
-    return {"sealed": m[1], "has_seed": m[2], "locked": m[3], "unlocked": m[4]}
+    return {"sealed": bool(m.get(1)), "has_seed": bool(m.get(2)),
+            "locked": bool(m.get(3)), "unlocked": bool(m.get(4))}
 
 
 def _wrap_for_channel(key, aad, secret):

@@ -207,6 +207,119 @@ fn assertion_with_pin_sets_uv_flag() {
     assert_eq!(ad[32] & FLAG_UV, FLAG_UV, "UV flag must be set");
 }
 
+#[test]
+fn unscoped_pin_token_binds_rpid_on_first_getassertion() {
+    // A GA-capable token minted without an rpId (legacy getPinToken) must bind
+    // to the request's rpId on first use (CTAP 2.1 §6.2.2), so it can't be
+    // replayed across RPs for its whole lifetime.
+    let (mut fs, mut rng) = setup();
+    let mut state = crate::FidoState::new();
+    let mut out = [0u8; 1024];
+    let cred_id = {
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 10,
+        };
+        let n = make_credential(&mut ctx, &mc_request(true), &mut out).unwrap();
+        parse_mc(&out[..n]).0
+    };
+    let token = arm_pin(&mut fs, &mut state);
+    assert!(!state.paut.has_rp_id, "token starts unscoped");
+    let mut param = [0u8; 32];
+    let plen = rsk_crypto::pinproto::authenticate(PinProto::Two, &token, &CDH, &mut param).unwrap();
+    {
+        let req = ga_request_pin(&cred_id, &param[..plen], 2);
+        let mut o = [0u8; 1024];
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 20,
+        };
+        get_assertion(&mut ctx, &req, &mut o).unwrap();
+    }
+    assert!(
+        state.paut.has_rp_id,
+        "unscoped token must bind on first use"
+    );
+    // A second GA for a DIFFERENT rpId is rejected before credential lookup.
+    let mut buf = [0u8; 512];
+    let m = {
+        let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+        e.map(4).unwrap();
+        e.u8(1).unwrap().str("other.example").unwrap();
+        e.u8(2).unwrap().bytes(&CDH).unwrap();
+        e.u8(6).unwrap().bytes(&param[..plen]).unwrap();
+        e.u8(7).unwrap().u64(2).unwrap();
+        e.writer().position()
+    };
+    let mut o = [0u8; 1024];
+    let mut presence = crate::AlwaysConfirm;
+    let mut ctx = Ctx {
+        presence: &mut presence,
+        dev: dev(),
+        fs: &mut fs,
+        rng: &mut rng,
+        state: &mut state,
+        now_ms: 30,
+    };
+    assert_eq!(
+        get_assertion(&mut ctx, &buf[..m], &mut o).unwrap_err(),
+        CtapError::PinAuthInvalid,
+        "a token bound to example.com must reject other.example"
+    );
+}
+
+#[test]
+fn numberofcredentials_clamped_to_queue_capacity() {
+    // With more resident creds for one rp than the getNextAssertion queue holds
+    // (MAX_ASSERTION_CREDS), numberOfCredentials must be clamped to what is
+    // servable, not over-report and strand the excess behind a NOT_ALLOWED.
+    let (mut fs, mut rng) = setup();
+    let mut state = crate::FidoState::new();
+    let mut out = [0u8; 1024];
+    for i in 0..(crate::state::MAX_ASSERTION_CREDS + 1) {
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 10,
+        };
+        make_credential(&mut ctx, &mc_request_user(&[i as u8; 16]), &mut out).unwrap();
+    }
+    let req = ga_request(None); // discovery, no allowList
+    let mut o = [0u8; 1024];
+    let n = {
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 20,
+        };
+        get_assertion(&mut ctx, &req, &mut o).unwrap()
+    };
+    let (_user, count) = user_and_count(&o[..n]);
+    assert_eq!(
+        count,
+        Some(crate::state::MAX_ASSERTION_CREDS as u32),
+        "count clamped to what the queue can serve"
+    );
+}
+
 fn ga_request(allow: Option<&[u8]>) -> std::vec::Vec<u8> {
     let mut buf = [0u8; 512];
     let n = {
@@ -1436,8 +1549,10 @@ fn hmac_secret_assertion_end_to_end() {
     rsk_crypto::pinproto::decrypt(PinProto::Two, &shared[..slen], hmac_out, &mut dec).unwrap();
 
     // It must equal HMAC(CredRandomWithoutUV, salt) for the stored credential.
-    let (cred_box, seed) = stored_box_and_seed(&mut fs);
-    let cr = crate::credential::derive_hmac_key(&seed, &cred_box);
+    // A v2 resident credential keys hmac-secret off the stable resident id, not
+    // the box, so the reseal-stable id is the expected derivation input.
+    let (_cred_box, seed) = stored_box_and_seed(&mut fs);
+    let cr = crate::credential::derive_hmac_key(&seed, &resident_id[..]);
     assert_eq!(&dec[..], &rsk_crypto::hmac_sha256(&cr[..32], &salt)[..]);
 }
 
@@ -1459,6 +1574,198 @@ fn run_mc_state(
     };
     let n = make_credential(&mut ctx, req, &mut out).unwrap();
     out[..n].to_vec()
+}
+
+// An updateUserInformation (credMgmt 0x07) request that reseals `cred_id`'s box
+// with a new name (same user id), MAC'd under `token` (protocol 2). The
+// subCommandParams are encoded once and embedded verbatim — the device re-MACs
+// exactly those bytes, so the request must carry the identical encoding.
+fn cm_update_request(
+    cred_id: &[u8],
+    uid: &[u8],
+    name: &str,
+    token: &[u8; 32],
+) -> std::vec::Vec<u8> {
+    use rsk_crypto::pinproto::authenticate;
+    let mut sp = [0u8; 256];
+    let spn = {
+        let mut e = Encoder::new(Cursor::new(&mut sp[..]));
+        e.map(2).unwrap();
+        e.u8(2).unwrap().map(2).unwrap();
+        e.str("id").unwrap().bytes(cred_id).unwrap();
+        e.str("type").unwrap().str("public-key").unwrap();
+        e.u8(3).unwrap().map(3).unwrap();
+        e.str("id").unwrap().bytes(uid).unwrap();
+        e.str("name").unwrap().str(name).unwrap();
+        e.str("displayName").unwrap().str(name).unwrap();
+        e.writer().position()
+    };
+    let subpara = &sp[..spn];
+
+    let mut payload = std::vec![0x07u8];
+    payload.extend_from_slice(subpara);
+    let mut mac = [0u8; 32];
+    let mlen = authenticate(PinProto::Two, token, &payload, &mut mac).unwrap();
+
+    let mut req = std::vec::Vec::new();
+    req.push(0xA4); // map(4)
+    req.extend_from_slice(&[0x01, 0x07]); // 1: subCommand = updateUserInformation
+    req.push(0x02); // 2: subCommandParams (raw, re-MAC'd verbatim)
+    req.extend_from_slice(subpara);
+    req.extend_from_slice(&[0x03, 0x02]); // 3: pinUvAuthProtocol = 2
+    req.push(0x04); // 4: pinUvAuthParam
+    req.push(0x58); // byte string, 1-byte length prefix
+    req.push(mlen as u8);
+    req.extend_from_slice(&mac[..mlen]);
+    req
+}
+
+// Drive updateUserInformation to reseal `cred_id` (fresh IV → new box), under a
+// freshly-armed credentialManagement token.
+fn reseal_credential(
+    fs: &mut Fs<RamStorage>,
+    rng: &mut SeqRng,
+    cred_id: &[u8],
+    uid: &[u8],
+    name: &str,
+) {
+    let token = [0x99u8; 32];
+    let mut state = crate::FidoState::new();
+    state.paut.token = token;
+    state.paut.permissions = crate::state::PERM_CM;
+    state.begin_using_token(false);
+    let req = cm_update_request(cred_id, uid, name, &token);
+    let mut out = [0u8; 512];
+    let mut presence = crate::AlwaysConfirm;
+    let mut ctx = Ctx {
+        presence: &mut presence,
+        dev: dev(),
+        fs,
+        rng,
+        state: &mut state,
+        now_ms: 50,
+    };
+    let n = crate::credmgmt::cred_mgmt(&mut ctx, &req, &mut out).unwrap();
+    assert_eq!(
+        n, 0,
+        "updateUserInformation replies with only the status byte"
+    );
+}
+
+// The decrypted (IV-stripped) hmac-secret extension output carried in an
+// assertion's authData, under the platform's shared secret.
+fn hmac_secret_plaintext(resp: &[u8], shared: &[u8]) -> std::vec::Vec<u8> {
+    let ad = assertion_auth_data(resp);
+    assert_eq!(ad[32] & FLAG_ED, FLAG_ED, "extension output present");
+    let mut d = Decoder::new(&ad[37..]);
+    assert_eq!(d.map().unwrap().unwrap(), 1);
+    assert_eq!(d.str().unwrap(), "hmac-secret");
+    let ct = d.bytes().unwrap();
+    let mut dec = [0u8; 32];
+    let n = rsk_crypto::pinproto::decrypt(PinProto::Two, shared, ct, &mut dec).unwrap();
+    dec[..n].to_vec()
+}
+
+// #3 hmac-secret, end to end across a REAL updateUserInformation reseal. Register
+// a resident credential with hmac-secret, evaluate hmac-secret through
+// getAssertion (the full ECDH + hmacsecret::eval path), run updateUserInformation
+// — which reseals the box with a fresh IV — then evaluate hmac-secret AGAIN. The
+// decrypted secret must be identical: a v2 credential keys cred_random off the
+// STABLE resident id, not the (rotated) box, so the platform's stored secret
+// survives the update. Neuter the marker (v2→v1) and this fails — the box changes
+// and dec2 diverges from dec1. This complements the derivation-level unit test
+// [`credential::resident_key_input`] with the full command path.
+#[test]
+fn hmac_secret_survives_updateuserinfo_reseal_end_to_end() {
+    use rsk_crypto::pinproto::{authenticate, ecdh, encrypt, public_xy};
+    let (mut fs, mut rng) = setup();
+    let mut state = crate::FidoState::new();
+    state.regenerate(&mut rng); // the clientPIN getKeyAgreement ephemeral key
+    let (ax, ay) = state.ephemeral_public().unwrap();
+
+    let mc = run_mc_state(&mut fs, &mut rng, &mut state, &mc_request_lbk_hmac());
+    let (resident_id, ..) = parse_mc(&mc);
+    assert_eq!(
+        resident_id[8], 1,
+        "new resident credential carries the v2 marker"
+    );
+
+    // Platform half (protocol two): ECDH against the authenticator ephemeral,
+    // encrypt the salt, MAC it. Fixed across both evaluations.
+    let plat = {
+        let mut s = [0u8; 32];
+        s[0] = 0x22;
+        s[31] = 0x22;
+        s
+    };
+    let (px, py) = public_xy(&plat).unwrap();
+    let mut shared = [0u8; 64];
+    let slen = ecdh(PinProto::Two, &plat, &ax, &ay, &mut shared).unwrap();
+    let salt = [0x77u8; 32];
+    let iv = [0x01u8; 16];
+    let mut se = [0u8; 48];
+    let ne = encrypt(PinProto::Two, &shared[..slen], &iv, &salt, &mut se).unwrap();
+    let mut sa = [0u8; 32];
+    let na = authenticate(PinProto::Two, &shared[..slen], &se[..ne], &mut sa).unwrap();
+    let req = ga_request_hmac(&resident_id, &px, &py, &se[..ne], &sa[..na]);
+
+    // First evaluation (before the reseal).
+    let dec1 = {
+        let mut out = [0u8; 1024];
+        let n = {
+            let mut presence = crate::AlwaysConfirm;
+            let mut ctx = Ctx {
+                presence: &mut presence,
+                dev: dev(),
+                fs: &mut fs,
+                rng: &mut rng,
+                state: &mut state,
+                now_ms: 20,
+            };
+            get_assertion(&mut ctx, &req, &mut out).unwrap()
+        };
+        hmac_secret_plaintext(&out[..n], &shared[..slen])
+    };
+
+    // updateUserInformation reseals the box with a fresh IV — the stored box MUST
+    // change, else box-derived keys could pass this test spuriously.
+    let box_before = stored_box_and_seed(&mut fs).0;
+    reseal_credential(&mut fs, &mut rng, &resident_id, &[9, 8, 7, 6], "bob2");
+    let box_after = stored_box_and_seed(&mut fs).0;
+    assert_ne!(
+        box_before, box_after,
+        "reseal must rotate the box (fresh IV)"
+    );
+
+    // Second evaluation (after the reseal). A fresh per-call IV makes the
+    // ciphertext differ, but the decrypted secret must be identical.
+    let dec2 = {
+        let mut out = [0u8; 1024];
+        let n = {
+            let mut presence = crate::AlwaysConfirm;
+            let mut ctx = Ctx {
+                presence: &mut presence,
+                dev: dev(),
+                fs: &mut fs,
+                rng: &mut rng,
+                state: &mut state,
+                now_ms: 30,
+            };
+            get_assertion(&mut ctx, &req, &mut out).unwrap()
+        };
+        hmac_secret_plaintext(&out[..n], &shared[..slen])
+    };
+
+    // The property this test adds: the hmac-secret secret survives the reseal.
+    assert_eq!(
+        dec1, dec2,
+        "hmac-secret output must survive an updateUserInformation reseal"
+    );
+    // And it is the correct HMAC(CredRandomWithoutUV, salt), keyed off the STABLE
+    // resident id rather than the rotated box.
+    let seed = crate::seed::load_keydev(&dev(), &mut fs).unwrap();
+    let cr = crate::credential::derive_hmac_key(&seed, &resident_id[..]);
+    assert_eq!(dec1, rsk_crypto::hmac_sha256(&cr[..32], &salt).to_vec());
 }
 
 #[test]
@@ -1513,8 +1820,9 @@ fn large_blob_key_in_assertion() {
             d.skip().unwrap();
         }
     }
-    let (cred_box, seed) = stored_box_and_seed(&mut fs);
-    let expected = crate::credential::derive_large_blob_key(&seed, &cred_box);
+    // v2 resident: largeBlobKey keys off the stable resident id, not the box.
+    let (_cred_box, seed) = stored_box_and_seed(&mut fs);
+    let expected = crate::credential::derive_large_blob_key(&seed, &resident_id[..]);
     assert_eq!(lbk.as_deref(), Some(&expected[..]));
 }
 
@@ -2177,4 +2485,254 @@ fn overlong_rpid_or_userid_rejected() {
             Err(CtapError::InvalidLength)
         );
     }
+}
+
+// Resident discovery + getNextAssertion must each sign with the credential's OWN
+// key. For v2 credentials that key derives from the stable resident id, so this
+// pins that BOTH signing sites (get_assertion and get_next_assertion) use it and
+// agree with makeCredential's pubkey — get_next_assertion had no such
+// signature-verify coverage before.
+#[test]
+fn discovery_and_getnext_sign_with_credential_keys() {
+    let (mut fs, mut rng) = setup();
+    let mut state = crate::FidoState::new();
+
+    // Register two resident creds for the same rp; capture each (uid, pubkey).
+    let mut keys: std::vec::Vec<([u8; 4], [u8; 32], [u8; 32])> = std::vec::Vec::new();
+    for (uid, t) in [(&[9u8, 8, 7, 6][..], 10u64), (&[1u8, 1, 1, 1][..], 20u64)] {
+        let mut out = [0u8; 1024];
+        let n = {
+            let mut presence = crate::AlwaysConfirm;
+            let mut ctx = Ctx {
+                presence: &mut presence,
+                dev: dev(),
+                fs: &mut fs,
+                rng: &mut rng,
+                state: &mut state,
+                now_ms: t,
+            };
+            make_credential(&mut ctx, &mc_request_user(uid), &mut out).unwrap()
+        };
+        let (_id, x, y) = parse_mc(&out[..n]);
+        let mut u = [0u8; 4];
+        u.copy_from_slice(uid);
+        keys.push((u, x, y));
+    }
+    let pick = |uid: &[u8]| -> ([u8; 32], [u8; 32]) {
+        for (u, x, y) in &keys {
+            if &u[..] == uid {
+                return (*x, *y);
+            }
+        }
+        panic!("uid not registered");
+    };
+
+    // Discovery getAssertion → newest credential; verify under its key.
+    let mut o1 = [0u8; 1024];
+    let n1 = {
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 30,
+        };
+        get_assertion(&mut ctx, &ga_request(None), &mut o1).unwrap()
+    };
+    let (u1, _c1) = user_and_count(&o1[..n1]);
+    let (x1, y1) = pick(&u1);
+    verify_assertion(&o1[..n1], &x1, &y1);
+
+    // getNextAssertion → the older credential; verify under ITS key.
+    let mut o2 = [0u8; 1024];
+    let n2 = {
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 31,
+        };
+        get_next_assertion(&mut ctx, &mut o2).unwrap()
+    };
+    let (u2, _c2) = user_and_count(&o2[..n2]);
+    assert_ne!(u1, u2, "two different credentials");
+    let (x2, y2) = pick(&u2);
+    verify_assertion(&o2[..n2], &x2, &y2);
+}
+
+// A resident makeCredential request (custom user id) that opts into hmac-secret.
+fn mc_request_hmac_user(uid: &[u8]) -> std::vec::Vec<u8> {
+    let mut buf = [0u8; 512];
+    let n = {
+        let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+        e.map(6).unwrap();
+        e.u8(1).unwrap().bytes(&CDH).unwrap();
+        e.u8(2)
+            .unwrap()
+            .map(1)
+            .unwrap()
+            .str("id")
+            .unwrap()
+            .str("example.com")
+            .unwrap();
+        e.u8(3).unwrap().map(2).unwrap();
+        e.str("id").unwrap().bytes(uid).unwrap();
+        e.str("name").unwrap().str("user").unwrap();
+        e.u8(4).unwrap().array(1).unwrap().map(2).unwrap();
+        e.str("alg").unwrap().i64(ALG_ES256).unwrap();
+        e.str("type").unwrap().str("public-key").unwrap();
+        e.u8(6)
+            .unwrap()
+            .map(1)
+            .unwrap()
+            .str("hmac-secret")
+            .unwrap()
+            .bool(true)
+            .unwrap();
+        e.u8(7)
+            .unwrap()
+            .map(1)
+            .unwrap()
+            .str("rk")
+            .unwrap()
+            .bool(true)
+            .unwrap();
+        e.writer().position()
+    };
+    buf[..n].to_vec()
+}
+
+// A discovery (no allowList) getAssertion carrying an hmac-secret extension.
+fn ga_request_hmac_discovery(
+    px: &[u8; 32],
+    py: &[u8; 32],
+    se: &[u8],
+    sa: &[u8],
+) -> std::vec::Vec<u8> {
+    let mut buf = [0u8; 512];
+    let n = {
+        let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+        e.map(3).unwrap();
+        e.u8(1).unwrap().str("example.com").unwrap();
+        e.u8(2).unwrap().bytes(&CDH).unwrap();
+        e.u8(4).unwrap().map(1).unwrap();
+        e.str("hmac-secret").unwrap().map(4).unwrap();
+        e.u8(1).unwrap();
+        cose_xy(&mut e, px, py);
+        e.u8(2).unwrap().bytes(se).unwrap();
+        e.u8(3).unwrap().bytes(sa).unwrap();
+        e.u8(4).unwrap().u8(2).unwrap();
+        e.writer().position()
+    };
+    buf[..n].to_vec()
+}
+
+// #3 getNextAssertion path: the hmac-secret cred_random for the SECOND and later
+// credentials in a resident discovery walk is evaluated in next_assertion_response
+// — a site the single-entry-allowList hmac tests (which resolve inside
+// get_assertion_inner) never reach. A v2 credential keys it off its stable resident
+// id, so this pins that getNextAssertion, not just the first getAssertion, uses the
+// credential's own resident-id-derived secret. Revert that site to the box and dec2
+// stops matching the resident-id derivation.
+#[test]
+fn getnextassertion_hmac_secret_keys_off_resident_id() {
+    use rsk_crypto::pinproto::{authenticate, ecdh, encrypt, public_xy};
+    let (mut fs, mut rng) = setup();
+    let mut state = crate::FidoState::new();
+    state.regenerate(&mut rng); // the clientPIN getKeyAgreement ephemeral key
+    let (ax, ay) = state.ephemeral_public().unwrap();
+
+    // Two resident creds for one RP with hmac-secret (distinct users + times, so
+    // discovery yields the newest and getNextAssertion the older).
+    for (uid, t) in [(&[9u8, 8, 7, 6][..], 10u64), (&[1u8, 1, 1, 1][..], 20u64)] {
+        let mut out = [0u8; 1024];
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: t,
+        };
+        make_credential(&mut ctx, &mc_request_hmac_user(uid), &mut out).unwrap();
+    }
+
+    // Platform half (protocol two), shared across both evaluations.
+    let plat = {
+        let mut s = [0u8; 32];
+        s[0] = 0x22;
+        s[31] = 0x22;
+        s
+    };
+    let (px, py) = public_xy(&plat).unwrap();
+    let mut shared = [0u8; 64];
+    let slen = ecdh(PinProto::Two, &plat, &ax, &ay, &mut shared).unwrap();
+    let salt = [0x77u8; 32];
+    let iv = [0x01u8; 16];
+    let mut se = [0u8; 48];
+    let ne = encrypt(PinProto::Two, &shared[..slen], &iv, &salt, &mut se).unwrap();
+    let mut sa = [0u8; 32];
+    let na = authenticate(PinProto::Two, &shared[..slen], &se[..ne], &mut sa).unwrap();
+    let req = ga_request_hmac_discovery(&px, &py, &se[..ne], &sa[..na]);
+
+    let seed = crate::seed::load_keydev(&dev(), &mut fs).unwrap();
+    let expected = |cred_id: &[u8]| {
+        let cr = crate::credential::derive_hmac_key(&seed, cred_id);
+        rsk_crypto::hmac_sha256(&cr[..32], &salt).to_vec()
+    };
+
+    // Discovery getAssertion → newest credential; its hmac output keys off its id.
+    let mut o1 = [0u8; 1024];
+    let n1 = {
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 30,
+        };
+        get_assertion(&mut ctx, &req, &mut o1).unwrap()
+    };
+    let id1 = cred_id_of(&o1[..n1]);
+    let dec1 = hmac_secret_plaintext(&o1[..n1], &shared[..slen]);
+    assert_eq!(
+        dec1,
+        expected(&id1),
+        "first assertion keys hmac off its resident id"
+    );
+
+    // getNextAssertion → the older credential — the next_assertion_response site.
+    let mut o2 = [0u8; 1024];
+    let n2 = {
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 31,
+        };
+        get_next_assertion(&mut ctx, &mut o2).unwrap()
+    };
+    let id2 = cred_id_of(&o2[..n2]);
+    let dec2 = hmac_secret_plaintext(&o2[..n2], &shared[..slen]);
+    assert_ne!(id1, id2, "two distinct credentials");
+    assert_eq!(
+        dec2,
+        expected(&id2),
+        "getNextAssertion must key hmac-secret off the credential's stable resident id"
+    );
+    assert_ne!(
+        dec1, dec2,
+        "distinct credentials → distinct hmac-secret outputs"
+    );
 }

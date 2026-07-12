@@ -784,7 +784,7 @@ pub fn reboot(bootsel: bool) -> Result<String, String> {
 // ===========================================================================
 
 /// Read the tamper-evident journal (vendor AUDIT_READ). Read-only; the device
-/// asks for a PIN if one is set. Returns `(title, pretty body)`.
+/// asks for a PIN if one is set, or a touch if not. Returns `(title, pretty body)`.
 pub fn audit_read(pin: Option<&str>) -> Result<(String, String), String> {
     let dev = hid_open().ok_or("no FIDO device")?;
     let cid = ctaphid_init(&dev).ok_or("CTAPHID init failed")?;
@@ -799,6 +799,12 @@ pub fn audit_read(pin: Option<&str>) -> Result<(String, String), String> {
     match st {
         0 => {}
         CTAP2_ERR_PIN_REQUIRED => return Err(MSG_PIN_REQUIRED.into()),
+        // No PIN set → the read is touch-gated instead (firmware ≥ 0x0808).
+        0x27 => {
+            return Err(
+                "no touch within the timeout — press the button when the LED blinks".into(),
+            );
+        }
         s => return Err(format!("status {s:#x}")),
     }
     let v = v.ok_or("decode failed")?;

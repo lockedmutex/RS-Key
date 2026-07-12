@@ -124,8 +124,9 @@ press of the BOOTSEL button while the LED blinks, within a 30-second window.
 `rsk` prints `touch the device …` to stderr before blocking. Touch-gated
 commands include `backup export`/`restore`/`finalize`, `audit verify`,
 `inventory verify`, `lock enable`/`disable`, and `fido attestation import`/
-`clear`. Read-only commands (`status`, `inventory list`, `*/status`,
-`audit log`) need no touch.
+`clear`. Read-only commands (`status`, `inventory list`, `*/status`) need no
+touch; `audit log` needs one only on a device with no PIN (the PIN token gates
+it otherwise).
 
 ### Machine-readable output
 

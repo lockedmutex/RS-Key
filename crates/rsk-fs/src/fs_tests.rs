@@ -146,6 +146,30 @@ fn dynamic_files_and_reboot() {
 }
 
 #[test]
+fn put_over_dynamic_cap_commits_nothing() {
+    // A `put` that overflows the dynamic-file set must fail atomically: reject
+    // before touching flash, not commit the bytes and then report NoMemory —
+    // otherwise the value is stranded on flash, readable yet unregistered, and
+    // survives a reboot as a phantom (`scan` re-drops it at the same cap).
+    let mut fs = fs();
+    for i in 0..MAX_DYNAMIC_FILES as u16 {
+        fs.put(0xD000 + i, b"x").unwrap();
+    }
+    let overflow = 0xD000 + MAX_DYNAMIC_FILES as u16;
+    assert_eq!(fs.put(overflow, b"orphan"), Err(Error::NoMemory));
+
+    // The rejected value left no trace: unknown, absent, unreadable — this run
+    // and across a modelled reboot.
+    let mut buf = [0u8; 8];
+    assert!(fs.search(overflow).is_none());
+    assert!(fs.read(overflow, &mut buf).is_none());
+    let mut fs2 = Fs::new(fs.into_storage(), TABLE);
+    fs2.scan();
+    assert!(fs2.search(overflow).is_none());
+    assert!(fs2.read(overflow, &mut buf).is_none());
+}
+
+#[test]
 fn delete_removes() {
     let mut fs = fs();
     fs.put(0xCF02, b"x").unwrap();

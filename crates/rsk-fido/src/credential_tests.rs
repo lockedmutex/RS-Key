@@ -168,7 +168,103 @@ fn resident_id_format_and_determinism() {
     assert_eq!(r1, r2);
     assert_eq!(r1.len(), CRED_RESIDENT_LEN);
     assert_eq!(&r1[4..8], CRED_PROTO_RESIDENT);
+    // New resident ids are stamped v2 (byte 8), in the header before the chain.
+    assert_eq!(r1[RESIDENT_VERSION_IDX], RESIDENT_VERSION_V2);
+    assert_eq!(r1[9], 0);
     assert!(is_resident(&r1));
+}
+
+// The v2 marker sits OUTSIDE the [10..42] HMAC chain, so it never feeds the id's
+// entropy. Prove it by recomputing the chain independently from ONLY its documented
+// inputs — the serial-derived header tail and the box — with the version byte
+// nowhere in the seed. If a refactor ever folded offset 8 into the chain, the real
+// id would diverge from this recomputation. (Flipping byte 8 on a COPY of the output
+// and comparing the tail proves nothing — the tail is below the mutated index by
+// construction, so it is equal for any array.)
+#[test]
+fn resident_version_marker_is_outside_the_hash_chain() {
+    let d = dev();
+    let cred_id = [0x55u8; 80];
+    let id = derive_resident(&cred_id, &d);
+    assert_eq!(id[RESIDENT_VERSION_IDX], RESIDENT_VERSION_V2);
+
+    // Seed = the pre-chain contents of outk[10..42]: the serial HMAC's tail
+    // (h0[10..32]) then zeroes. The version byte at offset 8 is not part of it.
+    let h0 = hmac_sha256(&[0u8; 32], d.serial_id);
+    let mut seed = [0u8; CRED_RESIDENT_LEN - CRED_RESIDENT_HEADER_LEN];
+    let tail = &h0[CRED_RESIDENT_HEADER_LEN..];
+    seed[..tail.len()].copy_from_slice(tail);
+
+    let mut chain = hmac_sha256(&seed, b"SLIP-0022");
+    chain = hmac_sha256(&chain, &cred_id[..PROTO_LEN]);
+    chain = hmac_sha256(&chain, b"resident");
+    chain = hmac_sha256(&chain, &cred_id);
+    assert_eq!(
+        &id[CRED_RESIDENT_HEADER_LEN..],
+        &chain[..],
+        "the [10..42] chain must not read the version byte at offset 8"
+    );
+}
+
+// The reseal-stability fix at the derivation level: a v2 resident id is the key
+// input regardless of the (resealed) box, so the signing / hmac-secret /
+// largeBlobKey derivations are identical across an updateUserInformation box
+// swap; a v1 id (older firmware) still follows the box; a non-resident box has no
+// id. Also pins per-credential key uniqueness.
+#[test]
+fn resident_key_input_v2_is_reseal_stable_v1_follows_box() {
+    use crate::keyderiv::fido_load_key;
+    let d = dev();
+    // Two DIFFERENT boxes, as an updateUserInformation reseal (fresh IV) yields.
+    let box1 = [0x55u8; 80];
+    let box2 = [0xAAu8; 80];
+
+    let rid = derive_resident(&box1, &d);
+    assert_eq!(rid[RESIDENT_VERSION_IDX], RESIDENT_VERSION_V2);
+
+    // v2: the key input is the STABLE id, independent of the box.
+    assert_eq!(resident_key_input(&box1, Some(&rid[..])), &rid[..]);
+    assert_eq!(resident_key_input(&box2, Some(&rid[..])), &rid[..]);
+    let (ki1, ki2) = (
+        resident_key_input(&box1, Some(&rid[..])),
+        resident_key_input(&box2, Some(&rid[..])),
+    );
+    assert_eq!(
+        fido_load_key(&SEED, ki1),
+        fido_load_key(&SEED, ki2),
+        "signing key stable across reseal"
+    );
+    assert_eq!(
+        derive_hmac_key(&SEED, ki1),
+        derive_hmac_key(&SEED, ki2),
+        "hmac-secret stable across reseal"
+    );
+    assert_eq!(
+        derive_large_blob_key(&SEED, ki1),
+        derive_large_blob_key(&SEED, ki2),
+        "largeBlobKey stable across reseal"
+    );
+
+    // v1 (marker 0): the key input is the box, so the RP's box-derived pubkey
+    // keeps verifying — no rotation, no regression for older credentials.
+    let mut rid_v1 = rid;
+    rid_v1[RESIDENT_VERSION_IDX] = 0;
+    assert_eq!(resident_key_input(&box1, Some(&rid_v1[..])), &box1[..]);
+    assert_eq!(resident_key_input(&box2, Some(&rid_v1[..])), &box2[..]);
+
+    // Non-resident credential: no resident id → the box.
+    assert_eq!(resident_key_input(&box1, None), &box1[..]);
+
+    // Uniqueness: two distinct credentials get distinct v2 ids → distinct keys.
+    let rid_other = derive_resident(&box2, &d);
+    assert_ne!(
+        rid[CRED_RESIDENT_HEADER_LEN..],
+        rid_other[CRED_RESIDENT_HEADER_LEN..]
+    );
+    assert_ne!(
+        fido_load_key(&SEED, &rid[..]),
+        fido_load_key(&SEED, &rid_other[..])
+    );
 }
 
 #[test]

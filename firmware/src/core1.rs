@@ -329,11 +329,19 @@ pub fn run_rsa_search_progress(
     while outcome.is_none() {
         // Observation hook (display spinner); time-gated by the caller, off the keygen state.
         on_tick();
-        // Core1's finds first (cheap to drain)…
-        let mut batch = MAILBOX.lock(|mb| {
-            let mut mb = mb.borrow_mut();
-            [mb.found[0].take(), mb.found[1].take()]
-        });
+        // Core1's finds first (cheap to drain) — but only when we actually
+        // engaged it this keygen. If the entry gate timed out (engaged=false),
+        // core1 is still on the PRIOR job, so anything in `found` is a stale
+        // prime for a different (possibly different-size) key; feeding it to this
+        // keygen would corrupt the modulus. Leave it for the wind-down scrub.
+        let mut batch = if engaged {
+            MAILBOX.lock(|mb| {
+                let mut mb = mb.borrow_mut();
+                [mb.found[0].take(), mb.found[1].take()]
+            })
+        } else {
+            [None, None]
+        };
         let mut had_finds = false;
         for f in batch.iter_mut().filter_map(Option::as_mut) {
             had_finds = true;

@@ -23,7 +23,8 @@ use crate::consts::{
 };
 use crate::credential::{
     CRED_BOX_MAX, CRED_REC_MAX, CRED_RESIDENT_LEN, Credential, RECORD_PREFIX, USER_ID_MAX,
-    USER_NAME_MAX, credential_load, derive_large_blob_key, is_resident, slot_map,
+    USER_NAME_MAX, credential_load, derive_large_blob_key, is_resident, resident_key_input,
+    slot_map,
 };
 use crate::ec::{CredKey, MAX_SIG_LEN};
 use crate::error::{CtapError, CtapResult};
@@ -342,6 +343,12 @@ fn enforce_pin<S: Storage, R: Rng>(
             {
                 return Err(CtapError::PinAuthInvalid);
             }
+            // Bind an unscoped token to this rpId on first use (CTAP 2.1 §6.2.2),
+            // as makeCredential does — else it stays reusable across RPs.
+            if !ctx.state.paut.has_rp_id {
+                ctx.state.paut.rp_id_hash = *rp_id_hash;
+                ctx.state.paut.has_rp_id = true;
+            }
             Ok(true)
         }
         // alwaysUv forces user verification (CTAP 2.1 alwaysUv); otherwise an
@@ -551,6 +558,15 @@ fn get_assertion_inner<S: Storage, R: Rng>(
     let sel_large_blob = sel.as_ref().map(|c| c.ext.large_blob_key).unwrap_or(false);
     let curve = sel.as_ref().map_or(CURVE_P256 as i64, |c| c.curve);
 
+    // The signing / hmac-secret / largeBlobKey key-derivation input: a v2 resident
+    // credential keys off its STABLE resident id (so an updateUserInformation
+    // reseal doesn't rotate the keys), everything else off the box — the same
+    // choice makeCredential made when it issued the RP's pubkey.
+    let key_input = resident_key_input(
+        &best.id[..best.len],
+        best.resident.then_some(&best.resident_id[..]),
+    );
+
     // hmac-secret output (needs the clientPIN ephemeral key + the RNG for the IV).
     let mut hs = [0u8; SALT_ENC_MAX];
     let hs_len = if req.hmac_secret.present {
@@ -559,7 +575,7 @@ fn get_assertion_inner<S: Storage, R: Rng>(
             &req.hmac_secret,
             &ephemeral,
             seed,
-            &best.id[..best.len],
+            key_input,
             uv,
             ctx.rng,
             &mut hs,
@@ -582,7 +598,7 @@ fn get_assertion_inner<S: Storage, R: Rng>(
     // largeBlobKey response field (0x07) — only when the request and the stored
     // credential both opted in.
     let large_blob_key = if req.ext_large_blob_key == Some(true) && sel_large_blob {
-        Some(derive_large_blob_key(seed, &best.id[..best.len]))
+        Some(derive_large_blob_key(seed, key_input))
     } else {
         None
     };
@@ -598,7 +614,7 @@ fn get_assertion_inner<S: Storage, R: Rng>(
         scalar.zeroize();
         key
     } else {
-        let mut raw = fido_load_key(seed, &best.id[..best.len]).ok_or(CtapError::Other)?;
+        let mut raw = fido_load_key(seed, key_input).ok_or(CtapError::Other)?;
         let key = CredKey::from_raw(curve, &raw).ok_or(CtapError::Other)?;
         raw.zeroize();
         key
@@ -694,8 +710,11 @@ fn get_assertion_inner<S: Storage, R: Rng>(
         }
     }
     if multi {
+        // Clamp to what the getNextAssertion queue can actually serve
+        // (MAX_ASSERTION_CREDS): over-reporting strands the excess credentials
+        // behind a premature NOT_ALLOWED.
         enc.u8(5)
-            .and_then(|e| e.u32(best.found))
+            .and_then(|e| e.u32(best.found.min(MAX_ASSERTION_CREDS as u32)))
             .map_err(|_| CtapError::Other)?;
     }
     if let Some(lbk) = large_blob_key {
@@ -820,6 +839,9 @@ fn next_assertion_response<S: Storage, R: Rng>(
     let cred = credential_load(seed, cred_box, rp_id_hash, &mut scratch)
         .ok_or(CtapError::NoCredentials)?;
     let curve = cred.curve;
+    // getNextAssertion only walks resident discovery, so a v2 credential keys off
+    // its stable resident id here too (matching the first assertion's key).
+    let key_input = resident_key_input(cred_box, Some(resident_id));
 
     // getNextAssertion only ever walks a multi-credential resident discovery;
     // name / displayName are user-identifiable and returned only when the user
@@ -851,7 +873,7 @@ fn next_assertion_response<S: Storage, R: Rng>(
             salt_auth: &salt_auth[..sa],
         };
         let ephemeral = *ctx.state.ephemeral_scalar();
-        hmacsecret::eval(&req, &ephemeral, seed, cred_box, uv, ctx.rng, &mut hs)?
+        hmacsecret::eval(&req, &ephemeral, seed, key_input, uv, ctx.rng, &mut hs)?
     } else {
         0
     };
@@ -867,7 +889,7 @@ fn next_assertion_response<S: Storage, R: Rng>(
     )?;
     let ed = if ext_len > 0 { FLAG_ED } else { 0 };
 
-    let mut raw = fido_load_key(seed, cred_box).ok_or(CtapError::Other)?;
+    let mut raw = fido_load_key(seed, key_input).ok_or(CtapError::Other)?;
     let key = CredKey::from_raw(curve, &raw).ok_or(CtapError::Other)?;
     raw.zeroize();
 
