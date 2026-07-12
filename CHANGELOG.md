@@ -32,6 +32,15 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Fixed
 
+- **A wrong PIN in `rsk fido set-pin` / `list-passkeys` now prints a clean error,
+  not a Python traceback.** python-fido2 raises `CtapError` when the device
+  rejects a clientPIN operation; `change_pin`, `set_pin` and `get_pin_token` left
+  it uncaught, so mistyping the current PIN while changing it dumped a stack trace
+  instead of "wrong PIN". These now map the CTAP 2.1 §6.5.5 status to an operator
+  message — a wrong PIN reports how many attempts remain before it blocks, and the
+  blocked / auth-blocked / policy statuses get actionable text — via a shared
+  `common.die_ctap_pin_error`. `rsk` `0.3.10` → `0.3.11`; host-only, no firmware
+  change.
 - **`rsk` now finds the FIDO HID on Linux hosts where hidapi doesn't report a
   usage page (issue #28).** `ctaphid.find()` matched a device solely by its HID
   `usage_page == 0xF1D0`, but some Linux `hidapi` builds (the libusb backend, and
