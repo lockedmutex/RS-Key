@@ -263,6 +263,51 @@ fn logout_clears_flag() {
 }
 
 #[test]
+fn pw1_modes_are_independent_latches_issue25() {
+    // Reproduces #25: gpg/scdaemon verifies one PIN entry into BOTH PW1 modes
+    // back-to-back (82 then 81) before a decrypt. PW1.82 (the DECIPHER latch,
+    // pso.rs `has_pw3 || has_pw2`) must survive the following PW1.81 verify —
+    // else the next PSO:DECIPHER returns 6982 and gpg reports "Bad PIN".
+    let mut fs = setup();
+    let mut sess = Session::new();
+    let d = dev();
+    let mut rng = CountRng(0);
+    assert_eq!(
+        verify(
+            &d,
+            &mut fs,
+            &mut sess,
+            &mut rng,
+            0x00,
+            PW1_MODE82,
+            PW1_DEFAULT
+        ),
+        Sw::OK
+    );
+    assert!(sess.has_pw2);
+    assert_eq!(
+        verify(
+            &d,
+            &mut fs,
+            &mut sess,
+            &mut rng,
+            0x00,
+            PW1_MODE81,
+            PW1_DEFAULT
+        ),
+        Sw::OK
+    );
+    assert!(sess.has_pw1, "PW1.81 raised");
+    assert!(
+        sess.has_pw2,
+        "PW1.82 must survive a later PW1.81 verify (else DECIPHER → 6982)"
+    );
+    // The DEK still unwraps under the surviving PW1 session.
+    let mut dek = [0u8; DEK_SIZE];
+    load_dek(&d, &mut fs, &sess, &mut dek).unwrap();
+}
+
+#[test]
 fn change_pw1_then_new_pin_works_and_dek_survives() {
     let mut fs = setup();
     let mut sess = Session::new();

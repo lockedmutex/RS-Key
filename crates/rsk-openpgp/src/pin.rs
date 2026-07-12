@@ -196,8 +196,10 @@ pub fn check_pin<S: Storage>(
     if let Err(sw) = pin_reset_retries(fs, fid, false) {
         return sw;
     }
-    sess.has_pw1 = false;
-    sess.has_pw2 = false;
+    // PW1.81 (PSO:CDS), PW1.82 (DECIPHER/INTERNAL AUTH) and PW3 are INDEPENDENT
+    // access latches: a successful VERIFY raises only its own, never clears a
+    // sibling. gpg/scdaemon verifies one PIN entry into both PW1 modes (82 then
+    // 81); clearing here dropped PW1.82 and bricked the next DECIPHER with 6982 (#25).
     if fid == EF_PW1 {
         if p2 == PW1_MODE81 {
             sess.has_pw1 = true;

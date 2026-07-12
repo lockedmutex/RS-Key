@@ -15,6 +15,18 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Fixed
 
+- **OpenPGP decrypt no longer breaks after a `VERIFY` of both PW1 modes (issue
+  #25).** `gpg`/`scdaemon` verifies one PIN entry into both PW1 modes
+  back-to-back — mode `82` (DECIPHER/INTERNAL AUTH) then mode `81` (signing) —
+  before a decrypt. `check_pin` cleared **both** PW1 latches on every successful
+  verify and re-raised only the current one, so the trailing mode-`81` verify
+  silently dropped the mode-`82` authorization the next `PSO:DECIPHER` needs,
+  which then returned `6982` and surfaced to the user as `Bad PIN` with the
+  correct PIN (typically after a replug, once `scdaemon` re-ran the full verify
+  sequence). PW1.81, PW1.82 and PW3 are now treated as the independent access
+  latches the card spec requires — a successful `VERIFY` raises only its own.
+  Session-only state; no wire or on-flash format change. Firmware `bcdDevice`
+  → `0x0809`.
 - **A `put` past the dynamic-file cap no longer strands its value on flash.** A
   new runtime file (e.g. a resident credential) written once the dynamic set is
   full committed its bytes to flash *before* the cap check rejected it, so the
