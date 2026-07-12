@@ -32,6 +32,16 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Fixed
 
+- **`rsk` now finds the FIDO HID on Linux hosts where hidapi doesn't report a
+  usage page (issue #28).** `ctaphid.find()` matched a device solely by its HID
+  `usage_page == 0xF1D0`, but some Linux `hidapi` builds (the libusb backend, and
+  older hidraw) enumerate the device with `usage_page` left `0`, so `rsk status`
+  (and every command behind it) reported `FIDO HID : not found` even with the key
+  plugged in. It now keeps the `usage_page` fast path and, when that field is
+  unset, confirms the FIDO usage page straight from each device's report
+  descriptor — VID/PID-agnostic, so it works for every build (the default
+  `0x1209:0x0001` identity and each `VIDPID` preset), unlike hard-coding a single
+  vendor's VID/PID. `rsk` `0.3.9` → `0.3.10`; host-only, no firmware change.
 - **New passkey registration no longer hangs on the touch after a PIN is set.**
   A zero-length `pinUvAuthParam` is the CTAP 2.1 §6.1.2 / §6.2.2 step-1 selection
   probe: the authenticator takes a device-selection touch and then reports the PIN
