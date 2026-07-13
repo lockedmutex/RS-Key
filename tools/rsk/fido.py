@@ -9,9 +9,10 @@ list-passkeys: list discoverable credentials via credentialManagement (needs PIN
 import sys
 from getpass import getpass
 
-from .common import add_pin_arg, device_has_pin, die, resolve_pin, sanitize
+from .common import add_pin_arg, device_has_pin, die, die_ctap_pin_error, resolve_pin, sanitize
 
 try:
+    from fido2.ctap import CtapError
     from fido2.hid import CtapHidDevice
     from fido2.ctap2 import Ctap2
     from fido2.ctap2.pin import ClientPin
@@ -72,10 +73,16 @@ def set_pin(args):
         die("PIN too short (min 4)")
     if has_pin:
         current = resolve_pin(args, has_pin=True, prompt="Current PIN: ", required=True)
-        cp.change_pin(current, new)
+        try:
+            cp.change_pin(current, new)
+        except CtapError as e:
+            die_ctap_pin_error(e, cp)
         print("FIDO2 PIN changed.")
     else:
-        cp.set_pin(new)
+        try:
+            cp.set_pin(new)
+        except CtapError as e:
+            die_ctap_pin_error(e, cp)
         print("FIDO2 PIN set.")
     print("clientPin now:", _ctap().info.options.get("clientPin"))
 
@@ -88,7 +95,10 @@ def list_passkeys(args):
         die("no FIDO2 PIN set — set one first (rsk fido set-pin)")
     cp = ClientPin(ctap)
     pin = resolve_pin(args, has_pin=True, required=True)
-    token = cp.get_pin_token(pin, ClientPin.PERMISSION.CREDENTIAL_MGMT)
+    try:
+        token = cp.get_pin_token(pin, ClientPin.PERMISSION.CREDENTIAL_MGMT)
+    except CtapError as e:
+        die_ctap_pin_error(e, cp)
     cm = CM(ctap, cp.protocol, token)
     meta = cm.get_metadata()
     existing = meta[CM.RESULT.EXISTING_CRED_COUNT]

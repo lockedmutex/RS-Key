@@ -322,11 +322,13 @@ fn enforce_pin<S: Storage, R: Rng>(
 ) -> Result<bool, CtapError> {
     match req.pin_uv_auth_param {
         // Zero-length probe (selection gesture): touch, then report PIN state.
-        // With no button configured this confirms instantly.
+        // With no button configured this confirms instantly. CTAP 2.1 §6.2.2 step 1
+        // (mirrors makeCredential): PIN set → PIN_INVALID, unset → PIN_NOT_SET — the
+        // code a selection-managing platform reads to move on to PIN entry.
         Some(&[]) => {
             ctx.require_presence(crate::Confirm::titled("Use this key?"))?;
             Err(if ctx.fs.has_data(EF_PIN) {
-                CtapError::PinAuthInvalid
+                CtapError::PinInvalid
             } else {
                 CtapError::PinNotSet
             })

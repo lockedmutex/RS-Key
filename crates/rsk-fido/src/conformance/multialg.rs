@@ -146,6 +146,19 @@ fn att_stmt(body: &[u8]) -> (i64, Vec<u8>) {
     (alg, d.bytes().unwrap().to_vec())
 }
 
+/// Assert the default-profile makeCredential shape: fmt "none" (field 1) with an
+/// empty attStmt map (field 3).
+fn assert_none_att_stmt(body: &[u8], name: &str) {
+    let mut f = field_at(body, 1).expect("fmt (0x01) present");
+    assert_eq!(f.str().unwrap(), "none", "{name}: default fmt is none");
+    let mut s = field_at(body, 3).expect("attStmt (0x03) present");
+    assert_eq!(
+        s.map().unwrap().unwrap(),
+        0,
+        "{name}: default attStmt is empty"
+    );
+}
+
 /// The assertion signature byte string at key 3 of a getAssertion reply.
 fn assertion_sig(body: &[u8]) -> Vec<u8> {
     let mut d = field_at(body, 3).expect("signature (0x03) present");
@@ -263,20 +276,26 @@ fn create_and_assert(spec: &AlgSpec) {
     );
     let ad = authdata(&mc.body);
     let key = cose_key(spec, &ad);
-    let (att_alg, att_sig) = att_stmt(&mc.body);
-    assert_eq!(
-        att_alg, spec.alg,
-        "{}: attStmt alg must match the credential key",
-        spec.name
-    );
-    // Packed self-attestation signs authData ‖ clientDataHash with the new key.
-    let mut att_signed = ad.clone();
-    att_signed.extend_from_slice(&CDH);
-    assert!(
-        verifies(spec.alg, &key, &att_signed, &att_sig),
-        "{}: packed self-attestation signature must verify",
-        spec.name
-    );
+    // Default ships fmt "none" with an empty attStmt; only the conformance
+    // profile emits (and lets us verify) the packed self-attestation.
+    if cfg!(feature = "fido-conformance") {
+        let (att_alg, att_sig) = att_stmt(&mc.body);
+        assert_eq!(
+            att_alg, spec.alg,
+            "{}: attStmt alg must match the credential key",
+            spec.name
+        );
+        // Packed self-attestation signs authData ‖ clientDataHash with the new key.
+        let mut att_signed = ad.clone();
+        att_signed.extend_from_slice(&CDH);
+        assert!(
+            verifies(spec.alg, &key, &att_signed, &att_sig),
+            "{}: packed self-attestation signature must verify",
+            spec.name
+        );
+    } else {
+        assert_none_att_stmt(&mc.body, spec.name);
+    }
 
     let cred_id = cred_id_of(&ad);
     let ga = a.send(CTAP_GET_ASSERTION, &ga_request(&cred_id));
@@ -330,20 +349,26 @@ fn tampered_authdata_fails_for_every_algorithm() {
     // A verification harness that never rejects would let every positive test
     // pass vacuously. Flipping the UP bit in the signed authData must break the
     // self-attestation for each algorithm, proving the signature binds authData.
+    // Only the conformance profile emits a self-attestation to tamper with; the
+    // default profile has an empty attStmt, so assert that shape instead.
     for spec in [&ES256, &ES384, &ES512, &EDDSA] {
         let mut a = Authr::fresh();
         let mc = a.send(CTAP_MAKE_CREDENTIAL, &mc_request(spec.alg));
         assert_ok(&mc);
         let ad = authdata(&mc.body);
         let key = cose_key(spec, &ad);
-        let (_, att_sig) = att_stmt(&mc.body);
-        let mut tampered = ad.clone();
-        tampered[32] ^= FLAG_UP;
-        tampered.extend_from_slice(&CDH);
-        assert!(
-            !verifies(spec.alg, &key, &tampered, &att_sig),
-            "{}: signature must not verify over mutated authData",
-            spec.name
-        );
+        if cfg!(feature = "fido-conformance") {
+            let (_, att_sig) = att_stmt(&mc.body);
+            let mut tampered = ad.clone();
+            tampered[32] ^= FLAG_UP;
+            tampered.extend_from_slice(&CDH);
+            assert!(
+                !verifies(spec.alg, &key, &tampered, &att_sig),
+                "{}: signature must not verify over mutated authData",
+                spec.name
+            );
+        } else {
+            assert_none_att_stmt(&mc.body, spec.name);
+        }
     }
 }

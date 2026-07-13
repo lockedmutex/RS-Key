@@ -93,6 +93,51 @@ def resolve_pin(args, *, has_pin=None, prompt="FIDO2 PIN: ", required=False):
     return entered
 
 
+# --- clientPIN error reporting ------------------------------------------------
+# python-fido2 raises CtapError on a PIN operation the device rejected (wrong PIN,
+# blocked, policy). Left uncaught it surfaces as a Python traceback; map the CTAP
+# 2.1 §6.5.5 status to an operator-facing message instead.
+
+CTAP_PIN_INVALID = 0x31
+CTAP_PIN_BLOCKED = 0x32
+CTAP_PIN_AUTH_BLOCKED = 0x34
+CTAP_PIN_POLICY_VIOLATION = 0x37
+
+
+def pin_error_message(code, retries=None):
+    """Friendly text for a CTAP2 clientPIN error status (int), or None when the
+    status isn't a recognised PIN error (the caller reports the raw code then)."""
+    if code == CTAP_PIN_INVALID:
+        # retries is device-reported; trust it only when it is really an int, so a
+        # hostile authenticator can't smuggle a string (terminal escapes) into die().
+        if isinstance(retries, int):
+            return f"wrong PIN — {retries} attempt(s) left before it blocks"
+        return "wrong PIN"
+    if code == CTAP_PIN_AUTH_BLOCKED:
+        return "too many wrong PINs this session — unplug and replug the device, then try again"
+    if code == CTAP_PIN_BLOCKED:
+        return "PIN blocked by too many wrong attempts — reset the FIDO app to set a PIN again"
+    if code == CTAP_PIN_POLICY_VIOLATION:
+        return "new PIN rejected by the device (too long, or a forbidden/too-simple value)"
+    return None
+
+
+def die_ctap_pin_error(exc, cp=None):
+    """Turn a python-fido2 CtapError from a clientPIN operation into a clean `die`.
+
+    `cp` (a ClientPin), when given, is queried for the remaining attempts on a
+    wrong PIN so the message can say how many tries are left."""
+    code = int(getattr(exc, "code", 0) or 0)
+    retries = None
+    if code == CTAP_PIN_INVALID and cp is not None:
+        try:
+            r = cp.get_pin_retries()
+            retries = r[0] if isinstance(r, (tuple, list)) else r
+        except Exception:
+            retries = None
+    die(pin_error_message(code, retries) or f"PIN operation failed (CTAP status {code:#04x})")
+
+
 def picotool(*args, check=True):
     """Run picotool (in the dev shell); die on failure unless check=False."""
     r = subprocess.run(["picotool", *args], capture_output=True, text=True)

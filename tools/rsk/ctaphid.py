@@ -26,6 +26,10 @@ CTAPHID_CBOR = 0x90
 CTAPHID_KEEPALIVE = 0xBB  # CTAPHID_KEEPALIVE status frame (device still processing)
 CTAP_GET_INFO = 0x04  # CTAP2 authenticatorGetInfo
 FIDO_USAGE_PAGE = 0xF1D0  # FIDO HID usage page (CTAPHID spec)
+# The Usage Page (0xF1D0) item as it appears in a HID report descriptor. Used to
+# confirm a FIDO device when hidapi leaves `usage_page` unset (some Linux
+# libusb/hidraw builds report 0), so detection stays VID/PID-agnostic.
+FIDO_USAGE_PAGE_ITEM = b"\x06\xd0\xf1"
 # Ceiling on the keepalive wait: a hostile device can stream keepalives forever, so bail
 # past any legitimate ceremony (30s presence window + flash-GC slack) rather than hang.
 KEEPALIVE_DEADLINE_S = 120
@@ -113,10 +117,33 @@ def decode(b):
 
 
 def find():
-    for d in hid.enumerate():
+    devices = hid.enumerate()
+    for d in devices:
         if d.get("usage_page") == FIDO_USAGE_PAGE:
             return d
+    # hidapi left usage_page unset (0/None) — read each such device's report
+    # descriptor and match the FIDO usage-page item directly, rather than guessing
+    # by VID/PID (RS-Key ships several presets, so no fixed pair to key off).
+    for d in devices:
+        if not d.get("usage_page") and _declares_fido(d.get("path")):
+            return d
     return None
+
+
+def _declares_fido(path):
+    """Open `path` and report whether its HID report descriptor names the FIDO
+    usage page. Passive read; any hidapi error means "treat as non-FIDO, skip"."""
+    if not path:
+        return False
+    dev = hid.device()
+    try:
+        dev.open_path(path)
+        desc = bytes(dev.get_report_descriptor())
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+    finally:
+        dev.close()
+    return FIDO_USAGE_PAGE_ITEM in desc
 
 
 def write(dev, payload):

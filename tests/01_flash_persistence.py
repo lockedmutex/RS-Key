@@ -20,6 +20,7 @@ except ImportError:
     sys.exit("missing dependency: pip install hidapi")
 
 FIDO_USAGE_PAGE = 0xF1D0
+FIDO_USAGE_PAGE_ITEM = b"\x06\xd0\xf1"  # Usage Page (0xF1D0) item in a HID report descriptor
 REPORT_LEN = 64
 CTAPHID_MSG = 0x83
 CTAPHID_ERROR = 0xBF
@@ -32,10 +33,30 @@ SW_OK = b"\x90\x00"
 
 
 def find():
-    for d in hid.enumerate():
+    devices = hid.enumerate()
+    for d in devices:
         if d.get("usage_page") == FIDO_USAGE_PAGE:
             return d
+    # hidapi may leave usage_page unset on Linux (libusb/older hidraw); confirm the
+    # FIDO usage page from the report descriptor instead (mirrors tools/rsk/ctaphid.py).
+    for d in devices:
+        if not d.get("usage_page") and _declares_fido(d.get("path")):
+            return d
     return None
+
+
+def _declares_fido(path):
+    if not path:
+        return False
+    dev = hid.device()
+    try:
+        dev.open_path(path)
+        desc = bytes(dev.get_report_descriptor())
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+    finally:
+        dev.close()
+    return FIDO_USAGE_PAGE_ITEM in desc
 
 
 def write_frame(dev, payload):

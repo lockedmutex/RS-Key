@@ -9,6 +9,7 @@ Every gated command routes its PIN through resolve_pin, so the precedence
 behaviour the whole CLI's consistency rests on — pin them here. No device.
 """
 import argparse
+import types
 
 import pytest
 
@@ -142,3 +143,96 @@ def test_sanitize_join_scalar_and_none():
 
 def test_sanitize_join_strips_escapes_in_elements():
     assert "\x1b" not in common.sanitize_join(["ok", "\x1b]0;pwn\x07"])
+
+
+# --- clientPIN error reporting: a wrong PIN reads as "wrong PIN", not a
+# python-fido2 traceback (rsk fido set-pin / list-passkeys) --------------------
+
+def test_pin_error_message_wrong_pin():
+    assert common.pin_error_message(common.CTAP_PIN_INVALID) == "wrong PIN"
+
+
+def test_pin_error_message_wrong_pin_with_retries():
+    msg = common.pin_error_message(common.CTAP_PIN_INVALID, 7)
+    assert "wrong PIN" in msg and "7" in msg
+
+
+def test_pin_error_message_blocked_variants():
+    assert "unplug" in common.pin_error_message(common.CTAP_PIN_AUTH_BLOCKED)
+    assert "reset" in common.pin_error_message(common.CTAP_PIN_BLOCKED)
+
+
+def test_pin_error_message_policy():
+    assert "rejected" in common.pin_error_message(common.CTAP_PIN_POLICY_VIOLATION)
+
+
+def test_pin_error_message_unknown_is_none():
+    assert common.pin_error_message(0x99) is None
+
+
+class _FakeCp:
+    """Duck of fido2's ClientPin.get_pin_retries; an Exception value is raised."""
+
+    def __init__(self, retries):
+        self._r = retries
+
+    def get_pin_retries(self):
+        if isinstance(self._r, Exception):
+            raise self._r
+        return self._r
+
+
+def _exc(code):
+    return types.SimpleNamespace(code=code)  # duck of fido2 CtapError (.code)
+
+
+def test_die_ctap_pin_error_wrong_pin_shows_retries(capsys):
+    with pytest.raises(SystemExit):
+        common.die_ctap_pin_error(_exc(common.CTAP_PIN_INVALID), _FakeCp((5, None)))
+    err = capsys.readouterr().err
+    assert "wrong PIN" in err and "5" in err
+    assert "Traceback" not in err
+
+
+def test_die_ctap_pin_error_retries_as_bare_int(capsys):
+    with pytest.raises(SystemExit):
+        common.die_ctap_pin_error(_exc(common.CTAP_PIN_INVALID), _FakeCp(3))
+    assert "3" in capsys.readouterr().err
+
+
+def test_die_ctap_pin_error_no_cp_omits_retries(capsys):
+    with pytest.raises(SystemExit):
+        common.die_ctap_pin_error(_exc(common.CTAP_PIN_INVALID), None)
+    assert capsys.readouterr().err.strip() == "error: wrong PIN"
+
+
+def test_die_ctap_pin_error_retries_query_failure_is_tolerated(capsys):
+    with pytest.raises(SystemExit):
+        common.die_ctap_pin_error(_exc(common.CTAP_PIN_INVALID), _FakeCp(OSError("boom")))
+    assert "wrong PIN" in capsys.readouterr().err  # no crash, retry-less fallback
+
+
+def test_die_ctap_pin_error_unknown_code_reports_hex(capsys):
+    with pytest.raises(SystemExit):
+        common.die_ctap_pin_error(_exc(0x99), None)
+    err = capsys.readouterr().err
+    assert "PIN operation failed" in err and "0x99" in err
+
+
+# A counterfeit device can return the PIN_RETRIES field as a text string (python-fido2
+# does not coerce it); it must NOT reach the terminal — only an int count is trusted.
+
+def test_pin_error_message_drops_non_int_retries():
+    evil = "\x1b]0;pwn\x07"  # OSC window-title escape smuggled as the "retry count"
+    assert common.pin_error_message(common.CTAP_PIN_INVALID, evil) == "wrong PIN"
+    assert "\x1b" not in common.pin_error_message(common.CTAP_PIN_INVALID, evil)
+    assert common.pin_error_message(common.CTAP_PIN_INVALID, 5).endswith("before it blocks")
+
+
+def test_die_ctap_pin_error_hostile_string_retries_not_printed(capsys):
+    evil = "\x1b]52;c;ZXZpbA==\x07"  # OSC-52 clipboard write
+    with pytest.raises(SystemExit):
+        common.die_ctap_pin_error(_exc(common.CTAP_PIN_INVALID), _FakeCp((evil, None)))
+    err = capsys.readouterr().err
+    assert err.strip() == "error: wrong PIN"
+    assert "\x1b" not in err

@@ -14,6 +14,10 @@ python-fido2 2.2 has no ML-DSA CoseKey yet — the credential public key parses
 as `UnsupportedKey` (raw COSE map), so the AKP `pub` (-1) bytes are handed to
 OpenSSL directly.
 
+Shipping firmware returns fmt="none" with an empty attStmt, so the packed
+self-attestation verify only runs on a `--features fido-conformance` build; on a
+default board it is skipped and the getAssertion signature carries the check.
+
     python3 -m venv /tmp/fido2-latest
     /tmp/fido2-latest/bin/pip install fido2 cryptography
     /tmp/fido2-latest/bin/python tests/61_pqc_thirdparty_client.py
@@ -83,10 +87,16 @@ def main():
     assert cose[1] == 7 and cose[3] == -48, f"COSE key not AKP/ML-DSA-44: {cose.keys()}"
     pub = mldsa.MLDSA44PublicKey.from_public_bytes(bytes(cose[-1]))
 
-    assert att.att_stmt["alg"] == -48, f"attStmt alg {att.att_stmt['alg']}"
-    pub.verify(att.att_stmt["sig"], bytes(att.auth_data) + reg.response.client_data.hash)
-    print(f"registration: AKP key parsed by python-fido2, attestation verified by OpenSSL "
-          f"(credId {len(cred_data.credential_id)}B, sig {len(att.att_stmt['sig'])}B)")
+    if att.fmt == "none" or not att.att_stmt:
+        print("SKIP: self-attestation verify needs a --features fido-conformance "
+              "firmware (shipping firmware sends fmt=none)")
+        print(f"registration: AKP key parsed by python-fido2 "
+              f"(credId {len(cred_data.credential_id)}B, fmt=none)")
+    else:
+        assert att.att_stmt["alg"] == -48, f"attStmt alg {att.att_stmt['alg']}"
+        pub.verify(att.att_stmt["sig"], bytes(att.auth_data) + reg.response.client_data.hash)
+        print(f"registration: AKP key parsed by python-fido2, attestation verified by OpenSSL "
+              f"(credId {len(cred_data.credential_id)}B, sig {len(att.att_stmt['sig'])}B)")
 
     # Authenticate with the returned credential; verify under the same key.
     sel = client.get_assertion(

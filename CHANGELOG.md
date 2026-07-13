@@ -13,6 +13,75 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+## [0.3.5] — 2026-07-14
+
+### Changed
+
+- **`makeCredential` now ships `fmt:"none"` attestation by default**, fixing
+  `ssh-keygen -t ed25519-sk` enrollment on Windows / OpenSSH 10.0p2 (issue #26).
+  RS-Key previously returned packed **self**-attestation, so an Ed25519 credential
+  carried an Ed25519 self-attestation signature. OpenSSH 10.0 added
+  `fido_cred_verify_self`, and the Windows WebAuthn API does not round-trip that
+  EdDSA signature faithfully, so the verify failed with `FIDO_ERR_INVALID_SIG` and
+  the enroll aborted with "Key enrollment failed: invalid format" (ES256 self-att
+  round-trips fine, so `ecdsa-sk` worked; a genuine YubiKey uses basic ES256 x5c
+  attestation and never hits the path). Self-attestation conveys no trust beyond
+  "none" (WebAuthn §6.5.2), so shipping "none" loses nothing and is more private.
+  An explicitly-requested **enterprise** attestation still emits its full x5c
+  statement, and the `fido-conformance` profile keeps packed self-attestation (its
+  MakeCredential tests cryptographically verify it). `getInfo.attestationFormats`
+  is now `["none","packed"]`. Firmware `bcdDevice` `0x080C` → `0x080D`.
+
+### Fixed
+
+- **A wrong PIN in `rsk fido set-pin` / `list-passkeys` now prints a clean error,
+  not a Python traceback.** python-fido2 raises `CtapError` when the device
+  rejects a clientPIN operation; `change_pin`, `set_pin` and `get_pin_token` left
+  it uncaught, so mistyping the current PIN while changing it dumped a stack trace
+  instead of "wrong PIN". These now map the CTAP 2.1 §6.5.5 status to an operator
+  message — a wrong PIN reports how many attempts remain before it blocks, and the
+  blocked / auth-blocked / policy statuses get actionable text — via a shared
+  `common.die_ctap_pin_error`. `rsk` `0.3.10` → `0.3.11`; host-only, no firmware
+  change.
+- **`rsk` now finds the FIDO HID on Linux hosts where hidapi doesn't report a
+  usage page (issue #28).** `ctaphid.find()` matched a device solely by its HID
+  `usage_page == 0xF1D0`, but some Linux `hidapi` builds (the libusb backend, and
+  older hidraw) enumerate the device with `usage_page` left `0`, so `rsk status`
+  (and every command behind it) reported `FIDO HID : not found` even with the key
+  plugged in. It now keeps the `usage_page` fast path and, when that field is
+  unset, confirms the FIDO usage page straight from each device's report
+  descriptor — VID/PID-agnostic, so it works for every build (the default
+  `0x1209:0x0001` identity and each `VIDPID` preset), unlike hard-coding a single
+  vendor's VID/PID. `rsk` `0.3.9` → `0.3.10`; host-only, no firmware change.
+- **New passkey registration no longer hangs on the touch after a PIN is set.**
+  A zero-length `pinUvAuthParam` is the CTAP 2.1 §6.1.2 / §6.2.2 step-1 selection
+  probe: the authenticator takes a device-selection touch and then reports the PIN
+  state through the returned error. With a PIN configured it must return
+  `CTAP2_ERR_PIN_INVALID` (0x31) — the code a platform managing device selection
+  (Chrome) reads to advance from that touch to PIN entry. `makeCredential` and
+  `getAssertion` returned `CTAP2_ERR_PIN_AUTH_INVALID` (0x33) instead, so once a
+  PIN was set a fresh registration showed "press the button" and the press never
+  advanced (the no-PIN `PIN_NOT_SET` code was already correct, which is why
+  registering *before* setting a PIN worked). Both now return `PIN_INVALID`.
+  Firmware `bcdDevice` `0x080B` → `0x080C`.
+
+### Security
+
+- **A counterfeit FIDO device can no longer inject terminal escapes through the
+  clientPIN retry count.** The wrong-PIN message added above reads the remaining
+  attempts from python-fido2's `get_pin_retries()`, which returns the device's
+  CBOR-encoded value without type-checking it. A hostile authenticator could
+  return that field as a text string of ANSI/OSC/bidi escapes instead of an
+  integer, and `pin_error_message` embedded it into the `error:` line that `die()`
+  prints to the terminal **without** the CLI's `sanitize()` filter — an operator
+  running `rsk fido set-pin`/`list-passkeys` with a wrong PIN against the device
+  would get those escapes interpreted (window-title spoof, OSC-52 clipboard write,
+  Trojan-Source bidi). The retry count is now embedded only when it is really an
+  `int`; anything else falls back to a plain `wrong PIN`. LOW (needs a malicious
+  device + a wrong-PIN attempt); same class as the run-11/12 host-tooling escapes.
+  Found by security-audit run-18. `rsk` `0.3.11` → `0.3.12`; host-only, no firmware
+  change.
+
 ## [0.3.4] — 2026-07-12
 
 ### Fixed
