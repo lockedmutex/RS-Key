@@ -537,6 +537,7 @@ fn miri_fido_credmgmt() {
                     &rp_hash,
                     "a.co",
                     &[1, 2],
+                    &[],
                 );
             }
         }
@@ -1504,6 +1505,7 @@ fn miri_fido_session() {
                 &rp_hash,
                 "a.co",
                 &[1, 2],
+                &[],
             );
         }
     }

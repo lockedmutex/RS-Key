@@ -168,8 +168,8 @@ fn resident_id_format_and_determinism() {
     assert_eq!(r1, r2);
     assert_eq!(r1.len(), CRED_RESIDENT_LEN);
     assert_eq!(&r1[4..8], CRED_PROTO_RESIDENT);
-    // New resident ids are stamped v2 (byte 8), in the header before the chain.
-    assert_eq!(r1[RESIDENT_VERSION_IDX], RESIDENT_VERSION_V2);
+    // New resident ids are stamped v3 (byte 8), in the header before the chain.
+    assert_eq!(r1[RESIDENT_VERSION_IDX], RESIDENT_VERSION_V3);
     assert_eq!(r1[9], 0);
     assert!(is_resident(&r1));
 }
@@ -186,7 +186,7 @@ fn resident_version_marker_is_outside_the_hash_chain() {
     let d = dev();
     let cred_id = [0x55u8; 80];
     let id = derive_resident(&cred_id, &d);
-    assert_eq!(id[RESIDENT_VERSION_IDX], RESIDENT_VERSION_V2);
+    assert_eq!(id[RESIDENT_VERSION_IDX], RESIDENT_VERSION_V3);
 
     // Seed = the pre-chain contents of outk[10..42]: the serial HMAC's tail
     // (h0[10..32]) then zeroes. The version byte at offset 8 is not part of it.
@@ -220,9 +220,9 @@ fn resident_key_input_v2_is_reseal_stable_v1_follows_box() {
     let box2 = [0xAAu8; 80];
 
     let rid = derive_resident(&box1, &d);
-    assert_eq!(rid[RESIDENT_VERSION_IDX], RESIDENT_VERSION_V2);
+    assert_eq!(rid[RESIDENT_VERSION_IDX], RESIDENT_VERSION_V3);
 
-    // v2: the key input is the STABLE id, independent of the box.
+    // v2/v3: the key input is the STABLE id, independent of the box.
     assert_eq!(resident_key_input(&box1, Some(&rid[..])), &rid[..]);
     assert_eq!(resident_key_input(&box2, Some(&rid[..])), &rid[..]);
     let (ki1, ki2) = (
@@ -283,15 +283,16 @@ fn store_then_dedup_and_rp_count() {
         &rp_hash,
         "example.com",
         &[0xDE, 0xAD, 0xBE, 0xEF],
+        &[],
     )
     .unwrap();
 
-    // Stored in the first EF_CRED slot, record = rp_hash ‖ resident ‖ box.
+    // Stored in the first EF_CRED slot: rp_hash ‖ resident(v3) ‖ len(=0) ‖ box.
     assert!(fs.has_data(EF_CRED));
     let mut rec = [0u8; 1024];
     let n = fs.read(EF_CRED, &mut rec).unwrap();
     assert_eq!(&rec[..32], &rp_hash[..]);
-    assert_eq!(n, RECORD_PREFIX + len);
+    assert_eq!(n, RECORD_PREFIX + 1 + len);
     // EF_RP created with count 1.
     let mut rp = [0u8; 256];
     let m = fs.read(EF_RP, &mut rp).unwrap();
@@ -317,12 +318,45 @@ fn store_then_dedup_and_rp_count() {
         &rp_hash,
         "example.com",
         &[0xDE, 0xAD, 0xBE, 0xEF],
+        &[],
     )
     .unwrap();
     assert!(!fs.has_data(EF_CRED + 1)); // still one credential slot used
     let m2 = fs.read(EF_RP, &mut rp).unwrap();
     assert_eq!(rp[0], 1, "same user must not bump the rp count");
     assert_eq!(m2, m);
+}
+
+#[test]
+fn v3_record_roundtrips_box_and_cached_pubkey() {
+    let d = dev();
+    let rp_hash = sha256(b"example.com");
+    let mut boxbuf = [0u8; 512];
+    let box_len = credential_create(&SEED, &d, &input(), &rp_hash, &IV, &mut boxbuf).unwrap();
+
+    // Store with a cached point (a 65-byte stand-in): the record must carry the
+    // length-prefixed trailer, and both the box and the point must read back.
+    let point = [0x04u8; 65];
+    let mut fs: Fs<RamStorage> = Fs::new(RamStorage::new(), &[]);
+    credential_store(
+        &SEED,
+        &d,
+        &mut fs,
+        &boxbuf[..box_len],
+        &rp_hash,
+        "example.com",
+        &[1, 2, 3],
+        &point,
+    )
+    .unwrap();
+
+    let mut rec = [0u8; 1024];
+    let n = fs.read(EF_CRED, &mut rec).unwrap();
+    assert_eq!(n, RECORD_PREFIX + 1 + point.len() + box_len);
+    assert_eq!(cred_record_pubkey(&rec[..n]), Some(&point[..]));
+    // The box after the trailer still decrypts to the stored credential.
+    let mut scratch = [0u8; 1024];
+    assert!(credential_load(&SEED, cred_record_box(&rec[..n]), &rp_hash, &mut scratch).is_some());
 }
 
 #[test]

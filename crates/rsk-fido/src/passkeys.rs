@@ -19,8 +19,8 @@ use rsk_fs::{Fs, Storage};
 
 use crate::consts::{EF_CRED, EF_RP, EF_RPNICK, MAX_RESIDENT_CREDENTIALS};
 use crate::credential::{
-    CRED_REC_MAX, NICK_BOX_MAX, RECORD_PREFIX, RP_PREFIX, RP_REC_MAX, credential_load, seal_nick,
-    slot_map, unseal_nick, unseal_rp_id,
+    CRED_REC_MAX, NICK_BOX_MAX, RECORD_PREFIX, RP_PREFIX, RP_REC_MAX, cred_record_box,
+    credential_load, seal_nick, slot_map, unseal_nick, unseal_rp_id,
 };
 
 /// The device-local PIN seam for a display-initiated action, re-exported here so the
@@ -224,7 +224,8 @@ where
         if n < RECORD_PREFIX || buf[..32] != *rp_id_hash {
             continue;
         }
-        let Some(cred) = credential_load(&seed, &buf[RECORD_PREFIX..n], rp_id_hash, &mut scratch)
+        let Some(cred) =
+            credential_load(&seed, cred_record_box(&buf[..n]), rp_id_hash, &mut scratch)
         else {
             continue;
         };

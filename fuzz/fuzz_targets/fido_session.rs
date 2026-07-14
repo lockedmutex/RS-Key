@@ -91,6 +91,7 @@ fn provisioned() -> &'static RamStorage {
                     &rp_hash,
                     "a.co",
                     &[1, 2],
+                    &[],
                 );
             }
         }

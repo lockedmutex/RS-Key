@@ -35,10 +35,10 @@ use crate::consts::{
     MAX_RESIDENT_CREDENTIALS, PREFER_PQC,
 };
 use crate::credential::{
-    CRED_BOX_MAX, CRED_REC_MAX, CRED_RESIDENT_LEN, CredExt, CredInput, Credential, RECORD_PREFIX,
-    RP_ID_MAX, USER_ID_MAX, USER_NAME_MAX, credential_create, credential_load, credential_store,
-    derive_large_blob_key, derive_resident, is_resident, resident_key_input, slot_map,
-    truncate_utf8,
+    CRED_BOX_MAX, CRED_PUBKEY_MAX, CRED_REC_MAX, CRED_RESIDENT_LEN, CredExt, CredInput, Credential,
+    RECORD_PREFIX, RP_ID_MAX, USER_ID_MAX, USER_NAME_MAX, cred_record_box, credential_create,
+    credential_load, credential_store, derive_large_blob_key, derive_resident, is_resident,
+    resident_key_input, slot_map, truncate_utf8,
 };
 use crate::ec::{CredKey, MAX_SIG_LEN, P256Key};
 use crate::error::{CtapError, CtapResult};
@@ -518,6 +518,12 @@ fn make_credential_inner<S: Storage, R: Rng>(
     let key = CredKey::from_raw(req.sel_curve, &raw).ok_or(CtapError::Other)?;
     raw.zeroize();
 
+    // Cache the public point in the resident record so enumeration emits it
+    // instead of recomputing d·G per call. `key` already holds it (it is the
+    // point encoded into authData below); empty for an uncacheable curve.
+    let mut cached_pubkey = [0u8; CRED_PUBKEY_MAX];
+    let cached_pubkey_len = key.public_point(&mut cached_pubkey).unwrap_or(0);
+
     // hmac-secret-mc output (an hmac-secret evaluation at registration time).
     let mut hs = [0u8; SALT_ENC_MAX];
     let hs_len = if req.hmac_secret_mc.present {
@@ -684,6 +690,7 @@ fn make_credential_inner<S: Storage, R: Rng>(
             rp_id_hash,
             req.rp_id,
             req.user_id,
+            &cached_pubkey[..cached_pubkey_len],
         )
         .is_err()
     {
@@ -793,7 +800,7 @@ fn exclude_hit<S: Storage>(
             };
             let n = n.min(rec.len());
             if n >= RECORD_PREFIX && rec[..32] == *rp_id_hash && rec[32..RECORD_PREFIX] == *id {
-                return credential_load(seed, &rec[RECORD_PREFIX..n], rp_id_hash, &mut scratch)
+                return credential_load(seed, cred_record_box(&rec[..n]), rp_id_hash, &mut scratch)
                     .map(|c| visible(&c))
                     .unwrap_or(false);
             }

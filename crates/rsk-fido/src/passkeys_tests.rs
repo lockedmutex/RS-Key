@@ -68,7 +68,7 @@ fn add(
     };
     let mut boxbuf = [0u8; 512];
     let len = credential_create(seed, &dev(), &inp, &rp_hash, &iv, &mut boxbuf).unwrap();
-    credential_store(seed, &dev(), fs, &boxbuf[..len], &rp_hash, rp_id, uid).unwrap();
+    credential_store(seed, &dev(), fs, &boxbuf[..len], &rp_hash, rp_id, uid, &[]).unwrap();
 }
 
 #[test]

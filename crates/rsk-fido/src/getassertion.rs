@@ -23,8 +23,8 @@ use crate::consts::{
 };
 use crate::credential::{
     CRED_BOX_MAX, CRED_REC_MAX, CRED_RESIDENT_LEN, Credential, RECORD_PREFIX, USER_ID_MAX,
-    USER_NAME_MAX, credential_load, derive_large_blob_key, is_resident, resident_key_input,
-    slot_map,
+    USER_NAME_MAX, cred_record_box, credential_load, derive_large_blob_key, is_resident,
+    resident_key_input, slot_map,
 };
 use crate::ec::{CredKey, MAX_SIG_LEN};
 use crate::error::{CtapError, CtapResult};
@@ -415,7 +415,7 @@ fn resolve_from_allowlist<S: Storage, R: Rng>(
                     best.consider(
                         seed,
                         rp_id_hash,
-                        &rec[RECORD_PREFIX..n],
+                        cred_record_box(&rec[..n]),
                         Some(&rec[32..RECORD_PREFIX]),
                         uv,
                         true,
@@ -462,7 +462,7 @@ fn resolve_by_discovery<S: Storage, R: Rng>(
             && let Some(created) = best.consider(
                 seed,
                 rp_id_hash,
-                &rec[RECORD_PREFIX..n],
+                cred_record_box(&rec[..n]),
                 Some(&rec[32..RECORD_PREFIX]),
                 uv,
                 false,
@@ -806,7 +806,7 @@ pub fn get_next_assertion<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, out: &mut [u8
     let mut seed = ctx.load_keydev().ok_or(CtapError::Other)?;
     let result = next_assertion_response(
         ctx,
-        &rec[RECORD_PREFIX..n],
+        cred_record_box(&rec[..n]),
         &resident_id,
         &rp_id_hash,
         &client_data_hash,

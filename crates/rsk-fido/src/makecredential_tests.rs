@@ -771,7 +771,7 @@ fn make_credential_extensions_stored_and_emitted() {
     let mut scratch = [0u8; 1024];
     let c = crate::credential::credential_load(
         &seed,
-        &rec[crate::credential::RECORD_PREFIX..n],
+        crate::credential::cred_record_box(&rec[..n]),
         &sha256(b"example.com"),
         &mut scratch,
     )

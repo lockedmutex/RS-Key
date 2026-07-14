@@ -13,6 +13,22 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+### Changed
+
+- **Passkey enumeration is much faster: the credential's public key is now cached
+  in its resident record** instead of being recomputed on every
+  `authenticatorCredentialManagement` enumerate call. On this MCU a software
+  P-256 public-key derivation (`d·G`) costs ~150–250 ms, so listing passkeys — as
+  the Yubico Authenticator "Passkeys" tab does — spent that per credential every
+  time (a measured ~1.2 s for four passkeys). makeCredential already computes the
+  point for authData, so the record now carries it (a length-prefixed trailer on
+  a new **v3** resident record) and enumeration emits it directly, dropping the
+  per-credential cost to a flash read. The one-time clientPIN unlock (an ECDH, not
+  cacheable) is unchanged. Records already on a device (v1/v2) keep deriving on
+  the fly and stay byte-for-byte compatible; passkeys created by this firmware get
+  the cache. EC curves (P-256/384/521, secp256k1, Ed25519) are cached; the lattice
+  schemes derive as before (their public keys exceed the record). bcdDevice → `0x080E`.
+
 ## [0.3.5] — 2026-07-14
 
 ### Changed

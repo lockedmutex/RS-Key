@@ -269,3 +269,57 @@ fn credkey_stays_compact_so_mldsa_key_is_off_the_stack() {
          An inline rsk-mldsa keypair (~13 KB) overflows the worker stack in sign()."
     );
 }
+
+#[test]
+fn cached_point_encodes_identically_to_derived() {
+    // The whole passkey-enumerate speedup rests on this: the COSE public key
+    // emitted from a cached point (`cose_public_from_point`) must be BYTE-for-byte
+    // the one the derive path (`cose_public`) produces, for every cacheable curve.
+    // A drift here would serve a wrong key in the enumeration response.
+    use crate::consts::{CURVE_MLDSA44, CURVE_P256};
+    use crate::credential::CRED_PUBKEY_MAX;
+
+    let raw = [0x11u8; RATCHET_LEN];
+    for curve in [
+        CURVE_P256 as i64,
+        CURVE_P384 as i64,
+        CURVE_P521 as i64,
+        CURVE_P256K1 as i64,
+        CURVE_ED25519 as i64,
+    ] {
+        let key = CredKey::from_raw(curve, &raw).unwrap();
+
+        let mut derived = [0u8; 256];
+        let dn = {
+            let mut enc = Encoder::new(Cursor::new(&mut derived[..]));
+            key.cose_public(&mut enc).unwrap();
+            enc.writer().position()
+        };
+
+        let mut pt = [0u8; CRED_PUBKEY_MAX];
+        let pn = key.public_point(&mut pt).unwrap();
+        assert_eq!(
+            Some(pn),
+            cached_point_len(curve),
+            "point length for curve {curve}"
+        );
+
+        let mut cached = [0u8; 256];
+        let cn = {
+            let mut enc = Encoder::new(Cursor::new(&mut cached[..]));
+            cose_public_from_point(curve, &pt[..pn], &mut enc).unwrap();
+            enc.writer().position()
+        };
+
+        assert_eq!(
+            &derived[..dn],
+            &cached[..cn],
+            "curve {curve}: cache != derive"
+        );
+    }
+
+    // The lattice schemes are not cached (their public keys exceed the record).
+    let mldsa = CredKey::from_raw(CURVE_MLDSA44 as i64, &raw).unwrap();
+    assert!(mldsa.public_point(&mut [0u8; CRED_PUBKEY_MAX]).is_none());
+    assert_eq!(cached_point_len(CURVE_MLDSA44 as i64), None);
+}

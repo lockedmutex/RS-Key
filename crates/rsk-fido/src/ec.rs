@@ -370,6 +370,81 @@ impl CredKey {
             Self::MlDsa65(k) => cose_key_akp(enc, ALG_MLDSA65, &k.public_key()),
         }
     }
+
+    /// The uncompressed public point for the EC schemes we cache in the EF_CRED
+    /// record (SEC1 `04 ‖ x ‖ y` for the NIST/secp curves, the raw 32-byte key
+    /// for Ed25519), written into `out`; returns its length. `None` for the
+    /// lattice schemes, whose public keys are far too large for the record (they
+    /// keep deriving per enumeration). The point is already computed for authData
+    /// at makeCredential, so caching it there costs no extra scalar mul.
+    pub fn public_point(&self, out: &mut [u8]) -> Option<usize> {
+        fn put(bytes: &[u8], out: &mut [u8]) -> Option<usize> {
+            out.get_mut(..bytes.len())?.copy_from_slice(bytes);
+            Some(bytes.len())
+        }
+        match self {
+            Self::P256(k) => put(k.verifying_key().to_encoded_point(false).as_bytes(), out),
+            Self::P384(k) => put(k.verifying_key().to_encoded_point(false).as_bytes(), out),
+            Self::K256(k) => put(k.verifying_key().to_encoded_point(false).as_bytes(), out),
+            Self::P521(d) => {
+                use p521::elliptic_curve::sec1::ToEncodedPoint;
+                put(
+                    comb_mul(d).to_affine().to_encoded_point(false).as_bytes(),
+                    out,
+                )
+            }
+            Self::Ed25519(k) => put(&k.verifying_key().to_bytes(), out),
+            Self::MlDsa44(_) | Self::MlDsa65(_) => None,
+        }
+    }
+}
+
+/// Byte length of the cached uncompressed public point for `curve`, or `None`
+/// for a scheme we do not cache (the lattice schemes). Credential enumeration
+/// validates a stored trailer against this before emitting it.
+pub fn cached_point_len(curve: i64) -> Option<usize> {
+    Some(match curve {
+        c if c == CURVE_P256 as i64 || c == CURVE_P256K1 as i64 => 65,
+        c if c == CURVE_P384 as i64 => 97,
+        c if c == CURVE_P521 as i64 => 133,
+        c if c == CURVE_ED25519 as i64 => 32,
+        _ => return None,
+    })
+}
+
+/// Encode the COSE public key from a cached uncompressed point (produced by
+/// [`CredKey::public_point`]) for `curve` — byte-identical to
+/// [`CredKey::cose_public`] but with NO scalar multiplication. The caller
+/// validates the point length against [`cached_point_len`] first; the guards
+/// here are defensive (a mismatch yields an encode error, not a bad key).
+pub fn cose_public_from_point<W: Write>(
+    curve: i64,
+    point: &[u8],
+    enc: &mut Encoder<W>,
+) -> Result<(), CborError<W::Error>> {
+    fn ec2<W: Write>(
+        enc: &mut Encoder<W>,
+        alg: i64,
+        crv: u8,
+        point: &[u8],
+        f: usize,
+    ) -> Result<(), CborError<W::Error>> {
+        let body = point
+            .strip_prefix(&[0x04])
+            .filter(|b| b.len() == 2 * f)
+            .ok_or(CborError::message("bad cached point"))?;
+        cose_key_ec2_var(enc, alg, crv, &body[..f], &body[f..])
+    }
+    match curve {
+        c if c == CURVE_P256 as i64 => ec2(enc, ALG_ES256, CURVE_P256, point, 32),
+        c if c == CURVE_P384 as i64 => ec2(enc, ALG_ES384, CURVE_P384, point, 48),
+        c if c == CURVE_P521 as i64 => ec2(enc, ALG_ES512, CURVE_P521, point, 66),
+        c if c == CURVE_P256K1 as i64 => ec2(enc, ALG_ES256K, CURVE_P256K1, point, 32),
+        c if c == CURVE_ED25519 as i64 && point.len() == 32 => {
+            cose_key_okp_var(enc, ALG_EDDSA, CURVE_ED25519, point)
+        }
+        _ => Err(CborError::message("uncacheable curve")),
+    }
 }
 
 /// Adapts the crate's [`Rng`] to `rand_core` for the one curve (P-521) that needs

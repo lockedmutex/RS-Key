@@ -71,6 +71,7 @@ fuzz_target!(|data: &[u8]| {
                 &rp_hash,
                 "a.co",
                 &[1, 2],
+                &[],
             );
         }
     }
