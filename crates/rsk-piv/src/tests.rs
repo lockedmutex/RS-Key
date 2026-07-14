@@ -1030,6 +1030,53 @@ fn ec_metadata_point_is_cached_and_derive_fallback_matches() {
 }
 
 #[test]
+fn ec_metadata_cache_is_best_effort_under_meta_pressure() {
+    let rng = RefCell::new(TestRng(7));
+    let pres = RefCell::new(AlwaysConfirm);
+    let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
+    let mut fs = new_fs();
+    select(&mut app, &mut fs);
+    auth_mgm(&mut app, &mut fs);
+    verify_pin(&mut app, &mut fs);
+
+    // Stuff EF_META (META_MAX=1024, reserve=256) so a new EC slot has no room to
+    // cache its ~65-byte point but ample room for its 4-byte head. Filler fid is
+    // outside the PIV key_fid range (0xD1xx), so GET METADATA never reads it.
+    let filler = [0u8; 740]; // record 744; point-budget (768) free = 24 < a P-256 record
+    fs.meta_add(0xABCD, &filler).unwrap();
+
+    let (sw, _resp) = run(
+        &mut app,
+        &mut fs,
+        INS_ASYM_KEYGEN,
+        0,
+        0x9A,
+        &gen_template(ALGO_ECCP256),
+    );
+    assert_eq!(
+        sw,
+        Sw::OK,
+        "key still provisions when its point cannot be cached"
+    );
+
+    // Under the reserve the slot stored only its essential 4-byte head, no point.
+    let mut meta = [0u8; 4 + MAX_EC_POINT];
+    let n = fs.meta_find(key_fid(0x9A).get(), &mut meta).unwrap();
+    assert_eq!(n, 4, "best-effort: no point cached under meta pressure");
+    assert_eq!(
+        meta[0], ALGO_ECCP256,
+        "the algo head is intact for the gate"
+    );
+
+    // GET METADATA still returns the public key, deriving the point on the fly.
+    let (sw, md) = run(&mut app, &mut fs, INS_GET_METADATA, 0, 0x9A, &[]);
+    assert_eq!(sw, Sw::OK);
+    let point = find_tag(find_tag(&md, 0x04).unwrap(), 0x86).unwrap();
+    assert_eq!(point.len(), 65, "derived uncompressed P-256 point");
+    assert_eq!(point[0], 0x04);
+}
+
+#[test]
 fn keygen_p256_sign_and_verify() {
     let rng = RefCell::new(TestRng(7));
     let pres = RefCell::new(AlwaysConfirm);

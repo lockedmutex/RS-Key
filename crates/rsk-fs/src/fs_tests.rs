@@ -376,6 +376,27 @@ fn meta_add_overflow_is_nomemory() {
 }
 
 #[test]
+fn meta_add_reserve_protects_reserved_headroom() {
+    let mut fs = fs();
+    // A record (4-byte header + 700 = 704) fits within META_MAX (1024) but leaves
+    // only 320 bytes free — under a 400-byte reserve, so the reserved write is
+    // rejected while the plain write (reserve 0) succeeds.
+    let big = [0u8; 700];
+    assert_eq!(fs.meta_add_reserve(0xCF00, &big, 400), Err(Error::NoMemory));
+    fs.meta_add(0xCF00, &big).unwrap();
+    // With the store now near full, a further reserved write still rejects (no
+    // headroom), but a plain small write — a slot's essential head — still fits
+    // in the reserved space. This is exactly PIV's best-effort cache fallback.
+    let head = [1u8, 2, 3, 4];
+    assert_eq!(
+        fs.meta_add_reserve(0xCF01, &head, 400),
+        Err(Error::NoMemory)
+    );
+    fs.meta_add(0xCF01, &head).unwrap();
+    assert_eq!(fs.meta_find(0xCF01, &mut [0u8; 8]), Some(4));
+}
+
+#[test]
 fn meta_delete_clears_ef_meta() {
     let mut fs = fs();
     fs.meta_add(0xCF00, b"x").unwrap();

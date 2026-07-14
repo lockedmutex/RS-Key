@@ -874,15 +874,16 @@ impl PivApplet<'_> {
             } else if let Some(tofid) = cert_to {
                 let _ = fs.delete(tofid);
             }
-            // Sized for a cached-EC-point record so the move carries the point
-            // to the destination slot verbatim (and never truncates it).
+            // Sized to read the full source record (head + any cached point).
+            // The point is carried to the destination best-effort — kept when
+            // EF_META has room, else dropped to the head alone (see meta_add_slot).
             let mut meta = [0u8; 4 + MAX_EC_POINT];
             match fs.meta_find(key_fid(from).get(), &mut meta) {
                 Some(n) => {
                     let n = n.min(meta.len());
-                    if fs.meta_add(key_fid(to).get(), &meta[..n]).is_err() {
+                    if let Err(e) = keygen::meta_add_slot(fs, key_fid(to).get(), &meta[..n]) {
                         blob.zeroize();
-                        return Sw::MEMORY_FAILURE;
+                        return e;
                     }
                 }
                 None => {

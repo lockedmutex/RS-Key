@@ -179,6 +179,28 @@ fn ec_slot_meta(algo: u8, pol: [u8; 2], origin: u8, point: &[u8], out: &mut [u8]
     4 + point.len()
 }
 
+/// EF_META bytes kept free for every slot's essential 4-byte head, so an optional
+/// cached public point can never crowd a head out. Well above the max PIV meta
+/// record count (4 active + 20 retired + card-mgmt + attestation slots) times the
+/// 8-byte head record, so every slot's head — and thus provisioning — always fits.
+pub(crate) const META_POINT_RESERVE: usize = 256;
+
+/// Store a slot's meta record best-effort. `rec` is the 4-byte
+/// `[algo, pin_pol, touch_pol, origin]` head, optionally followed by the cached
+/// public point ([`ec_slot_meta`]). The head is essential (GET METADATA and the
+/// PIN/touch gate read it); the point is only a GET METADATA speed-up. If the full
+/// record would leave too little room for other slots' heads, store just the head
+/// — GET METADATA then derives the point on the fly, exactly as for a key made by
+/// pre-cache firmware. So the optional cache can never fail provisioning or leave a
+/// key without its metadata, and EF_META stays bounded regardless of slot count.
+pub(crate) fn meta_add_slot<S: Storage>(fs: &mut Fs<S>, fid: u16, rec: &[u8]) -> Result<(), Sw> {
+    if fs.meta_add_reserve(fid, rec, META_POINT_RESERVE).is_ok() {
+        return Ok(());
+    }
+    fs.meta_add(fid, &rec[..rec.len().min(4)])
+        .map_err(|_| Sw::MEMORY_FAILURE)
+}
+
 /// The EC / Ed25519 / X25519 arm of GENERATE; RSA goes through
 /// [`crate::PivApplet::rsa_generate_finish`] (the firmware runs the dual-core
 /// prime search, CCID keepalives flowing meanwhile) or the blocking fallback
@@ -211,8 +233,8 @@ pub(crate) fn generate_ec<S: Storage>(
     let pol = resolved_policies(slot, req.pin_policy, req.touch_policy);
     let mut mbuf = [0u8; 4 + MAX_EC_POINT];
     let mlen = ec_slot_meta(req.algo, pol, ORIGIN_GENERATED, &point[..plen], &mut mbuf);
-    if fs.meta_add(key_fid(slot).get(), &mbuf[..mlen]).is_err() {
-        return Sw::MEMORY_FAILURE;
+    if let Err(e) = meta_add_slot(fs, key_fid(slot).get(), &mbuf[..mlen]) {
+        return e;
     }
     let mut out = [0u8; 110];
     let n = make_ec_pubkey_do(&point[..plen], &mut out);
@@ -323,8 +345,7 @@ pub(crate) fn generate_retired_ec<S: Storage>(
     let pol = resolved_policies(slot, None, None);
     let mut mbuf = [0u8; 4 + MAX_EC_POINT];
     let mlen = ec_slot_meta(algo, pol, ORIGIN_GENERATED, &point[..plen], &mut mbuf);
-    fs.meta_add(key_fid(slot).get(), &mbuf[..mlen])
-        .map_err(|_| Sw::MEMORY_FAILURE)
+    meta_add_slot(fs, key_fid(slot).get(), &mbuf[..mlen])
 }
 
 /// Persist a display-generated RSA key into an empty retired slot — the RSA companion
@@ -519,8 +540,8 @@ pub(crate) fn import<S: Storage>(
     } else {
         ec_slot_meta(algo, pol, ORIGIN_IMPORTED, &[], &mut mbuf)
     };
-    if fs.meta_add(key_fid(slot).get(), &mbuf[..mlen]).is_err() {
-        return Sw::MEMORY_FAILURE;
+    if let Err(e) = meta_add_slot(fs, key_fid(slot).get(), &mbuf[..mlen]) {
+        return e;
     }
     Sw::OK
 }

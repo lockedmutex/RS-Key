@@ -428,6 +428,16 @@ impl<S: Storage> Fs<S> {
 
     /// Insert or replace the metadata for `fid`.
     pub fn meta_add(&mut self, fid: u16, data: &[u8]) -> Result<()> {
+        self.meta_add_reserve(fid, data, 0)
+    }
+
+    /// Insert or replace the metadata for `fid`, keeping at least `reserve` bytes
+    /// of the meta store free — the write fails with [`Error::NoMemory`] if it
+    /// would not. Lets a caller reserve guaranteed headroom for other, essential
+    /// records: PIV writes an optional cached public point this way, reserving
+    /// space for every slot's 4-byte head so the cache can never crowd a head out
+    /// (which would fail provisioning). `reserve == 0` is the plain add.
+    pub fn meta_add_reserve(&mut self, fid: u16, data: &[u8], reserve: usize) -> Result<()> {
         let mut scratch = [0u8; META_MAX];
         // Read the existing blob unless EF_META is *confirmed* absent. Treating
         // an UNKNOWN EF_META as empty is the power-cut bug: a torn-migration
@@ -442,7 +452,10 @@ impl<S: Storage> Fs<S> {
                 .min(scratch.len())
         };
         let mut out = [0u8; META_MAX];
-        let w = rebuild_meta(&scratch[..n], fid, Some(data), &mut out)?;
+        // Cap the rebuild at META_MAX - reserve so the write leaves `reserve`
+        // bytes free (rebuild_meta bounds its output by the slice length).
+        let limit = META_MAX.saturating_sub(reserve);
+        let w = rebuild_meta(&scratch[..n], fid, Some(data), &mut out[..limit])?;
         self.storage.write(EF_META, &out[..w])?;
         self.mark_present(EF_META);
         Ok(())
