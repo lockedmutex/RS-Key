@@ -13,6 +13,8 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+## [0.3.5] — 2026-07-14
+
 ### Changed
 
 - **`makeCredential` now ships `fmt:"none"` attestation by default**, fixing
