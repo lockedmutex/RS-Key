@@ -4,12 +4,12 @@
 # rsk — the device CLI
 
 `rsk` is the host-side command-line tool for an RS-Key. It consolidates every
-day-to-day and production task into one command — device status, seed backup,
+day-to-day and production task into one command: device status, seed backup,
 secure-boot provisioning, OTP fuses, FIDO2 management, OpenPGP reset, audit
-verification, fleet inventory, offboarding — and talks to the device directly:
+verification, fleet inventory, offboarding. It talks to the device directly:
 CTAPHID over hidapi for the FIDO interface, and the CCID applets over PC/SC.
 
-It is the canonical interface; the [terminal cockpit (`rsk-tui`)](tui.md) is a
+It is the canonical interface. The [terminal cockpit (`rsk-tui`)](tui.md) is a
 read-mostly companion that points you back here for anything irreversible. Most
 other guides in this section assume `rsk` is on your `PATH` and show the exact
 `rsk <group> …` command for the task.
@@ -35,7 +35,7 @@ rsk <group> --help    # a group's subcommands and flags
 ### Without Nix
 
 `rsk` also runs on any host with Python ≥ 3.9, packaged at `tools/`. With
-[uv](https://docs.astral.sh/uv/) (no install step — an ephemeral environment),
+[uv](https://docs.astral.sh/uv/) (no install step, an ephemeral environment),
 from the repo root:
 
 ```sh
@@ -51,15 +51,15 @@ pipx install ./tools           # or pipx
 pip install ./tools            # or a venv + pip
 ```
 
-Two dependencies wrap system libraries — `hidapi` (the CTAPHID transport) and
+Two dependencies wrap system libraries: `hidapi` (the CTAPHID transport) and
 `pyscard` (PC/SC, for the CCID applets). macOS ships both frameworks and the
-wheels work out of the box; on Linux install `pcsclite` and run `pcscd` for the
+wheels work out of the box. On Linux install `pcsclite` and run `pcscd` for the
 CCID half, plus udev rules for non-root HID. The full setup and the Apple-Silicon
 `pyscard` rebuild note are in [tools/README.md](https://github.com/TheMaxMur/RS-Key/blob/main/tools/README.md)
 and [Linux host setup](../linux.md).
 
 The Nix shell stays the primary, reproducible path (it also carries `picotool`,
-`ykman`, `gpg`, and the test suites); the uv/pip path is for hosts without Nix.
+`ykman`, `gpg`, and the test suites). The uv/pip path is for hosts without Nix.
 
 ## Command groups
 
@@ -80,7 +80,7 @@ The Nix shell stays the primary, reproducible path (it also carries `picotool`,
 | `offboard` | guided full wipe + signed receipt **(destructive)** | [Fleet tooling](fleet.md) |
 
 > Note the two distinct "OTP"s: **`rsk otp`** burns the device's at-rest master
-> key into RP2350 one-time-programmable fuses (a production ritual), while the
+> key into RP2350 one-time-programmable fuses (a production ritual). The
 > Yubico-style **[OTP slots](otp.md)** feature (touch-to-type codes) is a runtime
 > applet managed with `ykman`. They share a name, not a mechanism.
 
@@ -99,7 +99,7 @@ rsk backup export --pin 1234     # explicit, for scripts / CI
 rsk backup export                # prompts:  FIDO2 PIN:
 ```
 
-The prompt is **only** shown when the device actually has a clientPIN set — a
+The prompt is **only** shown when the device actually has a clientPIN set. A
 touch-only key is never asked, so the plug-and-touch flow is unchanged. If stdin
 is not a terminal (a pipe) and no `--pin` was given, `rsk` skips the prompt and
 lets the device report `device requires a PIN` rather than hanging. The
@@ -110,27 +110,27 @@ PIN-gated commands are:
 - `lock enable` / `lock disable`
 - `inventory verify`
 - `fido list-passkeys`, `fido attestation import` / `clear`
-- `fido set-pin` — `--pin` is the *current* PIN when changing; `--new-pin` sets
+- `fido set-pin`: `--pin` is the *current* PIN when changing. `--new-pin` sets
   the new one (prompted, with confirmation, if omitted)
 
-This is always the FIDO2 clientPIN — the one `rsk fido set-pin` manages — never
+This is always the FIDO2 clientPIN (the one `rsk fido set-pin` manages), never
 an OpenPGP PW1/PW3 or a PIV PIN. Those are entered only in their own tools
 (`gpg`, `ykman`).
 
 ### Touch
 
-Operations that release or sign over a secret require a **physical touch** — a
+Operations that release or sign over a secret require a **physical touch**: a
 press of the BOOTSEL button while the LED blinks, within a 30-second window.
 `rsk` prints `touch the device …` to stderr before blocking. Touch-gated
 commands include `backup export`/`restore`/`finalize`, `audit verify`,
 `inventory verify`, `lock enable`/`disable`, and `fido attestation import`/
 `clear`. Read-only commands (`status`, `inventory list`, `*/status`) need no
-touch; `audit log` needs one only on a device with no PIN (the PIN token gates
+touch. `audit log` needs one only on a device with no PIN (the PIN token gates
 it otherwise).
 
 ### Machine-readable output
 
-`status` and `inventory list` take `--json` for scripting — a stable object you
+`status` and `inventory list` take `--json` for scripting: a stable object you
 can pipe to `jq`. Everything else is human-formatted text.
 
 ```sh
@@ -141,10 +141,10 @@ rsk inventory list --json        # one JSON object per connected key, per line
 ### Irreversible actions
 
 Destructive or fuse-burning commands (`offboard`, `secure-boot`, `otp`,
-`lock enable`, `openpgp reset`) require a **typed confirmation** — you type an
-exact token (e.g. `LOCK-SEED`) rather than pressing a single key; anything else
+`lock enable`, `openpgp reset`) require a **typed confirmation**: you type an
+exact token (e.g. `LOCK-SEED`) rather than pressing a single key. Anything else
 aborts. The OTP and secure-boot rituals burn one-time-programmable fuses and
-cannot be undone — read [Production setup](../production.md) before running them.
+cannot be undone. Read [Production setup](../production.md) before running them.
 
 ### Errors and exit codes
 
@@ -161,14 +161,14 @@ DEVK) instead of a bare stack trace.
 
 ## For contributors
 
-The CLI lives in `tools/rsk/` — one module per group, each exposing a
+The CLI lives in `tools/rsk/`: one module per group, each exposing a
 `register(sub)` that adds its argparse subparser, wired together in
 `__main__.py`. Shared helpers (error exit, the `--pin` flag + PIN resolution,
-the picotool runner, the FIDO HID connect) live in `common.py`; the raw CTAPHID
+the picotool runner, the FIDO HID connect) live in `common.py`. The raw CTAPHID
 transport and CBOR codec are in `ctaphid.py`.
 
-PIN entry goes through one chokepoint — `common.resolve_pin` (flag-or-prompt)
-and `common.add_pin_arg` (the shared flag) — so consistency is structural, not
+PIN entry goes through one chokepoint, `common.resolve_pin` (flag-or-prompt)
+and `common.add_pin_arg` (the shared flag), so consistency is structural, not
 per-command discipline. The pure-logic unit tests need no device:
 
 ```sh
@@ -176,5 +176,5 @@ per-command discipline. The pure-logic unit tests need no device:
 nix develop -c bash -c 'cd tools && python -m pytest rsk/'
 ```
 
-Host-tool changes like these do **not** bump the firmware `bcdDevice`; see
+Host-tool changes like these do **not** bump the firmware `bcdDevice`. See
 [Versions](../versioning.md).

@@ -5,7 +5,7 @@ on-card, over Yubico's YKOATH protocol (CCID). The HMAC secret is written once
 and never leaves the chip again: every code is derived inside the firmware and
 only the digits come back. Up to **255 accounts**.
 
-Clients are the stock Yubico tooling — `ykman oath` on the command line and the
+Clients are the stock Yubico tooling: `ykman oath` on the command line and the
 **Yubico Authenticator** desktop/mobile app over USB. There is no `rsk oath`
 subcommand; OATH is driven entirely through those. Both `ykman oath` and the
 Yubico Authenticator gate on a `Yubico YubiKey` reader name, so they only see
@@ -34,7 +34,7 @@ ykman oath accounts uri 'otpauth://totp/GitHub:me@example.com?secret=BASE32SECRE
 ```
 
 The account name shown in lists is `issuer:account` (here `GitHub:me@example.com`).
-Most sites hand you the secret two ways at enrollment — a QR code and a
+Most sites hand you the secret two ways at enrollment: a QR code and a
 "can't scan it?" base32 string. Either works:
 
 - **base32 string** → `accounts add` (or `accounts uri` if they give the full
@@ -57,7 +57,7 @@ Options that matter:
 
 All three hashes are implemented on-card (SHA-1/256/512); RFC 6238/4226 test
 vectors for each pass in `crates/rsk-oath`. Adding a name that already exists
-**overwrites** the old secret in place (`--force` skips the prompt) — there is
+**overwrites** the old secret in place (`--force` skips the prompt). There is
 one credential per name.
 
 ## Get codes
@@ -70,7 +70,7 @@ ykman oath accounts code github     # one account by name substring
 `code` with no name runs the bulk path (CALCULATE ALL). Two kinds of account
 are *not* computed there and show a placeholder instead:
 
-- **Touch-required accounts** are listed but not calculated — name them
+- **Touch-required accounts** are listed but not calculated. Name them
   explicitly (`ykman oath accounts code github`) and the firmware waits for the
   press, then prints the code. This is deliberate: a bulk read can never make a
   touch account leak a code without the button.
@@ -78,7 +78,7 @@ are *not* computed there and show a placeholder instead:
   the counter). Name them to step the counter once.
 
 The **Yubico Authenticator** GUI shows all TOTP codes live and re-derives them
-each period; touch and HOTP entries get a tap-to-reveal button instead.
+each period. Touch and HOTP entries get a tap-to-reveal button instead.
 
 ## Touch-required accounts
 
@@ -90,7 +90,7 @@ ykman oath accounts add aws --issuer AWS --touch
 With `--touch`, the firmware refuses to compute that account's code until the
 BOOTSEL button is pressed; a timeout or a declined press returns "security
 status not satisfied" and **nothing is computed**. For HOTP this gate sits
-*before* the counter advances, so a denied touch burns no counter — a refused
+*before* the counter advances, so a denied touch burns no counter. A refused
 press leaves the account exactly where it was. The button is the same physical
 press used by FIDO and OpenPGP UIF; only one prompt is outstanding at a time.
 
@@ -108,23 +108,23 @@ ykman oath access forget            # drop the cached password
 How it works on-card: the password becomes an HMAC key (PBKDF2 over the
 password, salted with the device serial, done host-side by `ykman`). On every
 fresh connection the card issues a random challenge; the host must answer with
-`HMAC(key, challenge)` before any account command is allowed, and the card
+`HMAC(key, challenge)` before any account command is allowed. The card
 answers the host's challenge with the same key (mutual proof). Selecting the
 applet again re-locks it. The compare is constant-time and full-length, so a
 truncated or guessed response can't brute-force its way in one byte at a time.
 
-Footguns, stated plainly:
+Footguns:
 
 - The password gates **listing and computing** codes over CCID, not the
-  secrets at rest. OATH blobs sit in **plaintext flash** — unlike PIV and
-  OpenPGP keys, they are not individually sealed. So this password protects the
+  secrets at rest. OATH blobs sit in **plaintext flash**. Unlike PIV and
+  OpenPGP keys, they are not individually sealed. This password protects the
   live applet, not a flash image; at-rest confidentiality for OATH rests only
   on the RP2350 device-level protections (secure boot / BOOTSEL lockout, see
   [threat-model.md](../threat-model.md)), not on per-credential sealing.
 - There is **no recovery** for a forgotten access password short of
   `ykman oath reset`, which wipes every account with it.
-- `--touch` per account and the access password are independent hardenings —
-  you can use either, both, or neither.
+- `--touch` per account and the access password are independent hardenings.
+  Use either, both, or neither.
 
 ## Manage
 
@@ -139,21 +139,21 @@ ykman oath reset                               # wipe the OATH applet only
 `rename` rewrites the name in place and keeps the same secret and counter;
 renaming to a name that already exists is rejected. `delete` of an unknown name
 is a no-op error. `reset` clears all accounts, the access password, and the OTP
-password-PIN — and nothing outside OATH (FIDO/PIV/OpenPGP survive). To wipe the
-whole key instead, see `rsk offboard`.
+password-PIN. Nothing outside OATH is affected (FIDO/PIV/OpenPGP survive). To
+wipe the whole key instead, see `rsk offboard`.
 
 ## Notes
 
-- Secrets live in device flash (in plaintext — OATH blobs are not individually
-  sealed, unlike PIV/OpenPGP); codes are computed on-card, so the secret never
+- Secrets live in device flash (in plaintext: OATH blobs are not individually
+  sealed, unlike PIV/OpenPGP). Codes are computed on-card, so the secret never
   returns to the host after `add`.
 - OATH accounts are **not** covered by the [seed backup](seed-backup.md) and
   do not come back on a [backup key](backup-key.md): they are sealed to *this*
   chip, not derived from the FIDO seed. Keep your `otpauth://` URIs/QRs
-  somewhere safe, or re-enroll on loss — the device cannot export a secret once
+  somewhere safe, or re-enroll on loss. The device cannot export a secret once
   it is stored.
-- HOTP counters are persisted across reboots and continue from where they were;
-  touch-required HOTP accounts only advance the counter *after* the touch, so
+- HOTP counters are persisted across reboots and continue from where they were.
+  Touch-required HOTP accounts only advance the counter *after* the touch, so
   there are no drive-by increments.
 - OATH interop (add → list → calculate → delete, plus TOTP crypto-verified
   against RFC vectors, via both `ykman oath` and Yubico Authenticator) is
@@ -162,15 +162,15 @@ whole key instead, see `rsk offboard`.
 ## Troubleshooting
 
 - **`ykman` finds no reader / "Failed to connect":** on Linux this is almost
-  always `scdaemon` holding the CCID interface after a `gpg` call — apply the
+  always `scdaemon` holding the CCID interface after a `gpg` call. Apply the
   `disable-ccid` line from [linux.md](../linux.md) and run
   `gpgconf --kill scdaemon`, then retry.
-- **Codes are rejected by the site:** TOTP depends on the host clock — the card
+- **Codes are rejected by the site:** TOTP depends on the host clock. The card
   has no battery-backed time and trusts the timestamp `ykman`/the GUI sends.
   Fix the host's clock (NTP) and re-read. For HOTP, a code is rejected once the
   server counter has moved past yours; resync on the server side.
-- **"Touch" account prints nothing under `accounts code`:** that's expected —
-  bulk read skips touch accounts. Name the account so the firmware prompts for
+- **"Touch" account prints nothing under `accounts code`:** that's expected.
+  Bulk read skips touch accounts. Name the account so the firmware prompts for
   the press.
 - **Forgot the access password:** there is no unlock; `ykman oath reset` is the
   only way out, and it deletes every account.

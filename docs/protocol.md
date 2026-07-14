@@ -6,12 +6,12 @@ byte layout of each request and response, and what authenticates each one.
 
 It exists so that third-party tooling (e.g. **PicoForge**) can configure and
 manage RS-Key devices without reverse-engineering the firmware. The canonical,
-runnable reference client is the `rsk` Python CLI — every command
+runnable reference client is the `rsk` Python CLI. Every command
 below is implemented there; file/line pointers are given throughout.
 
 > **Audience & scope.** This is a wire spec, not a tutorial. It documents the
 > commands a host sends and the bytes it gets back. It does **not** cover the
-> on-device storage format, the crypto internals, or the build system — those live
+> on-device storage format, the crypto internals, or the build system. Those live
 > in [architecture.md](architecture.md) and the crate sources.
 
 > **Licensing.** RS-Key firmware is AGPL-3.0-only. This protocol description is
@@ -20,7 +20,7 @@ below is implemented there; file/line pointers are given throughout.
 > talking to the device.
 
 > **Stability.** The two transports and the **standard** applets (FIDO2, U2F, PIV,
-> OATH, OTP, OpenPGP, Yubico Management) are stable — they follow public specs.
+> OATH, OTP, OpenPGP, Yubico Management) are stable. They follow public specs.
 > The **RS-Key-specific** surface (Rescue applet, Vendor/LED applet, CTAPHID
 > `authenticatorVendor 0x41`) is versioned by `bcdDevice` and may grow; new
 > tags/subcommands are added, existing ones are not silently repurposed. Probe the
@@ -51,10 +51,10 @@ def select(conn, aid):
     return transmit(conn, [0x00, 0xA4, 0x04, 0x00, len(aid)] + list(aid) + [0x00])
 ```
 
-![ISO-7816 short-APDU cases — every command opens with the four-byte header CLA INS P1 P2. Case 1 is header only; Case 2 appends a one-byte Le (expected response length, 00 meaning up to 256); Case 3 appends Lc then Lc bytes of command data; Case 4 appends Lc, data, and Le. SELECT is a Case 4 command, VERIFY a Case 3 command](images/apdu-cases.svg)
+![ISO-7816 short-APDU cases. Every command opens with the four-byte header CLA INS P1 P2. Case 1 is header only; Case 2 appends a one-byte Le (expected response length, 00 meaning up to 256); Case 3 appends Lc then Lc bytes of command data; Case 4 appends Lc, data, and Le. SELECT is a Case 4 command, VERIFY a Case 3 command](images/apdu-cases.svg)
 
-A success body longer than the request's `Le` — including a Case-3 command that
-carries no `Le` at all, capped at 256 — is returned with ISO-7816 **response
+A success body longer than the request's `Le` (including a Case-3 command that
+carries no `Le` at all, capped at 256) is returned with ISO-7816 **response
 chaining**: the first chunk ships with status `61 XX` (`XX` = further bytes
 available, `00` = 256+), and the host issues `GET RESPONSE` (`00 C0 00 00 <Le>`)
 until `9000`. Any `GET DATA` reading a certificate object over 256 bytes chains
@@ -67,7 +67,7 @@ continuation frames: `CID(4) | SEQ(1) | data[:59]`. `CTAPHID_INIT = 0x86`,
 `CTAPHID_CBOR = 0x90`, `CTAPHID_KEEPALIVE = 0xBB`. A CTAP2 message is
 `command_byte | CBOR_payload`. Reference: `tools/rsk/ctaphid.py`.
 
-![CTAPHID framing — a 64-byte init frame (CID, CMD, BCNT-hi/lo header then 57 payload bytes) and a continuation frame (CID, SEQ header then 59 payload bytes)](images/ctaphid-frame.svg)
+![CTAPHID framing: a 64-byte init frame (CID, CMD, BCNT-hi/lo header then 57 payload bytes) and a continuation frame (CID, SEQ header then 59 payload bytes)](images/ctaphid-frame.svg)
 
 ### 1.3 CCID secure PIN entry (pinpad) — **display builds only**
 
@@ -76,7 +76,7 @@ descriptor (body byte 50 / full descriptor byte 52), so a host driver treats it 
 a **pinpad reader** and sends `PC_to_RDR_Secure` (`0x69`) instead of a plaintext
 VERIFY; the PIN is then typed **on the device's own screen**. A standard (no-screen)
 build leaves `bPINSupport = 0x00` and rejects `0x69`. No control transfer is
-involved — the host CCID driver reads `bPINSupport` straight from the descriptor;
+involved. The host CCID driver reads `bPINSupport` straight from the descriptor;
 the device only has to handle `0x69`. The validated trigger is **GnuPG's internal
 CCID** driver (keys solely off `bPINSupport`); PC/SC + libccid and macOS
 CryptoTokenKit also expose pinpad from the descriptor, but their `FEATURE_VERIFY_PIN_DIRECT`
@@ -85,7 +85,7 @@ coverage varies, so treat the GnuPG-internal path as the reliable one.
 **Scope (honest):** this keeps the PIN off the wire **only when the host uses
 pinpad mode**. The device still accepts a normal plaintext `XfrBlock` VERIFY
 (`00 20 P1 P2 Lc <PIN>`), so a host that chooses to send one puts the PIN on the
-wire — standard pinpad *enables* on-device entry, it does not *enforce* it (a
+wire. Standard pinpad *enables* on-device entry, it does not *enforce* it (a
 device-enforced mode is a planned opt-in follow-up).
 
 Whatever the host driver, the bytes on the wire follow the **CCID** structure
@@ -227,18 +227,18 @@ Sources: `crates/rsk-fido/src/consts.rs`,
 These follow public specifications; a tool that already speaks YubiKey/FIDO2
 needs only the identifiers above. RS-Key implements:
 
-- **FIDO2 / CTAP 2.1** — getInfo, makeCredential, getAssertion, getNextAssertion,
+- **FIDO2 / CTAP 2.1**: getInfo, makeCredential, getAssertion, getNextAssertion,
   clientPIN, reset, selection, credentialManagement, authenticatorConfig,
   largeBlobs. `maxMsgSize` = `7609`. Supported COSE algorithms:
   ES256 `-7`, ES384 `-35`, ES512 `-36`, ES256K `-47`, EdDSA `-8`,
   ML-DSA-44 `-48`, ML-DSA-65 `-49` (both negotiable via `pubKeyCredParams`;
   advertised in getInfo only under the `advertise-pqc` build). ML-DSA-87 `-50`
-  is recognised but unsupported — its response overruns `maxMsgSize`.
+  is recognised but unsupported: its response overruns `maxMsgSize`.
   (`crates/rsk-fido/src/consts.rs`.)
 - **CTAP1 / U2F 1.1/1.2.**
-- **PIV** — NIST SP 800-73 (Yubico PIV extensions for metadata).
-- **OATH** — Yubico OATH (TOTP/HOTP).
-- **OTP** — Yubico OTP / HOTP keyboard + CCID.
+- **PIV**: NIST SP 800-73 (Yubico PIV extensions for metadata).
+- **OATH**: Yubico OATH (TOTP/HOTP).
+- **OTP**: Yubico OTP / HOTP keyboard + CCID.
 - **OpenPGP card 3.x.**
 
 The only RS-Key-specific bytes a config tool needs are §6 (Management config),
@@ -300,7 +300,7 @@ FIDO2+U2F → inner blob `03 02 02 02`, full APDU
 > WRITE CONFIG refuses an inner blob > 64 bytes (`6A80`) so a malformed config
 > can't wedge later reads. It also requires an **on-device user-presence
 > confirmation** (Approve on the trusted-display build, a BOOTSEL press
-> otherwise) — a hostile USB host cannot rewrite the reported config on its own;
+> otherwise). A hostile USB host cannot rewrite the reported config on its own;
 > declined/timed-out → `6985`. There is no separate config-lock code.
 
 ---
@@ -315,7 +315,7 @@ attestation key, and the one-way OTP fuses. Source:
 
 **SELECT response** (identity): `MCU(1) | PRODUCT(1) | SDK_MAJOR(1) | SDK_MINOR(1) | serial(8)`
 = `01 02 08 06 <8-byte chip serial>`. (`MCU 1` = RP2350, `PRODUCT 2` = FIDO,
-`SDK 8.6` is the applet SDK version — distinct from the `5.7.4` firmware version.)
+`SDK 8.6` is the applet SDK version, distinct from the `5.7.4` firmware version.)
 Use this as the **capability/version handshake**: a non-`9000` here means the
 firmware predates the rescue applet.
 
@@ -346,14 +346,14 @@ firmware predates the rescue applet.
 > precondition), both are idempotent, and the firmware now also requires an
 > **on-device user-presence confirmation** before the burn (the magic payload is
 > a source-visible constant, not authentication). A config tool **must** still put
-> these behind an explicit, clearly-worded user confirmation — never a default
+> these behind an explicit, clearly-worded user confirmation: never a default
 > action, never a bulk "apply". Most management tools should not expose them at all.
 > `1F/01` (BOOTSEL) drops the device into the bootloader for reflashing; also
 > confirm.
 
 > ### User-presence gate (runtime)
 > The runtime-reachable privileged commands require an **on-device user-presence
-> confirmation** — a button touch, or an Approve on the trusted-display build —
+> confirmation** (a button touch, or an Approve on the trusted-display build)
 > before the firmware acts, and return `6985` (CONDITIONS_NOT_SATISFIED) if the
 > operator declines or the wait times out. This gates `10/01` (attestation
 > sign), `10/03` (store cert), `1C/01` (WRITE phy record), the irreversible OTP
@@ -378,7 +378,7 @@ optional. An unknown tag is skipped; a record whose length runs past the buffer
 ends the parse. The firmware applies the record at **boot** (USB identity + LED
 hardware).
 
-![EF_PHY record — a TAG(1) LEN(1) VALUE(LEN) triple, then a worked three-record blob concatenating VIDPID (1209:0001), LED_DRIVER (ws2812) and OPTS (LED_STEADY)](images/phy-record.svg)
+![EF_PHY record: a TAG(1) LEN(1) VALUE(LEN) triple, then a worked three-record blob concatenating VIDPID (1209:0001), LED_DRIVER (ws2812) and OPTS (LED_STEADY)](images/phy-record.svg)
 
 | Tag | Name | Len | Value |
 |---|---|---|---|
@@ -395,18 +395,18 @@ hardware).
 | `0E` | LED_NUM | 1 | **RS-Key extension** — addressable LEDs actually connected (`1..=255`; `0`/absent = the build's `MAX_LEDS`). Firmware saturates a value above its compiled `MAX_LEDS` ceiling. |
 
 Notes for a host implementation:
-- **Read-modify-write.** READ the record, change only your tags, WRITE it back —
-  this is exactly what `rsk hw` does (`tools/rsk/hw.py`).
+- **Read-modify-write.** READ the record, change only your tags, WRITE it back.
+  This is exactly what `rsk hw` does (`tools/rsk/hw.py`).
   Preserve tags you don't recognize.
 - **RS-Key-specific tags** PicoForge skips as unknown: `0x0B` (ENABLED_USB_ITF)
   and `0x0E` (LED_NUM). RS-Key's own tools preserve them across a RMW; LED_NUM
   sets how many daisy-chained addressable LEDs are lit (the binary carries a
-  compile-time `MAX_LEDS` ceiling and drives the first LED_NUM of it). The rest —
-  including `0x08` (PRESENCE_TIMEOUT) and `0x0D` (LED_ORDER) — is shared with
+  compile-time `MAX_LEDS` ceiling and drives the first LED_NUM of it). The rest,
+  including `0x08` (PRESENCE_TIMEOUT) and `0x0D` (LED_ORDER), is shared with
   PicoForge.
 - **`ENABLED_USB_ITF`**: absent ⇒ ALL. A mask that would disable every interface
   the firmware actually builds (`CCID | HID | KB`) is rejected and falls back to
-  ALL — otherwise CCID would vanish and the rescue applet that could fix it would
+  ALL. Otherwise CCID would vanish and the rescue applet that could fix it would
   be unreachable. **Never write a mask without CCID** unless you intend that.
 - A never-written record reads back as the single zero-OPTS TLV `06 02 00 00`.
 
@@ -432,10 +432,10 @@ per device status), persisted in flash and applied immediately. Source:
 builds and are not part of the stable surface.
 
 **SET LED `0x10` P2 layout:** bits `[2:0]` = color, bit `3` (`0x08`) = steady
-(solid, no blink — a **global** toggle), bits `[5:4]` = status. P1 = per-channel
+(solid, no blink, a **global** toggle), bits `[5:4]` = status. P1 = per-channel
 brightness. The command data field is optional: `data[0]` sets the status's
 **effect**, `data[1]` its **speed** (`0` = the effect's built-in default). They
-are independent — send no data to leave both unchanged, one byte to set only the
+are independent: send no data to leave both unchanged, one byte to set only the
 effect (the current speed is kept), two bytes to set both.
 
 **GET LED `0x11` response** (`config_block`, 17 bytes):
@@ -443,7 +443,7 @@ effect (the current speed is kept), two bytes to set both.
 processing, touch, boot** in that order. (`block[0]` = steady; status *s* →
 effect `block[1+4s]`, color `block[2+4s]`, brightness `block[3+4s]`, speed
 `block[4+4s]`.) **Read the response length:** older firmware returns a 13-byte
-(`effect, color, brightness`) or 9-byte (`color, brightness`) block — the stride
+(`effect, color, brightness`) or 9-byte (`color, brightness`) block. The stride
 is `(len − 1) / 4`.
 
 | Color | Code |  | Status | Code |
@@ -457,7 +457,7 @@ is `(len − 1) / 4`.
 | cyan | 6 |  | | |
 | white | 7 |  | | |
 
-**Effects** (the `effect` byte — `ws2812` backend only; `gpio`/`pimoroni` always
+**Effects** (the `effect` byte, `ws2812` backend only; `gpio`/`pimoroni` always
 use the classic on/off blink). `legacy` reproduces the original blink; the rest
 animate across the connected LEDs and reduce gracefully on a single LED:
 
@@ -467,9 +467,9 @@ animate across the connected LEDs and reduce gracefully on a single LED:
 | vapor (breathing) | 1 |  | sparkle | 4 |
 | bounce | 2 |  | | |
 
-Example — set the **idle** status to solid blue at brightness `0x20`:
+Example. Set the **idle** status to solid blue at brightness `0x20`:
 P2 = `color 3 | steady 0x08 | status 0<<4` = `0x0B`, APDU `00 10 20 0B`.
-Example — set **touch** to yellow `bounce` at brightness `0x10`, speed `0x0F`:
+Example. Set **touch** to yellow `bounce` at brightness `0x10`, speed `0x0F`:
 P2 = `color 4 | status 2<<4` = `0x24`, data = `effect 2 ‖ speed 0x0F`,
 APDU `00 10 10 24 02 02 0F`.
 
@@ -504,15 +504,15 @@ Keys 3/4 are present only when a PIN is set (see gating).
 > ### Device configuration over FIDO (`CONFIG_WRITE 0x0C`)
 > The pcscd-free twin of the CCID device-config writes (§6 WRITE CONFIG and the
 > `§7`/`§8` phy/LED records): a host that cannot reach the CCID interface writes
-> the same config over CTAPHID. `target` selects the record — `0x00` = the
+> the same config over CTAPHID. `target` selects the record: `0x00` = the
 > management enabled-apps TLV (`EF_DEV_CONF`, the §6 blob, `≤ 64` bytes → the same
-> `CTAP1_ERR_INVALID_LENGTH 0x03` cap); `0x01` = the phy record (`EF_PHY`, §7.1 —
+> `CTAP1_ERR_INVALID_LENGTH 0x03` cap); `0x01` = the phy record (`EF_PHY`, §7.1:
 > VID/PID, USB interfaces, LED wiring, presence-timeout; the same lenient TLV parse
 > the CCID path uses, effective on the next boot); `0x02` = the LED config block
-> (`EF_LED_CONF`, §8, `CONF_LEN` bytes) — persisted and then applied **live** by the
+> (`EF_LED_CONF`, §8, `CONF_LEN` bytes), persisted and then applied **live** by the
 > firmware, which reloads the block after a `0x41` command (the LED atomics are
 > firmware-side; `CONFIG_READ 0x02` returns the current block, seeded with the build
-> defaults on first boot, so a host can read-modify-write it). No MSE channel — the
+> defaults on first boot, so a host can read-modify-write it). No MSE channel. The
 > config is not secret. It is gated by a
 > physical touch **and**, when a PIN is set, a `pinUvAuthToken` with the `acfg`
 > permission (the MAC below): a **stronger** gate than the CCID path's
@@ -605,28 +605,28 @@ SET     00 10 40 11        # P1=0x40 brightness, P2 = color 1 | status 1<<4 = 0x
    **AID** is `A0 58 3F C1 9B 7E 4F 21` (not the upstream one), the Rescue **CLA is
    `0x80`**, and tag `0x0D` (LED_ORDER) is an RS-Key extension you can skip on read
    but should preserve on a read-modify-write.
-2. **Hardware config over FIDO (no PC/SC) is supported** — PicoForge's legacy
+2. **Hardware config over FIDO (no PC/SC) is supported**: PicoForge's legacy
    hardware-config path. Send `authenticatorConfig` (CTAP `0x0D`) with subCommand
    `vendorPrototype` (`0xFF`) and subCommandParams `{1: vendorCommandId(u64),
    3: value(uint)}`, gated by an `acfg` pinUvAuthToken (no touch). The supported
-   IDs — the ones PicoForge writes — set the phy record and take effect on the
+   IDs, the ones PicoForge writes, set the phy record and take effect on the
    next boot: `PhysicalVidPid 0x6fcb19b0cbe3acfa` (value `(vid<<16)|pid`),
    `PhysicalLedGpio 0x7b392a394de9f948`, `PhysicalLedBrightness 0x76a85945985d02fd`,
    `PhysicalOptions 0x269f3b09eceb805f` (bitmask `0x2` dimmable / `0x4`
    disable-power-reset / `0x8` led-steady). Product name, touch-timeout, LED driver
    and curves stay Rescue-only. RS-Key reports firmware `5.x` (< 7), so PicoForge
    enables its legacy hardware-config path. (RS-Key's own `rsk` uses the CTAPHID
-   `0x41` `CONFIG_WRITE/READ` path instead — see §9 — which also covers those
+   `0x41` `CONFIG_WRITE/READ` path instead, see §9, which also covers those
    extras.)
-3. **Applet enable/disable** is the Yubico-compatible Management applet (§6) —
+3. **Applet enable/disable** is the Yubico-compatible Management applet (§6),
    identical to how you'd configure a YubiKey's USB applications.
 4. **Version-gate** on the Rescue SELECT identity (`01 02 08 06 …`, §7) and the
    Management SELECT version string. Treat unknown phy tags / `0x41` subcommands as
    skippable, not errors.
-5. **Keep the dangerous surface behind explicit confirmation** — the OTP fuse
+5. **Keep the dangerous surface behind explicit confirmation**: the OTP fuse
    burns (§7), BOOTSEL reboot (§7/§8), and seed export (§9). Consider not exposing
    the fuse burns at all in a general management UI.
 6. **Reference client:** `tools/rsk` is a complete, runnable
-   implementation of everything here — `ccid.py` (transport), `ctaphid.py` (CTAP),
+   implementation of everything here: `ccid.py` (transport), `ctaphid.py` (CTAP),
    `hw.py` (phy), `led.py` (LED), `backup.py` (`0x41`), `status.py`/`inventory.py`
    (DeviceInfo). When in doubt, match its bytes.

@@ -1,13 +1,13 @@
 # Git with the device
 
 Two jobs you do with git and a hardware key: **sign** your commits and tags, and
-**authenticate** — push, pull, and clear the forge's 2FA / "confirm access"
-challenges. The same RS-Key handles both; they are just different credentials on
-it. Signing comes first; [authentication and 2FA](#authenticating-push-pull-and-2fa)
+**authenticate** to push, pull, and clear the forge's 2FA / "confirm access"
+challenges. The same RS-Key handles both. They are just different credentials on
+it. Signing comes first. [Authentication and 2FA](#authenticating-push-pull-and-2fa)
 are at the end.
 
 Signing keeps the key off the disk and takes a touch per signature. It has two
-flavours, and RS-Key supports both:
+flavours. RS-Key supports both:
 
 | | SSH signing | OpenPGP signing |
 |---|---|---|
@@ -17,7 +17,7 @@ flavours, and RS-Key supports both:
 | Touch / PIN | touch per signature | PIN once, then touch per signature (UIF) |
 | Best when | you only want commit signing, no GPG | you already use GPG, or want WoT |
 
-If you have no GPG setup and just want verified commits, use **SSH signing** — it
+If you have no GPG setup and just want verified commits, use **SSH signing**. It
 is the smaller path. If you already keep a GPG identity, use **OpenPGP**.
 
 ## SSH signing
@@ -54,18 +54,18 @@ git log --show-signature -1
 ```
 
 Without that file git can *make* signatures but reports every commit as
-"No signature" on verify — that is the file missing, not a bad signature.
+"No signature" on verify. That means the file is missing, not a bad signature.
 
 ### On GitHub / GitLab
 
-Add the **same `.pub`** as a **Signing key** (this is a separate entry from an
-authentication key — GitHub: *Settings → SSH and GPG keys → New SSH key → Key
+Add the **same `.pub`** as a **Signing key**. On GitHub this is a *separate* entry
+from an authentication key (*Settings → SSH and GPG keys → New SSH key → Key
 type: Signing Key*). Commits then show as **Verified**. Turn on **vigilant mode**
 (GitHub) to flag any *unsigned* commit on your account as Unverified.
 
 ## OpenPGP signing
 
-First put a signing-capable key on the card and learn its key id — see
+First put a signing-capable key on the card and learn its key id. See
 [openpgp.md](openpgp.md). Then:
 
 ```sh
@@ -102,16 +102,16 @@ Verified.
 ## Authenticating: push, pull, and 2FA
 
 Signing proves *who wrote* a commit. **Authenticating** is how you push, pull, and
-get past the forge's security-key prompts. The device does this too — with
+get past the forge's security-key prompts. The device does this too, with
 *separate* credentials from the signing key.
 
 ### Push / pull over SSH
 
 The cleanest path: use the device's `-sk` SSH key (or the OpenPGP **AUT** subkey
 via gpg-agent) as your transport. Add the **public** key to the forge as an
-**Authentication** key — on GitHub this is a *separate* entry from the signing
-key (*Settings → SSH and GPG keys → New SSH key → Key type: Authentication*) —
-point the remote at SSH, and each connection is a challenge the key answers with
+**Authentication** key. On GitHub this is a *separate* entry from the signing
+key (*Settings → SSH and GPG keys → New SSH key → Key type: Authentication*).
+Point the remote at SSH, and each connection is a challenge the key answers with
 a touch:
 
 ```sh
@@ -133,19 +133,19 @@ Host github.com
     ControlPersist 10m         # one touch covers everything in the window
 ```
 
-The key setup itself is the [SSH guide](ssh.md); here it just doubles as the git
+The key setup itself is the [SSH guide](ssh.md). Here it just doubles as the git
 transport.
 
 ### Push / pull over HTTPS
 
-Over HTTPS git authenticates with a **token**, not the key — the device isn't in
+Over HTTPS git authenticates with a **token**, not the key. The device isn't in
 that path. But it protects the *account* the token comes from: `gh auth login`,
 or signing in to mint a token, triggers the 2FA challenge below, which a tap
 clears.
 
 ### Account 2FA and "confirm access" challenges
 
-The forges require 2FA and re-challenge for sensitive actions — signing in on a
+The forges require 2FA and re-challenge for sensitive actions: signing in on a
 new machine, changing keys, deleting a repo (GitHub calls this *sudo mode*).
 Register the device once and a tap answers every such prompt:
 
@@ -153,26 +153,26 @@ Register the device once and a tap answers every such prompt:
   tap, no password) or a **Security key** (second factor).
 - **GitLab:** *Settings → Account →* enable a **WebAuthn Device**.
 
-A **passkey** is a resident credential — it costs one of the device's 256
-discoverable slots ([ssh.md](ssh.md#resident-discoverable-keys)); a **security
+A **passkey** is a resident credential. It costs one of the device's 256
+discoverable slots ([ssh.md](ssh.md#resident-discoverable-keys)). A **security
 key** 2FA credential is non-resident. Either way the browser shows "use your
 security key", you touch, and the challenge clears.
 
 > One device, three jobs: a **signing** key for commits, an **SSH auth** key for
-> push/pull, and a **passkey / 2FA** credential for the account — three
+> push/pull, and a **passkey / 2FA** credential for the account. Three
 > independent credentials on the same RS-Key, each its own touch.
 
 ## Living with the touch
 
-Every signature is one touch — that is the security benefit (malware can't sign
+Every signature is one touch. That is the security benefit (malware can't sign
 in the background), but it adds up on a rebase that re-signs many commits.
 
-- **SSH signing** always touches; there is no caching. For a big rebase, sign the
+- **SSH signing** always touches. There is no caching. For a big rebase, sign the
   final result rather than every intermediate commit, or temporarily set
   `commit.gpgsign false` for the rebase and re-sign at the end.
 - **OpenPGP** caches the *PIN* (via `gpg-agent`, `default-cache-ttl`), but the
   **touch** still happens per signature when UIF is on. Turn UIF off on the SIG
-  slot if you want PIN-only signing (weaker — any process with the cached PIN can
+  slot if you want PIN-only signing (weaker: any process with the cached PIN can
   then sign).
 - `git commit --no-gpg-sign` skips signing for a one-off commit.
 
@@ -184,11 +184,11 @@ in the background), but it adds up on a rebase that re-signs many commits.
   `allowed_signers` file isn't configured (above).
 - **OpenPGP: `No secret key` / `selecting card failed`** → `scdaemon` lost the
   reader (often after `ykman`/another tool grabbed it): `gpgconf --kill scdaemon`
-  and retry; on Linux apply the [linux.md](../linux.md) scdaemon settings.
+  and retry. On Linux apply the [linux.md](../linux.md) scdaemon settings.
 - **Commits show Unverified on the forge** → the signing key/GPG key isn't added
   to your account, or the commit email doesn't match the key's identity.
 - **`git push` says `Permission denied (publickey)`** → the **authentication** key
   isn't on the forge (it is a separate entry from the signing key), or the remote
-  is HTTPS not SSH — check with `git remote -v` and `ssh -T git@github.com`.
+  is HTTPS not SSH. Check with `git remote -v` and `ssh -T git@github.com`.
 - **The device never prompts for a touch** → another process is holding it (a
-  browser, `gpg-agent`, the [TUI](tui.md)); close it and retry.
+  browser, `gpg-agent`, the [TUI](tui.md)). Close it and retry.

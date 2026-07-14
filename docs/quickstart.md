@@ -3,8 +3,8 @@
 From zero to a working security key in about ten minutes.
 
 > This is experimental firmware with no security audit and no secure element.
-> It's fine for trying things out and for credentials you can afford to lose;
-> see the [threat model](threat-model.md) before using it for anything real.
+> It's fine for trying things out and for credentials you can afford to lose.
+> See the [threat model](threat-model.md) before using it for anything real.
 
 ```mermaid
 flowchart TD
@@ -19,8 +19,8 @@ flowchart TD
 
 - An RP2350 board (tested: Waveshare RP2350-One; any RP2350 with USB works)
 - A USB cable
-- [Nix](https://nixos.org/download/) with flakes enabled (everything —
-  toolchain, `picotool`, host tools — comes from the dev shell). Without Nix:
+- [Nix](https://nixos.org/download/) with flakes enabled (the dev shell provides
+  everything: toolchain, `picotool`, host tools). Without Nix:
   rustup + `rustup target add thumbv8m.main-none-eabihf` + picotool ≥ 2.0,
   and the Python deps from `flake.nix` for the host tools.
 
@@ -45,10 +45,10 @@ suites, or if your board is hard to reach) add `--features no-touch`. All build 
 2. Flash it, either way:
    - **Drag-and-drop:** `cp firmware.uf2 /Volumes/RP2350/` (macOS) or copy it to
      the mounted drive on Linux.
-   - **picotool (more robust — it verifies, and skips the mass-storage layer):**
+   - **picotool (more reliable: it verifies and skips the mass-storage layer):**
      `picotool load -v firmware.uf2 && picotool reboot`.
 
-   The `RP2350` drive is a *fake* FAT volume the bootrom emulates — it only
+   The `RP2350` drive is a *fake* FAT volume the bootrom emulates. It only
    understands the UF2 blocks written to it, not a real filesystem. On some
    machines the OS's mass-storage layer breaks that (macOS resource-fork sidecar
    files and Spotlight, buffered or reordered writes, the board rebooting the
@@ -60,7 +60,7 @@ suites, or if your board is hard to reach) add `--features no-touch`. All build 
    `0x1209:0x0001` from pid.codes; the PC/SC reader name contains "RS-Key".
    For a build that presents the YubiKey USB identity so `ykman`/Yubico
    Authenticator auto-recognize it, build the opt-in `VIDPID=Yubikey5`
-   flavor — see [build.md](build.md).)
+   flavor; see [build.md](build.md).)
 
 Check it:
 
@@ -70,7 +70,7 @@ ykman info        # needs the opt-in VIDPID=Yubikey5 build: YubiKey 5A, firmware
 ```
 
 On Linux, the CCID half (OpenPGP/PIV/OATH) needs `pcscd` + a polkit rule
-first — see [linux.md](linux.md). FIDO works as soon as the udev rules are in
+first. See [linux.md](linux.md). FIDO works as soon as the udev rules are in
 place.
 
 ## 3. Set a PIN (recommended)
@@ -80,11 +80,11 @@ rsk fido set-pin
 ```
 
 Browsers and `ssh-keygen` will prompt for it when enrolling. 8 wrong attempts
-lock the PIN until a reset — standard security-key behaviour.
+lock the PIN until a reset. Standard security-key behaviour.
 
 ## 4. Enroll something
 
-**A passkey** — go to any WebAuthn site (or https://webauthn.io to try),
+**A passkey:** go to any WebAuthn site (or https://webauthn.io to try),
 register a security key, touch the button when the LED asks.
 
 **An SSH key:**
@@ -95,7 +95,7 @@ ssh-copy-id -i ~/.ssh/id_ed25519_sk you@server
 ssh -i ~/.ssh/id_ed25519_sk you@server              # one touch to log in
 ```
 
-The `id_ed25519_sk` file is a *handle*, not a key — it is useless without the
+The `id_ed25519_sk` file is a *handle*, not a key. It is useless without the
 board. Copy it to other machines you ssh from.
 
 > macOS note: Apple's `/usr/bin/ssh` has no FIDO support. Use Homebrew
@@ -113,14 +113,14 @@ rsk backup finalize                       # seals the export window
 The words recover your deterministic FIDO identity (ssh-sk logins, 2FA
 registrations) onto a fresh board with `rsk backup restore`. Anyone who has the
 words can recreate that identity on their own board, so store them like cash.
-They do **not** cover resident passkeys, OpenPGP or PIV keys — see
+They do **not** cover resident passkeys, OpenPGP or PIV keys. See
 [guides/seed-backup.md](guides/seed-backup.md).
 
 ## Where next
 
-- [Feature guides](guides/fido2.md) — OpenPGP with gpg, PIV, OATH codes, OTP
+- [Feature guides](guides/fido2.md): OpenPGP with gpg, PIV, OATH codes, OTP
   slots, soft-lock, LED colors
-- [production.md](production.md) — fuse the master key into OTP + enable
+- [production.md](production.md): fuse the master key into OTP + enable
   secure boot (irreversible, read first)
-- [threat-model.md](threat-model.md) — what this device actually protects
+- [threat-model.md](threat-model.md): what this device protects
   against
