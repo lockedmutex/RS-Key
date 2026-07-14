@@ -443,3 +443,20 @@ fn truncate_utf8_is_exhaustively_safe() {
         }
     }
 }
+
+#[test]
+fn remaining_rk_clamps_by_shared_file_budget() {
+    let mut fs: Fs<RamStorage> = Fs::new(RamStorage::new(), &[]);
+    // Plenty of free files → the EF_CRED headroom (256 − used) binds, as before.
+    assert_eq!(remaining_rk(&mut fs, 10), MAX_RESIDENT_CREDENTIALS - 10);
+
+    // Drain the shared dynamic-file budget down to 40 free — a stand-in for a device
+    // whose PIV keys / OATH creds have eaten the shared store. Now free/2 = 20 < 256,
+    // so the honest estimate clamps to the file budget, not the EF_CRED headroom
+    // (this is exactly the getInfo-0x14 over-report the HW stress test exposed).
+    for i in 0..(rsk_fs::MAX_DYNAMIC_FILES as u16 - 40) {
+        fs.put(0xD000 + i, b"x").unwrap();
+    }
+    assert_eq!(fs.free_dynamic(), 40);
+    assert_eq!(remaining_rk(&mut fs, 0), 20);
+}

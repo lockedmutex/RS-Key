@@ -15,6 +15,19 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Changed
 
+- **Higher, decoupled credential/key capacity.** All applets shared one 256-entry
+  dynamic-file budget, so filling PIV key slots shrank the passkey ceiling — a HW
+  stress test hit `KEY_STORE_FULL` at ~80 passkeys (not the logical 256) once ~48 PIV
+  files were provisioned, and `remainingDiscoverableCredentials` over-reported the
+  free slots. The shared budget (`MAX_DYNAMIC_FILES`) is raised 256 → 1280 to exceed
+  the union of every applet's own cap, and the storage key-pointer cache
+  (`MAIN_CACHE_KEYS`) is raised 512 → 1280 in lockstep so the freed capacity stays on
+  the O(1) read/migrate path instead of falling off the flash-scan cliff. getInfo
+  `remainingDiscoverableCredentials` (0x14) and credMgmt `getCredsMetadata` (0x02) now
+  report an honest estimate clamped by the true free shared-file budget, so the host
+  is no longer promised slots the store can't back. RAM cost ~8 KiB; no on-flash
+  format change (the indexes are rebuilt from flash on boot, so provisioned devices
+  upgrade transparently). bcdDevice → `0x0811`.
 - **PIV GET METADATA is faster: a key slot's public point is now cached in its
   metadata record** instead of being recomputed on every probe. `ykman piv info`
   and the Yubico Authenticator read `GET METADATA` (INS 0xF7) for every slot, and

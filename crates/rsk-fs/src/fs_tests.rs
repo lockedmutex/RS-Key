@@ -170,6 +170,21 @@ fn put_over_dynamic_cap_commits_nothing() {
 }
 
 #[test]
+fn dynamic_budget_exceeds_the_old_256_cap() {
+    // The shared dynamic-file budget is 1280, not the old 256, so applets no longer
+    // starve each other (filling PIV cannot shrink the passkey ceiling). 300 dynamic
+    // files — well past the old cap — coexist, and free_dynamic tracks the budget.
+    let mut fs = fs();
+    for i in 0..300u16 {
+        fs.put(0xD000 + i, b"x").unwrap();
+    }
+    let mut buf = [0u8; 8];
+    assert_eq!(fs.read(0xD000, &mut buf), Some(1)); // first still live
+    assert_eq!(fs.read(0xD000 + 299, &mut buf), Some(1)); // and the 300th
+    assert_eq!(fs.free_dynamic(), MAX_DYNAMIC_FILES - 300);
+}
+
+#[test]
 fn delete_removes() {
     let mut fs = fs();
     fs.put(0xCF02, b"x").unwrap();

@@ -642,14 +642,27 @@ pub(crate) fn slot_map<S: Storage>(fs: &mut Fs<S>, base: u16, out: &mut [bool]) 
 }
 
 /// Estimated free discoverable-credential slots (getInfo
-/// `remainingDiscoverableCredentials`, 0x14): capacity minus the occupied EF_CRED
-/// slots. Walks only the present-key index (cheap, in-RAM — safe on the getInfo
-/// hot path).
+/// `remainingDiscoverableCredentials`, 0x14): the EF_CRED headroom, clamped so it
+/// never over-promises against the SHARED dynamic-file store (see [`remaining_rk`]).
+/// Walks only the present-key index (cheap, in-RAM — safe on the getInfo hot path).
 pub(crate) fn remaining_discoverable<S: Storage>(fs: &mut Fs<S>) -> u16 {
     let mut occupied = [false; MAX_RESIDENT_CREDENTIALS as usize];
     slot_map(fs, EF_CRED, &mut occupied);
     let used = occupied.iter().filter(|&&b| b).count() as u16;
-    MAX_RESIDENT_CREDENTIALS.saturating_sub(used)
+    remaining_rk(fs, used)
+}
+
+/// The honest free-discoverable-credential estimate reported by BOTH getInfo 0x14
+/// and credMgmt getCredsMetadata (0x02): the EF_CRED headroom, clamped so it never
+/// promises slots the SHARED dynamic-file store can't back. A new discoverable
+/// credential costs up to two dynamic files — its EF_CRED record, plus an EF_RP
+/// record for a new rp — so halve the free file budget. Without this the reports
+/// over-promise once PIV keys / OATH creds have drained the shared store; both
+/// fields are CTAP 2.1 *estimates*, so clamping down is spec-compliant.
+pub(crate) fn remaining_rk<S: Storage>(fs: &mut Fs<S>, used_ef_cred: u16) -> u16 {
+    let by_slots = MAX_RESIDENT_CREDENTIALS.saturating_sub(used_ef_cred);
+    let by_files = (fs.free_dynamic() / 2) as u16;
+    by_slots.min(by_files)
 }
 
 /// Persist a resident credential into a free or matching EF_CRED slot and bump

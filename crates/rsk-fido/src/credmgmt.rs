@@ -26,8 +26,8 @@ use crate::consts::{
 use crate::credential::{
     CRED_BOX_MAX, CRED_REC_MAX, CRED_RESIDENT_LEN, CredInput, RECORD_PREFIX, RP_PREFIX, RP_REC_MAX,
     USER_NAME_MAX, compose_cred_record, cred_record_box, cred_record_pubkey, credential_create,
-    credential_load, derive_large_blob_key, resident_key_input, slot_map, truncate_utf8,
-    unseal_rp_id,
+    credential_load, derive_large_blob_key, remaining_rk, resident_key_input, slot_map,
+    truncate_utf8, unseal_rp_id,
 };
 use crate::ec::{CredKey, cached_point_len, cose_public_from_point};
 use crate::error::{CtapError, CtapResult};
@@ -253,7 +253,7 @@ fn creds_metadata<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, out: &mut [u8]) -> Ct
     let mut occupied = [false; MAX_RESIDENT_CREDENTIALS as usize];
     slot_map(ctx.fs, EF_CRED, &mut occupied);
     let existing = occupied.iter().filter(|&&b| b).count() as u16;
-    let remaining = MAX_RESIDENT_CREDENTIALS - existing;
+    let remaining = remaining_rk(ctx.fs, existing);
     let mut enc = Encoder::new(Cursor::new(out));
     enc.map(2)
         .and_then(|e| e.u8(1)?.u16(existing))

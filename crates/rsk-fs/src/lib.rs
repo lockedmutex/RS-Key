@@ -45,5 +45,10 @@ pub const ACL_OP_READ_SEARCH: u8 = 0x06;
 /// The metadata side-store EF.
 pub const EF_META: u16 = 0xE010;
 
-/// Max number of dynamic (runtime-created) files.
-pub const MAX_DYNAMIC_FILES: usize = 256;
+/// Max number of dynamic (runtime-created) files — the shared budget across ALL
+/// applets (each FIDO cred, each PIV key + cert, each OATH cred, each OpenPGP DO, …).
+/// Sized to the union of every applet's own logical cap so one applet can't starve
+/// another (e.g. filling PIV must not shrink the passkey ceiling). The storage
+/// backend's key-pointer cache (firmware `MAIN_CACHE_KEYS`) MUST stay `>=` this, or
+/// files past the cache read/migrate off an O(flash) latency cliff.
+pub const MAX_DYNAMIC_FILES: usize = 1280;

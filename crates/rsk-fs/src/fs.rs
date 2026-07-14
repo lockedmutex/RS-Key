@@ -247,6 +247,15 @@ impl<S: Storage> Fs<S> {
         Ok(())
     }
 
+    /// Free slots in the shared dynamic-file budget: how many more dynamic files
+    /// (across every applet) can be stored before [`MAX_DYNAMIC_FILES`] binds. Lets
+    /// a caller report capacity honestly against the SHARED store — e.g. FIDO's
+    /// remaining-credential estimate, which must not promise slots a PIV or OATH
+    /// fill has already consumed.
+    pub fn free_dynamic(&self) -> usize {
+        MAX_DYNAMIC_FILES - self.dynamic.len()
+    }
+
     /// Physically scrub superseded records from the backing store (a full
     /// garbage-collection lap). See [`Storage::compact`]. No-op on backends that
     /// overwrite in place and accumulate no remnants. Used once, after the

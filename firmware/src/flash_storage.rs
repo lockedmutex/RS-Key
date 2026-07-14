@@ -57,9 +57,12 @@ const SCRUB_FILLER: [u8; 1024] = [0xA5; 1024];
 
 /// Cached key→location maps. A hit lets `store_item`'s `migrate_items` take the O(1)
 /// path per item instead of a full-partition scan — the difference between a ~0.2 s
-/// and a multi-second migration. Main covers ~250 resident credentials (two FIDs
-/// each) + the fixed FIDO files + OpenPGP DOs; counter only needs its few keys.
-const MAIN_CACHE_KEYS: usize = 512;
+/// and a multi-second migration. Main must cover EVERY live main-partition file, so
+/// keep it `>= rsk_fs::MAX_DYNAMIC_FILES`: sized for the full applet union (256
+/// passkeys + 256 EF_RP + 256 nicks + PIV key/cert pairs + OATH creds + OpenPGP DOs)
+/// so a fully-provisioned device never demotes to the cliff. Counter only needs its
+/// few keys.
+const MAIN_CACHE_KEYS: usize = 1280;
 const COUNTER_CACHE_KEYS: usize = 16;
 
 pub type AsyncFlash = BlockingAsync<Flash<'static, FLASH, Blocking, FLASH_SIZE>>;
