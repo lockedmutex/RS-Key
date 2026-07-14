@@ -217,3 +217,22 @@ def test_die_ctap_pin_error_unknown_code_reports_hex(capsys):
         common.die_ctap_pin_error(_exc(0x99), None)
     err = capsys.readouterr().err
     assert "PIN operation failed" in err and "0x99" in err
+
+
+# A counterfeit device can return the PIN_RETRIES field as a text string (python-fido2
+# does not coerce it); it must NOT reach the terminal — only an int count is trusted.
+
+def test_pin_error_message_drops_non_int_retries():
+    evil = "\x1b]0;pwn\x07"  # OSC window-title escape smuggled as the "retry count"
+    assert common.pin_error_message(common.CTAP_PIN_INVALID, evil) == "wrong PIN"
+    assert "\x1b" not in common.pin_error_message(common.CTAP_PIN_INVALID, evil)
+    assert common.pin_error_message(common.CTAP_PIN_INVALID, 5).endswith("before it blocks")
+
+
+def test_die_ctap_pin_error_hostile_string_retries_not_printed(capsys):
+    evil = "\x1b]52;c;ZXZpbA==\x07"  # OSC-52 clipboard write
+    with pytest.raises(SystemExit):
+        common.die_ctap_pin_error(_exc(common.CTAP_PIN_INVALID), _FakeCp((evil, None)))
+    err = capsys.readouterr().err
+    assert err.strip() == "error: wrong PIN"
+    assert "\x1b" not in err

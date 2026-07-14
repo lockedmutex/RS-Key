@@ -108,7 +108,9 @@ def pin_error_message(code, retries=None):
     """Friendly text for a CTAP2 clientPIN error status (int), or None when the
     status isn't a recognised PIN error (the caller reports the raw code then)."""
     if code == CTAP_PIN_INVALID:
-        if retries is not None:
+        # retries is device-reported; trust it only when it is really an int, so a
+        # hostile authenticator can't smuggle a string (terminal escapes) into die().
+        if isinstance(retries, int):
             return f"wrong PIN — {retries} attempt(s) left before it blocks"
         return "wrong PIN"
     if code == CTAP_PIN_AUTH_BLOCKED:

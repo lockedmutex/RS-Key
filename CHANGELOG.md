@@ -63,6 +63,23 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   registering *before* setting a PIN worked). Both now return `PIN_INVALID`.
   Firmware `bcdDevice` `0x080B` → `0x080C`.
 
+### Security
+
+- **A counterfeit FIDO device can no longer inject terminal escapes through the
+  clientPIN retry count.** The wrong-PIN message added above reads the remaining
+  attempts from python-fido2's `get_pin_retries()`, which returns the device's
+  CBOR-encoded value without type-checking it. A hostile authenticator could
+  return that field as a text string of ANSI/OSC/bidi escapes instead of an
+  integer, and `pin_error_message` embedded it into the `error:` line that `die()`
+  prints to the terminal **without** the CLI's `sanitize()` filter — an operator
+  running `rsk fido set-pin`/`list-passkeys` with a wrong PIN against the device
+  would get those escapes interpreted (window-title spoof, OSC-52 clipboard write,
+  Trojan-Source bidi). The retry count is now embedded only when it is really an
+  `int`; anything else falls back to a plain `wrong PIN`. LOW (needs a malicious
+  device + a wrong-PIN attempt); same class as the run-11/12 host-tooling escapes.
+  Found by security-audit run-18. `rsk` `0.3.11` → `0.3.12`; host-only, no firmware
+  change.
+
 ## [0.3.4] — 2026-07-12
 
 ### Fixed
