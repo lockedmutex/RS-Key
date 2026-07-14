@@ -695,17 +695,20 @@ impl PivApplet<'_> {
                 if !fs.has_key(key_fid(s)) {
                     return Sw::REFERENCE_NOT_FOUND;
                 }
-                let mut meta = [0u8; 8];
+                // Sized to hold a cached EC public point trailing the 4-byte
+                // [algo, pin_pol, touch_pol, origin] head (see slot_pubkey_tlv).
+                let mut meta = [0u8; 4 + MAX_EC_POINT];
                 let Some(n) = fs.meta_find(key_fid(s).get(), &mut meta) else {
                     return Sw::REFERENCE_NOT_FOUND;
                 };
+                let n = n.min(meta.len());
                 if n < 4 {
                     return Sw::REFERENCE_NOT_FOUND;
                 }
                 res.extend(&[0x01, 0x01, meta[0]]);
                 res.extend(&[0x02, 0x02, meta[1], meta[2]]);
                 res.extend(&[0x03, 0x01, meta[3]]);
-                self.slot_pubkey_tlv(dev, fs, s, meta[0], res)
+                self.slot_pubkey_tlv(dev, fs, s, &meta[..n], res)
             }
             _ => Sw::REFERENCE_NOT_FOUND,
         }
@@ -718,11 +721,11 @@ impl PivApplet<'_> {
         dev: &Device,
         fs: &mut Fs<S>,
         slot: u8,
-        algo: u8,
+        meta: &[u8],
         res: &mut ResBuf,
     ) -> Sw {
         let mut body = [0u8; MAX_RSA_PUBDO];
-        let n = match algo {
+        let n = match meta[0] {
             ALGO_RSA1024 | ALGO_RSA2048 | ALGO_RSA3072 | ALGO_RSA4096 => {
                 let key = match seal::load_rsa_key(dev, fs, key_fid(slot)) {
                     Ok(k) => k,
@@ -735,19 +738,28 @@ impl PivApplet<'_> {
                 full - 5
             }
             ALGO_ECCP256 | ALGO_ECCP384 | ALGO_ED25519 | ALGO_X25519 => {
-                let key = match seal::load_ec_key(dev, fs, key_fid(slot)) {
-                    Ok(k) => k,
-                    Err(_) => return Sw::EXEC_ERROR,
-                };
+                // The public point is cached in the meta record (bytes 4..) at
+                // key creation, so GET METADATA emits it without recomputing the
+                // ~tens-of-ms `d·G`; a pre-cache key (bare 4-byte record) falls
+                // back to deriving it from the sealed scalar.
                 let mut point = [0u8; MAX_EC_POINT];
-                let plen = match key.public_point(&mut point) {
-                    Ok(p) => p,
-                    Err(e) => return e,
+                let pt: &[u8] = if meta.len() > 4 {
+                    &meta[4..]
+                } else {
+                    let key = match seal::load_ec_key(dev, fs, key_fid(slot)) {
+                        Ok(k) => k,
+                        Err(_) => return Sw::EXEC_ERROR,
+                    };
+                    let plen = match key.public_point(&mut point) {
+                        Ok(p) => p,
+                        Err(e) => return e,
+                    };
+                    &point[..plen]
                 };
                 body[0] = 0x86;
-                let ll = format_len(plen as u16, &mut body[1..4]);
-                body[1 + ll..1 + ll + plen].copy_from_slice(&point[..plen]);
-                1 + ll + plen
+                let ll = format_len(pt.len() as u16, &mut body[1..4]);
+                body[1 + ll..1 + ll + pt.len()].copy_from_slice(pt);
+                1 + ll + pt.len()
             }
             _ => return Sw::REFERENCE_NOT_FOUND,
         };
@@ -862,9 +874,12 @@ impl PivApplet<'_> {
             } else if let Some(tofid) = cert_to {
                 let _ = fs.delete(tofid);
             }
-            let mut meta = [0u8; 8];
+            // Sized for a cached-EC-point record so the move carries the point
+            // to the destination slot verbatim (and never truncates it).
+            let mut meta = [0u8; 4 + MAX_EC_POINT];
             match fs.meta_find(key_fid(from).get(), &mut meta) {
                 Some(n) => {
+                    let n = n.min(meta.len());
                     if fs.meta_add(key_fid(to).get(), &meta[..n]).is_err() {
                         blob.zeroize();
                         return Sw::MEMORY_FAILURE;
