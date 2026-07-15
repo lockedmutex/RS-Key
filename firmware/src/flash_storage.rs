@@ -12,7 +12,10 @@ use embassy_futures::block_on;
 use embassy_rp::flash::{Blocking, Flash};
 use embassy_rp::peripherals::FLASH;
 use embedded_storage_async::nor_flash::{ErrorType, MultiwriteNorFlash, NorFlash, ReadNorFlash};
-use sequential_storage::cache::{KeyCacheImpl, KeyPointerCache};
+use sequential_storage::cache::key_pointers::ArrayKeyPointers;
+use sequential_storage::cache::page_pointers::ArrayPagePointers;
+use sequential_storage::cache::page_states::ArrayPageStates;
+use sequential_storage::cache::{Cache, CacheImpl};
 use sequential_storage::map::{MapConfig, MapStorage};
 
 use rsk_fs::Storage;
@@ -66,8 +69,21 @@ const MAIN_CACHE_KEYS: usize = 1280;
 const COUNTER_CACHE_KEYS: usize = 16;
 
 pub type AsyncFlash = BlockingAsync<Flash<'static, FLASH, Blocking, FLASH_SIZE>>;
-type MainCache = KeyPointerCache<MAIN_PAGES, u16, MAIN_CACHE_KEYS>;
-type CounterCache = KeyPointerCache<COUNTER_PAGES, u16, COUNTER_CACHE_KEYS>;
+// sequential-storage 8.0 replaced the `KeyPointerCache` alias with a composite
+// `Cache` of three sub-caches (page states + page pointers + key pointers); the
+// key-pointer array is the one that maps FID -> flash address for O(1) reads.
+type MainCache = Cache<
+    ArrayPageStates<MAIN_PAGES>,
+    ArrayPagePointers<MAIN_PAGES>,
+    ArrayKeyPointers<u16, MAIN_CACHE_KEYS>,
+    u16,
+>;
+type CounterCache = Cache<
+    ArrayPageStates<COUNTER_PAGES>,
+    ArrayPagePointers<COUNTER_PAGES>,
+    ArrayKeyPointers<u16, COUNTER_CACHE_KEYS>,
+    u16,
+>;
 
 /// A `'static`, shared handle to the one flash peripheral, so the two partitions can
 /// each own a `MapStorage` over it. `MapStorage` takes its flash *by value* and the
@@ -146,8 +162,24 @@ impl FlashStorage {
         debug_assert!((counter_range.end - counter_range.start) as usize == COUNTER_LEN);
         let flash = SharedFlash { inner: flash };
         Self {
-            main: MapStorage::new(flash, MapConfig::new(main_range), MainCache::new()),
-            counter: MapStorage::new(flash, MapConfig::new(counter_range), CounterCache::new()),
+            main: MapStorage::new(
+                flash,
+                MapConfig::new(main_range),
+                MainCache::new(
+                    ArrayPageStates::new(),
+                    ArrayPagePointers::new(),
+                    ArrayKeyPointers::new(),
+                ),
+            ),
+            counter: MapStorage::new(
+                flash,
+                MapConfig::new(counter_range),
+                CounterCache::new(
+                    ArrayPageStates::new(),
+                    ArrayPagePointers::new(),
+                    ArrayKeyPointers::new(),
+                ),
+            ),
             buf: [0; KV_BUF],
         }
     }
@@ -238,7 +270,7 @@ impl Storage for FlashStorage {
 }
 
 /// Iterate every live key in one partition (used by `for_each_key` over both).
-fn for_each_in<C: KeyCacheImpl<u16>>(
+fn for_each_in<C: CacheImpl<u16>>(
     map: &mut MapStorage<u16, SharedFlash, C>,
     buf: &mut [u8],
     f: &mut dyn FnMut(u16),

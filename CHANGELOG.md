@@ -15,6 +15,14 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Changed
 
+- **`sequential-storage` 7.2.0 → 8.0.0.** The flash key/value backend's cache API was
+  restructured upstream into a single composite `Cache` of three sub-caches (page
+  states + page pointers + key pointers); `flash_storage.rs` and the fuzz harnesses
+  are migrated to it. The release is on-flash-compatible with 7.x, so a provisioned
+  device upgrades with no migration. The crate is vendored under
+  `third_party/sequential-storage/` and wired via `[patch.crates-io]` because it
+  carries one local change (below) that has no public API; the single-function diff is
+  kept in `third_party/sequential-storage.patch`.
 - **Higher, decoupled credential/key capacity.** All applets shared one 256-entry
   dynamic-file budget, so filling PIV key slots shrank the passkey ceiling — a HW
   stress test hit `KEY_STORE_FULL` at ~80 passkeys (not the logical 256) once ~48 PIV
@@ -31,6 +39,22 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Fixed
 
+- **The first credential enumeration after a power-cycle is no longer slow: the boot
+  scan warms the flash key-pointer cache it was already reading.** `sequential-storage`
+  keeps a RAM cache mapping each key to its flash address so a read is O(1); it starts
+  empty after every boot, so the first `fetch_item` of each key did a cold backward
+  ring-scan — listing 256 passkeys right after plug-in measured ~9 s (vs ~2.6 s warm).
+  The boot `scan` already walks the whole store once (via `fetch_all_items`) but threw
+  the addresses away. The vendored `sequential-storage` (see Changed) now seeds the
+  key-pointer cache from that existing walk, so the cache is warm before USB even
+  enumerates and the first list is as fast as a warm one — no extra flash reads. The
+  warm is completion-gated: the cache is held "dirty" during the walk and cleared only
+  when the iterator runs to the end, so a walk that errors partway self-invalidates via
+  the existing dirty guard rather than caching a stale pointer (power-cut-safe — the
+  cache is RAM-only, rebuilt each boot). Adds ~30–120 ms of pre-USB boot bookkeeping at
+  a full store. Measured on a 100-passkey device: first list after a power-cycle
+  3044 ms → 1023 ms (the slowest single-cred read 2044 ms → 23 ms), now identical to a
+  warm list. bcdDevice → `0x0818`.
 - **OATH LIST / CALCULATE ALL are faster on a full store: the occupied-slot map is
   read from the in-RAM present index instead of scanning flash.** Enumerating
   accounts sorted the live OATH slots with a whole-partition `for_each_key` walk on

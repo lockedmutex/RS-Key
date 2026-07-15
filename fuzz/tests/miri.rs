@@ -1616,7 +1616,10 @@ fn miri_power_cut() {
         ErrorType, MultiwriteNorFlash, NorFlash, ReadNorFlash,
     };
     use rsk_fs::Storage;
-    use sequential_storage::cache::KeyPointerCache;
+    use sequential_storage::cache::Cache;
+    use sequential_storage::cache::key_pointers::ArrayKeyPointers;
+    use sequential_storage::cache::page_pointers::ArrayPagePointers;
+    use sequential_storage::cache::page_states::ArrayPageStates;
     use sequential_storage::map::{MapConfig, MapStorage};
     use sequential_storage::mock_flash::{
         MockFlashBase, MockFlashError, Operation, WriteCountCheck,
@@ -1625,6 +1628,9 @@ fn miri_power_cut() {
     type Mock = MockFlashBase<6, 4, 1024>;
     const MAIN: core::ops::Range<u32> = 0..(4 * 4096);
     const CNT: core::ops::Range<u32> = (4 * 4096)..(6 * 4096);
+
+    type MainCache = Cache<ArrayPageStates<4>, ArrayPagePointers<4>, ArrayKeyPointers<u16, 8>, u16>;
+    type CntCache = Cache<ArrayPageStates<2>, ArrayPagePointers<2>, ArrayKeyPointers<u16, 4>, u16>;
 
     #[derive(Clone)]
     struct SharedMock {
@@ -1678,15 +1684,31 @@ fn miri_power_cut() {
     impl MultiwriteNorFlash for SharedMock {}
 
     struct TortureStorage {
-        main: MapStorage<u16, SharedMock, KeyPointerCache<4, u16, 8>>,
-        counter: MapStorage<u16, SharedMock, KeyPointerCache<2, u16, 4>>,
+        main: MapStorage<u16, SharedMock, MainCache>,
+        counter: MapStorage<u16, SharedMock, CntCache>,
         buf: [u8; 2048],
     }
     impl TortureStorage {
         fn new(flash: SharedMock) -> Self {
             Self {
-                main: MapStorage::new(flash.clone(), MapConfig::new(MAIN), KeyPointerCache::new()),
-                counter: MapStorage::new(flash, MapConfig::new(CNT), KeyPointerCache::new()),
+                main: MapStorage::new(
+                    flash.clone(),
+                    MapConfig::new(MAIN),
+                    MainCache::new(
+                        ArrayPageStates::new(),
+                        ArrayPagePointers::new(),
+                        ArrayKeyPointers::new(),
+                    ),
+                ),
+                counter: MapStorage::new(
+                    flash,
+                    MapConfig::new(CNT),
+                    CntCache::new(
+                        ArrayPageStates::new(),
+                        ArrayPagePointers::new(),
+                        ArrayKeyPointers::new(),
+                    ),
+                ),
                 buf: [0; 2048],
             }
         }

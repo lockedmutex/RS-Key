@@ -24,7 +24,10 @@ use std::rc::Rc;
 
 use embassy_futures::block_on;
 use embedded_storage_async::nor_flash::{ErrorType, MultiwriteNorFlash, NorFlash, ReadNorFlash};
-use sequential_storage::cache::KeyPointerCache;
+use sequential_storage::cache::Cache as SsCache;
+use sequential_storage::cache::key_pointers::ArrayKeyPointers;
+use sequential_storage::cache::page_pointers::ArrayPagePointers;
+use sequential_storage::cache::page_states::ArrayPageStates;
 use sequential_storage::map::{MapConfig, MapStorage};
 use sequential_storage::mock_flash::{MockFlashBase, MockFlashError, WriteCountCheck};
 
@@ -38,7 +41,8 @@ const SECTOR: usize = 4096;
 const PARTITION_LEN: usize = PAGES * SECTOR;
 const RANGE: core::ops::Range<u32> = 0..(PARTITION_LEN as u32);
 const KV_BUF: usize = 2048;
-type Cache = KeyPointerCache<PAGES, u16, 16>;
+type Cache =
+    SsCache<ArrayPageStates<PAGES>, ArrayPagePointers<PAGES>, ArrayKeyPointers<u16, 16>, u16>;
 type Store = MapStorage<u16, SharedMock, Cache>;
 
 // The churn parameters mirror `firmware/src/flash_storage.rs` exactly; only the
@@ -108,7 +112,11 @@ fn churn_lap_physically_scrubs_superseded_secret() {
     let mut map = Store::new(
         SharedMock(flash.clone()),
         MapConfig::new(RANGE),
-        Cache::new(),
+        Cache::new(
+            ArrayPageStates::new(),
+            ArrayPagePointers::new(),
+            ArrayKeyPointers::new(),
+        ),
     );
     let mut buf = [0u8; KV_BUF];
 

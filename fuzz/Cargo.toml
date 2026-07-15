@@ -31,7 +31,7 @@ minicbor = { version = "2.2", default-features = false }
 aes = { version = "0.8", default-features = false }
 # power_cut: the real on-device storage stack (pinned to the firmware's
 # version) over sequential-storage's power-cut-injecting mock flash (`_test`).
-sequential-storage = { version = "=7.2.0", features = ["_test"] }
+sequential-storage = { version = "=8.0.0", features = ["_test"] }
 embedded-storage-async = "0.4"
 embassy-futures = "0.1"
 
@@ -366,3 +366,9 @@ bench = false
 
 # Standalone workspace so the parent (thumbv8m) build never pulls these in.
 [workspace]
+
+# Same vendored sequential-storage patch as the root workspace, so the power_cut /
+# kv_durability fuzz targets exercise the exact KV code the firmware ships (see the
+# root Cargo.toml [patch] note + third_party/sequential-storage.patch).
+[patch.crates-io]
+sequential-storage = { path = "../third_party/sequential-storage" }
