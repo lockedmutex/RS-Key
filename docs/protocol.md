@@ -60,6 +60,12 @@ available, `00` = 256+), and the host issues `GET RESPONSE` (`00 C0 00 00 <Le>`)
 until `9000`. Any `GET DATA` reading a certificate object over 256 bytes chains
 this way, so a host that sends `GET DATA` without an `Le` must still follow `61xx`.
 
+OATH `LIST` (`0xA1`) and `CALCULATE ALL` (`0xA4`) responses that outgrow one
+frame chain the YubiKey-OATH way instead: `61 XX` followed by **SEND REMAINING**
+(`00 A5 00 00`) rather than `GET RESPONSE`, matching what ykman / Yubico
+Authenticator send. A host that stops at the first frame still sees a valid
+(shorter) list.
+
 ### 1.2 CTAPHID framing
 
 64-byte HID reports. Init frame: `CID(4) | CMD(1) | BCNT_HI | BCNT_LO | data[:57]`;

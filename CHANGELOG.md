@@ -31,6 +31,18 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Fixed
 
+- **OATH LIST / CALCULATE ALL now page through a full store instead of silently
+  truncating.** A device holding many accounts (up to the 255 the applet stores)
+  built each enumeration response into a single ~2 KiB CCID frame and stopped when
+  it filled, returning `9000` — so `ykman oath accounts list` / Yubico
+  Authenticator saw only the ~135 (LIST) / ~94 (CALCULATE ALL) that fit, and the
+  rest were invisible even though stored and individually usable (HW-found on a
+  255-account fill). LIST (`0xA1`) and CALCULATE ALL (`0xA4`) now implement the
+  YubiKey-OATH `61xx` + SEND REMAINING (`0xA5`) chaining they had stubbed out: when
+  a frame fills they return `61 00` and resume the sorted-credential sweep on the
+  next `0xA5`, so every account surfaces. ykman / Yubico Authenticator already speak
+  this and need no change; a host that ignores `0xA5` still gets the first frame
+  exactly as before (no regression). bcdDevice → `0x0813`.
 - **getAssertion no longer wedges the device after the capacity bump.** The
   credential-key builder (`CredKey::from_raw`) and signer (`CredKey::sign`) folded
   the lattice (ML-DSA) key-expansion / streaming-sign frames — ~106 KiB and ~50 KiB —
