@@ -126,6 +126,17 @@ pub fn cert_fid_for_slot(slot: u8) -> Option<u16> {
     })
 }
 
+/// The cached public-point file for a key slot (`0xD4xx`, low byte = wire slot).
+/// A plain (unsealed — the point is public) O(1) read that lets GET METADATA emit
+/// the slot's public key without recomputing `d·G` at ANY slot count. Written
+/// best-effort at key creation; a slot without it (pre-upgrade, or an import whose
+/// derive failed) falls back to the in-EF_META cache, then to deriving the point.
+/// `0xD4xx` sits outside the host-addressable `5FC1xx` object space (`0xD2xx`) and
+/// every other applet's fid range, so it is private to PIV and never on the wire.
+pub fn pubkey_fid(slot: u8) -> u16 {
+    0xD400 | slot as u16
+}
+
 /// The F9 attestation certificate object (`5FFF01`).
 pub const EF_ATTESTATION_CERT: u16 = 0xD2F1;
 /// YubiKey "ADMIN DATA" object (`5FFF00`, a.k.a. PivmanData) — the protection
@@ -234,6 +245,7 @@ pub fn scan_files<S: Storage>(dev: &Device, fs: &mut Fs<S>, rng: &mut dyn Rng) -
         seal::store_ec_key(dev, fs, rng, key_fid(SLOT_ATTESTATION), &key)?;
         let mut point = [0u8; MAX_EC_POINT];
         let plen = key.public_point(&mut point)?;
+        let _ = fs.put(pubkey_fid(SLOT_ATTESTATION), &point[..plen]);
         let mut cert = [0u8; x509::MAX_CERT];
         let n = x509::build_cert(
             &x509::CertParams {
@@ -269,7 +281,10 @@ pub fn reset_files<S: Storage>(dev: &Device, fs: &mut Fs<S>, rng: &mut dyn Rng) 
         let mut fids = [0u16; 32];
         let mut n = 0;
         fs.for_each_key(&mut |fid| {
-            if (0xD100..=0xD2FF).contains(&fid) && n < fids.len() {
+            // PIV fid range: keys/PINs + objects (0xD100..=0xD2FF) and the per-slot
+            // pubkey cache (0xD4xx). 0xD3xx is FIDO's, so it is deliberately skipped.
+            let piv = (0xD100..=0xD2FF).contains(&fid) || (0xD400..=0xD4FF).contains(&fid);
+            if piv && n < fids.len() {
                 fids[n] = fid;
                 n += 1;
             }

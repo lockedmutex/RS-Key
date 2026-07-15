@@ -692,9 +692,9 @@ impl PivApplet<'_> {
                 Sw::OK
             }
             s if is_key(s) => {
-                if !fs.has_key(key_fid(s)) {
-                    return Sw::REFERENCE_NOT_FOUND;
-                }
+                // meta_find below gates existence (delete clears the meta record
+                // unconditionally), so the old separate has_key probe here was a
+                // redundant per-slot flash fetch on every GET METADATA — dropped.
                 // Sized to hold a cached EC public point trailing the 4-byte
                 // [algo, pin_pol, touch_pol, origin] head (see slot_pubkey_tlv).
                 let mut meta = [0u8; 4 + MAX_EC_POINT];
@@ -738,12 +738,14 @@ impl PivApplet<'_> {
                 full - 5
             }
             ALGO_ECCP256 | ALGO_ECCP384 | ALGO_ED25519 | ALGO_X25519 => {
-                // The public point is cached in the meta record (bytes 4..) at
-                // key creation, so GET METADATA emits it without recomputing the
-                // ~tens-of-ms `d·G`; a pre-cache key (bare 4-byte record) falls
-                // back to deriving it from the sealed scalar.
+                // Emit the slot public point without recomputing the ~tens-of-ms
+                // `d·G`. Prefer the per-slot cache file (O(1), works at any slot
+                // count); then the legacy in-EF_META cache (older keys that fit);
+                // finally derive it from the sealed scalar (pre-cache keys).
                 let mut point = [0u8; MAX_EC_POINT];
-                let pt: &[u8] = if meta.len() > 4 {
+                let pt: &[u8] = if let Some(pn) = fs.read(pubkey_fid(slot), &mut point) {
+                    &point[..pn.min(point.len())]
+                } else if meta.len() > 4 {
                     &meta[4..]
                 } else {
                     let key = match seal::load_ec_key(dev, fs, key_fid(slot)) {
@@ -891,8 +893,15 @@ impl PivApplet<'_> {
                 }
             }
         }
+        // Carry the cached public point to the destination slot (best-effort),
+        // then drop the source's — MOVE relocates the whole slot.
+        let mut pk = [0u8; MAX_EC_POINT];
+        if let Some(pn) = fs.read(pubkey_fid(from), &mut pk) {
+            let _ = fs.put(pubkey_fid(to), &pk[..pn.min(pk.len())]);
+        }
         blob.zeroize();
         let _ = fs.delete_key(key_fid(from));
+        let _ = fs.delete(pubkey_fid(from));
         if let Some(f) = cert_from {
             let _ = fs.delete(f);
         }

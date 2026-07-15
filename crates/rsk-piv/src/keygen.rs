@@ -230,6 +230,10 @@ pub(crate) fn generate_ec<S: Storage>(
     if let Err(e) = seal::store_ec_key(dev, fs, rng, key_fid(slot), &key) {
         return e;
     }
+    // Cache the public point in its own per-slot file so GET METADATA stays O(1) at
+    // any slot count — the shared EF_META cache fills after ~10 EC slots and the
+    // rest would recompute d·G. Best-effort: on failure GET METADATA derives it.
+    let _ = fs.put(pubkey_fid(slot), &point[..plen]);
     let pol = resolved_policies(slot, req.pin_policy, req.touch_policy);
     let mut mbuf = [0u8; 4 + MAX_EC_POINT];
     let mlen = ec_slot_meta(req.algo, pol, ORIGIN_GENERATED, &point[..plen], &mut mbuf);
@@ -534,7 +538,10 @@ pub(crate) fn import<S: Storage>(
     ) {
         let mut point = [0u8; MAX_EC_POINT];
         match seal::load_ec_key(dev, fs, key_fid(slot)).and_then(|k| k.public_point(&mut point)) {
-            Ok(plen) => ec_slot_meta(algo, pol, ORIGIN_IMPORTED, &point[..plen], &mut mbuf),
+            Ok(plen) => {
+                let _ = fs.put(pubkey_fid(slot), &point[..plen]);
+                ec_slot_meta(algo, pol, ORIGIN_IMPORTED, &point[..plen], &mut mbuf)
+            }
             Err(_) => ec_slot_meta(algo, pol, ORIGIN_IMPORTED, &[], &mut mbuf),
         }
     } else {

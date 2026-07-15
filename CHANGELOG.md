@@ -31,6 +31,19 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Fixed
 
+- **PIV GET METADATA is fast at any slot count: each slot's public point is cached
+  in its own flash file instead of a shared, capacity-bound record.** The earlier
+  cache packed every EC slot's point into one EF_META blob (≤768 B for points), so
+  past ~10 populated EC slots the rest kept only a bare head and GET METADATA
+  recomputed the software point (`d·G`, ~30 ms) on every read — `ykman piv info` over
+  24 slots measured ~1.0 s (~3× a hardware YubiKey), ~400 ms of it that d·G. Each
+  slot now caches its point in a private per-slot file (`0xD4xx`, unsealed — the
+  point is public) written at key generate/import and read O(1) by GET METADATA at
+  any slot count; a slot without one (pre-upgrade, or a failed import derive) falls
+  back to the old EF_META cache, then to deriving the point, so provisioned devices
+  upgrade transparently. The redundant per-slot `has_key` probe GET METADATA did on
+  top of the existing `meta_find` gate is dropped. No wire change; GET METADATA
+  output is byte-identical. bcdDevice → `0x0816`.
 - **credMgmt enumeration and makeCredential are much faster on a full store: the
   occupied-slot map is read from the in-RAM present index instead of scanning
   flash.** `slot_map` — run on every getCredsMetadata / enumerateRPs /
