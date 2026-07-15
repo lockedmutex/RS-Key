@@ -1104,23 +1104,29 @@ fn calculate(truncate: bool, key: &[u8], chal: &[u8], res: &mut ResBuf) -> Optio
     Some(())
 }
 
-/// FIDs of every present OATH credential (slots `EF_OATH_CRED..`), gathered in a
-/// single storage pass; returns the count written to `out`. Iterating these is
-/// O(present). The old `for i in 0..MAX_OATH_CRED { fs.read/delete/has_data }`
-/// probe was O(255·items): a read of an *absent* slot rescans all of flash, so
-/// sweeping the whole 255-slot range cost tens of seconds on a busy store. See
-/// the anti-pattern note on [`rsk_fs::Fs::for_each_key`].
+/// FIDs of every present OATH credential (slots `EF_OATH_CRED..`), in ascending
+/// FID order; returns the count written to `out`. Reads occupancy straight from
+/// the in-RAM present index via [`rsk_fs::Fs::present_slots`] — O(255) bit tests,
+/// no flash access — instead of a whole-partition [`for_each_key`] scan on every
+/// LIST / CALCULATE ALL (which cost tens of ms on a busy store: the exact
+/// anti-pattern fixed for FIDO's `slot_map`). Occupancy-equivalent — both derive
+/// from the boot [`scan`](rsk_fs::Fs::scan) seed kept live by every put/delete —
+/// and ascending by construction, so enumeration output stays byte-identical to
+/// the old sorted `for_each_key` sweep. A stale present bit at worst costs one
+/// skipped `seal_read` at the call site; the absent direction keeps the bulk
+/// pass's torn-migration semantics (no new false-absent).
+///
+/// [`for_each_key`]: rsk_fs::Fs::for_each_key
 fn present_creds<S: Storage>(fs: &mut Fs<S>, out: &mut [u16; MAX_OATH_CRED as usize]) -> usize {
+    let mut occ = [false; MAX_OATH_CRED as usize];
+    fs.present_slots(EF_OATH_CRED, &mut occ);
     let mut n = 0;
-    fs.for_each_key(&mut |fid| {
-        if (EF_OATH_CRED..EF_OATH_CRED + MAX_OATH_CRED).contains(&fid) && n < out.len() {
-            out[n] = fid;
+    for (i, &present) in occ.iter().enumerate() {
+        if present {
+            out[n] = EF_OATH_CRED + i as u16;
             n += 1;
         }
-    });
-    // for_each_key yields storage order; sort to the old FID-order sweep so LIST /
-    // CALCULATE ALL responses stay byte-identical to the previous behavior.
-    out[..n].sort_unstable();
+    }
     n
 }
 
@@ -1299,16 +1305,13 @@ fn reseal_if_plaintext<S: Storage>(
     }
 }
 
+/// Lowest unused credential slot for a new PUT, or `None` if all 255 are taken.
+/// Reads occupancy from the in-RAM present index (see [`present_creds`]) — no flash
+/// scan on the PUT path. A live slot always carries a set present bit after the boot
+/// scan, so this cannot hand out an occupied slot in normal operation.
 fn free_slot<S: Storage>(fs: &mut Fs<S>) -> Option<u16> {
     let mut used = [false; MAX_OATH_CRED as usize];
-    fs.for_each_key(&mut |fid| {
-        let Some(i) = fid.checked_sub(EF_OATH_CRED) else {
-            return;
-        };
-        if (i as usize) < used.len() {
-            used[i as usize] = true;
-        }
-    });
+    fs.present_slots(EF_OATH_CRED, &mut used);
     used.iter()
         .position(|&u| !u)
         .map(|i| EF_OATH_CRED + i as u16)

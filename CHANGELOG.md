@@ -31,6 +31,19 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Fixed
 
+- **OATH LIST / CALCULATE ALL are faster on a full store: the occupied-slot map is
+  read from the in-RAM present index instead of scanning flash.** Enumerating
+  accounts sorted the live OATH slots with a whole-partition `for_each_key` walk on
+  every LIST (`0xA1`) and CALCULATE ALL (`0xA4`) — and PUT re-paid it to find a free
+  slot — so a busy store (a parity fill measured `ykman oath accounts list` ~1.6×
+  slower than a hardware YubiKey) spent tens of ms per call on the scan. `Fs` already
+  keeps an authoritative in-RAM present index (seeded at boot by `scan`, kept live by
+  every put/delete), so the slot gather (`present_creds`) and free-slot search now
+  read occupancy from it in O(255) bit tests with no flash access — the same fix
+  applied to FIDO `slot_map` and PIV. Occupancy-equivalent to the old `for_each_key`
+  pass (same torn-migration semantics) and ascending by construction, so LIST /
+  CALCULATE ALL output — including its `61xx` paging — is byte-identical. No wire or
+  on-flash change. bcdDevice → `0x0817`.
 - **PIV GET METADATA is fast at any slot count: each slot's public point is cached
   in its own flash file instead of a shared, capacity-bound record.** The earlier
   cache packed every EC slot's point into one EF_META blob (≤768 B for points), so

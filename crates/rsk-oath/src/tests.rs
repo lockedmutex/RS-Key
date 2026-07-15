@@ -428,6 +428,62 @@ fn cred_secret_is_sealed_on_flash() {
     assert_eq!(calc_code(&mut app, &mut fs, b"acct", 1, 8), 94287082);
 }
 
+/// `present_creds` (now the in-RAM `present_slots` bitmap) must return exactly the
+/// same ascending FID set a fresh `for_each_key` scan of the OATH range yields —
+/// including across a deletion gap — so LIST / CALCULATE ALL stay byte-identical.
+#[test]
+fn present_creds_matches_for_each_key_occupancy() {
+    let mut fs = new_fs();
+    let rng = RefCell::new(CountRng(7));
+    let touch = RefCell::new(AlwaysConfirm);
+    let mut app = OathApplet::new(SERIAL, [0x22; 32], None, &rng, &touch);
+
+    for name in [b"aa".as_slice(), b"bb", b"cc", b"dd"] {
+        assert_eq!(
+            put(
+                &mut app,
+                &mut fs,
+                &put_data(name, 0x21, 6, SECRET_SHA1, false, None)
+            ),
+            Sw::OK
+        );
+    }
+    // Delete the second credential so the live set has an interior gap.
+    assert_eq!(
+        run(
+            &mut app,
+            &mut fs,
+            &apdu(INS_DELETE, 0, 0, &tlv(TAG_NAME, b"bb"))
+        )
+        .0,
+        Sw::OK
+    );
+
+    let mut fids = [0u16; MAX_OATH_CRED as usize];
+    let n = present_creds(&mut fs, &mut fids);
+
+    // Independent occupancy oracle: a fresh whole-partition scan of the range.
+    let mut want = Vec::new();
+    fs.for_each_key(&mut |fid| {
+        if (EF_OATH_CRED..EF_OATH_CRED + MAX_OATH_CRED).contains(&fid) {
+            want.push(fid);
+        }
+    });
+    want.sort_unstable();
+
+    assert_eq!(
+        &fids[..n],
+        want.as_slice(),
+        "present_creds != for_each_key occupancy"
+    );
+    assert!(
+        fids[..n].windows(2).all(|w| w[0] < w[1]),
+        "present_creds not strictly ascending"
+    );
+    // free_slot must land on the freed interior slot, not append past the tail.
+    assert_eq!(free_slot(&mut fs), Some(EF_OATH_CRED + 1));
+}
+
 #[test]
 fn legacy_plaintext_cred_migrates_and_stays_usable() {
     // A credential enrolled before sealing existed is stored as a bare TLV
