@@ -184,6 +184,24 @@ impl<S: Storage> Fs<S> {
         self.storage.for_each_key(f);
     }
 
+    /// Fill `out[i]` with whether `base + i` is known present, read straight from
+    /// the in-RAM present index — no backend scan. Occupancy-equivalent to a
+    /// [`for_each_key`](Self::for_each_key) pass over the range (both derive from
+    /// the boot [`scan`](Self::scan) seed, kept live by every `put`/`delete`), but
+    /// O(len) RAM bit tests instead of O(flash items). Use it where a caller needs
+    /// only the occupied-slot bitmap over a FID range (credMgmt enumerate,
+    /// makeCredential dedup / free-slot); occupied slots must still be `read` for
+    /// their data. A `present` bit is only ever set by a confirmed put/read, so a
+    /// stale-positive at worst costs one skipped `read`; the absent direction keeps
+    /// the same torn-migration semantics as the bulk pass (no new false-absent).
+    pub fn present_slots(&self, base: u16, out: &mut [bool]) {
+        for (i, b) in out.iter_mut().enumerate() {
+            *b = base
+                .checked_add(i as u16)
+                .is_some_and(|fid| self.present_bit(fid));
+        }
+    }
+
     /// Free slots in the shared dynamic-file budget: how many more dynamic files
     /// (across every applet) can be stored before [`MAX_DYNAMIC_FILES`] binds. Lets
     /// a caller report capacity honestly against the SHARED store — e.g. FIDO's

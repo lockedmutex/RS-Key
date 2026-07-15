@@ -625,20 +625,15 @@ pub(crate) const RP_PREFIX: usize = 1 + 32;
 /// length-driven with no fixed-size assumptions.
 pub(crate) const RP_REC_MAX: usize = RP_PREFIX + IV_LEN + RP_ID_MAX + TAG_LEN;
 
-/// Mark, in one storage pass, which slots `base+0..base+out.len()` hold a live
-/// record (`out[i]` is occupied iff a key `base+i` exists). One pass is
-/// O(items); per-slot `fs.read` probing is not — a `read` of an *absent* slot
-/// rescans the whole flash partition. Callers still `fs.read` the occupied
-/// slots — those reads hit the key cache.
+/// Mark which slots `base+0..base+out.len()` hold a live record (`out[i]` is
+/// occupied iff a key `base+i` exists), read from the fs in-RAM present index —
+/// no flash scan. This runs on every credMgmt enumerate/getNext and every
+/// makeCredential (dedup + free-slot), so scanning the whole partition each call
+/// (~84 ms on a full store) dominated those paths; the present index answers it
+/// in sub-ms and is occupancy-equivalent (see [`Fs::present_slots`]). Callers
+/// still `fs.read` the occupied slots — those hit the key cache.
 pub(crate) fn slot_map<S: Storage>(fs: &mut Fs<S>, base: u16, out: &mut [bool]) {
-    out.iter_mut().for_each(|b| *b = false);
-    fs.for_each_key(&mut |fid| {
-        if let Some(i) = fid.checked_sub(base)
-            && (i as usize) < out.len()
-        {
-            out[i as usize] = true;
-        }
-    });
+    fs.present_slots(base, out);
 }
 
 /// Estimated free discoverable-credential slots (getInfo

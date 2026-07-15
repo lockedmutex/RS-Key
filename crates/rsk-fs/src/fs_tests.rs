@@ -165,6 +165,44 @@ fn present_cache_tracks_put_delete_reput() {
 }
 
 #[test]
+fn present_slots_matches_for_each_key_occupancy() {
+    // slot_map (credMgmt / makeCredential) now reads the in-RAM present index
+    // instead of scanning flash; it MUST report the same occupancy a for_each_key
+    // pass would over the range — including after a delete and after a reboot scan.
+    const BASE: u16 = 0xCF00; // EF_CRED-style range
+    let mut fs = fs();
+    for fid in [0xCF00u16, 0xCF01, 0xCF05, 0xCF10, 0xCFFE] {
+        fs.put(fid, b"rk").unwrap();
+    }
+    fs.delete(0xCF05).unwrap();
+
+    let mut want = [false; 256];
+    fs.for_each_key(&mut |fid| {
+        if let Some(i) = fid.checked_sub(BASE)
+            && (i as usize) < want.len()
+        {
+            want[i as usize] = true;
+        }
+    });
+    let mut got = [false; 256];
+    fs.present_slots(BASE, &mut got);
+    assert_eq!(got, want);
+    assert!(
+        got[0] && got[1] && got[0x10] && got[0xFE],
+        "live slots occupied"
+    );
+    assert!(!got[5] && !got[2], "deleted and never-written slots free");
+
+    // Reboot: the present index is reseeded from flash by scan(), so the RAM-read
+    // occupancy must survive a rebuild identically.
+    let mut fs2 = Fs::new(fs.into_storage());
+    fs2.scan();
+    let mut got2 = [false; 256];
+    fs2.present_slots(BASE, &mut got2);
+    assert_eq!(got2, want);
+}
+
+#[test]
 fn present_cache_rebuilt_by_scan() {
     // The negative cache MUST be rebuilt by scan(), or post-reboot reads of
     // present files would falsely return None — silent data loss.

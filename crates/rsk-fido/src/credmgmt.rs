@@ -272,12 +272,12 @@ fn enumerate_rps<S: Storage, R: Rng>(
     if begin {
         ctx.state.cm.rp_counter = 1;
         ctx.state.cm.rp_total = 0;
+        ctx.state.cm.rp_next_slot = 0;
     } else if ctx.state.cm.rp_counter > ctx.state.cm.rp_total {
         return Err(CtapError::NotAllowed);
     }
     let target = ctx.state.cm.rp_counter;
 
-    let mut skip = 0u16;
     let mut total = 0u16;
     let mut found = false;
     let mut rp = [0u8; RP_REC_MAX];
@@ -285,7 +285,10 @@ fn enumerate_rps<S: Storage, R: Rng>(
     let mut buf = [0u8; RP_REC_MAX];
     let mut occupied = [false; MAX_RESIDENT_CREDENTIALS as usize];
     slot_map(ctx.fs, EF_RP, &mut occupied);
-    for i in 0..MAX_RESIDENT_CREDENTIALS {
+    // Resume at rp_next_slot (0 on Begin, past the last match on getNext) so a
+    // getNext is O(gap-to-next) not O(scan-from-0); Begin still makes one full
+    // pass to count rp_total.
+    for i in ctx.state.cm.rp_next_slot..MAX_RESIDENT_CREDENTIALS {
         if !occupied[i as usize] {
             continue;
         }
@@ -294,11 +297,11 @@ fn enumerate_rps<S: Storage, R: Rng>(
         };
         let n = n.min(buf.len());
         if n >= RP_PREFIX && buf[0] > 0 {
-            skip = skip.saturating_add(1);
-            if skip == target && !found {
+            if !found {
                 found = true;
                 rp[..n].copy_from_slice(&buf[..n]);
                 rp_len = n;
+                ctx.state.cm.rp_next_slot = i + 1;
                 if !begin {
                     break;
                 }
@@ -350,12 +353,12 @@ fn enumerate_creds<S: Storage, R: Rng>(
     if begin {
         ctx.state.cm.cred_counter = 1;
         ctx.state.cm.cred_total = 0;
+        ctx.state.cm.cred_next_slot = 0;
     } else if ctx.state.cm.cred_counter > ctx.state.cm.cred_total {
         return Err(CtapError::NotAllowed);
     }
     let target = ctx.state.cm.cred_counter;
 
-    let mut skip = 0u16;
     let mut total = 0u16;
     let mut found = false;
     let mut rec = [0u8; CRED_REC_MAX];
@@ -363,7 +366,10 @@ fn enumerate_creds<S: Storage, R: Rng>(
     let mut buf = [0u8; CRED_REC_MAX];
     let mut occupied = [false; MAX_RESIDENT_CREDENTIALS as usize];
     slot_map(ctx.fs, EF_CRED, &mut occupied);
-    for i in 0..MAX_RESIDENT_CREDENTIALS {
+    // Resume at cred_next_slot (0 on Begin, past the last match on getNext) so a
+    // getNext is O(gap-to-next) not O(scan-from-0); Begin still makes one full
+    // pass to count cred_total for this rp.
+    for i in ctx.state.cm.cred_next_slot..MAX_RESIDENT_CREDENTIALS {
         if !occupied[i as usize] {
             continue;
         }
@@ -372,11 +378,11 @@ fn enumerate_creds<S: Storage, R: Rng>(
         };
         let n = n.min(buf.len());
         if n >= RECORD_PREFIX && buf[..32] == *rp_id_hash {
-            skip = skip.saturating_add(1);
-            if skip == target && !found {
+            if !found {
                 found = true;
                 rec[..n].copy_from_slice(&buf[..n]);
                 rec_len = n;
+                ctx.state.cm.cred_next_slot = i + 1;
                 if !begin {
                     break;
                 }

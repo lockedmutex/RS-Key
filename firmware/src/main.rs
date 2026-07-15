@@ -380,7 +380,7 @@ async fn main(spawner: Spawner) {
     config.max_power = 100;
     config.max_packet_size_0 = 64;
     // bcdDevice build counter; also surfaced on the trusted-display Firmware screen.
-    let device_release: u16 = 0x0813;
+    let device_release: u16 = 0x0815;
     config.device_release = device_release;
 
     let mut builder = Builder::new(
@@ -399,7 +399,10 @@ async fn main(spawner: Spawner) {
             HidConfig {
                 report_descriptor: FIDO_REPORT_DESCRIPTOR,
                 request_handler: None,
-                poll_ms: 5,
+                // 1 ms HID interval: a credMgmt/getAssertion response is several
+                // 64-byte IN frames; at 5 ms/frame that framing dominated once the
+                // per-call flash scan was removed. Full-speed floor is 1 ms.
+                poll_ms: 1,
                 max_packet_size: 64,
                 hid_subclass: HidSubclass::No,
                 hid_boot_protocol: HidBootProtocol::None,

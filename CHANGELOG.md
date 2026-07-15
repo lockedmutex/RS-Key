@@ -31,6 +31,29 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Fixed
 
+- **credMgmt enumeration and makeCredential are much faster on a full store: the
+  occupied-slot map is read from the in-RAM present index instead of scanning
+  flash.** `slot_map` — run on every getCredsMetadata / enumerateRPs /
+  enumerateCredentials / getNext and on every makeCredential (dedup + free-slot) —
+  walked the whole flash partition each call (~84 ms on a 256-passkey device), so
+  listing every credential paid it ~289 times (~24 s of a measured ~34 s walk) and
+  each registration re-paid it (~336 → 480 ms as the store filled). `Fs` already
+  keeps an authoritative in-RAM present index (seeded at boot by `scan`, kept live
+  by every put/delete), so `slot_map` now reads occupancy from it in sub-ms with no
+  flash scan and no new state — occupancy-equivalent to the old `for_each_key` pass
+  (same torn-migration under-count semantics). The FIDO HID poll interval is also
+  tightened 5 ms → 1 ms so a multi-frame enumerate/assertion response drains faster.
+  No wire or on-flash change. bcdDevice → `0x0814`.
+- **credMgmt enumeration is O(n), not O(n²): getNextRP / getNextCredential resume
+  from a slot cursor instead of re-scanning from slot 0.** With the per-call flash
+  scan removed (above), the remaining full-walk cost was each getNext re-reading the
+  store from the first slot to the N-th match — quadratic in the credential count.
+  `CredMgmtState` now carries a per-enumeration slot cursor (separate cursors for the
+  RP and credential walks, each reset by its Begin and advanced by each getNext), so a
+  getNext reads only the gap to the next match. On a full 256-passkey device the warm
+  per-credential enumeration cost flattens (~10 ms, matching a hardware YubiKey)
+  instead of climbing with slot position. No wire change; enumerate output is
+  byte-identical. bcdDevice → `0x0815`.
 - **OATH LIST / CALCULATE ALL now page through a full store instead of silently
   truncating.** A device holding many accounts (up to the 255 the applet stores)
   built each enumeration response into a single ~2 KiB CCID frame and stopped when
