@@ -40,7 +40,7 @@ fn armed(perms: u8) -> FidoState {
 }
 
 fn seeded_fs() -> Fs<RamStorage> {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     fs.put(EF_LARGEBLOB, &LARGEBLOB_INITIAL).unwrap();
     fs
 }

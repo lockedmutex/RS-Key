@@ -11,7 +11,7 @@ fn over_long_algo_do_does_not_panic() {
     // nothing, so a PW3 host can leave an over-16-byte C1/C2/C3 algorithm
     // attribute. The read+slice in generate / rsa_generate_params must clamp
     // to the fixed buffer — an index-OOB panic on device is a brick.
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     fs.scan();
     let mut algo = [0u8; 48]; // > the 16-byte reader buffer
     algo[0] = ALGO_RSA;
@@ -35,7 +35,7 @@ fn short_algo_do_does_not_panic() {
     let mut sess = Session::new();
     sess.has_pw3 = true;
     for short in [&[ALGO_RSA][..], &[ALGO_RSA, 0x00][..]] {
-        let mut fs = Fs::new(RamStorage::new(), &[]);
+        let mut fs = Fs::new(RamStorage::new());
         fs.scan();
         fs.put(EF_ALGO_PRIV1, short).unwrap();
         assert_eq!(

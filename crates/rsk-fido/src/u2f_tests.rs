@@ -72,7 +72,7 @@ impl crate::UserPresence for CountingPresence {
 
 #[test]
 fn register_without_touch_is_refused() {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut rng = SeqRng(1);
     ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
     let mut data = std::vec::Vec::new();
@@ -100,7 +100,7 @@ fn register_without_touch_is_refused() {
 
 #[test]
 fn register_then_authenticate() {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut rng = SeqRng(1);
     ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
 
@@ -195,7 +195,7 @@ fn register_then_authenticate() {
 
 #[test]
 fn check_only_and_bad_handle() {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut rng = SeqRng(2);
     ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
 
@@ -262,7 +262,7 @@ fn enforce_auth_rejects_unknown_handle_without_touch() {
     // CONDITIONS_NOT_SATISFIED (0x6985) after a timed-out touch and streamed
     // keepalives that desynced the host. The handle check must win, and the
     // touch must not even be requested.
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut rng = SeqRng(7);
     ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
 
@@ -299,7 +299,7 @@ fn enforce_auth_rejects_unknown_handle_without_touch() {
 
 #[test]
 fn version() {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut rng = SeqRng(3);
     let ver = Apdu::parse(&[0x00, CTAP_VERSION, 0x00, 0x00]).unwrap();
     let mut o = [0u8; 16];
@@ -320,7 +320,7 @@ fn version() {
 
 #[test]
 fn bad_cla_and_ins() {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut rng = SeqRng(9);
     ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
     let mut state = crate::FidoState::new();

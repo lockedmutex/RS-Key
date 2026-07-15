@@ -162,10 +162,9 @@ fn miri_fs_meta() {
         }
         fn for_each_key(&mut self, _f: &mut dyn FnMut(u16)) {}
     }
-    static TABLE: &[rsk_fs::FileDesc] = &[];
 
     for data in [&b""[..], b"\x00\x00", b"\xcf\x01\x01\x42"] {
-        let mut fs = Fs::new(MetaBlob(data), TABLE);
+        let mut fs = Fs::new(MetaBlob(data));
         let mut out = [0u8; 256];
         for fid in [0x0000, 0xCF01, 0xE010, 0xFFFF] {
             let _ = fs.meta_find(fid, &mut out);
@@ -350,7 +349,7 @@ fn miri_fido_cbor() {
         &[],
     ] {
         let d = dev();
-        let mut fs = Fs::new(RamStorage::new(), &[]);
+        let mut fs = Fs::new(RamStorage::new());
         let mut rng = SeqRng(1);
         let _ = ensure_seed(&d, &mut fs, &mut rng);
         let mut out = [0u8; 2048];
@@ -380,7 +379,7 @@ fn miri_fido_vendor() {
 
     for (data, soft_lock) in [(&b"\x00"[..], false), (b"\x01", true)] {
         let d = dev();
-        let mut fs = Fs::new(RamStorage::new(), &[]);
+        let mut fs = Fs::new(RamStorage::new());
         let mut rng = SeqRng(1);
         let _ = ensure_seed(&d, &mut fs, &mut rng);
         if soft_lock {
@@ -502,7 +501,7 @@ fn miri_fido_credmgmt() {
 
     for data in [&b""[..], b"\x08\xa1\x02\xa1", b"\x05\xa1\x03\xa1\x05\xa1"] {
         let d = dev();
-        let mut fs = Fs::new(RamStorage::new(), &[]);
+        let mut fs = Fs::new(RamStorage::new());
         let mut rng = SeqRng(1);
         let _ = ensure_seed(&d, &mut fs, &mut rng);
         let rp_hash = sha256(b"a.co");
@@ -575,7 +574,7 @@ fn miri_fido_u2f() {
             continue;
         };
         let d = dev();
-        let mut fs = Fs::new(RamStorage::new(), &[]);
+        let mut fs = Fs::new(RamStorage::new());
         let mut rng = SeqRng(1);
         let _ = ensure_seed(&d, &mut fs, &mut rng);
         let mut out = [0u8; 2048];
@@ -605,7 +604,7 @@ fn miri_fido_largeblobs() {
 
     for data in [&b""[..], b"\x01", b"\x00"] {
         let d = dev();
-        let mut fs = Fs::new(RamStorage::new(), &[]);
+        let mut fs = Fs::new(RamStorage::new());
         let mut rng = SeqRng(1);
         let _ = ensure_seed(&d, &mut fs, &mut rng);
         let mut state = FidoState::new();
@@ -710,7 +709,7 @@ fn miri_openpgp_apdu() {
         serial_id: &SERIAL_ID,
         otp_key: None,
     };
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     fs.scan();
     if scan_files(&d, &mut fs, &mut CountRng(0)).is_err() {
         return;
@@ -945,7 +944,7 @@ fn miri_mgmt_apdu() {
         b"\x00\xcc\x00\x00\x04\x01\x02\x03\x04",
         b"\x00\xcb\x00\x00",
     ] {
-        let mut fs = Fs::new(RamStorage::new(), &[]);
+        let mut fs = Fs::new(RamStorage::new());
         fs.scan();
         let mut app = ManagementApplet::new([0x12, 0x34, 0x56, 0x78, 1, 2, 3, 4], &presence);
         if let Ok(apdu) = Apdu::parse(data) {
@@ -972,7 +971,7 @@ fn miri_mgmt_config() {
         }
     }
 
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     fs.scan();
     let presence = RefCell::new(AlwaysConfirm);
     let mut app = ManagementApplet::new([0x12, 0x34, 0x56, 0x78, 1, 2, 3, 4], &presence);
@@ -1035,7 +1034,7 @@ fn miri_cross_applet() {
     const SID: [u8; 8] = [0x12, 0x34, 0x56, 0x78, 1, 2, 3, 4];
     const SH: [u8; 32] = [0x22; 32];
 
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     fs.scan();
     let rng = RefCell::new(R(1));
     let pgp_pres = RefCell::new(rsk_openpgp::AlwaysConfirm);
@@ -1091,7 +1090,7 @@ fn miri_oath_apdu() {
         }
     }
 
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     fs.scan();
     let rng = RefCell::new(CountRng(0));
     let touch = RefCell::new(rsk_oath::AlwaysConfirm);
@@ -1149,7 +1148,7 @@ fn miri_otp_apdu() {
         }
     }
 
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     fs.scan();
     let rng = RefCell::new(CountRng(0));
     let presence = RefCell::new(AlwaysConfirm);
@@ -1260,7 +1259,7 @@ fn miri_piv_apdu() {
     let rng = RefCell::new(CountRng(0));
     let pres = RefCell::new(AlwaysConfirm);
     let mut app = PivApplet::new([1, 2, 3, 4, 5, 6, 7, 8], [0x22; 32], None, &rng, &pres);
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     fs.scan();
 
     {
@@ -1353,7 +1352,7 @@ fn miri_rescue_apdu() {
         b"\x80\x1e\x06\x00\x00",           // anti-rollback state read
         &[0x00; 10],
     ] {
-        let mut fs = Fs::new(RamStorage::new(), &[]);
+        let mut fs = Fs::new(RamStorage::new());
         fs.scan();
         let rng = RefCell::new(CountRng(0));
         let platform = RefCell::new(FakePlatform {
@@ -1432,7 +1431,7 @@ fn miri_seed_blob() {
         if data.is_empty() || data.len() > 64 {
             continue;
         }
-        let mut fs = Fs::new(RamStorage::new(), &[]);
+        let mut fs = Fs::new(RamStorage::new());
         if fs.put(EF_KEY_DEV, data).is_err() {
             continue;
         }
@@ -1471,7 +1470,7 @@ fn miri_fido_session() {
         serial_id: &[1, 2, 3, 4, 5, 6, 7, 8],
         otp_key: None,
     };
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut rng = SeqRng(1);
     let _ = ensure_seed(&d, &mut fs, &mut rng);
     let rp_hash = sha256(b"a.co");
@@ -1556,7 +1555,7 @@ fn miri_fs_ops() {
     const F1: u16 = 0xB001;
     const F2: u16 = 0xB002;
 
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     fs.scan();
 
     // put / clamped read: full length back, copy truncated to the view.
@@ -1577,7 +1576,7 @@ fn miri_fs_ops() {
 
     // Reboot: same image, fresh scan; data and meta survive.
     let storage = fs.into_storage();
-    let mut fs = Fs::new(storage, &[]);
+    let mut fs = Fs::new(storage);
     fs.scan();
     assert_eq!(fs.size(F1), Some(200));
     assert_eq!(fs.meta_find(F1, &mut out), Some(8));
@@ -1742,7 +1741,7 @@ fn miri_power_cut() {
     };
 
     // Commit two files (one per partition) under stable power.
-    let mut fs = Fs::new(TortureStorage::new(shared.clone()), &[]);
+    let mut fs = Fs::new(TortureStorage::new(shared.clone()));
     fs.scan();
     let old = [0xA5u8; 24];
     fs.put(0xB000, &old).unwrap();
@@ -1757,7 +1756,7 @@ fn miri_power_cut() {
     assert!(r.is_err() || !dead.get());
     loop {
         dead.set(false);
-        fs = Fs::new(TortureStorage::new(shared.clone()), &[]);
+        fs = Fs::new(TortureStorage::new(shared.clone()));
         fs.scan();
         if !dead.get() {
             break;

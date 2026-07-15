@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 RS-Key contributors
 
-//! Static file table plus the file/metadata API over a [`Storage`] backend.
+//! The key/value file and metadata API over a [`Storage`] backend.
 
 use heapless::Vec;
 use rsk_sdk::error::{Error, Result};
 
 use crate::sealed::{KeyFid, Sealed};
 use crate::storage::Storage;
-use crate::{EF_META, FILE_EF_TRANSPARENT, FILE_TYPE_WORKING_EF, MAX_DYNAMIC_FILES};
+use crate::{EF_META, MAX_DYNAMIC_FILES};
 
 /// Max size of the meta side-store blob.
 const META_MAX: usize = 1024;
@@ -20,38 +20,10 @@ const META_REC_HDR: usize = 4;
 /// bitmap (8 KiB). Backs the fast-negative cache in [`Fs`].
 const FID_PRESENT_BYTES: usize = (u16::MAX as usize + 1) / 8;
 
-/// Static descriptor of a known file. File *contents* live in [`Storage`],
-/// not here.
-#[derive(Clone, Copy, Debug)]
-pub struct FileDesc {
-    pub fid: u16,
-    pub name: Option<&'static [u8]>,
-    /// Index of the parent entry in the table.
-    pub parent: u8,
-    pub file_type: u8,
-    pub ef_structure: u8,
-    pub acl: [u8; 7],
-}
-
-impl FileDesc {
-    /// Default descriptor for a runtime-created working EF.
-    const fn dynamic(fid: u16) -> Self {
-        FileDesc {
-            fid,
-            name: None,
-            parent: 5,
-            file_type: FILE_TYPE_WORKING_EF,
-            ef_structure: FILE_EF_TRANSPARENT,
-            acl: [0u8; 7],
-        }
-    }
-}
-
-/// The file system: a static descriptor table plus the set of dynamic FIDs,
-/// over a [`Storage`] backend.
+/// The file system: the set of live dynamic FIDs and a present-cache over a
+/// [`Storage`] backend.
 pub struct Fs<S: Storage> {
     storage: S,
-    table: &'static [FileDesc],
     dynamic: Vec<u16, MAX_DYNAMIC_FILES>,
     /// Negative cache (paired with [`decided`](Self#structfield.decided)): bit
     /// `fid` set iff the backend is KNOWN to hold a value for `fid`. Lets
@@ -74,19 +46,15 @@ pub struct Fs<S: Storage> {
     /// impossible. Cost: the first probe of each absent FID per boot pays one
     /// backend scan, then it is O(1). See [`known_absent`](Self::known_absent).
     decided: [u8; FID_PRESENT_BYTES],
-    /// Set after user authentication; gates PIN-protected ACL entries.
-    pub user_authenticated: bool,
 }
 
 impl<S: Storage> Fs<S> {
-    pub fn new(storage: S, table: &'static [FileDesc]) -> Self {
+    pub fn new(storage: S) -> Self {
         Fs {
             storage,
-            table,
             dynamic: Vec::new(),
             present: [0u8; FID_PRESENT_BYTES],
             decided: [0u8; FID_PRESENT_BYTES],
-            user_authenticated: false,
         }
     }
 
@@ -148,9 +116,8 @@ impl<S: Storage> Fs<S> {
     /// Rebuild the dynamic-file set from what's already in storage (run once
     /// after a reboot).
     pub fn scan(&mut self) {
-        let table = self.table;
-        // Disjoint field borrows so the `for_each_key` closure can update both
-        // while `self.storage` drives the pass.
+        // Disjoint field borrows so the `for_each_key` closure can update all
+        // three while `self.storage` drives the pass.
         let dynamic = &mut self.dynamic;
         let present = &mut self.present;
         let decided = &mut self.decided;
@@ -158,45 +125,23 @@ impl<S: Storage> Fs<S> {
         present.fill(0);
         decided.fill(0);
         self.storage.for_each_key(&mut |fid| {
-            // Every enumerated key — static, dynamic, or EF_META — is confirmed
-            // present. Keys the bulk pass does NOT yield stay *undecided* (not
-            // fast-absent), so a torn-migration under-count can't turn one into a
-            // false-absent; it is confirmed against the backend on first access.
+            // Every enumerated key — dynamic or EF_META — is confirmed present.
+            // Keys the bulk pass does NOT yield stay *undecided* (not fast-absent),
+            // so a torn-migration under-count can't turn one into a false-absent;
+            // it is confirmed against the backend on first access.
             let (i, m) = ((fid >> 3) as usize, 1u8 << (fid & 7));
             present[i] |= m;
             decided[i] |= m;
             if fid == EF_META {
                 return;
             }
-            let is_static = table.iter().any(|d| d.fid == fid);
-            if !is_static && !dynamic.contains(&fid) {
-                // `put`/`new_file` reject a dynamic file past the cap before it
-                // reaches flash, so the store can never hold more than fit here.
+            if !dynamic.contains(&fid) {
+                // `put` rejects a dynamic file past the cap before it reaches
+                // flash, so the store can never hold more than fit here.
                 debug_assert!(!dynamic.is_full(), "dynamic overflow on rescan");
                 let _ = dynamic.push(fid);
             }
         });
-    }
-
-    fn is_static(&self, fid: u16) -> bool {
-        self.table.iter().any(|d| d.fid == fid)
-    }
-
-    /// Descriptor for `fid`: static entry, or a default dynamic one if the FID
-    /// is a known dynamic file. `None` if unknown.
-    pub fn descriptor(&self, fid: u16) -> Option<FileDesc> {
-        if let Some(d) = self.table.iter().find(|d| d.fid == fid) {
-            Some(*d)
-        } else if self.dynamic.contains(&fid) {
-            Some(FileDesc::dynamic(fid))
-        } else {
-            None
-        }
-    }
-
-    /// Is this FID a known file (static or dynamic)?
-    pub fn search(&self, fid: u16) -> Option<FileDesc> {
-        self.descriptor(fid)
     }
 
     /// Copy file contents into `buf`; returns the value's full length, or `None`.
@@ -237,14 +182,6 @@ impl<S: Storage> Fs<S> {
     /// while one `for_each_key` pass is O(items).
     pub fn for_each_key(&mut self, f: &mut dyn FnMut(u16)) {
         self.storage.for_each_key(f);
-    }
-
-    /// Register a dynamic working EF (idempotent).
-    pub fn new_file(&mut self, fid: u16) -> Result<()> {
-        if !self.is_static(fid) && !self.dynamic.contains(&fid) {
-            self.dynamic.push(fid).map_err(|_| Error::NoMemory)?;
-        }
-        Ok(())
     }
 
     /// Free slots in the shared dynamic-file budget: how many more dynamic files
@@ -310,7 +247,7 @@ impl<S: Storage> Fs<S> {
         // flash write: registering only after committing would strand the value
         // on flash — readable yet unregistered — and leave `scan` to re-drop it
         // at the same cap on every reboot.
-        let register = !self.is_static(fid) && !self.dynamic.contains(&fid);
+        let register = !self.dynamic.contains(&fid);
         if register && self.dynamic.is_full() {
             return Err(Error::NoMemory);
         }
@@ -334,12 +271,11 @@ impl<S: Storage> Fs<S> {
     ///
     /// The metadata drop and the dynamic-set cleanup, by contrast, run
     /// unconditionally: a file can carry metadata (a [`meta_add`](Self::meta_add)
-    /// with no `put`) or a dynamic entry (a [`new_file`](Self::new_file) never
-    /// written) without its contents ever being present, so gating either on the
-    /// file's present bit would orphan it — a deleted file's metadata would read
-    /// back alive. Both stay O(1) when there is nothing to drop: `meta_delete`
-    /// has its own EF_META present-cache guard and skips the rewrite when `fid`
-    /// had no record.
+    /// with no `put`) without its contents ever being present, so gating the meta
+    /// cleanup on the file's present bit would orphan it — a deleted file's
+    /// metadata would read back alive. It stays O(1) when there is nothing to
+    /// drop: `meta_delete` has its own EF_META present-cache guard and skips the
+    /// rewrite when `fid` had no record.
     ///
     /// Unlike the read paths, the backend `remove` keys off the *raw* present bit
     /// rather than `known_absent`: an UNKNOWN FID is skipped, not confirmed. This
@@ -384,21 +320,6 @@ impl<S: Storage> Fs<S> {
     /// Delete a key slot.
     pub fn delete_key(&mut self, fid: KeyFid) -> Result<()> {
         self.delete(fid.get())
-    }
-
-    /// ACL gate for `op` (an `ACL_OP_*` index).
-    pub fn authenticate(&self, fid: u16, op: u8) -> bool {
-        let acl = match self.descriptor(fid) {
-            Some(d) => d.acl[op as usize],
-            None => 0,
-        };
-        match acl {
-            0x00 => true,
-            0xff => false,
-            0x90 => self.user_authenticated,
-            a if a & 0x9f == 0x10 => self.user_authenticated,
-            _ => false,
-        }
     }
 
     // ---- meta side-store ----

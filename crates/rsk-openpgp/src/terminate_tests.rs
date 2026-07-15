@@ -23,7 +23,7 @@ fn dev() -> Device<'static> {
 }
 
 fn seeded() -> Fs<RamStorage> {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     fs.scan();
     scan_files(&dev(), &mut fs, &mut CountRng(0)).unwrap();
     fs

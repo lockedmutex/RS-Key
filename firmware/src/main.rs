@@ -273,7 +273,7 @@ async fn main(spawner: Spawner) {
     let flash = Flash::<_, Blocking, FLASH_SIZE>::new_blocking(p.FLASH);
     let flash_cell = FLASH_CELL.init(RefCell::new(flash_storage::wrap_flash(flash)));
     let storage = FlashStorage::new(flash_cell, kvmain_range(), kvcnt_range());
-    let mut fs = Fs::new(storage, &[]);
+    let mut fs = Fs::new(storage);
     fs.scan(); // recover dynamic files (counter, resident creds) from flash
 
     let mut usb_vid = USB_VID;

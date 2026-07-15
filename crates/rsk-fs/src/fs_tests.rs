@@ -4,40 +4,11 @@
 use super::*;
 use crate::storage::ram::RamStorage;
 
-// A tiny static table: an RO file, a PIN-gated file (0x90), and a file whose
-// ACL uses the `& 0x9f == 0x10` auth-required encoding.
+// A stand-in working-EF fid used by the plain put/read tests.
 const KEY_DEV: u16 = 0xCC00;
-const PIN: u16 = 0x1080;
-const AUTH10: u16 = 0xCC10;
-static TABLE: &[FileDesc] = &[
-    FileDesc {
-        fid: KEY_DEV,
-        name: None,
-        parent: 0,
-        file_type: FILE_TYPE_WORKING_EF,
-        ef_structure: FILE_EF_TRANSPARENT,
-        acl: [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00], // ACL_RO: read allowed
-    },
-    FileDesc {
-        fid: PIN,
-        name: None,
-        parent: 0,
-        file_type: FILE_TYPE_WORKING_EF,
-        ef_structure: FILE_EF_TRANSPARENT,
-        acl: [0x90; 7], // PIN required for every op
-    },
-    FileDesc {
-        fid: AUTH10,
-        name: None,
-        parent: 0,
-        file_type: FILE_TYPE_WORKING_EF,
-        ef_structure: FILE_EF_TRANSPARENT,
-        acl: [0x10; 7], // auth required via the `& 0x9f == 0x10` arm
-    },
-];
 
 fn fs() -> Fs<RamStorage> {
-    Fs::new(RamStorage::new(), TABLE)
+    Fs::new(RamStorage::new())
 }
 
 /// A `Storage` that counts backend probes, proving the present-cache answers
@@ -97,7 +68,7 @@ fn put_read_size() {
 #[test]
 fn factory_wipe_erases_all_but_preserved() {
     let mut fs = fs();
-    fs.put(0x1080, b"pin").unwrap(); // a static-range file
+    fs.put(0x1080, b"pin").unwrap();
     fs.put(0xCF01, b"cred").unwrap(); // a dynamic resident credential
     fs.put(0xC000, b"ctr").unwrap(); // a counter
     fs.put(0xAAAA, b"keep").unwrap(); // stands in for the preserved attestation
@@ -109,7 +80,6 @@ fn factory_wipe_erases_all_but_preserved() {
     assert!(fs.read(0x1080, &mut buf).is_none());
     assert!(fs.read(0xCF01, &mut buf).is_none());
     assert!(fs.read(0xC000, &mut buf).is_none());
-    assert!(fs.search(0xCF01).is_none());
     // The preserved key survives, contents intact.
     assert_eq!(fs.read(0xAAAA, &mut buf), Some(4));
     assert_eq!(&buf[..4], b"keep");
@@ -127,25 +97,6 @@ fn factory_wipe_with_nothing_to_keep_empties_the_store() {
 }
 
 #[test]
-fn dynamic_files_and_reboot() {
-    let mut fs = fs();
-    // A FID not in the static table becomes a dynamic file on put.
-    assert!(fs.search(0xCF01).is_none());
-    fs.put(0xCF01, b"cred").unwrap();
-    assert!(fs.search(0xCF01).is_some());
-
-    // Model a reboot: rebuild Fs over the same storage and rescan.
-    let storage = fs.into_storage();
-    let mut fs2 = Fs::new(storage, TABLE);
-    assert!(fs2.search(0xCF01).is_none()); // not yet scanned
-    fs2.scan();
-    assert!(fs2.search(0xCF01).is_some());
-    let mut buf = [0u8; 8];
-    assert_eq!(fs2.read(0xCF01, &mut buf), Some(4));
-    assert_eq!(&buf[..4], b"cred");
-}
-
-#[test]
 fn put_over_dynamic_cap_commits_nothing() {
     // A `put` that overflows the dynamic-file set must fail atomically: reject
     // before touching flash, not commit the bytes and then report NoMemory —
@@ -158,14 +109,12 @@ fn put_over_dynamic_cap_commits_nothing() {
     let overflow = 0xD000 + MAX_DYNAMIC_FILES as u16;
     assert_eq!(fs.put(overflow, b"orphan"), Err(Error::NoMemory));
 
-    // The rejected value left no trace: unknown, absent, unreadable — this run
-    // and across a modelled reboot.
+    // The rejected value left no trace: absent, unreadable — this run and across
+    // a modelled reboot.
     let mut buf = [0u8; 8];
-    assert!(fs.search(overflow).is_none());
     assert!(fs.read(overflow, &mut buf).is_none());
-    let mut fs2 = Fs::new(fs.into_storage(), TABLE);
+    let mut fs2 = Fs::new(fs.into_storage());
     fs2.scan();
-    assert!(fs2.search(overflow).is_none());
     assert!(fs2.read(overflow, &mut buf).is_none());
 }
 
@@ -188,9 +137,8 @@ fn dynamic_budget_exceeds_the_old_256_cap() {
 fn delete_removes() {
     let mut fs = fs();
     fs.put(0xCF02, b"x").unwrap();
-    assert!(fs.search(0xCF02).is_some());
+    assert!(fs.has_data(0xCF02));
     fs.delete(0xCF02).unwrap();
-    assert!(fs.search(0xCF02).is_none());
     assert!(!fs.has_data(0xCF02));
 }
 
@@ -224,7 +172,7 @@ fn present_cache_rebuilt_by_scan() {
     fs.put(0xD20A, b"sig-cert").unwrap();
     fs.put(0xCF09, b"resident").unwrap();
     let storage = fs.into_storage();
-    let mut fs2 = Fs::new(storage, TABLE);
+    let mut fs2 = Fs::new(storage);
     fs2.scan();
     let mut buf = [0u8; 16];
     assert_eq!(fs2.read(0xD20A, &mut buf), Some(8));
@@ -241,7 +189,7 @@ fn absent_probe_confirms_once_then_caches() {
     // touches the backend again. Confirming (rather than trusting a bulk-scan
     // clear bit) is what prevents a post-power-cut false-absent; the PIV-tab
     // lag returns only as a one-time-per-boot first probe, then stays fast.
-    let mut fs = Fs::new(CountingStorage::new(), TABLE);
+    let mut fs = Fs::new(CountingStorage::new());
     let mut buf = [0u8; 8];
     assert_eq!(fs.read(0xD205, &mut buf), None); // unknown → one confirming read
     // Now decided-absent — answered from the cache, no backend.
@@ -265,7 +213,7 @@ fn confirm_on_miss_recovers_unscanned_key() {
     // building an Fs that never scanned it.
     let mut backend = RamStorage::new();
     backend.write(0xCF09, b"resident-cred").unwrap();
-    let mut fs = Fs::new(backend, TABLE);
+    let mut fs = Fs::new(backend);
     let mut buf = [0u8; 32];
     assert_eq!(fs.read(0xCF09, &mut buf), Some(13)); // recovered, not false-absent
     assert_eq!(&buf[..13], b"resident-cred");
@@ -283,7 +231,7 @@ fn meta_add_keeps_records_when_ef_meta_unknown() {
     fs.meta_add(0xB000, b"keep-me").unwrap();
     let backend = fs.into_storage(); // backend now holds EF_META = {B000}
     // Rebuild without scan() → EF_META is unknown (decided clear).
-    let mut fs2 = Fs::new(backend, TABLE);
+    let mut fs2 = Fs::new(backend);
     fs2.meta_add(0xB004, b"new").unwrap();
     assert_eq!(fs2.meta_find(0xB000, &mut [0u8; 16]), Some(7)); // survived
     assert_eq!(fs2.meta_find(0xB004, &mut [0u8; 16]), Some(3));
@@ -297,7 +245,7 @@ fn absent_delete_never_touches_the_backend() {
     // over absent slots is otherwise O(slots·partition): the FIDO reset
     // audit-ring scrub deletes AUDIT_RING_SLOTS(128) slots and measured ~12 s
     // on hardware, overrunning the conformance tool's 10 s reset timeout.
-    let mut fs = Fs::new(CountingStorage::new(), TABLE);
+    let mut fs = Fs::new(CountingStorage::new());
     for fid in 0xC110u16..0xC110 + 128 {
         fs.delete(fid).unwrap(); // all absent
     }
@@ -455,7 +403,7 @@ fn meta_delete_of_absent_record_does_not_rewrite() {
     // rewrite EF_META: a FIDO-reset sweep deletes many absent slots, and a
     // redundant rewrite each time is flash churn plus a needless torn-write
     // window. The sibling record must survive untouched.
-    let mut fs = Fs::new(CountingStorage::new(), TABLE);
+    let mut fs = Fs::new(CountingStorage::new());
     fs.meta_add(0xCF00, b"keep").unwrap(); // exactly one EF_META write
     fs.delete(0xB001).unwrap(); // neither data nor a meta record
     assert_eq!(fs.meta_find(0xCF00, &mut [0u8; 8]), Some(4)); // sibling intact
@@ -465,30 +413,4 @@ fn meta_delete_of_absent_record_does_not_rewrite() {
         "deleting a meta-less FID must not rewrite EF_META (only the setup write)"
     );
     assert_eq!(st.remove_calls, 0, "absent delete must not hit the backend");
-}
-
-#[test]
-fn new_file_then_put() {
-    let mut fs = fs();
-    fs.new_file(0xCF07).unwrap();
-    assert!(fs.search(0xCF07).is_some()); // registered...
-    assert!(!fs.has_data(0xCF07)); // ...but empty until written
-    fs.put(0xCF07, b"z").unwrap();
-    assert!(fs.has_data(0xCF07));
-}
-
-#[test]
-fn acl_gate() {
-    let mut fs = fs();
-    // RO file: read allowed, write denied.
-    assert!(fs.authenticate(KEY_DEV, crate::ACL_OP_READ_SEARCH));
-    assert!(!fs.authenticate(KEY_DEV, crate::ACL_OP_WRITE));
-    // PIN file (0x90) and 0x10-encoded file: both denied until authenticated.
-    assert!(!fs.authenticate(PIN, crate::ACL_OP_READ_SEARCH));
-    assert!(!fs.authenticate(AUTH10, crate::ACL_OP_READ_SEARCH));
-    fs.user_authenticated = true;
-    assert!(fs.authenticate(PIN, crate::ACL_OP_READ_SEARCH));
-    assert!(fs.authenticate(AUTH10, crate::ACL_OP_READ_SEARCH));
-    // Unknown/dynamic FID: default-allow (acl all-zero).
-    assert!(fs.authenticate(0xDEAD, crate::ACL_OP_WRITE));
 }

@@ -14,7 +14,7 @@ impl UserPresence for DenyPresence {
 }
 
 fn fs() -> Fs<RamStorage> {
-    Fs::new(RamStorage::new(), &[])
+    Fs::new(RamStorage::new())
 }
 
 fn select(app: &mut ManagementApplet<'_>, fs: &mut Fs<RamStorage>) -> (Sw, Vec<u8>) {
@@ -196,7 +196,7 @@ fn config_tlv_clamps_a_lying_over_read() {
         }
         fn for_each_key(&mut self, _: &mut dyn FnMut(u16)) {}
     }
-    let mut fs = Fs::new(OverRead, &[]);
+    let mut fs = Fs::new(OverRead);
     let mut out = [0u8; 256];
     let mut res = ResBuf::new(&mut out);
     assert_eq!(config_tlv(&[0u8; 4], &mut fs, &mut res), Sw::OK);

@@ -37,7 +37,7 @@ fn run(app: &mut OathApplet, fs: &mut Fs<RamStorage>, raw: &[u8]) {
 }
 
 fuzz_target!(|data: &[u8]| {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     fs.scan();
     let rng = RefCell::new(CountRng(0));
     let touch = RefCell::new(rsk_oath::AlwaysConfirm);

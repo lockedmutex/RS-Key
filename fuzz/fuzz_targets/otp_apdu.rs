@@ -52,7 +52,7 @@ fn crc16(data: &[u8]) -> u16 {
 }
 
 fuzz_target!(|data: &[u8]| {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     fs.scan();
     let presence = RefCell::new(AlwaysConfirm);
     let rng = RefCell::new(CountRng(0));

@@ -24,7 +24,7 @@ fn dev() -> Device<'static> {
 }
 
 fn fresh() -> Fs<RamStorage> {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     fs.scan();
     fs
 }

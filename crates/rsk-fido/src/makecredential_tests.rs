@@ -64,7 +64,7 @@ fn build_request(rk: bool) -> std::vec::Vec<u8> {
 }
 
 fn run(req: &[u8]) -> (std::vec::Vec<u8>, Fs<RamStorage>) {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let dev = Device {
         serial_hash: &[0xAB; 32],
         serial_id: &[1, 2, 3, 4, 5, 6, 7, 8],
@@ -90,7 +90,7 @@ fn run(req: &[u8]) -> (std::vec::Vec<u8>, Fs<RamStorage>) {
 }
 
 fn run_err(req: &[u8]) -> CtapError {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let dev = Device {
         serial_hash: &[0xAB; 32],
         serial_id: &[1, 2, 3, 4, 5, 6, 7, 8],
@@ -122,7 +122,7 @@ impl crate::UserPresence for Decline {
 
 // `run_err` with a declining button, to prove an operation is touch-gated.
 fn run_err_no_touch(req: &[u8]) -> CtapError {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let dev = Device {
         serial_hash: &[0xAB; 32],
         serial_id: &[1, 2, 3, 4, 5, 6, 7, 8],
@@ -280,7 +280,7 @@ fn makecred_cancel_maps_keepalive_cancel() {
         }
     }
     let req = mc_build(4, good_params);
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let dev = Device {
         serial_hash: &[0xAB; 32],
         serial_id: &[1, 2, 3, 4, 5, 6, 7, 8],
@@ -420,7 +420,7 @@ fn unsupported_alg_rejected() {
         e.str("type").unwrap().str("public-key").unwrap();
         e.writer().position()
     };
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let dev = Device {
         serial_hash: &[0xAB; 32],
         serial_id: &[1, 2, 3, 4, 5, 6, 7, 8],
@@ -450,7 +450,7 @@ fn enterprise_attestation_uses_org_chain_when_provisioned() {
     use p256::EncodedPoint;
     use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
 
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let dev = Device {
         serial_hash: &[0xAB; 32],
         serial_id: &[1, 2, 3, 4, 5, 6, 7, 8],
@@ -565,7 +565,7 @@ fn missing_mandatory_param_rejected() {
             .unwrap();
         e.writer().position()
     };
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let dev = Device {
         serial_hash: &[0xAB; 32],
         serial_id: &[1, 2, 3, 4, 5, 6, 7, 8],
@@ -846,7 +846,7 @@ fn hmac_secret_mc_empty_salt_rejected() {
 
 #[test]
 fn min_pin_length_extension_for_listed_rp() {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut rng = SeqRng(1);
     ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
     // EF_MINPINLEN = [minLen=6, force=0, sha256("example.com")].
@@ -981,7 +981,7 @@ fn large_blob_key_in_make_credential() {
 
 #[test]
 fn make_credential_with_pin_sets_uv_flag() {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut rng = SeqRng(1);
     ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
     let mut state = crate::FidoState::new();
@@ -1010,7 +1010,7 @@ fn make_credential_with_pin_sets_uv_flag() {
 
 #[test]
 fn make_credential_requires_pin_when_set() {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut rng = SeqRng(1);
     ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
     let mut state = crate::FidoState::new();
@@ -1034,7 +1034,7 @@ fn make_credential_requires_pin_when_set() {
 
 #[test]
 fn always_uv_requires_user_verification_without_pin() {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut rng = SeqRng(1);
     ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
     let mut state = crate::FidoState::new();
@@ -1060,7 +1060,7 @@ fn always_uv_requires_user_verification_without_pin() {
 
 #[test]
 fn make_credential_bad_pin_auth_rejected() {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut rng = SeqRng(1);
     ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
     let mut state = crate::FidoState::new();
@@ -1107,7 +1107,7 @@ fn selected_alg(algs: &[i64]) -> Result<i64, CtapError> {
         e.writer().position()
     };
 
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let dev = Device {
         serial_hash: &[0xAB; 32],
         serial_id: &[1, 2, 3, 4, 5, 6, 7, 8],
@@ -1204,7 +1204,7 @@ fn build_request_ea(ea: u64) -> std::vec::Vec<u8> {
 // Run makeCredential with enterprise attestation enabled/disabled (the
 // enable persists in flash — EF_EA_ENABLED — per CTAP 2.1).
 fn run_ea(req: &[u8], enable: bool) -> Result<(std::vec::Vec<u8>, Fs<RamStorage>), CtapError> {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut rng = SeqRng(1);
     ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
     let mut out = [0u8; 1024];
@@ -1329,7 +1329,7 @@ fn enterprise_type1_non_eligible_ignores_org_key() {
     // request for an RP NOT on the enterprise list must NOT use the org/EP cert.
     // It returns a normal basic_full attestation with the DEVICE's own cert and
     // no `ep` — never the enterprise batch cert.
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut rng = SeqRng(1);
     ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
     crate::seed::store_att_key(&dev(), &mut fs, &[0x21u8; 32]).unwrap();

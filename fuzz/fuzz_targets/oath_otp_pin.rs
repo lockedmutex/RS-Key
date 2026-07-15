@@ -67,7 +67,7 @@ fuzz_target!(|data: &[u8]| {
     // Both generations: None exercises the legacy/serial arm, Some exercises the
     // v1 OTP-rooted verifier and its without_otp() fallback.
     for otp in [None, Some([0x5A; 32])] {
-        let mut fs = Fs::new(RamStorage::new(), &[]);
+        let mut fs = Fs::new(RamStorage::new());
         fs.scan();
         // Seed the fuzzer's raw record (EF_OTP_PIN is a plaintext verifier slot).
         if fs.put(EF_OTP_PIN, rec).is_err() {

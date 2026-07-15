@@ -34,10 +34,8 @@ impl Storage for MetaBlob<'_> {
     fn for_each_key(&mut self, _f: &mut dyn FnMut(u16)) {}
 }
 
-static TABLE: &[rsk_fs::FileDesc] = &[];
-
 fuzz_target!(|data: &[u8]| {
-    let mut fs = Fs::new(MetaBlob(data), TABLE);
+    let mut fs = Fs::new(MetaBlob(data));
     let mut out = [0u8; 256];
     for fid in [0x0000, 0xCF01, 0xE010, 0xFFFF] {
         let _ = fs.meta_find(fid, &mut out);

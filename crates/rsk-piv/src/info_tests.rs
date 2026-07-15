@@ -5,7 +5,7 @@ use super::*;
 use rsk_fs::storage::ram::RamStorage;
 
 fn fs() -> Fs<RamStorage> {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     fs.scan();
     fs
 }

@@ -45,7 +45,7 @@ fuzz_target!(|data: &[u8]| {
     };
     let mut rng = CountRng(1);
 
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     fs.scan();
     // Seed EF_DEVCERT_KEY with the fuzzer's bytes — any on-flash shape (a legacy
     // CBC record, a pre-OTP or OTP GCM record, or garbage). The raw-FID `put` is

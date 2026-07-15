@@ -270,7 +270,7 @@ fn resident_key_input_v2_is_reseal_stable_v1_follows_box() {
 #[test]
 fn store_then_dedup_and_rp_count() {
     let d = dev();
-    let mut fs: Fs<RamStorage> = Fs::new(RamStorage::new(), &[]);
+    let mut fs: Fs<RamStorage> = Fs::new(RamStorage::new());
     let rp_hash = sha256(b"example.com");
 
     let mut out = [0u8; 512];
@@ -337,7 +337,7 @@ fn v3_record_roundtrips_box_and_cached_pubkey() {
     // Store with a cached point (a 65-byte stand-in): the record must carry the
     // length-prefixed trailer, and both the box and the point must read back.
     let point = [0x04u8; 65];
-    let mut fs: Fs<RamStorage> = Fs::new(RamStorage::new(), &[]);
+    let mut fs: Fs<RamStorage> = Fs::new(RamStorage::new());
     credential_store(
         &SEED,
         &d,
@@ -446,7 +446,7 @@ fn truncate_utf8_is_exhaustively_safe() {
 
 #[test]
 fn remaining_rk_clamps_by_shared_file_budget() {
-    let mut fs: Fs<RamStorage> = Fs::new(RamStorage::new(), &[]);
+    let mut fs: Fs<RamStorage> = Fs::new(RamStorage::new());
     // Plenty of free files → the EF_CRED headroom (256 − used) binds, as before.
     assert_eq!(remaining_rk(&mut fs, 10), MAX_RESIDENT_CREDENTIALS - 10);
 

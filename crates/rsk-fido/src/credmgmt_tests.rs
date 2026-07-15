@@ -128,7 +128,7 @@ fn parse_mc(resp: &[u8]) -> (std::vec::Vec<u8>, [u8; 32], [u8; 32]) {
 }
 
 fn setup() -> (Fs<RamStorage>, SeqRng) {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut rng = SeqRng(1);
     ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
     (fs, rng)
@@ -757,7 +757,7 @@ fn rp_present(fs: &mut Fs<RamStorage>, state: &mut FidoState, rp_hash: &[u8; 32]
 
 #[test]
 fn missing_param_is_puat_required() {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut state = armed(PERM_CM);
     let mut out = [0u8; 64];
     // {1: 1} — getCredsMetadata with no pinUvAuthParam.

@@ -258,7 +258,7 @@ fn load_req(buf: &mut [u8], blob: &[u8]) -> usize {
 }
 
 fn setup() -> (Fs<RamStorage>, SeqRng, FidoState) {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut rng = SeqRng(1);
     ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
     (fs, rng, FidoState::new())

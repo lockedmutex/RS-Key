@@ -52,7 +52,7 @@ fuzz_target!(|data: &[u8]| {
     // (skipped when over-length), then the OTP boot migration must recover and
     // re-seal them — never orphan (drop) or double-seal (corrupt).
     {
-        let mut fs = Fs::new(RamStorage::new(), &[]);
+        let mut fs = Fs::new(RamStorage::new());
         fs.scan();
         if seal_put(&dev_old, &mut fs, &mut rng, fid, data) {
             let n = seal_read(&dev_old, &mut fs, fid, &mut out).expect("a fresh seal must unseal");
@@ -75,7 +75,7 @@ fuzz_target!(|data: &[u8]| {
     // Robustness: migrate_seal over arbitrary raw stored bytes (not a valid seal)
     // must never panic, under either generation, and leave a readable-or-absent slot.
     {
-        let mut fs = Fs::new(RamStorage::new(), &[]);
+        let mut fs = Fs::new(RamStorage::new());
         fs.scan();
         let _ = fs.put(SLOT_FID, data);
         rsk_otp::migrate_seal(&dev_new, &mut fs, &mut rng);

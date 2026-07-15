@@ -75,7 +75,7 @@ fn config_request(subcmd: u8, subpara: &[u8], token: &[u8; 32]) -> std::vec::Vec
 }
 
 fn run(state: &mut FidoState, req: &[u8]) -> CtapResult {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut rng = SeqRng(1);
     let mut out = [0u8; 64];
     let mut presence = crate::AlwaysConfirm;
@@ -107,7 +107,7 @@ fn run_fs(fs: &mut Fs<RamStorage>, state: &mut FidoState, req: &[u8]) -> CtapRes
 
 #[test]
 fn set_min_pin_length_stores_policy() {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut state = armed(PERM_ACFG);
     let req = config_request(0x03, &subpara_min_pin(6), &TOKEN);
     assert_eq!(run_fs(&mut fs, &mut state, &req), Ok(0));
@@ -121,7 +121,7 @@ fn set_min_pin_length_rejects_truncating_value() {
     // run-3 #3: a newMinPINLength above the max PIN length must be rejected
     // before the `as u8` store, which would truncate (256 -> 0) and pass the
     // `256 < current` monotonic guard while silently lowering the floor.
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut state = armed(PERM_ACFG);
     assert_eq!(
         run_fs(
@@ -146,7 +146,7 @@ fn set_min_pin_length_rejects_truncating_value() {
 
 #[test]
 fn toggle_always_uv_flips_state() {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut state = armed(PERM_ACFG);
     let req = config_request(CONFIG_TOGGLE_ALWAYS_UV as u8, &[], &TOKEN);
     // Off by default; first toggle enables, second disables.
@@ -161,7 +161,7 @@ fn toggle_always_uv_flips_state() {
 fn toggle_always_uv_requires_acfg_permission() {
     // The shared token check rejects a token lacking the acfg permission, so
     // alwaysUv cannot be flipped without it.
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut state = armed(0);
     let req = config_request(CONFIG_TOGGLE_ALWAYS_UV as u8, &[], &TOKEN);
     assert_eq!(
@@ -189,7 +189,7 @@ fn subpara_min_pin_rpids(new_min: u64, rp_ids: &[&str]) -> std::vec::Vec<u8> {
 
 #[test]
 fn set_min_pin_stores_rpid_hashes() {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut state = armed(PERM_ACFG);
     let req = config_request(0x03, &subpara_min_pin_rpids(6, &["example.com"]), &TOKEN);
     assert_eq!(run_fs(&mut fs, &mut state, &req), Ok(0));
@@ -202,7 +202,7 @@ fn set_min_pin_stores_rpid_hashes() {
 
 #[test]
 fn set_min_pin_cannot_be_lowered() {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut state = armed(PERM_ACFG);
     run_fs(
         &mut fs,
@@ -252,7 +252,7 @@ fn config_without_param_is_puat_required() {
 
 #[test]
 fn enable_enterprise_attestation() {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut state = armed(PERM_ACFG);
     let req = config_request(0x01, &[], &TOKEN);
     assert_eq!(run_fs(&mut fs, &mut state, &req), Ok(0));
@@ -262,7 +262,7 @@ fn enable_enterprise_attestation() {
 
 #[test]
 fn set_min_pin_forces_change_when_pin_too_short() {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     // A 4-char PIN on file (`[retries, len, format, verifier…]`).
     let mut pin_file = [0u8; 35];
     pin_file[0] = 8;
@@ -324,7 +324,7 @@ fn vendor_req(sub: &[u8], token: &[u8; 32]) -> std::vec::Vec<u8> {
 
 #[test]
 fn picoforge_config_sets_vidpid_in_phy() {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut st = armed(PERM_ACFG);
     let vidpid = (0x1050u64 << 16) | 0x0407; // Yubico
     let sub = subpara_vendor_int(CONFIG_PHY_VIDPID, vidpid);
@@ -337,7 +337,7 @@ fn picoforge_config_sets_vidpid_in_phy() {
 
 #[test]
 fn picoforge_config_sets_led_gpio_and_options_in_phy() {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let g = subpara_vendor_int(CONFIG_PHY_LED_GPIO, 22);
     let mut st = armed(PERM_ACFG);
     assert_eq!(run_fs(&mut fs, &mut st, &vendor_req(&g, &TOKEN)), Ok(0));
@@ -352,7 +352,7 @@ fn picoforge_config_sets_led_gpio_and_options_in_phy() {
 
 #[test]
 fn picoforge_config_requires_acfg_permission() {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut st = armed(0); // no acfg permission
     let sub = subpara_vendor_int(CONFIG_PHY_VIDPID, 0x1050_0407);
     assert_eq!(

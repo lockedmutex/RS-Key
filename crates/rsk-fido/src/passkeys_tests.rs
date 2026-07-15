@@ -29,7 +29,7 @@ fn dev() -> Device<'static> {
 }
 
 fn provisioned() -> (Fs<RamStorage>, [u8; 32]) {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut rng = SeqRng(1);
     ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
     let seed = load_keydev(&dev(), &mut fs).unwrap();
@@ -172,7 +172,7 @@ fn true_total_even_when_visitor_keeps_fewer() {
 
 #[test]
 fn empty_when_unprovisioned() {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut calls = 0;
     let total = for_each_rp(&dev(), &mut fs, |_| calls += 1);
     assert_eq!(total, 0);

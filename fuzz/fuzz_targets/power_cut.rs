@@ -206,7 +206,7 @@ fn reboot_verify(
 ) {
     loop {
         shared.dead.set(false);
-        *fs = Fs::new(TortureStorage::new(shared.clone()), &[]);
+        *fs = Fs::new(TortureStorage::new(shared.clone()));
         fs.scan();
         if shared.dead.get() {
             continue; // the cut landed inside the mount/repair — die again
@@ -331,7 +331,7 @@ fuzz_target!(|data: &[u8]| {
         flash: flash.clone(),
         dead: dead.clone(),
     };
-    let mut fs = Fs::new(TortureStorage::new(shared.clone()), &[]);
+    let mut fs = Fs::new(TortureStorage::new(shared.clone()));
     fs.scan();
 
     let mut val: HashMap<u16, Vec<u8>> = HashMap::new();

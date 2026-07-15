@@ -29,7 +29,7 @@ fn dev() -> Device<'static> {
 
 #[test]
 fn reset_wipes_state_and_regenerates() {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut rng = SeqRng(1);
     ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
     // Provisioned state: a PIN, a resident credential, an advanced counter,
@@ -103,7 +103,7 @@ impl crate::UserPresence for Fixed {
 
 #[test]
 fn reset_aborts_without_touch() {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut rng = SeqRng(1);
     ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
     fs.put(EF_PIN, &[8, 4, 1, 0, 0]).unwrap();

@@ -56,7 +56,7 @@ fn provisioned() -> &'static RamStorage {
     static IMG: OnceLock<RamStorage> = OnceLock::new();
     IMG.get_or_init(|| {
         let d = dev();
-        let mut fs = Fs::new(RamStorage::new(), &[]);
+        let mut fs = Fs::new(RamStorage::new());
         let mut rng = SeqRng(1);
         let _ = ensure_seed(&d, &mut fs, &mut rng);
         let rp_hash = sha256(b"a.co");
@@ -101,7 +101,7 @@ fn provisioned() -> &'static RamStorage {
 
 fuzz_target!(|data: &[u8]| {
     let d = dev();
-    let mut fs = Fs::new(provisioned().clone(), &[]);
+    let mut fs = Fs::new(provisioned().clone());
     fs.scan();
     let mut rng = SeqRng(2);
 

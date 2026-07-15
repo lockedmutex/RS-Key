@@ -34,7 +34,7 @@ fuzz_target!(|data: &[u8]| {
         ..dev_old
     };
 
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     if fs.put(EF_KEY_DEV, data).is_err() {
         return;
     }

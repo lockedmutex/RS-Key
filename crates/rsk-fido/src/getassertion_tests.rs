@@ -346,7 +346,7 @@ fn ga_request(allow: Option<&[u8]>) -> std::vec::Vec<u8> {
 }
 
 fn setup() -> (Fs<RamStorage>, SeqRng) {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut rng = SeqRng(1);
     ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
     (fs, rng)

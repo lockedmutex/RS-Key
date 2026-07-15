@@ -68,7 +68,7 @@ fuzz_target!(|data: &[u8]| {
     const SERIAL_ID: [u8; 8] = [0x12, 0x34, 0x56, 0x78, 1, 2, 3, 4];
     const SERIAL_HASH: [u8; 32] = [0x22; 32];
 
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     fs.scan();
 
     let rng = RefCell::new(SeqRng(1));

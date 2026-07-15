@@ -89,7 +89,7 @@ fn product_string_stops_at_nul_and_caps_at_32() {
 
 #[test]
 fn save_and_load() {
-    let mut fs = rsk_fs::Fs::new(rsk_fs::storage::ram::RamStorage::new(), &[]);
+    let mut fs = rsk_fs::Fs::new(rsk_fs::storage::ram::RamStorage::new());
     assert!(load(&mut fs).is_none());
     let phy = PhyData {
         led_brightness: Some(50),
