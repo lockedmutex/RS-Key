@@ -156,6 +156,54 @@ impl Drop for CredKey {
     }
 }
 
+/// Build a boxed ML-DSA-44 credential key from the ratchet seed. `#[inline(never)]`
+/// is load-bearing: `MlDsa44::from_seed` has a ~100 KiB matrix-expansion frame, and
+/// folding it into [`CredKey::from_raw`] would size that function's frame for the
+/// lattice worst case on EVERY curve — a P-256 getAssertion would then reserve
+/// ~100 KiB it never uses and overflow the worker stack (a hard, replug-only wedge).
+#[inline(never)]
+fn mldsa44_from_raw(raw: &[u8]) -> Option<CredKey> {
+    let mut xi = [0u8; 32];
+    xi.copy_from_slice(raw.get(..32)?);
+    let key = Box::new(rsk_crypto::MlDsa44::from_seed(&xi));
+    xi.zeroize();
+    Some(CredKey::MlDsa44(key))
+}
+
+/// Boxed ML-DSA-65 credential key from the ratchet seed — same
+/// stack-isolation rationale as [`mldsa44_from_raw`].
+#[inline(never)]
+fn mldsa65_from_raw(raw: &[u8]) -> Option<CredKey> {
+    let mut xi = [0u8; 32];
+    xi.copy_from_slice(raw.get(..32)?);
+    let key = Box::new(rsk_crypto::MlDsa65::from_seed(&xi));
+    xi.zeroize();
+    Some(CredKey::MlDsa65(key))
+}
+
+/// Hedged FIPS 204 ML-DSA-44 signing (32 fresh RNG bytes per signature), kept
+/// `#[inline(never)]` for the same reason as [`mldsa44_from_raw`]: the streaming
+/// sign has a ~50 KiB frame that must not be folded into [`CredKey::sign`]'s frame
+/// — which every EC assertion pays.
+#[inline(never)]
+fn mldsa44_sign<R: Rng>(k: &rsk_crypto::MlDsa44, msg: &[u8], rng: &mut R, out: &mut [u8]) -> usize {
+    let mut rnd = [0u8; 32];
+    rng.fill(&mut rnd);
+    let n = k.sign(msg, &rnd, out).unwrap_or(0);
+    rnd.zeroize();
+    n
+}
+
+/// ML-DSA-65 counterpart of [`mldsa44_sign`].
+#[inline(never)]
+fn mldsa65_sign<R: Rng>(k: &rsk_crypto::MlDsa65, msg: &[u8], rng: &mut R, out: &mut [u8]) -> usize {
+    let mut rnd = [0u8; 32];
+    rng.fill(&mut rnd);
+    let n = k.sign(msg, &rnd, out).unwrap_or(0);
+    rnd.zeroize();
+    n
+}
+
 impl CredKey {
     /// Build the key for `curve` (a `CURVE_*` id) from the ratchet output
     /// `raw`: read the curve's scalar byte length, masking the P-521 top byte
@@ -203,27 +251,13 @@ impl CredKey {
                 seed.zeroize();
                 Some(Self::Ed25519(key))
             }
-            c if c == CURVE_MLDSA44 as i64 => {
-                // The ratchet's first 32 bytes are the FIPS 204 keygen seed ξ;
-                // expansion is deterministic, so the same credential id always
-                // rebuilds the same lattice keypair (as the EC schemes do).
-                // Boxed onto the heap so the ~13 KB keypair is off the worker
-                // stack before the stack-heavy `sign` runs (see the variant doc).
-                let mut xi = [0u8; 32];
-                xi.copy_from_slice(raw.get(..32)?);
-                let key = Box::new(rsk_crypto::MlDsa44::from_seed(&xi));
-                xi.zeroize();
-                Some(Self::MlDsa44(key))
-            }
-            c if c == CURVE_MLDSA65 as i64 => {
-                // Same 32-byte-seed derivation as -44, the ML-DSA-65 parameter
-                // set. Boxed off the worker stack (see the variant doc).
-                let mut xi = [0u8; 32];
-                xi.copy_from_slice(raw.get(..32)?);
-                let key = Box::new(rsk_crypto::MlDsa65::from_seed(&xi));
-                xi.zeroize();
-                Some(Self::MlDsa65(key))
-            }
+            // The lattice keygen (`from_seed`) has a ~100 KiB matrix-expansion
+            // frame; keep it behind an `#[inline(never)]` call so it is NOT folded
+            // into `from_raw`'s own frame, which would otherwise reserve that
+            // ~100 KiB on EVERY credential — even a P-256 getAssertion — and
+            // overflow the worker stack. See [`mldsa44_from_raw`].
+            c if c == CURVE_MLDSA44 as i64 => mldsa44_from_raw(raw),
+            c if c == CURVE_MLDSA65 as i64 => mldsa65_from_raw(raw),
             _ => None,
         }
     }
@@ -299,21 +333,10 @@ impl CredKey {
                 let s: ed25519_dalek::Signature = k.sign(msg);
                 put(&s.to_bytes(), out)
             }
-            Self::MlDsa44(k) => {
-                // Hedged FIPS 204 signing: 32 fresh RNG bytes per signature.
-                let mut rnd = [0u8; 32];
-                rng.fill(&mut rnd);
-                let n = k.sign(msg, &rnd, out).unwrap_or(0);
-                rnd.zeroize();
-                n
-            }
-            Self::MlDsa65(k) => {
-                let mut rnd = [0u8; 32];
-                rng.fill(&mut rnd);
-                let n = k.sign(msg, &rnd, out).unwrap_or(0);
-                rnd.zeroize();
-                n
-            }
+            // Kept behind `#[inline(never)]` so the ~50 KiB streaming-sign frame is
+            // not folded into this function's frame (paid by every EC assertion).
+            Self::MlDsa44(k) => mldsa44_sign(k, msg, rng, out),
+            Self::MlDsa65(k) => mldsa65_sign(k, msg, rng, out),
         }
     }
 

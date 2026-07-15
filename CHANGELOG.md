@@ -28,6 +28,20 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   is no longer promised slots the store can't back. RAM cost ~8 KiB; no on-flash
   format change (the indexes are rebuilt from flash on boot, so provisioned devices
   upgrade transparently). bcdDevice → `0x0811`.
+
+### Fixed
+
+- **getAssertion no longer wedges the device after the capacity bump.** The
+  credential-key builder (`CredKey::from_raw`) and signer (`CredKey::sign`) folded
+  the lattice (ML-DSA) key-expansion / streaming-sign frames — ~106 KiB and ~50 KiB —
+  into their own stack frames, so **every** assertion, including a P-256 one that
+  never touches ML-DSA, reserved that ~106 KiB on the worker stack. With the capacity
+  bump's extra ~16 KiB of static RAM shrinking that stack, a getAssertion overflowed
+  it into the adjacent USB/IRQ wakers and hung the device hard (still USB-enumerated
+  but unresponsive on HID and CCID, recoverable only by replug). The ML-DSA build/sign
+  arms are moved behind `#[inline(never)]` helpers so their large frames stay off the
+  EC path; a P-256 getAssertion's builder/signer frames are now negligible.
+  HW-verified on the full capacity build. bcdDevice → `0x0812`.
 - **PIV GET METADATA is faster: a key slot's public point is now cached in its
   metadata record** instead of being recomputed on every probe. `ykman piv info`
   and the Yubico Authenticator read `GET METADATA` (INS 0xF7) for every slot, and
