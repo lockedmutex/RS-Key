@@ -1,7 +1,7 @@
 # Threat model
 
 What RS-Key defends against, what it deliberately does not, and the honest
-residuals in between. The defenses compose in tiers — each one assumes the
+residuals in between. The defenses compose in tiers: each one assumes the
 ones before it.
 
 ![What RS-Key defends and what is out of scope — attacker-controlled USB bytes enter the RP2350 and pass through three composing tiers: memory-safe parsers (safe Rust plus fuzzing), then protocol gates (PIN/UV, touch, management key), then the key material, which is additionally protected by an at-rest seal meaningful after the OTP master-key burn; physical and lab attacks and a compromised, unlocked host are explicitly out of scope and reach the device undefended, since the RP2350 is not a secure element](images/threat-tiers.svg)
@@ -19,11 +19,11 @@ keys, OATH secrets, OTP slot secrets, PINs.
 Everything arriving over USB is attacker-controlled: CTAPHID frames, the CCID
 bulk stream, ISO-7816 APDUs, CTAP2 CBOR. Defenses:
 
-- **Memory safety.** `no_std` Rust end to end; the parsers and applet
+- **Memory safety.** `no_std` Rust end to end. The parsers and applet
   dispatch are safe code. The handful of `unsafe` sites are enumerated and
   justified in [unsafe.md](unsafe.md).
 - **Fuzzing.** Every parser and every applet's full dispatch path has a
-  `cargo-fuzz` target (30+); see [testing.md](testing.md).
+  `cargo-fuzz` target (30+). See [testing.md](testing.md).
 - **Protocol gates.** PINs/UV with retry counters and lockout, physical-touch
   requirements on FIDO operations and OpenPGP UIF, OATH access codes, PIV
   management-key auth.
@@ -31,7 +31,7 @@ bulk stream, ISO-7816 APDUs, CTAP2 CBOR. Defenses:
   while the device is plugged in and unlocked (sign, decrypt, assert). A
   security key authenticates *presence and possession*, not the intent of
   every byte the host sends. Touch requirements bound the rate.
-- **The residual gap is *intent* — the trusted-display flavor closes it.** Because
+- **The residual gap is *intent*. The trusted-display flavor closes it.** Because
   a standard key attests presence and possession, a malicious page can silently
   drive an authorized key over WebUSB to phish a real sign-in ([demonstrated
   against YubiKeys in Chrome](https://www.wired.com/story/chrome-yubikey-phishing-webusb/)).
@@ -47,32 +47,32 @@ bulk stream, ISO-7816 APDUs, CTAP2 CBOR. Defenses:
   and the OTP master key once provisioned), OpenPGP keys under the
   PIN-wrapped DEK chain.
 - **OTP master key** ([production.md](production.md) stage 1): with the MKEK
-  fused and page-58 hard-locked, a flash dump — even with BOOTSEL access and
-  the chip id — does not reproduce the sealing key. Without the burn, the
+  fused and page-58 hard-locked, a flash dump (even with BOOTSEL access and
+  the chip id) does not reproduce the sealing key. Without the burn, the
   sealing key derives from on-chip state an attacker with full flash + chip
-  access could reconstruct; the burn is what makes at-rest real.
+  access could reconstruct. The burn is what makes at-rest real.
 - **Soft-lock** ([guides/soft-lock.md](guides/soft-lock.md)): optionally, the
   seed at rest is additionally wrapped with ChaCha20-Poly1305 under a 32-byte
-  key only you hold (BIP-39/SLIP-39 words). A stolen device — even running
-  genuine firmware — refuses every FIDO operation until that key is presented
+  key only you hold (BIP-39/SLIP-39 words). A stolen device (even running
+  genuine firmware) refuses every FIDO operation until that key is presented
   over an encrypted channel at power-up. Device + words, two factors.
-- Caveat — superseded records linger: the flash log is append-only, so
+- Caveat: superseded records linger. The flash log is append-only, so
   re-sealing or deleting a secret leaves the old copy on flash until its page
   is reclaimed. Two cases differ in how much that matters:
   - The **OTP-burn migration** supersedes the *pre-OTP* seed, which was sealed
     under the chip-serial-only root (no fuse secret). Left alone, a flash dump
-    plus the chip id would recover it — bypassing the burn. So it is **not**
+    plus the chip id would recover it, bypassing the burn. So it is **not**
     left to lazy healing: the first boot after provisioning runs a one-shot
     compaction (`Fs::compact`, gated by the `EF_HARDENED` marker, crash-safe)
     that drives a full GC lap over the credential partition and physically
     erases every superseded pre-OTP record before the device re-attaches to USB.
   - The **soft-lock** transition leaves the same kind of lingering record, but
-    on a provisioned device it is already sealed under the fused root — moot
-    against anything short of a fused-key compromise — so soft-lock's at-rest
+    on a provisioned device it is already sealed under the fused root (moot
+    against anything short of a fused-key compromise), so soft-lock's at-rest
     guarantee simply hardens over time as natural compaction overwrites it.
 - The FIDO seed is **never PIN-wrapped at rest** (a deliberate design
-  decision): UP-only operations — `ssh ed25519-sk`, U2F, no-PIN assertions —
-  must work from a cold boot with no PIN presented, so a PIN-keyed at-rest
+  decision). UP-only operations (`ssh ed25519-sk`, U2F, no-PIN assertions)
+  must work from a cold boot with no PIN presented. So a PIN-keyed at-rest
   copy adds no protection an attacker couldn't bypass via the always-loadable
   copy, while breaking those flows. At-rest strength is the kbase (tier
   above), not the PIN.
@@ -83,8 +83,8 @@ bulk stream, ISO-7816 APDUs, CTAP2 CBOR. Defenses:
   refuses unsigned images, so no foreign code ever runs to read the OTP key
   in secure mode. Glitch detectors are fused on along the way.
 - **Anti-rollback** ([anti-rollback.md](anti-rollback.md), optional): with
-  `ROLLBACK_REQUIRED` fused, images below your board's rollback floor — or
-  carrying no version at all, i.e. anything sealed before the feature — no
+  `ROLLBACK_REQUIRED` fused, images below your board's rollback floor (or
+  carrying no version at all, i.e. anything sealed before the feature) no
   longer boot. A kept copy of an old signed release with a since-fixed bug
   stops being a downgrade path.
 - Before secure boot is enabled, this attacker wins against the OTP tier:
@@ -94,7 +94,7 @@ bulk stream, ISO-7816 APDUs, CTAP2 CBOR. Defenses:
 ### 4. Physical / lab attacks — OUT OF SCOPE
 
 Decapping, microprobing, advanced fault injection beyond the RP2350's glitch
-detectors, power/EM side channels, and the **XIP TOCTOU** — interposing on the
+detectors, power/EM side channels, and the **XIP TOCTOU**: interposing on the
 QSPI bus to serve the genuine image to secure boot's verifier and a tampered one
 to the CPU, since nothing binds checked bytes to executed bytes and the image is
 too large to verify-in-place from SRAM. An in-package-flash part (RP2354) leaves
@@ -104,50 +104,50 @@ threat model includes a funded lab, buy a certified key.
 
 ### 5. Network
 
-None. The device speaks USB only; there is no radio and no IP stack.
+None. The device speaks USB only. There is no radio and no IP stack.
 
 ## Platform silicon: the RP2350 security challenges
 
-Raspberry Pi has publicly stress-tested the RP2350 die, and the results bound
+Raspberry Pi has publicly stress-tested the RP2350 die. The results bound
 RS-Key's physical-attack posture.
 
 **Challenge 1 broke the A2 stepping** ([results][c1]). The task was to extract an
 OTP secret from a board running secure boot. The winning attacks:
 
-- **Aedan Cullen** — voltage glitch on the `USB_OTP_VDD` rail, reading OTP
+- **Aedan Cullen**: voltage glitch on the `USB_OTP_VDD` rail, reading OTP
   secrets out of the guarded path (erratum E16) ([writeup][cullen], [talk][c38c3]).
-- **Marius Muench** — a glitch plus a boot-ROM flaw, bypassing secure boot to run
+- **Marius Muench**: a glitch plus a boot-ROM flaw, bypassing secure boot to run
   unsigned code.
-- **Kévin Courdesses** — laser fault injection corrupting the boot-time signature
+- **Kévin Courdesses**: laser fault injection corrupting the boot-time signature
   check (erratum E24) ([writeup][courk]).
-- **IOActive** — focused-ion-beam (FIB) plus passive voltage contrast (PVC),
+- **IOActive**: focused-ion-beam (FIB) plus passive voltage contrast (PVC),
   reading the antifuse array directly: the bitwise OR of two physically paired
   bitcell rows ([writeup][ioactive]).
 
-The first three are comparatively cheap fault / boot-ROM attacks; the IOActive
+The first three are comparatively cheap fault / boot-ROM attacks. The IOActive
 readout needs FIB-class lab equipment (a tool worth hundreds of thousands of
 dollars, one to two days per target) and applies to *every* device built on the
-Synopsys `dwc_nvm_ts40*` antifuse IP on TSMC's 40 nm node — an antifuse property,
+Synopsys `dwc_nvm_ts40*` antifuse IP on TSMC's 40 nm node, an antifuse property,
 not an RP2350-specific defect.
 
-**The A4 stepping fixes the fault and boot-ROM attacks in silicon — but not the
+**The A4 stepping fixes the fault and boot-ROM attacks in silicon, but not the
 antifuse readout** ([announcement][a4]). A4 closes the boot-ROM errata
 (E20/E21/E24, including the laser signature bypass) in a new boot ROM, the OTP
 power-glitch (E16) through changes to the wrapper circuitry around the OTP macro,
 and the GPIO errata (E9, E3). The antifuse-array PVC readout is explicitly **not**
-fixed in A4; Raspberry Pi's guidance is to mitigate it by how secrets are stored
-in OTP — the chaffing RS-Key applies (see [otp-fuses.md](otp-fuses.md)). A third
-challenge — power side-channel analysis of the secure-boot AES — is open with no
+fixed in A4. Raspberry Pi's guidance is to mitigate it by how secrets are stored
+in OTP, the chaffing RS-Key applies (see [otp-fuses.md](otp-fuses.md)). A third
+challenge (power side-channel analysis of the secure-boot AES) is open with no
 break reported ([challenge 2][c2]).
 
-**What this means for RS-Key.** Our development boards are **A2** — the broken
+**What this means for RS-Key.** Our development boards are **A2**: the broken
 stepping, kept as the conservative worst case. The firmware is **A4-compatible**,
 and A4 is recommended for the fault / boot-ROM attacks above. Against the antifuse
-readout — which no stepping fixes — RS-Key applies the chaffing mitigation
+readout (which no stepping fixes), RS-Key applies the chaffing mitigation
 directly ([otp-fuses.md](otp-fuses.md)). What remains out of scope is unchanged: a
 funded lab with FIB/PVC, laser fault injection, or power/EM analysis against a
 device in hand. No software or provisioning choice on a general-purpose die closes
-those — that is what a dedicated secure element is for ([limitations.md](limitations.md)).
+those. That is what a dedicated secure element is for ([limitations.md](limitations.md)).
 
 [c1]: https://www.raspberrypi.com/news/security-through-transparency-rp2350-hacking-challenge-results-are-in/
 [a4]: https://www.raspberrypi.com/news/rp2350-a4-rp2354-and-a-new-hacking-challenge/
@@ -159,15 +159,15 @@ those — that is what a dedicated secure element is for ([limitations.md](limit
 
 ## Seed backup (the deliberate exception)
 
-A FIDO authenticator's pitch is non-exportable keys; the wallet-style backup
+A FIDO authenticator's pitch is non-exportable keys. The wallet-style backup
 is a conscious trade for recoverability, gated accordingly. Export moves the
 seed over an ephemeral encrypted channel (P-256 ECDH → HKDF →
-ChaCha20-Poly1305), and requires — all at once — physical touch, the FIDO
+ChaCha20-Poly1305), and requires (all at once) physical touch, the FIDO
 PIN/UV token when a PIN is set, and the **one-time setup window**: after an
 explicit `finalize`, export is refused until a full reset regenerates a new
 seed. Malware cannot exfiltrate the seed silently or later. Restore re-seals
 the seed under the *destination* chip's root. The host driving a backup
-necessarily sees the seed plaintext — do it on a machine you trust.
+necessarily sees the seed plaintext. Do it on a machine you trust.
 Scope: the deterministic identity only (resident passkeys, OpenPGP, PIV are
 not covered).
 
@@ -175,7 +175,7 @@ On the **trusted-display flavor** the host need not be in that trust path: the
 device can render its BIP-39 recovery phrase **on its own screen** (the seed is
 turned into words on-device and never crosses USB), so a backup can be taken
 without trusting any host. That trades the host-observation surface for a
-physical/visual one — the words are briefly on the panel (shoulder-surf, camera).
+physical/visual one. The words are briefly on the panel (shoulder-surf, camera).
 It is gated to keep that surface small: it requires a **device PIN** set and
 re-entered, a deliberate hold past an explicit "no one watching" warning, runs
 only inside the same one-time window (and seal closes it), is disabled on the
@@ -202,36 +202,36 @@ ends: session state and PIN/UV tokens on drop, transient key copies at end of
 scope including error paths, and the transport/exchange buffers as soon as a
 message completes (requests carry PINs and imported keys). Accepted
 residuals: `Copy` temporaries inside RustCrypto curve arithmetic, digest
-internals, and heap temporaries inside the `rsa` crate — short-lived,
+internals, and heap temporaries inside the `rsa` crate. Short-lived,
 library-internal, not wipeable without forking the crates.
 
 ## Supply chain & process
 
 - `cargo audit` + `cargo deny` (advisories, license allow-list, source
   policy) and `gitleaks` run in `scripts/check.sh` and the pre-commit hook.
-- Dependencies are pinned (`Cargo.lock`); the git dependencies are restricted
+- Dependencies are pinned (`Cargo.lock`). The git dependencies are restricted
   to the embassy organization.
 - One known-unfixed advisory is accepted deliberately: RUSTSEC-2023-0071
-  (Marvin timing side channel in `rsa`) — the OpenPGP RSA backend, mitigated
-  by per-operation base blinding on **every** private-key path (PKCS#1 v1.5
-  sign, decipher, and the raw fallback `rsa_raw`); rationale in `deny.toml`.
-  The [constant-time audit](ct-audit.md) verified that this blinding leaves no
-  unblinded private-exponent path.
+  (Marvin timing side channel in `rsa`), the OpenPGP RSA backend. It is
+  mitigated by per-operation base blinding on **every** private-key path
+  (PKCS#1 v1.5 sign, decipher, and the raw fallback `rsa_raw`). Rationale in
+  `deny.toml`. The [constant-time audit](ct-audit.md) verified that this
+  blinding leaves no unblinded private-exponent path.
 
 ## Post-quantum notes
 
-ML-DSA-44 (COSE −48) and ML-DSA-65 (COSE −49) FIDO2 credentials — both the
-in-tree `rsk-mldsa` crate — with hedged signing (32 fresh DRBG bytes
+ML-DSA-44 (COSE −48) and ML-DSA-65 (COSE −49) FIDO2 credentials (both the
+in-tree `rsk-mldsa` crate) with hedged signing (32 fresh DRBG bytes
 per signature; the hedge and expanded keys are zeroized). `rsk-mldsa` streams
 the FIPS 204 matrix A on the fly so ML-DSA-65's keygen+sign fit the RP2350
-stack — a hand-written implementation, so its constant-time posture is a
-source-level claim (branch-free reductions, masked norm checks, no secret
-division), not proven at machine code; it is checked byte-for-byte against
-NIST ACVP KATs, with Kani proofs over the reductions and rounding. ML-DSA-87 (−50) is out of
+stack. It is hand-written, so its constant-time posture is a source-level
+claim (branch-free reductions, masked norm checks, no secret division), not
+proven at machine code. It is checked byte-for-byte against NIST ACVP KATs,
+with Kani proofs over the reductions and rounding. ML-DSA-87 (−50) is out of
 reach on this chip (keygen overflows the stack; its makeCredential response
 also overruns the CTAPHID message ceiling). ML-KEM-768 is compiled in as
 scaffolding but nothing calls it until a CTAP PQC PIN/UV protocol exists.
-None of these has a third-party audit yet — the same standing as the rest of
+None of these has a third-party audit yet, the same standing as the rest of
 the RustCrypto stack, tracked via cargo-audit/deny.
 
 ## Reporting

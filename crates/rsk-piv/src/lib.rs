@@ -692,20 +692,23 @@ impl PivApplet<'_> {
                 Sw::OK
             }
             s if is_key(s) => {
-                if !fs.has_key(key_fid(s)) {
-                    return Sw::REFERENCE_NOT_FOUND;
-                }
-                let mut meta = [0u8; 8];
+                // meta_find below gates existence (delete clears the meta record
+                // unconditionally), so the old separate has_key probe here was a
+                // redundant per-slot flash fetch on every GET METADATA — dropped.
+                // Sized to hold a cached EC public point trailing the 4-byte
+                // [algo, pin_pol, touch_pol, origin] head (see slot_pubkey_tlv).
+                let mut meta = [0u8; 4 + MAX_EC_POINT];
                 let Some(n) = fs.meta_find(key_fid(s).get(), &mut meta) else {
                     return Sw::REFERENCE_NOT_FOUND;
                 };
+                let n = n.min(meta.len());
                 if n < 4 {
                     return Sw::REFERENCE_NOT_FOUND;
                 }
                 res.extend(&[0x01, 0x01, meta[0]]);
                 res.extend(&[0x02, 0x02, meta[1], meta[2]]);
                 res.extend(&[0x03, 0x01, meta[3]]);
-                self.slot_pubkey_tlv(dev, fs, s, meta[0], res)
+                self.slot_pubkey_tlv(dev, fs, s, &meta[..n], res)
             }
             _ => Sw::REFERENCE_NOT_FOUND,
         }
@@ -718,11 +721,11 @@ impl PivApplet<'_> {
         dev: &Device,
         fs: &mut Fs<S>,
         slot: u8,
-        algo: u8,
+        meta: &[u8],
         res: &mut ResBuf,
     ) -> Sw {
         let mut body = [0u8; MAX_RSA_PUBDO];
-        let n = match algo {
+        let n = match meta[0] {
             ALGO_RSA1024 | ALGO_RSA2048 | ALGO_RSA3072 | ALGO_RSA4096 => {
                 let key = match seal::load_rsa_key(dev, fs, key_fid(slot)) {
                     Ok(k) => k,
@@ -735,19 +738,30 @@ impl PivApplet<'_> {
                 full - 5
             }
             ALGO_ECCP256 | ALGO_ECCP384 | ALGO_ED25519 | ALGO_X25519 => {
-                let key = match seal::load_ec_key(dev, fs, key_fid(slot)) {
-                    Ok(k) => k,
-                    Err(_) => return Sw::EXEC_ERROR,
-                };
+                // Emit the slot public point without recomputing the ~tens-of-ms
+                // `d·G`. Prefer the per-slot cache file (O(1), works at any slot
+                // count); then the legacy in-EF_META cache (older keys that fit);
+                // finally derive it from the sealed scalar (pre-cache keys).
                 let mut point = [0u8; MAX_EC_POINT];
-                let plen = match key.public_point(&mut point) {
-                    Ok(p) => p,
-                    Err(e) => return e,
+                let pt: &[u8] = if let Some(pn) = fs.read(pubkey_fid(slot), &mut point) {
+                    &point[..pn.min(point.len())]
+                } else if meta.len() > 4 {
+                    &meta[4..]
+                } else {
+                    let key = match seal::load_ec_key(dev, fs, key_fid(slot)) {
+                        Ok(k) => k,
+                        Err(_) => return Sw::EXEC_ERROR,
+                    };
+                    let plen = match key.public_point(&mut point) {
+                        Ok(p) => p,
+                        Err(e) => return e,
+                    };
+                    &point[..plen]
                 };
                 body[0] = 0x86;
-                let ll = format_len(plen as u16, &mut body[1..4]);
-                body[1 + ll..1 + ll + plen].copy_from_slice(&point[..plen]);
-                1 + ll + plen
+                let ll = format_len(pt.len() as u16, &mut body[1..4]);
+                body[1 + ll..1 + ll + pt.len()].copy_from_slice(pt);
+                1 + ll + pt.len()
             }
             _ => return Sw::REFERENCE_NOT_FOUND,
         };
@@ -862,12 +876,16 @@ impl PivApplet<'_> {
             } else if let Some(tofid) = cert_to {
                 let _ = fs.delete(tofid);
             }
-            let mut meta = [0u8; 8];
+            // Sized to read the full source record (head + any cached point).
+            // The point is carried to the destination best-effort — kept when
+            // EF_META has room, else dropped to the head alone (see meta_add_slot).
+            let mut meta = [0u8; 4 + MAX_EC_POINT];
             match fs.meta_find(key_fid(from).get(), &mut meta) {
                 Some(n) => {
-                    if fs.meta_add(key_fid(to).get(), &meta[..n]).is_err() {
+                    let n = n.min(meta.len());
+                    if let Err(e) = keygen::meta_add_slot(fs, key_fid(to).get(), &meta[..n]) {
                         blob.zeroize();
-                        return Sw::MEMORY_FAILURE;
+                        return e;
                     }
                 }
                 None => {
@@ -875,8 +893,19 @@ impl PivApplet<'_> {
                 }
             }
         }
+        // Carry the cached public point to the destination slot (best-effort), then
+        // drop the source's — MOVE relocates the whole slot. Skip the carry when
+        // `to == 0xFF` (the delete sentinel): there is no destination slot, so a put
+        // to `pubkey_fid(0xFF)` would only strand an unread `0xD4FF` orphan file.
+        if to != 0xFF {
+            let mut pk = [0u8; MAX_EC_POINT];
+            if let Some(pn) = fs.read(pubkey_fid(from), &mut pk) {
+                let _ = fs.put(pubkey_fid(to), &pk[..pn.min(pk.len())]);
+            }
+        }
         blob.zeroize();
         let _ = fs.delete_key(key_fid(from));
+        let _ = fs.delete(pubkey_fid(from));
         if let Some(f) = cert_from {
             let _ = fs.delete(f);
         }

@@ -37,7 +37,7 @@ fn otp_dev() -> Device<'static> {
 }
 
 fn fs() -> Fs<RamStorage> {
-    Fs::new(RamStorage::new(), &[])
+    Fs::new(RamStorage::new())
 }
 
 /// Manually CBC-seal a scalar the pre-#16 way (fixed serial-hash IV, bare 32

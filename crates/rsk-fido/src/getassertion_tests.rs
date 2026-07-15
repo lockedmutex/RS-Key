@@ -2,7 +2,7 @@
 // Copyright (C) 2026 RS-Key contributors
 
 use super::*;
-use crate::consts::ALG_ES256;
+use crate::consts::{ALG_ES256, EF_ALWAYS_UV};
 use crate::makecredential::make_credential;
 use crate::seed::ensure_seed;
 use minicbor::Decoder;
@@ -346,7 +346,7 @@ fn ga_request(allow: Option<&[u8]>) -> std::vec::Vec<u8> {
 }
 
 fn setup() -> (Fs<RamStorage>, SeqRng) {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut rng = SeqRng(1);
     ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
     (fs, rng)
@@ -656,6 +656,7 @@ fn discovery_returns_stored_resident_id() {
     for (i, b) in sentinel.iter_mut().enumerate() {
         *b = 0xC0 ^ i as u8;
     }
+    sentinel[8] = 2; // keep the v3 marker so the record's pubkey trailer still parses
     rec[32..RECORD_PREFIX].copy_from_slice(&sentinel);
     fs.put(EF_CRED, &rec[..n]).unwrap();
 
@@ -1462,7 +1463,7 @@ fn stored_box_and_seed(fs: &mut Fs<RamStorage>) -> (std::vec::Vec<u8>, [u8; 32])
     let mut rec = [0u8; 1024];
     let n = fs.read(EF_CRED, &mut rec).unwrap();
     let seed = crate::seed::load_keydev(&dev(), fs).unwrap();
-    (rec[RECORD_PREFIX..n].to_vec(), seed)
+    (cred_record_box(&rec[..n]).to_vec(), seed)
 }
 
 fn cose_xy(e: &mut Encoder<Cursor<&mut [u8]>>, x: &[u8; 32], y: &[u8; 32]) {
@@ -1694,8 +1695,8 @@ fn hmac_secret_survives_updateuserinfo_reseal_end_to_end() {
     let mc = run_mc_state(&mut fs, &mut rng, &mut state, &mc_request_lbk_hmac());
     let (resident_id, ..) = parse_mc(&mc);
     assert_eq!(
-        resident_id[8], 1,
-        "new resident credential carries the v2 marker"
+        resident_id[8], 2,
+        "new resident credential carries the v3 marker"
     );
 
     // Platform half (protocol two): ECDH against the authenticator ephemeral,

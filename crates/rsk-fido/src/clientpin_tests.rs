@@ -29,7 +29,7 @@ fn dev() -> Device<'static> {
 }
 
 fn setup() -> (Fs<RamStorage>, SeqRng) {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut rng = SeqRng(1);
     ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
     (fs, rng)
@@ -1176,13 +1176,10 @@ fn pin_verify_fails_closed_when_the_retry_write_does_not_persist() {
     }
 
     let drop_writes = Rc::new(Cell::new(false));
-    let mut fs = Fs::new(
-        StaleEfPin {
-            inner: RamStorage::new(),
-            drop_ef_pin_writes: drop_writes.clone(),
-        },
-        &[],
-    );
+    let mut fs = Fs::new(StaleEfPin {
+        inner: RamStorage::new(),
+        drop_ef_pin_writes: drop_writes.clone(),
+    });
     let mut rng = SeqRng(1);
     ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
 

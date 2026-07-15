@@ -4,16 +4,16 @@
 # rsk-tui — the terminal cockpit
 
 `rsk-tui` is a host-side dashboard for an RS-Key. It talks to the device
-directly — CTAPHID over hidapi and the CCID applets over PC/SC — so it does not
+directly (CTAPHID over hidapi and the CCID applets over PC/SC), so it does not
 shell out to `rsk` or any other process. It lives in its own workspace
 (`tools/tui`), separate from the firmware, and links the host PC/SC and HID
 stacks.
 
 It is a companion to the `rsk` CLI, not a replacement: the cockpit covers the
 safe, day-to-day reads and a few in-band actions (LED, seed backup, reboot,
-audit, identity verify). Irreversible production rituals — secure-boot staging,
-OTP fuses, factory resets, soft-lock, attestation import — stay in the CLI on
-purpose, and the cockpit points you at the exact command instead of doing them.
+audit, identity verify). Irreversible production rituals (secure-boot staging,
+OTP fuses, factory resets, soft-lock, attestation import) stay in the CLI on
+purpose. The cockpit points you at the exact command instead of doing them.
 
 ![rsk-tui cockpit — a terminal dashboard: a header with the device summary, a sidebar of sections (Overview selected, then FIDO, OpenPGP, PIV, OATH/OTP, Backup, LED, Audit, Reboot/Maintenance, Help), an Overview panel grouping Identity, Transports and Security rows, an actions panel, an events log and a key-binding footer](../images/tui-cockpit.svg)
 
@@ -33,7 +33,7 @@ rsk-tui              # interactive cockpit
 ```
 
 Without Nix, run it from its workspace (the repo defaults to the firmware
-target, so name the host target explicitly — this is what the launcher does):
+target, so name the host target explicitly; this is what the launcher does):
 
 ```sh
 cargo run --release --manifest-path tools/tui/Cargo.toml \
@@ -42,7 +42,7 @@ cargo run --release --manifest-path tools/tui/Cargo.toml \
 
 On Linux the CCID half needs `pcscd` + a polkit rule; see
 [linux.md](../linux.md). FIDO works as soon as the udev rules are in place. If
-PC/SC is down, the cockpit still starts — the FIDO sections work and every CCID
+PC/SC is down, the cockpit still starts: the FIDO sections work and every CCID
 field shows `CCID unavailable` rather than a fabricated value.
 
 ### Flags
@@ -50,7 +50,7 @@ field shows `CCID unavailable` rather than a fabricated value.
 | Flag            | Effect                                                          |
 |-----------------|----------------------------------------------------------------|
 | *(none)*        | interactive cockpit                                            |
-| `--demo`, `--mock` | interactive cockpit against a **simulated** device — no hardware needed |
+| `--demo`, `--mock` | interactive cockpit against a **simulated** device, no hardware needed |
 | `--once`        | print the gathered status once (human-readable) and exit       |
 | `--json`        | one-shot machine-readable status (JSON) and exit               |
 | `--selftest [PIN]` | native backup export/restore round-trip (needs a no-touch build) |
@@ -60,10 +60,10 @@ field shows `CCID unavailable` rather than a fabricated value.
 key plugged in. Demo data is clearly labelled `[DEMO]` and every simulated
 action is prefixed `[demo]`; it never pretends to touch hardware.
 
-`--json` and `--once` are the scriptable paths — both gather one snapshot and
+`--json` and `--once` are the scriptable paths. Both gather one snapshot and
 exit, so they fit a health check or a CI probe. `--json` emits a stable,
 explicit object (`identity`, `fido`, `backup`, `secure_boot`, `rollback`,
-`applets`, `errors`, …); `--once` is the same data formatted for a human. Either
+`applets`, `errors`, ...); `--once` is the same data formatted for a human. Either
 honours `--demo`, so you can shape a pipeline against the mock first:
 
 ```sh
@@ -72,8 +72,8 @@ rsk-tui --once --demo            # see the field layout without a key
 ```
 
 `--selftest` drives the native MSE channel + clientPIN token + BIP-39 path
-end-to-end — export a seed, re-derive its fingerprint, restore it, confirm the
-fingerprint is stable — without revealing the seed. It needs a **no-touch
+end-to-end: export a seed, re-derive its fingerprint, restore it, confirm the
+fingerprint is stable, all without revealing the seed. It needs a **no-touch
 firmware build** (the touch build would block waiting for a button press), and
 takes the FIDO2 PIN as an optional positional argument if one is set.
 
@@ -117,7 +117,7 @@ The sidebar narrows and the event panel drops away on small terminals; the UI
 keeps working down to a few rows. Status uses an `OK / WARN / ERR / UNK / N/A`
 word plus a colored glyph, so it reads on a monochrome or color-blind terminal.
 `N/A` is reserved for things the device supports but the TUI deliberately leaves
-to the CLI — it is never a faked or unknown value. Set `RSK_TUI_ASCII=1` (or run
+to the CLI. It is never a faked or unknown value. Set `RSK_TUI_ASCII=1` (or run
 in a non-UTF-8 locale) to force ASCII glyphs (`[+] [!] [x] [?] [-]` instead of
 `● ▲ ✖ ○ –`); a UTF-8 `LANG`/`LC_*` is auto-detected otherwise.
 
@@ -135,7 +135,7 @@ in a non-UTF-8 locale) to force ASCII glyphs (`[+] [!] [x] [?] [-]` instead of
 | `q` or `Ctrl-C` | quit (terminal restored on exit) |
 
 The status also auto-refreshes every few seconds while you are in the normal
-view — never while a modal is open, so a read can't redraw over a PIN prompt or
+view, never while a modal is open, so a read can't redraw over a PIN prompt or
 hammer the CCID bus mid-task.
 
 Inside a modal the keys narrow to that modal: a text/PIN input takes characters +
@@ -159,7 +159,7 @@ as you type, `↑`/`↓` pick, `Enter` jumps to that action's section and starts
 | Reboot / Maintenance | device summary | Reboot → app, Reboot → BOOTSEL |
 | Help | key bindings, section guide, safety model | — |
 
-The applet sections (OpenPGP, PIV, OATH, OTP) show **presence only** — whether
+The applet sections (OpenPGP, PIV, OATH, OTP) show **presence only**: whether
 the applet answered `SELECT`. Reading their contents (keys, accounts, retry
 counters) needs the applet's own tooling, so those rows point you at the command
 instead: `gpg --card-status` ([openpgp.md](openpgp.md)), `ykman piv info`,
@@ -167,32 +167,32 @@ instead: `gpg --card-status` ([openpgp.md](openpgp.md)), `ykman piv info`,
 
 **Verify identity** issues a fresh 16-byte challenge, has the device sign it
 with its DEVK-derived P-256 attestation key (vendor `AUDIT_CHECKPOINT`), and
-**verifies the ECDSA signature locally** over `tag‖head‖seq‖challenge` — it is a
+**verifies the ECDSA signature locally** over `tag‖head‖seq‖challenge`. This is a
 real cryptographic check, not a display of device-asserted bytes. On success it
 prints an 8-byte **fingerprint** of the attestation public key. Record that
 fingerprint: a later `rsk inventory verify --expect-key <hex>` (or `rsk audit
 verify --expect-key …`) pins it, so a swapped or cloned board fails the check
 instead of quietly verifying. Verify needs a touch, the FIDO2 PIN if one is set,
-and a provisioned OTP DEVK — without the DEVK it says
+and a provisioned OTP DEVK. Without the DEVK it says
 `no OTP DEVK provisioned — attestation unavailable` rather than guessing.
 
 **Read journal** dumps the tamper-evident audit log (vendor `AUDIT_READ`): a
 hash-chained sequence of events (`BOOT`, `MAKE_CREDENTIAL`, `GET_ASSERTION`,
-`PIN_SET`, `BACKUP_EXPORT`, `CHECKPOINT`, …) folded into an epoch, with the
-running chain `head`. It is read-only — the device never lets the host rewrite
-it — and asks for the FIDO2 PIN if one is set, or a physical touch if not. The full cross-check against the
+`PIN_SET`, `BACKUP_EXPORT`, `CHECKPOINT`, ...) folded into an epoch, with the
+running chain `head`. It is read-only (the device never lets the host rewrite
+it) and asks for the FIDO2 PIN if one is set, or a physical touch if not. The full cross-check against the
 signed head lives in `rsk audit verify`.
 
-**LED** reads the four LED states the firmware drives — `idle`, `processing`,
-`touch`, `boot` — each with a color and brightness, plus whether the idle LED is
+**LED** reads the four LED states the firmware drives (`idle`, `processing`,
+`touch`, `boot`), each with a color and brightness, plus whether the idle LED is
 steady or blinking. *Cycle idle color* steps the idle color through the palette
 (`red → green → blue → yellow → magenta → cyan → white`, then wraps) and writes
 it back; it is a cosmetic, unauthenticated setting, not a security control.
 
 ### PINs in the cockpit
 
-Every PIN the TUI asks for is the **FIDO2 clientPIN** — the same one
-`rsk fido set-pin` manages — not an OpenPGP PW1/PW3 or a PIV PIN. It gates the
+Every PIN the TUI asks for is the **FIDO2 clientPIN** (the same one
+`rsk fido set-pin` manages), not an OpenPGP PW1/PW3 or a PIV PIN. It gates the
 in-band actions that need it: Verify, Read journal, and seed Export/Restore (when
 a PIN is set). If no clientPIN is set, those actions skip the prompt. OpenPGP and
 PIV PINs are only ever entered in their own tools (`gpg`, `ykman`), never here.
@@ -200,22 +200,22 @@ PIV PINs are only ever entered in their own tools (`gpg`, `ykman`), never here.
 ### CLI-only / unsupported in the TUI
 
 These are surfaced as menu entries that, when selected, print the exact command
-to run — they are never performed from the cockpit:
+to run. They are never performed from the cockpit:
 
 - **FIDO**: set/change PIN (`rsk fido set-pin`), list resident passkeys (`rsk
   fido list-passkeys --pin …`), factory reset (`ykman fido reset`)
 - **OpenPGP / PIV / OATH / OTP**: full card data and factory resets (`gpg
   --card-status`, `ykman piv info`, `ykman oath accounts`, `rsk openpgp reset`,
-  `ykman piv reset`, …). The `ykman` commands gate on the "Yubico YubiKey"
+  `ykman piv reset`, ...). The `ykman` commands gate on the "Yubico YubiKey"
   reader name, so they only see the device on the opt-in `VIDPID=Yubikey5`
   build; `gpg` and `rsk` work on the default RS-Key build.
-- **Backup**: SLIP-39 *restore* (recombining shares) — `rsk backup restore
+- **Backup**: SLIP-39 *restore* (recombining shares): `rsk backup restore
   --scheme slip39`. SLIP-39 *export* is now in the cockpit (2-of-3 shares, via
   the in-tree `rsk-slip39` crate); other T-of-N splits stay in the CLI
   ([seed-backup.md](seed-backup.md))
 - **Maintenance** (Reboot section): seed soft-lock (`rsk lock enable | unlock |
   disable`), org-attestation import/clear (`rsk fido attestation import | clear`),
-  secure-boot staging, OTP fuses — see [production.md](../production.md) and
+  secure-boot staging, OTP fuses. See [production.md](../production.md) and
   [otp-fuses.md](../otp-fuses.md)
 
 Credential and passkey counts are not shown because there is no unauthenticated
@@ -228,23 +228,23 @@ way to read them; use `rsk fido list-passkeys --pin …`.
   (`SEAL`), reboot to BOOTSEL (`BOOTSEL`). The typed word must match exactly
   (case-sensitive); anything else cancels the action. Reboot to app uses a
   yes/no prompt. *Finalize* is refused outright once the window is already
-  sealed — it explains rather than re-confirming.
+  sealed. It explains rather than re-confirming.
 - **PINs are masked** on entry and **never written to the event log**. The log
   additionally redacts any live PIN/phrase substring as a backstop, and it is a
-  bounded ring (the last 200 lines), so nothing accumulates on disk — it is only
+  bounded ring (the last 200 lines), so nothing accumulates on disk. It is only
   ever in memory.
 - **The seed is shown only after you confirm export.** It appears once, in a
   modal, is zeroized from memory when you press a key, and **never reaches the
   event log or any file**. The same goes for a restore phrase you type in.
 - Sensitive buffers (PIN, phrase, revealed seed) are wiped (`zeroize`) on cancel,
-  on submit, and on Ctrl-C — `Ctrl-C` wipes the in-flight buffer *before* it
+  on submit, and on Ctrl-C. `Ctrl-C` wipes the in-flight buffer *before* it
   quits, from any modal.
-- The terminal is restored on every exit path — `q`, `Ctrl-C`, an I/O error, or
+- The terminal is restored on every exit path: `q`, `Ctrl-C`, an I/O error, or
   a panic (device I/O can panic, so a panic hook leaves the alternate screen and
   raw mode first).
 
 The seed backup flows here are exactly the BIP-39 export/restore/finalize of
-`rsk backup`, just interactive — same touch + PIN + setup-window gates, same
+`rsk backup`, just interactive: same touch + PIN + setup-window gates, same
 forever-sealed semantics after finalize. Read [seed-backup.md](seed-backup.md)
 for what a backup does and does not recover before you rely on it.
 
@@ -253,22 +253,22 @@ for what a backup does and does not recover before you rely on it.
 `tools/tui/src` is split so rendering, state, and I/O stay separate and the UI
 is testable without hardware:
 
-- `model.rs` — typed state (`DeviceSnapshot`, `TransportStatus`, `Section`,
-  `Action`, `ActionResult`, `EventLog`, …) and `--json` serialization. No I/O.
-- `device.rs` — native CTAPHID + PC/SC I/O behind a `DeviceProvider` trait, with
+- `model.rs`: typed state (`DeviceSnapshot`, `TransportStatus`, `Section`,
+  `Action`, `ActionResult`, `EventLog`, ...) and `--json` serialization. No I/O.
+- `device.rs`: native CTAPHID + PC/SC I/O behind a `DeviceProvider` trait, with
   `HardwareProvider` (real) and `MockProvider` (`--demo`). Holds the native seed
   backup crypto: the MSE channel (P-256 ECDH → HKDF → ChaCha20-Poly1305) and the
   clientPIN protocol-two token (ECDH + HKDF + AES-CBC + HMAC).
-- `app.rs` — app state, navigation, and the modal/confirmation flow.
-- `actions.rs` — action dispatch + result handling (the one place that blocks on
+- `app.rs`: app state, navigation, and the modal/confirmation flow.
+- `actions.rs`: action dispatch + result handling (the one place that blocks on
   device I/O; it paints a "working — touch the device…" line and redraws *before*
   the blocking call so the prompt is visible).
-- `input.rs` — key handling → state change + `Flow`.
-- `ui.rs` — rendering only.
-- `theme.rs` — styles, colors, ASCII fallback.
+- `input.rs`: key handling → state change + `Flow`.
+- `ui.rs`: rendering only.
+- `theme.rs`: styles, colors, ASCII fallback.
 
-Because the UI is driven by a `DeviceProvider`, the whole cockpit — navigation,
-confirmation flows, secret redaction, rendering — is unit-tested against the
+Because the UI is driven by a `DeviceProvider`, the whole cockpit (navigation,
+confirmation flows, secret redaction, rendering) is unit-tested against the
 mock with no device attached.
 
 ```sh

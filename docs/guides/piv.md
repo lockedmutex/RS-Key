@@ -3,9 +3,9 @@
 A PIV smart-card (NIST SP 800-73-4) over CCID: X.509 client certificates,
 S/MIME, PIV-aware OS login, SSH and `age` through PKCS#11. Driven with
 `ykman piv` or `yubico-piv-tool`; the applet also speaks the Yubico extensions
-(metadata, serial, attestation, move/delete, set-retries) those tools use. Note
-that `ykman piv` and `yubico-piv-tool` gate on the "Yubico YubiKey" reader name,
-which the default RS-Key build (VID:PID `0x1209:0x0001`) does not present — they
+(metadata, serial, attestation, move/delete, set-retries) those tools use.
+`ykman piv` and `yubico-piv-tool` gate on the "Yubico YubiKey" reader name,
+which the default RS-Key build (VID:PID `0x1209:0x0001`) does not present. They
 need the opt-in `VIDPID=Yubikey5` interop build ([build.md](../build.md)). The
 PKCS#11 / OpenSC and OS-native (macOS CryptoTokenKit, Windows) routes below
 identify the card by its applet, not the reader name, so they work on the default
@@ -43,26 +43,26 @@ The applet accepts AES-128/192/256 management keys; under the FIPS-style build
 it refuses to *set* a new 3DES key, though an existing 3DES key still
 authenticates so a reflashed device can migrate itself to AES.
 
-**On the panel (trusted-display builds).** The PIV PIN and PUK can be changed —
-and a blocked PIN unblocked with the PUK — on the device, no host needed:
+**On the panel (trusted-display builds).** The PIV PIN and PUK can be changed
+(and a blocked PIN unblocked with the PUK) on the device, no host needed:
 Settings → Security → **PIV PIN** → *Change PIN* / *Change PUK* / *Unblock PIN*.
 Each verifies the current PIN/PUK against the applet's own retry counter (shown
 on the pad) and stores the new value in the 8-byte `0xFF`-padded wire form, so a
 later `ykman` / `yubico-piv-tool` VERIFY accepts it.
 
 A 24-byte **management key** can't be typed on a numeric pad, so the panel sets a
-**random, PIN-protected** one instead — Settings → Security → **PIV PIN** →
+**random, PIN-protected** one instead: Settings → Security → **PIV PIN** →
 *Protect mgmt key*. The device generates a random AES-256 management key, seals
 it, and marks it PIN-protected (the ykman `--protect` scheme), so a host then
-uses it with just the PIV PIN — `ykman piv info` shows it as protected and
+uses it with just the PIV PIN. `ykman piv info` shows it as protected and
 `ykman piv` operations no longer need the hex key. **Security:** once protected,
 the PIV PIN **alone** grants management access (it unlocks the random key), so
 treat the PIN accordingly; the panel states this and gates the action behind the
 device PIN and a hold. (`ykman piv access change-management-key --generate
 --protect` does the same thing from the host.)
 
-The panel manages PINs/PUKs that follow the standard PIV convention — **6–8
-digits, padded to 8 bytes with `0xFF`** — which is what `ykman`, `yubico-piv-tool`
+The panel manages PINs/PUKs that follow the standard PIV convention (**6–8
+digits, padded to 8 bytes with `0xFF`**), which is what `ykman`, `yubico-piv-tool`
 and OpenSC all use. A PIN or PUK provisioned *outside* that convention (e.g.
 hand-crafted raw `CHANGE REFERENCE DATA` / `RESET RETRY` APDUs that store an
 unpadded or sub-6-digit value) can't be verified on the panel; re-set it with
@@ -87,7 +87,7 @@ out of the box.
 
 The signature slot (`9c`) demands the PIN before **every** private-key
 operation; the other slots cache the PIN for the rest of the session after one
-VERIFY. `9e` carries no special default on this firmware — like the other
+VERIFY. `9e` carries no special default on this firmware. Like the other
 non-signature slots it defaults to PIN **once per session**, so a default-policy
 9e key still needs one VERIFY before use. For true card-auth / contactless
 no-PIN behaviour, generate the 9e key with an explicit `--pin-policy NEVER`.
@@ -95,7 +95,7 @@ no-PIN behaviour, generate the 9e key with an explicit `--pin-policy NEVER`.
 **Algorithms.** On-card generation and import accept **RSA-2048 / 3072 / 4096**,
 **RSA-1024** (disabled under the FIPS-style build, SP 800-131A), **ECC P-256 /
 P-384**, and the Curve25519 pair **Ed25519** (signing) and **X25519** (key
-agreement) — the Yubico 5.7 PIV algorithm ids `0xE0` / `0xE1`, so `ykman` drives
+agreement), the Yubico 5.7 PIV algorithm ids `0xE0` / `0xE1`, so `ykman` drives
 them as `--algorithm ED25519` / `X25519`. An Ed25519 key generates with a
 self-signed certificate like the other curves; an X25519 key is key-agreement-only
 and can't self-sign, so generation writes **no** auto-certificate (provision one
@@ -123,10 +123,10 @@ ykman piv certificates import 9a issued.pem
 ```
 
 On-card generation means the private key never existed off-device and cannot be
-exported or backed up — losing the card loses the key (that is the point). RSA
+exported or backed up. Losing the card loses the key (that is the point). RSA
 generation is slow on this hardware (RSA-2048 takes roughly 4–6 s, and the prime
 search is random so run-to-run times vary; the device streams CCID keepalives so
-the connection stays alive — it is not a hang). See [limitations.md](../limitations.md)
+the connection stays alive; it is not a hang). See [limitations.md](../limitations.md)
 for the measured dual-core figures. EC generation is instant.
 
 ## Or import an existing key
@@ -138,7 +138,7 @@ ykman piv certificates import 9d existing-cert.pem
 
 Import is management-key gated and also accepts RSA-2048/1024, P-256/P-384 and
 Ed25519/X25519.
-An imported key keeps whatever copy you imported it from — your call which way
+An imported key keeps whatever copy you imported it from. Your call which way
 the trade-off goes. Imported keys **cannot be attested** (see below): attestation
 proves on-card *generation*, which import didn't do.
 
@@ -160,10 +160,10 @@ ykman piv keys generate --pin-policy ALWAYS --touch-policy ALWAYS 9a pub.pem
 |---|---|
 | `NEVER` | no button press (default for the `9b` management key) |
 | `ALWAYS` | a physical touch before every private-key operation (default for generated slot keys) |
-| `CACHED` | treated as `ALWAYS` on this device — see below |
+| `CACHED` | treated as `ALWAYS` on this device (see below) |
 
 Generated slot keys default to **touch ALWAYS**: each sign / decrypt / ECDH
-needs a button press, declined-touch fails the operation with `6982`. The
+needs a button press. A declined touch fails the operation with `6982`. The
 management key ships **touch NEVER** so admin provisioning isn't gated; raise it
 with `ykman piv access change-management-key --touch` if you want admin actions
 to require a press too.
@@ -180,7 +180,7 @@ ykman piv keys attest 9a attestation.pem
 
 Proves a slot key was generated on-device, not imported. The attestation
 certificate is signed on-card by the `f9` key (a P-384 CA key, self-signed at
-first boot) and carries the standard Yubico OIDs — firmware version, device
+first boot) and carries the standard Yubico OIDs: firmware version, device
 serial, and the slot's pin/touch policy. Subject/issuer names are
 `C=ES, O=RS-Key, CN=RS-Key PIV …`. Read the `f9` CA cert with:
 
@@ -190,7 +190,7 @@ ykman piv certificates export f9 attestation-ca.pem
 
 Attestation only works for **generated** keys; an imported key returns
 `6A80` / `INCORRECT PARAMS` (there is nothing to attest). For the FIDO side of
-attestation — org-provisioned enterprise attestation — see
+attestation (org-provisioned enterprise attestation) see
 [attestation.md](attestation.md).
 
 ## Move and delete keys
@@ -211,9 +211,9 @@ operations require management-key auth.
 The card shows up as a standard PIV token; nothing here is RS-Key-specific.
 
 - **PKCS#11** (browsers, VPNs, SSH, `age`): point the app at OpenSC's
-  `opensc-pkcs11.so` — `/usr/lib/x86_64-linux-gnu/opensc-pkcs11.so` on Debian,
-  `/usr/lib/opensc-pkcs11.so` on many distros, the Nix store path under NixOS
-  ([linux.md](../linux.md)).
+  `opensc-pkcs11.so`, found at `/usr/lib/x86_64-linux-gnu/opensc-pkcs11.so` on
+  Debian, `/usr/lib/opensc-pkcs11.so` on many distros, or the Nix store path
+  under NixOS ([linux.md](../linux.md)).
 - **SSH** via PKCS#11:
 
   ```sh
@@ -221,8 +221,8 @@ The card shows up as a standard PIV token; nothing here is RS-Key-specific.
   ssh -I /usr/lib/opensc-pkcs11.so you@host        # log in with it (touch + PIN per policy)
   ```
 
-  For an `ed25519-sk` hardware SSH key the FIDO path is simpler — see
-  [ssh.md](ssh.md). PIV-over-PKCS#11 is the route when you need an RSA or
+  For an `ed25519-sk` hardware SSH key the FIDO path is simpler (see
+  [ssh.md](ssh.md)). PIV-over-PKCS#11 is the route when you need an RSA or
   NIST-curve key, a smart-card-login certificate, or a server that wants a real
   X.509 chain.
 
@@ -245,11 +245,11 @@ The card shows up as a standard PIV token; nothing here is RS-Key-specific.
 PIV private keys are stored **AES-256-GCM-sealed** under the device root (the
 sealed blob is `nonce ‖ ciphertext ‖ tag`, authenticated against the device
 serial). Once the OTP master key is [fused](../otp-fuses.md), a flash dump does
-not yield key material; **before** that burn the seal's root derives from
+not yield key material; **before** that burn, the seal's root derives from
 on-chip state an attacker with the flash and chip could reconstruct, so at-rest
 protection is only meaningful after provisioning (see
 [threat-model.md](../threat-model.md)). The seal is bound to the device, not the
-slot, so a `keys move` re-homes the blob verbatim — no re-encryption.
+slot, so a `keys move` re-homes the blob verbatim (no re-encryption).
 
 ## Factory reset (PIV only)
 
@@ -258,10 +258,10 @@ ykman piv reset
 ```
 
 Wipes PIV keys, certificates and PINs only; the other applets are untouched.
-The reset is **only accepted once both the PIN and the PUK are blocked** —
+The reset is **only accepted once both the PIN and the PUK are blocked**;
 `ykman` blocks them for you first. To wipe *every* applet at once (PIV included),
 use `rsk offboard`, which blocks PIN+PUK then resets PIV as part of a full-device
-wipe with a signed receipt — see [fleet.md](fleet.md#offboarding).
+wipe with a signed receipt (see [fleet.md](fleet.md#offboarding)).
 
 There is no `rsk piv` command group: PIV is provisioned entirely through
 `ykman piv` / `yubico-piv-tool` / PKCS#11, with `rsk` only involved for a

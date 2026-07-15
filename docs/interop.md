@@ -2,7 +2,7 @@
 
 RS-Key has three test layers below this one (`tests/`, the vendored
 [`third_party/`](https://github.com/TheMaxMur/RS-Key/tree/main/third_party)
-suites, and the host `cargo test` / fuzz / Kani stack — see
+suites, and the host `cargo test` / fuzz / Kani stack, see
 [testing.md](testing.md)). All of them drive the device at the **protocol**
 level: APDUs, CBOR, CTAPHID frames. They prove the wire format is correct
 against *our* reading of the specs and against two upstream suites.
@@ -15,8 +15,8 @@ flowchart BT
 ```
 
 This document is the layer above: **does the device work end-to-end with the
-software a real user actually runs** — `gpg`, `ssh`, a browser's WebAuthn
-stack, `ykman`, `fido2-token`, OpenSC — not with our own scripts. Protocol
+software a real user actually runs** (`gpg`, `ssh`, a browser's WebAuthn
+stack, `ykman`, `fido2-token`, OpenSC), not with our own scripts. Protocol
 conformance is necessary but not sufficient: a response can be spec-arguable
 yet still trip a strict third-party parser. (The canonical example is the
 `ykman openpgp info` crash below: our GET DATA `6E` was readable by `gpg` but
@@ -24,11 +24,11 @@ rejected by ykman's stricter `Tlv.unpack(0x6E, …)`.)
 
 > This is experimental firmware with no security audit. Most cells below run on
 > the **default RS-Key build** (USB VID:PID `0x1209:0x0001`, reader name
-> "RS-Key") — `gpg`, `ssh`, browsers, OpenSC, and libfido2 bind the ATR / FIDO
+> "RS-Key"). `gpg`, `ssh`, browsers, OpenSC, and libfido2 bind the ATR / FIDO
 > HID usage page, not the VID/PID, so they don't care about branding. The
 > `ykman` and Yubico Authenticator cells are the exception: they derive the
 > device from the "Yubico YubiKey" reader name, so they need the opt-in
-> `VIDPID=Yubikey5` interop flavor (`0x1050:0x0407`) — see [build.md](build.md).
+> `VIDPID=Yubikey5` interop flavor (`0x1050:0x0407`), see [build.md](build.md).
 > A ✅ means the cell was observed working on the dated build; it is a record,
 > not a guarantee of future builds or other hosts.
 
@@ -37,22 +37,22 @@ run on hardware and dated; everything else is `⏳ untested`. The `0758` /
 `0759` tags in the Status column are the firmware `bcdDevice` the cell was run
 against.
 
-**Baseline — 2026-06-13, firmware `0x0758`** (`tests/interop/run.py`, live
+**Baseline, 2026-06-13, firmware `0x0758`** (`tests/interop/run.py`, live
 device): libfido2 enumeration + getInfo, `gpg --card-status`, and `ykman`
 `piv`/`oath`/`otp` info all ✅; `ykman openpgp info` ❌ (the GET DATA `6E`
-wrapper bug below — reproduced live as `ERROR: Incorrect TLV length`).
+wrapper bug below, reproduced live as `ERROR: Incorrect TLV length`).
 
-**Re-verified — 2026-06-13, firmware `0x0759`** (the fix): the full CLI sweep
-is green — **7 passed, 0 failed**, `ssh-sk` skipped (touch). `ykman openpgp
+**Re-verified, 2026-06-13, firmware `0x0759`** (the fix): the full CLI sweep
+is green: **7 passed, 0 failed**, `ssh-sk` skipped (touch). `ykman openpgp
 info` now prints the card (`OpenPGP version: 3.4`, app `4.6.0`, PIN counters)
 instead of the TLV error.
 
-**Touch / GUI round — 2026-06-13, firmware `0x0759`→`0x075A`** (`--features
+**Touch / GUI round, 2026-06-13, firmware `0x0759`→`0x075A`** (`--features
 up-button` confirmed live): `ssh-keygen -t ed25519-sk` enrol, `fido2-cred`/
 `fido2-assert` (assertion verified), and the OTP HID keyboard (short-tap typed
 the static slot verbatim) all ✅ with a real button press; Chrome / Firefox /
 Safari WebAuthn ✅ by user attestation. `gpg --edit-card generate` was the lone
-❌ on `0x0759` — **not** a crypto failure (the APDU suites GENERATE
+❌ on `0x0759`, **not** a crypto failure (the APDU suites GENERATE
 P-256/Ed25519/RSA-2048 and UIF-sign fine) but a GET DATA `6E` short-`Le`
 overflow in scdaemon; **fixed in `0x075A`** (dispatcher response chaining) and
 re-verified end-to-end. See
@@ -75,9 +75,9 @@ needs the **no-touch test build** (`cargo build -p firmware
 --features no-touch`, see [build.md](build.md)) or a human. The matrix splits
 accordingly:
 
-- **CLI sweep** — run on the **no-touch** build; fully automatable
+- **CLI sweep**: run on the **no-touch** build; fully automatable
   (`tests/interop/run.py`).
-- **GUI / ceremony** — run on the **touch** build with a finger on the button
+- **GUI / ceremony**: run on the **touch** build with a finger on the button
   (browser WebAuthn, `ssh-keygen -t ed25519-sk`, OpenPGP UIF signing).
 
 ## Matrix
@@ -124,18 +124,18 @@ accordingly:
 
 Detail for the ⚠️ / multi-result cells above.
 
-**python-fido2 (Yubico) — `075A`, 191 passed / 4 failed / 9 errored (8m26s).** All
+**python-fido2 (Yubico): `075A`, 191 passed / 4 failed / 9 errored (8m26s).** All
 four failures are test-side, not firmware defects:
 
 - `test_lockout` / `test_pin_attempts` need a manual `device.reboot()`
   (conftest.py:205 human prompt, unanswered headless) → our spec-correct
   `PIN_AUTH_BLOCKED` correctly persists.
-- `test_option_up` calls `doGA(options=…)` — no such kwarg; broken upstream test.
+- `test_option_up` calls `doGA(options=…)`, no such kwarg; broken upstream test.
 - `test_bad_auth` expects the upstream `0xE0` for an invalid `(0,0)` EC
   keyAgreement, where our `INVALID_PARAMETER` is spec-reasonable.
 - The 9 errors are `test_070_oath` fixture setup, not core CTAP2.
 
-**openpgp-card-tests (Gnuk-derived) — `075A`, `001_initial_check` 31/34.** The
+**openpgp-card-tests (Gnuk-derived): `075A`, `001_initial_check` 31/34.** The
 3 fails (`6E`, `65`, `7A`) share one root and are not a defect:
 `util.get_data_object` strips the constructed-DO wrapper only when
 `is_yubikey=True` (never set in this Gnuk config), so our deliberately-wrapped
@@ -143,7 +143,7 @@ templates (the bug-#1 ykman/real-Yubikey requirement) fail the Gnuk "unwrapped"
 asserts. Wrapping is mandatory for ykman; the two expectations are mutually
 exclusive.
 
-**Yubico Authenticator (app) — `075A`** (built `VIDPID=Yubikey5`; the GUI gates
+**Yubico Authenticator (app): `075A`** (built `VIDPID=Yubikey5`; the GUI gates
 on the "Yubico YubiKey" reader name). Detects the key + all 6 apps
 (OTP/PIV/OATH/OpenPGP/U2F/FIDO2); OATH add → calculate → delete all work in-GUI.
 The displayed TOTP `111429` then `629022` cryptographically matched an
@@ -155,14 +155,14 @@ independent software HMAC-SHA1 TOTP of the same secret/window (`2026-06-13`).
 
 ykman/yubikit parse the application-related-data response with
 `ApplicationRelatedData.parse`, which calls
-`Tlv.unpack(0x6E, response)` — it requires the whole GET DATA `6E` reply to be
+`Tlv.unpack(0x6E, response)`: it requires the whole GET DATA `6E` reply to be
 a single TLV tagged `6E`. RS-Key stripped the outer `6E 82 LL LL` wrapper for
 *every* non-flash DO, returning the bare nested `4F …`, so ykman failed with
 `ERROR: Incorrect TLV length` (the `4F` TLV parses but leaves a trailing
 remainder `Tlv.unpack` rejects) while `gpg` (which tolerates either form)
 worked. Fixed by keeping
 the wrapper on **constructed** template DOs (`6E/65/73/7A/FA`, BER constructed
-bit `0x20`) and stripping only **primitive** DOs — which is what real OpenPGP
+bit `0x20`) and stripping only **primitive** DOs, which is what real OpenPGP
 cards do. See `crates/rsk-openpgp/src/getdata.rs`. **Verified on hardware
 2026-06-13 (firmware `0x0759`):** `ykman openpgp info` prints the card data
 (`OpenPGP version: 3.4`, app `4.6.0`, PIN counters) instead of `ERROR:
@@ -182,14 +182,14 @@ body instead of truncating to 256 with `61 0D` ("13 more bytes") for a
 `SCARD_E_INSUFFICIENT_BUFFER (0x80100008)` → `apdu_send_simple … failed: invalid
 value`, so key enumeration and `gpg --edit-card generate` aborted with
 `card_key_generate … General error` / `KEY_NOT_CREATED`. Reproduced on **two
-boards**. The on-card crypto was never the problem — `tests/36_openpgp_keygen.py`
+boards**. The on-card crypto was never the problem: `tests/36_openpgp_keygen.py`
 GENERATEs P-256/Ed25519/ECDH/**RSA-2048 (3.7 s)** and `tests/52_openpgp_uif_touch.py`
 UIF-signs with a real touch, both fine, because they use **extended** Le and so
 never overran the buffer (which masked the bug). Likely surfaced by the bug-#1
 fix, which restored the `6E` wrapper and pushed the template past 256 bytes.
 
 **Fix:** the dispatcher (`crates/rsk-sdk/src/applet.rs`) now does ISO 7816-4
-outgoing response chaining — when an opted-in applet's body exceeds the command's
+outgoing response chaining: when an opted-in applet's body exceeds the command's
 short `Le` it ships the first `Le` bytes with `61xx` and serves the remainder on
 GET RESPONSE (`0xC0`); the held tail is zeroized after delivery. OpenPGP and PIV
 opt in via `Applet::response_chaining`; OATH (own `0xA5` SEND REMAINING) and the
@@ -200,7 +200,7 @@ consumer (ykman, the APDU suites) is byte-for-byte unchanged.
 read returns `256 + 61 0D` then `GET RESPONSE → 13 + 9000` (**0** `insufficient
 buffer` in the scdaemon log), `gpg --card-status` prints the full card, and both
 EC and RSA `gpg --edit-card generate` complete (`KEY_CREATED`, keys land
-on-card). The RSA GENERATE response itself never needed chaining — scdaemon
+on-card). The RSA GENERATE response itself never needed chaining: scdaemon
 issues GENERATE with extended `Le` (`em=1`), so its 270-byte pubkey is fine.
 
 ```text

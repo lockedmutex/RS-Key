@@ -3,14 +3,14 @@
 
 # AAGUID & metadata
 
-Every FIDO2 authenticator model carries an **AAGUID** — a 128-bit identifier
+Every FIDO2 authenticator model carries an **AAGUID**, a 128-bit identifier
 that says "this is a *Model X* authenticator." It rides inside the attested
-credential data of every `makeCredential`, and a relying party (RP) uses it to
+credential data of every `makeCredential`. A relying party (RP) uses it to
 look up the model's **Metadata Statement**: a machine-readable description of
 what the model can do and how it attests.
 
 This page explains RS-Key's AAGUID, the self-published Metadata Statement that
-ships in the repo, and — importantly — the line between what that buys you for
+ships in the repo, and (importantly) the line between what that buys you for
 free and what is gated behind FIDO certification.
 
 ## RS-Key's AAGUID
@@ -26,7 +26,7 @@ python -c 'import uuid; print(uuid.uuid5(uuid.NAMESPACE_URL, "https://github.com
 # -> 2479c7bf-6b30-5683-9ec8-0e8171a918b7
 ```
 
-An AAGUID is **self-assigned** — no central registration is required to pick
+An AAGUID is **self-assigned**. No central registration is required to pick
 one. Earlier RS-Key builds inherited an upstream AAGUID (the bytes of
 `SHA-256("Pico FIDO2")`), which meant the device claimed another project's model
 identity. As of firmware `bcdDevice 0x075F` it carries its own.
@@ -36,11 +36,11 @@ A few consequences worth knowing:
 - **One AAGUID for every flavor.** It identifies the firmware *model*, not the
   USB branding, so the default pid.codes identity and the opt-in YubiKey-identity
   interop build report the same AAGUID. The YubiKey-identity build deliberately
-  does **not** claim a real YubiKey AAGUID — that would be a forgery and would
+  does **not** claim a real YubiKey AAGUID. That would be a forgery and would
   fail attestation anyway (it cannot chain to Yubico's roots).
 - **Existing credentials keep working.** The AAGUID only appears in attestation
   at registration time. Resident keys made on an older build still assert
-  fine; only *new* registrations report the new AAGUID. An RP that pinned the
+  fine. Only *new* registrations report the new AAGUID. An RP that pinned the
   old AAGUID for attestation matching would need a re-enroll.
 
 ## The Metadata Statement
@@ -54,18 +54,18 @@ embedded `authenticatorGetInfo` that mirrors exactly what the device returns to
 
 | Field | RS-Key value |
 |---|---|
-| `attestationTypes` | `["basic_surrogate"]` — packed self-attestation, no cert chain |
-| `attestationRootCertificates` | `[]` — none, by definition of surrogate |
+| `attestationTypes` | `["basic_surrogate"]`: packed self-attestation, no cert chain |
+| `attestationRootCertificates` | `[]`: none, by definition of surrogate |
 | `authenticationAlgorithms` | secp256r1 / ed25519 / secp384r1 / secp521r1 / secp256k1 (ECDSA + EdDSA) |
-| `keyProtection` | `["hardware"]` — RP2350 flash/OTP, not a separate certified secure element |
-| `matcherProtection` | `["on_chip"]` — the PIN is verified on the device |
-| `attachmentHint` | `["external", "wired"]` — a USB roaming token |
-| `upv` | `1.0` — matches the `FIDO_2_0` entry the device advertises in `versions` |
+| `keyProtection` | `["hardware"]`: RP2350 flash/OTP, not a separate certified secure element |
+| `matcherProtection` | `["on_chip"]`: the PIN is verified on the device |
+| `attachmentHint` | `["external", "wired"]`: a USB roaming token |
+| `upv` | `1.0`: matches the `FIDO_2_0` entry the device advertises in `versions` |
 
 A drift guard, [`tests/62_metadata_statement.py`](https://github.com/TheMaxMur/RS-Key/blob/main/tests/62_metadata_statement.py),
 checks the statement against both the firmware source (the AAGUID const) and a
 live device (the embedded `authenticatorGetInfo` vs the real one). Run it by
-hand; it is not in the hardware gate.
+hand. It is not in the hardware gate.
 
 ### Two caveats baked into the statement
 
@@ -74,16 +74,16 @@ hand; it is not in the hardware gate.
   registry has **no enum value** for ML-DSA/Dilithium, so they cannot appear in
   `authenticationAlgorithms`. They are visible only inside the embedded
   `authenticatorGetInfo` (and only on the `advertise-pqc` build). A strict MDS
-  consumer will simply not see the PQC capability.
+  consumer will not see the PQC capability.
 - **One profile per statement.** The build features `advertise-pqc` (adds COSE
   `-48` to the algorithm list) and `fips-profile` (drops secp256k1, raises the
   PIN floor to 6) change `getInfo`. The shipped statement describes the
-  **default** build; a different profile needs its own statement.
+  **default** build. A different profile needs its own statement.
 
 ## What this does — and does not — get you
 
 RS-Key works as a passkey/security key with the overwhelming majority of relying
-parties **without any of this** — self-attestation is accepted by GitHub,
+parties **without any of this**. Self-attestation is accepted by GitHub,
 Google, Microsoft consumer accounts, browsers, `ssh`, and any RP that does not
 *enforce* attestation. The AAGUID and statement add a stable, honest identity
 and a machine-readable capability description for tooling that wants one.
@@ -94,11 +94,11 @@ as the strict reference:
 
 | Entra policy | What RS-Key needs |
 |---|---|
-| Attestation **not** enforced (the common case) | Nothing extra — `none` / packed-surrogate / a custom format ≤ 32 chars is accepted. RS-Key works today. |
+| Attestation **not** enforced (the common case) | Nothing extra: `none` / packed-surrogate / a custom format ≤ 32 chars is accepted. RS-Key works today. |
 | Attestation **enforced** | A packed attestation chaining to a root **extracted from the FIDO MDS**, the model's metadata **uploaded to the FIDO MDS**, and a **FIDO2 certification** (any level). |
 
 That second row is a deliberate **non-goal** here: official MDS listing and FIDO
-certification require FIDO Alliance membership, a certification lab, and money —
+certification require FIDO Alliance membership, a certification lab, and money,
 none of which is a code change. The self-published statement is the part that
 *is* actionable: an RP or library that can import a local metadata file (rather
 than only trusting the MDS BLOB) can consume it directly. If RS-Key is ever

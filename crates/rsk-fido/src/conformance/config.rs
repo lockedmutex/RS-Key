@@ -67,9 +67,15 @@ fn config_enable_enterprise_attestation_round_trips() {
 #[test]
 fn config_toggle_always_uv_round_trips() {
     let mut a = Authr::fresh();
-    assert!(
-        !getinfo_option(&mut a, "alwaysUv"),
-        "options.alwaysUv starts disabled"
+    // alwaysUv starts at the compiled default — disabled on the shipped and
+    // conformance images, enabled only under `--features always-uv` — and
+    // toggleAlwaysUv must flip whatever that default is. A real conformance run is a
+    // default build, so it still observes the "starts disabled → true" path.
+    let start = getinfo_option(&mut a, "alwaysUv");
+    assert_eq!(
+        start,
+        cfg!(feature = "always-uv"),
+        "options.alwaysUv starts at the compiled default"
     );
     let token = a.arm_token(PERM_ACFG);
     let param = acfg_param(&token, CONFIG_TOGGLE_ALWAYS_UV);
@@ -77,9 +83,10 @@ fn config_toggle_always_uv_round_trips() {
         CTAP_CONFIG,
         &config_request(CONFIG_TOGGLE_ALWAYS_UV, &param),
     ));
-    assert!(
+    assert_eq!(
         getinfo_option(&mut a, "alwaysUv"),
-        "options.alwaysUv must flip to true after toggleAlwaysUv"
+        !start,
+        "toggleAlwaysUv must flip options.alwaysUv"
     );
 }
 

@@ -124,10 +124,18 @@ const CRED_RESIDENT_HEADER_LEN: usize = 10;
 const RESIDENT_VERSION_IDX: usize = 8;
 /// v2 marker: the signing / hmac-secret / largeBlobKey keys derive from the
 /// STABLE resident id, so they survive an updateUserInformation reseal (CTAP2.1
-/// §6.8). Every newly created resident credential is v2; older stored credentials
-/// carry the implicit v1 marker (0) and keep deriving from the box, so an
-/// already-provisioned device stays byte-for-byte compatible across the upgrade.
+/// §6.8). Older stored credentials carry the implicit v1 marker (0) and keep
+/// deriving from the box, so an already-provisioned device stays byte-for-byte
+/// compatible across the upgrade.
 const RESIDENT_VERSION_V2: u8 = 1;
+/// v3 marker: v2 key-derivation semantics PLUS a length-prefixed cached public
+/// key in the EF_CRED record (see [`compose_cred_record`]), so credential
+/// enumeration emits the stored point instead of recomputing `d·G` per call —
+/// the dominant per-credential cost on this MCU's software EC. Every newly
+/// created resident credential is v3; [`resident_key_input`] treats v2 and v3
+/// identically (stable-id derivation), so the id the RP stores stays opaque and
+/// v1/v2 records already on a device keep working (they derive on the fly).
+const RESIDENT_VERSION_V3: u8 = 2;
 
 /// Credential extensions sealed into the box. `minPinLength` is not stored —
 /// it is a request-only flag that gates the authData `minPINLength` output.
@@ -445,16 +453,17 @@ fn parse_body(cbor: &[u8]) -> Option<Credential<'_>> {
 /// Header = `serial-derived(4) ‖ proto23(4) ‖ version(1) ‖ 00`, then a 32-byte
 /// HMAC chain over the box. The version byte ([`RESIDENT_VERSION_IDX`]) is not
 /// part of the chain (which spans `[10..42]`), so setting it leaves the id's
-/// entropy — and every already-stored v1 id's `[10..42]` — unchanged. New
-/// resident credentials are stamped v2 so their keys derive from this stable id
-/// (see [`resident_key_input`]); it is written only at create time and never
-/// re-derived for a lookup, so the flip cannot strand older stored ids.
+/// entropy — and every already-stored v1/v2 id's `[10..42]` — unchanged. New
+/// resident credentials are stamped v3 so their keys derive from this stable id
+/// (see [`resident_key_input`]) AND their record carries a cached public key; it
+/// is written only at create time and never re-derived for a lookup, so the bump
+/// cannot strand older stored ids.
 pub fn derive_resident(cred_id: &[u8], dev: &Device) -> [u8; CRED_RESIDENT_LEN] {
     let mut outk = [0u8; CRED_RESIDENT_LEN];
     let h0 = hmac_sha256(&[0u8; 32], dev.serial_id);
     outk[..32].copy_from_slice(&h0);
     outk[4..8].copy_from_slice(CRED_PROTO_RESIDENT);
-    outk[RESIDENT_VERSION_IDX] = RESIDENT_VERSION_V2;
+    outk[RESIDENT_VERSION_IDX] = RESIDENT_VERSION_V3;
     outk[9] = 0;
 
     let mut cred_idr = [0u8; 32];
@@ -494,8 +503,8 @@ pub fn derive_large_blob_key(seed: &[u8; 32], cred_id: &[u8]) -> [u8; 32] {
 /// The key-derivation input for a credential's signing key ([`fido_load_key`]),
 /// hmac-secret ([`derive_hmac_key`]) and largeBlobKey ([`derive_large_blob_key`]).
 ///
-/// A **v2 resident** credential (its stored `resident_id` carries the
-/// [`RESIDENT_VERSION_V2`] marker) keys off that STABLE id, so the keys survive an
+/// A **v2 or v3 resident** credential (its stored `resident_id` carries a marker
+/// `>= `[`RESIDENT_VERSION_V2`]) keys off that STABLE id, so the keys survive an
 /// updateUserInformation reseal — which draws a fresh IV and thus a new box
 /// ([`crate::credmgmt`], CTAP2.1 §6.8). Every other case keys off the box exactly
 /// as before: a **v1** resident credential (older, marker 0) so the RP's stored
@@ -512,7 +521,7 @@ pub(crate) fn resident_key_input<'a>(
     match resident_id {
         Some(rid)
             if rid.len() == CRED_RESIDENT_LEN
-                && rid[RESIDENT_VERSION_IDX] == RESIDENT_VERSION_V2 =>
+                && rid[RESIDENT_VERSION_IDX] >= RESIDENT_VERSION_V2 =>
         {
             rid
         }
@@ -520,14 +529,93 @@ pub(crate) fn resident_key_input<'a>(
     }
 }
 
-/// A resident record is `rp_id_hash(32) ‖ resident_id(42) ‖ full_cred_id`.
+/// A resident record is `rp_id_hash(32) ‖ resident_id(42) ‖ [pubkey trailer] ‖
+/// full_cred_id`. The trailer (`pubkey_len(1) ‖ pubkey`) is present only for a v3
+/// resident id and is read/written through [`cred_record_box`] /
+/// [`cred_record_pubkey`] / [`compose_cred_record`]; v1/v2 records have the box
+/// directly at `RECORD_PREFIX`.
 pub const RECORD_PREFIX: usize = 32 + CRED_RESIDENT_LEN;
+
+/// Largest cached public point a v3 record can carry: an uncompressed P-521
+/// point (`04 ‖ x(66) ‖ y(66)`). The lattice schemes cache no point (their
+/// public keys dwarf the record), so this bounds the trailer.
+pub const CRED_PUBKEY_MAX: usize = 133;
 
 /// Largest EF_CRED record — up to ~1 KiB with a large credBlob.
 pub(crate) const CRED_REC_MAX: usize = 1024;
 
-// A ceiling-sized resident box must still fit its EF_CRED record.
-const _: () = assert!(RECORD_PREFIX + CRED_BOX_MAX <= CRED_REC_MAX);
+// A ceiling-sized resident box, plus the v3 public-key trailer, must still fit
+// its EF_CRED record. Conservative: no single credential hits both maxima at
+// once (the max box is a lattice cred, which caches no point).
+const _: () = assert!(RECORD_PREFIX + 1 + CRED_PUBKEY_MAX + CRED_BOX_MAX <= CRED_REC_MAX);
+
+/// Offset at which the credential box begins in a stored record, skipping the v3
+/// length-prefixed public-key trailer. Total (never panics): a corrupt v3 length
+/// is clamped to the record end, so the box then fails to decrypt and the
+/// credential is skipped rather than mis-sliced.
+fn cred_box_offset(rec: &[u8]) -> usize {
+    if rec.len() > RECORD_PREFIX && rec[32 + RESIDENT_VERSION_IDX] == RESIDENT_VERSION_V3 {
+        (RECORD_PREFIX + 1 + rec[RECORD_PREFIX] as usize).min(rec.len())
+    } else {
+        RECORD_PREFIX
+    }
+}
+
+/// The credential box within a stored record — the bytes [`credential_load`]
+/// decrypts. For a v3 record this is AFTER the cached-pubkey trailer; for v1/v2
+/// it starts at [`RECORD_PREFIX`]. Every reader of a stored EF_CRED record MUST
+/// go through this, or a v3 trailer would be fed into the box and break decrypt.
+pub(crate) fn cred_record_box(rec: &[u8]) -> &[u8] {
+    &rec[cred_box_offset(rec)..]
+}
+
+/// The cached public point stored in a v3 record, or `None` for a v1/v2 record
+/// or a v3 record with an empty (uncacheable-curve) trailer.
+pub(crate) fn cred_record_pubkey(rec: &[u8]) -> Option<&[u8]> {
+    if rec.len() > RECORD_PREFIX && rec[32 + RESIDENT_VERSION_IDX] == RESIDENT_VERSION_V3 {
+        let len = rec[RECORD_PREFIX] as usize;
+        if len == 0 {
+            return None;
+        }
+        rec.get(RECORD_PREFIX + 1..RECORD_PREFIX + 1 + len)
+    } else {
+        None
+    }
+}
+
+/// Assemble an EF_CRED record into `out`, returning its length. A v3 `resident_id`
+/// (marker [`RESIDENT_VERSION_V3`]) gets the length-prefixed `pubkey` trailer
+/// between the resident id and the box; a v1/v2 id writes the box directly, byte
+/// for byte as before. Returns `None` if it would not fit or the inputs are
+/// malformed.
+pub(crate) fn compose_cred_record(
+    rp_id_hash: &[u8; 32],
+    resident_id: &[u8],
+    pubkey: &[u8],
+    cred_box: &[u8],
+    out: &mut [u8],
+) -> Option<usize> {
+    if resident_id.len() != CRED_RESIDENT_LEN || pubkey.len() > CRED_PUBKEY_MAX {
+        return None;
+    }
+    let v3 = resident_id[RESIDENT_VERSION_IDX] == RESIDENT_VERSION_V3;
+    let trailer = if v3 { 1 + pubkey.len() } else { 0 };
+    let total = RECORD_PREFIX + trailer + cred_box.len();
+    if total > out.len() {
+        return None;
+    }
+    out[..32].copy_from_slice(rp_id_hash);
+    out[32..RECORD_PREFIX].copy_from_slice(resident_id);
+    let mut p = RECORD_PREFIX;
+    if v3 {
+        out[p] = pubkey.len() as u8;
+        p += 1;
+        out[p..p + pubkey.len()].copy_from_slice(pubkey);
+        p += pubkey.len();
+    }
+    out[p..p + cred_box.len()].copy_from_slice(cred_box);
+    Some(p + cred_box.len())
+}
 
 /// EF_RP head before the (boxed) rpId tail: `count(1) ‖ rpIdHash(32)`.
 pub(crate) const RP_PREFIX: usize = 1 + 32;
@@ -537,35 +625,50 @@ pub(crate) const RP_PREFIX: usize = 1 + 32;
 /// length-driven with no fixed-size assumptions.
 pub(crate) const RP_REC_MAX: usize = RP_PREFIX + IV_LEN + RP_ID_MAX + TAG_LEN;
 
-/// Mark, in one storage pass, which slots `base+0..base+out.len()` hold a live
-/// record (`out[i]` is occupied iff a key `base+i` exists). One pass is
-/// O(items); per-slot `fs.read` probing is not — a `read` of an *absent* slot
-/// rescans the whole flash partition. Callers still `fs.read` the occupied
-/// slots — those reads hit the key cache.
+/// Mark which slots `base+0..base+out.len()` hold a live record (`out[i]` is
+/// occupied iff a key `base+i` exists), read from the fs in-RAM present index —
+/// no flash scan. This runs on every credMgmt enumerate/getNext and every
+/// makeCredential (dedup + free-slot), so scanning the whole partition each call
+/// (~84 ms on a full store) dominated those paths; the present index answers it
+/// in sub-ms and is occupancy-equivalent (see [`Fs::present_slots`]). Callers
+/// still `fs.read` the occupied slots — those hit the key cache.
 pub(crate) fn slot_map<S: Storage>(fs: &mut Fs<S>, base: u16, out: &mut [bool]) {
-    out.iter_mut().for_each(|b| *b = false);
-    fs.for_each_key(&mut |fid| {
-        if let Some(i) = fid.checked_sub(base)
-            && (i as usize) < out.len()
-        {
-            out[i as usize] = true;
-        }
-    });
+    fs.present_slots(base, out);
 }
 
 /// Estimated free discoverable-credential slots (getInfo
-/// `remainingDiscoverableCredentials`, 0x14): capacity minus the occupied EF_CRED
-/// slots. Walks only the present-key index (cheap, in-RAM — safe on the getInfo
-/// hot path).
+/// `remainingDiscoverableCredentials`, 0x14): the EF_CRED headroom, clamped so it
+/// never over-promises against the SHARED dynamic-file store (see [`remaining_rk`]).
+/// Walks only the present-key index (cheap, in-RAM — safe on the getInfo hot path).
 pub(crate) fn remaining_discoverable<S: Storage>(fs: &mut Fs<S>) -> u16 {
     let mut occupied = [false; MAX_RESIDENT_CREDENTIALS as usize];
     slot_map(fs, EF_CRED, &mut occupied);
     let used = occupied.iter().filter(|&&b| b).count() as u16;
-    MAX_RESIDENT_CREDENTIALS.saturating_sub(used)
+    remaining_rk(fs, used)
+}
+
+/// The honest free-discoverable-credential estimate reported by BOTH getInfo 0x14
+/// and credMgmt getCredsMetadata (0x02): the EF_CRED headroom, clamped so it never
+/// promises slots the SHARED dynamic-file store can't back. A new discoverable
+/// credential costs up to two dynamic files — its EF_CRED record, plus an EF_RP
+/// record for a new rp — so halve the free file budget. Without this the reports
+/// over-promise once PIV keys / OATH creds have drained the shared store; both
+/// fields are CTAP 2.1 *estimates*, so clamping down is spec-compliant.
+pub(crate) fn remaining_rk<S: Storage>(fs: &mut Fs<S>, used_ef_cred: u16) -> u16 {
+    let by_slots = MAX_RESIDENT_CREDENTIALS.saturating_sub(used_ef_cred);
+    let by_files = (fs.free_dynamic() / 2) as u16;
+    by_slots.min(by_files)
 }
 
 /// Persist a resident credential into a free or matching EF_CRED slot and bump
-/// the EF_RP count.
+/// the EF_RP count. `pubkey` is the credential's uncompressed public point
+/// (from [`crate::ec::CredKey::public_point`], already computed for authData at
+/// makeCredential), cached in the v3 record so enumeration need not recompute
+/// `d·G`; pass an empty slice for an uncacheable-curve credential.
+// Each argument is a distinct field of the resident record (seed, device, store,
+// box, rpIdHash, rpId, userId, cached pubkey); a struct would add indirection for
+// the single makeCredential call site.
+#[allow(clippy::too_many_arguments)]
 pub fn credential_store<S: Storage>(
     seed: &[u8; 32],
     dev: &Device,
@@ -574,6 +677,7 @@ pub fn credential_store<S: Storage>(
     rp_id_hash: &[u8; 32],
     rp_id: &str,
     user_id: &[u8],
+    pubkey: &[u8],
 ) -> Result<()> {
     let mut slot: Option<u16> = None;
     let mut new_record = true;
@@ -596,7 +700,7 @@ pub fn credential_store<S: Storage>(
         if n < RECORD_PREFIX || rec[..32] != *rp_id_hash {
             continue;
         }
-        if let Some(c) = credential_load(seed, &rec[RECORD_PREFIX..n], rp_id_hash, &mut scratch)
+        if let Some(c) = credential_load(seed, cred_record_box(&rec[..n]), rp_id_hash, &mut scratch)
             && c.user_id == user_id
         {
             slot = Some(i);
@@ -607,13 +711,8 @@ pub fn credential_store<S: Storage>(
 
     let slot = slot.ok_or(Error::NoMemory)?; // KEY_STORE_FULL
     let resident = derive_resident(cred_id, dev);
-    let total = RECORD_PREFIX + cred_id.len();
-    if total > rec.len() {
-        return Err(Error::NoMemory);
-    }
-    rec[..32].copy_from_slice(rp_id_hash);
-    rec[32..RECORD_PREFIX].copy_from_slice(&resident);
-    rec[RECORD_PREFIX..total].copy_from_slice(cred_id);
+    let total = compose_cred_record(rp_id_hash, &resident, pubkey, cred_id, &mut rec)
+        .ok_or(Error::NoMemory)?;
     fs.put(EF_CRED + slot, &rec[..total])?;
 
     if new_record {

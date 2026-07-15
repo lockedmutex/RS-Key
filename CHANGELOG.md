@@ -13,6 +13,189 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+## [0.3.6] — 2026-07-16
+
+### Added
+
+- **`always-uv` build feature — ship with CTAP 2.1 `alwaysUv` on by default.** A new
+  opt-in cargo feature (`cargo build --release -p firmware --features always-uv`) bakes
+  the `alwaysUv` option on, so the key demands user verification for every
+  makeCredential / getAssertion out of the box — no post-flash `ykman fido config
+  toggle-always-uv`. OFF by default; the shipped image is unchanged (its alwaysUv still
+  starts off until a platform toggles it). The stored state is now tri-state — an
+  explicit `toggleAlwaysUv` override (`EF_ALWAYS_UV` = `[1]`/`[0]`, survives reboots,
+  cleared by `authenticatorReset`) over the compile-time default — so the feature build
+  stays fully runtime-toggleable and a reset returns alwaysUv to the compiled default.
+  On a normal build the on/off representation is the same `[1]`/absent pair as before
+  (no on-flash change). With alwaysUv on and no PIN set, FIDO operations return
+  `CTAP2_ERR_PUAT_REQUIRED` until a PIN is configured — the standard cue for the platform
+  (Windows, Chrome) to prompt for one. Whenever alwaysUv is on (via this default or a
+  runtime `toggleAlwaysUv`) the **CTAP1/U2F interface is now disabled** (CTAP 2.1 §7.2.4):
+  U2F only proves presence, so leaving it live would bypass the always-require-UV
+  guarantee — register / authenticate return `CONDITIONS_NOT_SATISFIED`, matching a
+  YubiKey. WebAuthn / CTAP2 is unaffected. bcdDevice → `0x081A`. See docs/build.md.
+
+### Changed
+
+- **`sequential-storage` 7.2.0 → 8.0.0.** The flash key/value backend's cache API was
+  restructured upstream into a single composite `Cache` of three sub-caches (page
+  states + page pointers + key pointers); `flash_storage.rs` and the fuzz harnesses
+  are migrated to it. The release is on-flash-compatible with 7.x, so a provisioned
+  device upgrades with no migration. The crate is vendored under
+  `third_party/sequential-storage/` and wired via `[patch.crates-io]` because it
+  carries one local change (below) that has no public API; the single-function diff is
+  kept in `third_party/sequential-storage.patch`.
+- **Higher, decoupled credential/key capacity.** All applets shared one 256-entry
+  dynamic-file budget, so filling PIV key slots shrank the passkey ceiling — a HW
+  stress test hit `KEY_STORE_FULL` at ~80 passkeys (not the logical 256) once ~48 PIV
+  files were provisioned, and `remainingDiscoverableCredentials` over-reported the
+  free slots. The shared budget (`MAX_DYNAMIC_FILES`) is raised 256 → 1280 to exceed
+  the union of every applet's own cap, and the storage key-pointer cache
+  (`MAIN_CACHE_KEYS`) is raised 512 → 1280 in lockstep so the freed capacity stays on
+  the O(1) read/migrate path instead of falling off the flash-scan cliff. getInfo
+  `remainingDiscoverableCredentials` (0x14) and credMgmt `getCredsMetadata` (0x02) now
+  report an honest estimate clamped by the true free shared-file budget, so the host
+  is no longer promised slots the store can't back. RAM cost ~8 KiB; no on-flash
+  format change (the indexes are rebuilt from flash on boot, so provisioned devices
+  upgrade transparently). bcdDevice → `0x0811`.
+
+### Fixed
+
+- **Run-20 audit hardening (no exploitable defect; defense-in-depth on the perf delta
+  above).** Three follow-ups from the security review:
+  - The boot cache-warm no longer trusts a partial walk after a flash *read* fault. The
+    vendored `sequential-storage` page-advance loop swallowed a page-state error and
+    still cleared the "dirty" flag at the walk's end, so a read fault that skipped a
+    live page could leave a stale key→address entry marked clean. It now skips only an
+    interrupted-erase page (always a fully-migrated source, so enumeration stays
+    complete) and aborts the walk on any other error, leaving the cache dirty for the
+    existing `is_dirty` guard to discard. No observable change on RP2350 (in-range flash
+    reads don't fault); the update is in `third_party/sequential-storage.patch`, and the
+    vendored tree is verified byte-identical to published 8.0.0 apart from that one file.
+  - `MAIN_CACHE_KEYS` is raised 1280 → 1281 (`MAX_DYNAMIC_FILES + 1`) so the one live
+    main-partition key the dynamic-file budget does not count (`EF_META`) can never fall
+    off the key-pointer cache on a fully-provisioned device.
+  - PIV MOVE to the `0xFF` delete sentinel no longer writes an unread `0xD4FF` orphan
+    public-point file: the per-slot pubkey carry is skipped when there is no destination
+    slot (the source slot's cache is still dropped).
+  No wire or on-flash change. bcdDevice → `0x0819`.
+- **The first credential enumeration after a power-cycle is no longer slow: the boot
+  scan warms the flash key-pointer cache it was already reading.** `sequential-storage`
+  keeps a RAM cache mapping each key to its flash address so a read is O(1); it starts
+  empty after every boot, so the first `fetch_item` of each key did a cold backward
+  ring-scan — listing 256 passkeys right after plug-in measured ~9 s (vs ~2.6 s warm).
+  The boot `scan` already walks the whole store once (via `fetch_all_items`) but threw
+  the addresses away. The vendored `sequential-storage` (see Changed) now seeds the
+  key-pointer cache from that existing walk, so the cache is warm before USB even
+  enumerates and the first list is as fast as a warm one — no extra flash reads. The
+  warm is completion-gated: the cache is held "dirty" during the walk and cleared only
+  when the iterator runs to the end, so a walk that errors partway self-invalidates via
+  the existing dirty guard rather than caching a stale pointer (power-cut-safe — the
+  cache is RAM-only, rebuilt each boot). Adds ~30–120 ms of pre-USB boot bookkeeping at
+  a full store. Measured on a 100-passkey device: first list after a power-cycle
+  3044 ms → 1023 ms (the slowest single-cred read 2044 ms → 23 ms), now identical to a
+  warm list. bcdDevice → `0x0818`.
+- **OATH LIST / CALCULATE ALL are faster on a full store: the occupied-slot map is
+  read from the in-RAM present index instead of scanning flash.** Enumerating
+  accounts sorted the live OATH slots with a whole-partition `for_each_key` walk on
+  every LIST (`0xA1`) and CALCULATE ALL (`0xA4`) — and PUT re-paid it to find a free
+  slot — so a busy store (a parity fill measured `ykman oath accounts list` ~1.6×
+  slower than a hardware YubiKey) spent tens of ms per call on the scan. `Fs` already
+  keeps an authoritative in-RAM present index (seeded at boot by `scan`, kept live by
+  every put/delete), so the slot gather (`present_creds`) and free-slot search now
+  read occupancy from it in O(255) bit tests with no flash access — the same fix
+  applied to FIDO `slot_map` and PIV. Occupancy-equivalent to the old `for_each_key`
+  pass (same torn-migration semantics) and ascending by construction, so LIST /
+  CALCULATE ALL output — including its `61xx` paging — is byte-identical. No wire or
+  on-flash change. bcdDevice → `0x0817`.
+- **PIV GET METADATA is fast at any slot count: each slot's public point is cached
+  in its own flash file instead of a shared, capacity-bound record.** The earlier
+  cache packed every EC slot's point into one EF_META blob (≤768 B for points), so
+  past ~10 populated EC slots the rest kept only a bare head and GET METADATA
+  recomputed the software point (`d·G`, ~30 ms) on every read — `ykman piv info` over
+  24 slots measured ~1.0 s (~3× a hardware YubiKey), ~400 ms of it that d·G. Each
+  slot now caches its point in a private per-slot file (`0xD4xx`, unsealed — the
+  point is public) written at key generate/import and read O(1) by GET METADATA at
+  any slot count; a slot without one (pre-upgrade, or a failed import derive) falls
+  back to the old EF_META cache, then to deriving the point, so provisioned devices
+  upgrade transparently. The redundant per-slot `has_key` probe GET METADATA did on
+  top of the existing `meta_find` gate is dropped. No wire change; GET METADATA
+  output is byte-identical. bcdDevice → `0x0816`.
+- **credMgmt enumeration and makeCredential are much faster on a full store: the
+  occupied-slot map is read from the in-RAM present index instead of scanning
+  flash.** `slot_map` — run on every getCredsMetadata / enumerateRPs /
+  enumerateCredentials / getNext and on every makeCredential (dedup + free-slot) —
+  walked the whole flash partition each call (~84 ms on a 256-passkey device), so
+  listing every credential paid it ~289 times (~24 s of a measured ~34 s walk) and
+  each registration re-paid it (~336 → 480 ms as the store filled). `Fs` already
+  keeps an authoritative in-RAM present index (seeded at boot by `scan`, kept live
+  by every put/delete), so `slot_map` now reads occupancy from it in sub-ms with no
+  flash scan and no new state — occupancy-equivalent to the old `for_each_key` pass
+  (same torn-migration under-count semantics). The FIDO HID poll interval is also
+  tightened 5 ms → 1 ms so a multi-frame enumerate/assertion response drains faster.
+  No wire or on-flash change. bcdDevice → `0x0814`.
+- **credMgmt enumeration is O(n), not O(n²): getNextRP / getNextCredential resume
+  from a slot cursor instead of re-scanning from slot 0.** With the per-call flash
+  scan removed (above), the remaining full-walk cost was each getNext re-reading the
+  store from the first slot to the N-th match — quadratic in the credential count.
+  `CredMgmtState` now carries a per-enumeration slot cursor (separate cursors for the
+  RP and credential walks, each reset by its Begin and advanced by each getNext), so a
+  getNext reads only the gap to the next match. On a full 256-passkey device the warm
+  per-credential enumeration cost flattens (~10 ms, matching a hardware YubiKey)
+  instead of climbing with slot position. No wire change; enumerate output is
+  byte-identical. bcdDevice → `0x0815`.
+- **OATH LIST / CALCULATE ALL now page through a full store instead of silently
+  truncating.** A device holding many accounts (up to the 255 the applet stores)
+  built each enumeration response into a single ~2 KiB CCID frame and stopped when
+  it filled, returning `9000` — so `ykman oath accounts list` / Yubico
+  Authenticator saw only the ~135 (LIST) / ~94 (CALCULATE ALL) that fit, and the
+  rest were invisible even though stored and individually usable (HW-found on a
+  255-account fill). LIST (`0xA1`) and CALCULATE ALL (`0xA4`) now implement the
+  YubiKey-OATH `61xx` + SEND REMAINING (`0xA5`) chaining they had stubbed out: when
+  a frame fills they return `61 00` and resume the sorted-credential sweep on the
+  next `0xA5`, so every account surfaces. ykman / Yubico Authenticator already speak
+  this and need no change; a host that ignores `0xA5` still gets the first frame
+  exactly as before (no regression). bcdDevice → `0x0813`.
+- **getAssertion no longer wedges the device after the capacity bump.** The
+  credential-key builder (`CredKey::from_raw`) and signer (`CredKey::sign`) folded
+  the lattice (ML-DSA) key-expansion / streaming-sign frames — ~106 KiB and ~50 KiB —
+  into their own stack frames, so **every** assertion, including a P-256 one that
+  never touches ML-DSA, reserved that ~106 KiB on the worker stack. With the capacity
+  bump's extra ~16 KiB of static RAM shrinking that stack, a getAssertion overflowed
+  it into the adjacent USB/IRQ wakers and hung the device hard (still USB-enumerated
+  but unresponsive on HID and CCID, recoverable only by replug). The ML-DSA build/sign
+  arms are moved behind `#[inline(never)]` helpers so their large frames stay off the
+  EC path; a P-256 getAssertion's builder/signer frames are now negligible.
+  HW-verified on the full capacity build. bcdDevice → `0x0812`.
+- **PIV GET METADATA is faster: a key slot's public point is now cached in its
+  metadata record** instead of being recomputed on every probe. `ykman piv info`
+  and the Yubico Authenticator read `GET METADATA` (INS 0xF7) for every slot, and
+  for a populated EC slot that recomputed the public key (`d·G`, ~tens of ms in
+  software) every time. Key generation and import already derive that point, so
+  the slot's metadata record now carries it (appended after `[algo, pin policy,
+  touch policy, origin]`) and GET METADATA emits it directly. RSA slots are
+  unchanged (their modulus rebuild is cheap). Keys generated by earlier firmware
+  keep working and derive the point on the fly (the bare record has no trailer).
+  The cached point is **best-effort**: the shared `EF_META` store reserves room for
+  every slot's essential 4-byte head, so when it is near full (many populated EC
+  slots) a new key stores just the head and GET METADATA derives its point on the
+  fly — provisioning never fails or leaves a key without metadata because of the
+  cache, and `EF_META` stays bounded regardless of how many slots are used.
+  bcdDevice → `0x0810`.
+- **Passkey enumeration is much faster: the credential's public key is now cached
+  in its resident record** instead of being recomputed on every
+  `authenticatorCredentialManagement` enumerate call. On this MCU a software
+  P-256 public-key derivation (`d·G`) costs ~150–250 ms, so listing passkeys — as
+  the Yubico Authenticator "Passkeys" tab does — spent that per credential every
+  time (a measured ~1.2 s for four passkeys). makeCredential already computes the
+  point for authData, so the record now carries it (a length-prefixed trailer on
+  a new **v3** resident record) and enumeration emits it directly, dropping the
+  per-credential cost to a flash read. The one-time clientPIN unlock (an ECDH, not
+  cacheable) is unchanged. Records already on a device (v1/v2) keep deriving on
+  the fly and stay byte-for-byte compatible; passkeys created by this firmware get
+  the cache. EC curves (P-256/384/521, secp256k1, Ed25519) are cached; the lattice
+  schemes derive as before (their public keys exceed the record). bcdDevice → `0x080E`.
+
 ## [0.3.5] — 2026-07-14
 
 ### Changed
@@ -1412,7 +1595,9 @@ family that keeps the "enterprise" features in the open tree.
   signature of it, and a CycloneDX SBOM. See
   [docs/releases.md](docs/releases.md) to verify a download.
 
-[Unreleased]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.4...HEAD
+[Unreleased]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.6...HEAD
+[0.3.6]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.5...v0.3.6
+[0.3.5]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.1...v0.3.2

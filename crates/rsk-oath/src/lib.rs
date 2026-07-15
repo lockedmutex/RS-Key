@@ -135,6 +135,23 @@ const SW_WRONG_DATA: Sw = Sw::WRONG_LENGTH;
 /// three password-safe fields ≤255 each).
 const CRED_MAX: usize = 1024;
 
+/// In-progress LIST / CALCULATE ALL pagination. YKOATH streams a large response
+/// via `61xx` + SEND REMAINING (0xA5); this records where to resume the stable
+/// sorted present-cred sweep and the context needed to rebuild the next page.
+/// Any command other than SEND REMAINING clears it.
+#[derive(Clone, Copy)]
+enum Chain {
+    None,
+    List {
+        ext: bool,
+    },
+    CalcAll {
+        p2: u8,
+        chal: [u8; CHALLENGE_LEN],
+        chal_len: u8,
+    },
+}
+
 pub struct OathApplet<'a> {
     serial_id: [u8; 8],
     serial_hash: [u8; 32],
@@ -150,6 +167,10 @@ pub struct OathApplet<'a> {
     /// Challenge the host must answer in VALIDATE; regenerated on SELECT and
     /// SET CODE.
     challenge: [u8; CHALLENGE_LEN],
+    /// LIST / CALCULATE ALL pagination cursor: the command context and the
+    /// position in the sorted present-cred sweep to resume on SEND REMAINING.
+    chain: Chain,
+    chain_at: u16,
 }
 
 impl<'a> OathApplet<'a> {
@@ -168,6 +189,8 @@ impl<'a> OathApplet<'a> {
             presence,
             validated: true,
             challenge: [0; CHALLENGE_LEN],
+            chain: Chain::None,
+            chain_at: 0,
         }
     }
 
@@ -362,50 +385,80 @@ impl<'a> OathApplet<'a> {
         }
         // Extended list (nitropy): one data byte 0x01 appends a properties byte.
         let ext = apdu.nc == 1 && apdu.data[0] == 0x01;
-        let mut fids = [0u16; MAX_OATH_CRED as usize];
-        let nfids = present_creds(fs, &mut fids);
-        let dev = self.device();
-        let mut scratch = [0u8; CRED_MAX];
-        for &fid in &fids[..nfids] {
-            let Some(n) = seal::seal_read(&dev, fs, KeyFid::new(fid), &mut scratch) else {
-                continue;
-            };
-            let blob = &scratch[..n.min(CRED_MAX)];
-            let (Some(name), Some(key)) = (
-                find_tag(blob, TAG_NAME as u16),
-                find_tag(blob, TAG_KEY as u16),
-            ) else {
-                continue;
-            };
-            if key.is_empty() || name.len() + 2 > 255 {
-                continue;
-            }
-            let entry = 2 + 1 + name.len() + ext as usize;
-            if res.len() + entry > res.capacity() {
-                break;
-            }
-            res.push(TAG_NAME_LIST);
-            res.push((name.len() + 1 + ext as usize) as u8);
-            res.push(key[0]);
-            res.extend(name);
-            if ext {
-                let mut props = 0u8;
-                if find_tag(blob, TAG_PWS_LOGIN as u16).is_some()
-                    || find_tag(blob, TAG_PWS_PASSWORD as u16).is_some()
-                    || find_tag(blob, TAG_PWS_METADATA as u16).is_some()
-                {
-                    props |= 0x4;
+        self.chain = Chain::List { ext };
+        self.chain_at = 0;
+        self.list_page(fs, res)
+    }
+
+    /// Emit LIST name entries from `self.chain_at` until the response frame fills.
+    /// On overrun, stash the resume position and return `61xx` (SEND REMAINING
+    /// continues here); otherwise clear the chain and return OK. The sweep order
+    /// is the stable sorted present-cred list, so pages never skip or repeat.
+    fn list_page<S: Storage>(&mut self, fs: &mut Fs<S>, res: &mut ResBuf) -> Sw {
+        let Chain::List { ext } = self.chain else {
+            return Sw::OK;
+        };
+        let start = self.chain_at as usize;
+        let mut resume = None;
+        {
+            let dev = self.device();
+            let mut fids = [0u16; MAX_OATH_CRED as usize];
+            let nfids = present_creds(fs, &mut fids);
+            let mut scratch = [0u8; CRED_MAX];
+            let mut idx = start;
+            while idx < nfids {
+                let fid = fids[idx];
+                idx += 1;
+                let Some(n) = seal::seal_read(&dev, fs, KeyFid::new(fid), &mut scratch) else {
+                    continue;
+                };
+                let blob = &scratch[..n.min(CRED_MAX)];
+                let (Some(name), Some(key)) = (
+                    find_tag(blob, TAG_NAME as u16),
+                    find_tag(blob, TAG_KEY as u16),
+                ) else {
+                    continue;
+                };
+                if key.is_empty() || name.len() + 2 > 255 {
+                    continue;
                 }
-                if find_tag(blob, TAG_PROPERTY as u16)
-                    .and_then(|v| v.first())
-                    .is_some_and(|p| p & PROP_TOUCH != 0)
-                {
-                    props |= 0x1;
+                let entry = 2 + 1 + name.len() + ext as usize;
+                if res.len() + entry > res.capacity() {
+                    resume = Some(idx - 1);
+                    break;
                 }
-                res.push(props);
+                res.push(TAG_NAME_LIST);
+                res.push((name.len() + 1 + ext as usize) as u8);
+                res.push(key[0]);
+                res.extend(name);
+                if ext {
+                    let mut props = 0u8;
+                    if find_tag(blob, TAG_PWS_LOGIN as u16).is_some()
+                        || find_tag(blob, TAG_PWS_PASSWORD as u16).is_some()
+                        || find_tag(blob, TAG_PWS_METADATA as u16).is_some()
+                    {
+                        props |= 0x4;
+                    }
+                    if find_tag(blob, TAG_PROPERTY as u16)
+                        .and_then(|v| v.first())
+                        .is_some_and(|p| p & PROP_TOUCH != 0)
+                    {
+                        props |= 0x1;
+                    }
+                    res.push(props);
+                }
             }
         }
-        Sw::OK
+        match resume {
+            Some(at) => {
+                self.chain_at = at as u16;
+                Sw::BYTES_REMAINING_00
+            }
+            None => {
+                self.chain = Chain::None;
+                Sw::OK
+            }
+        }
     }
 
     fn cmd_validate<S: Storage>(&mut self, apdu: &Apdu, fs: &mut Fs<S>, res: &mut ResBuf) -> Sw {
@@ -542,53 +595,97 @@ impl<'a> OathApplet<'a> {
         let Some(chal) = find_tag(&apdu.data[..apdu.nc], TAG_CHALLENGE as u16) else {
             return Sw::INCORRECT_PARAMS;
         };
-        let mut fids = [0u16; MAX_OATH_CRED as usize];
-        let nfids = present_creds(fs, &mut fids);
-        let dev = self.device();
-        let mut scratch = [0u8; CRED_MAX];
-        for &fid in &fids[..nfids] {
-            let Some(n) = seal::seal_read(&dev, fs, KeyFid::new(fid), &mut scratch) else {
-                continue;
-            };
-            let blob = &scratch[..n.min(CRED_MAX)];
-            let (Some(name), Some(key)) = (
-                find_tag(blob, TAG_NAME as u16),
-                find_tag(blob, TAG_KEY as u16),
-            ) else {
-                continue;
-            };
-            if key.len() < 2 || name.len() > 255 {
-                continue;
-            }
-            // Worst-case entry: name TLV + full-response TLV (64 + digits).
-            if res.len() + 2 + name.len() + 2 + 65 > res.capacity() {
-                break;
-            }
-            res.push(TAG_NAME);
-            res.push(name.len() as u8);
-            res.extend(name);
-            if key[0] & OATH_TYPE_MASK == OATH_TYPE_HOTP {
-                // HOTP is never computed in bulk (it would burn counters).
-                res.push(TAG_NO_RESPONSE);
-                res.push(1);
-                res.push(key[1]);
-            } else if find_tag(blob, TAG_PROPERTY as u16)
-                .and_then(|v| v.first())
-                .is_some_and(|p| p & PROP_TOUCH != 0)
-            {
-                res.push(TAG_TOUCH_RESPONSE);
-                res.push(1);
-                res.push(key[1]);
-            } else {
-                res.push(TAG_RESPONSE + apdu.p2);
-                if calculate(apdu.p2 == 0x01, key, chal, res).is_none() {
-                    // Unknown algorithm: emit the digits byte only.
+        // Stash the (8-byte, per YKOATH) time challenge so SEND REMAINING pages
+        // recompute the same codes; a longer challenge is clamped (spec is 8).
+        let mut chal_buf = [0u8; CHALLENGE_LEN];
+        let chal_len = chal.len().min(CHALLENGE_LEN);
+        chal_buf[..chal_len].copy_from_slice(&chal[..chal_len]);
+        self.chain = Chain::CalcAll {
+            p2: apdu.p2,
+            chal: chal_buf,
+            chal_len: chal_len as u8,
+        };
+        self.chain_at = 0;
+        self.calc_all_page(fs, res)
+    }
+
+    /// Emit CALCULATE ALL entries from `self.chain_at` until the frame fills
+    /// (each reserves the 64-byte worst-case response), paging via `61xx` /
+    /// SEND REMAINING exactly like [`Self::list_page`].
+    fn calc_all_page<S: Storage>(&mut self, fs: &mut Fs<S>, res: &mut ResBuf) -> Sw {
+        let Chain::CalcAll {
+            p2,
+            chal: chal_buf,
+            chal_len,
+        } = self.chain
+        else {
+            return Sw::OK;
+        };
+        let chal = &chal_buf[..chal_len as usize];
+        let start = self.chain_at as usize;
+        let mut resume = None;
+        {
+            let dev = self.device();
+            let mut fids = [0u16; MAX_OATH_CRED as usize];
+            let nfids = present_creds(fs, &mut fids);
+            let mut scratch = [0u8; CRED_MAX];
+            let mut idx = start;
+            while idx < nfids {
+                let fid = fids[idx];
+                idx += 1;
+                let Some(n) = seal::seal_read(&dev, fs, KeyFid::new(fid), &mut scratch) else {
+                    continue;
+                };
+                let blob = &scratch[..n.min(CRED_MAX)];
+                let (Some(name), Some(key)) = (
+                    find_tag(blob, TAG_NAME as u16),
+                    find_tag(blob, TAG_KEY as u16),
+                ) else {
+                    continue;
+                };
+                if key.len() < 2 || name.len() > 255 {
+                    continue;
+                }
+                // Worst-case entry: name TLV + full-response TLV (64 + digits).
+                if res.len() + 2 + name.len() + 2 + 65 > res.capacity() {
+                    resume = Some(idx - 1);
+                    break;
+                }
+                res.push(TAG_NAME);
+                res.push(name.len() as u8);
+                res.extend(name);
+                if key[0] & OATH_TYPE_MASK == OATH_TYPE_HOTP {
+                    // HOTP is never computed in bulk (it would burn counters).
+                    res.push(TAG_NO_RESPONSE);
                     res.push(1);
                     res.push(key[1]);
+                } else if find_tag(blob, TAG_PROPERTY as u16)
+                    .and_then(|v| v.first())
+                    .is_some_and(|p| p & PROP_TOUCH != 0)
+                {
+                    res.push(TAG_TOUCH_RESPONSE);
+                    res.push(1);
+                    res.push(key[1]);
+                } else {
+                    res.push(TAG_RESPONSE + p2);
+                    if calculate(p2 == 0x01, key, chal, res).is_none() {
+                        // Unknown algorithm: emit the digits byte only.
+                        res.push(1);
+                        res.push(key[1]);
+                    }
                 }
             }
         }
-        Sw::OK
+        match resume {
+            Some(at) => {
+                self.chain_at = at as u16;
+                Sw::BYTES_REMAINING_00
+            }
+            None => {
+                self.chain = Chain::None;
+                Sw::OK
+            }
+        }
     }
 
     fn cmd_verify_code<S: Storage>(&mut self, apdu: &Apdu, fs: &mut Fs<S>) -> Sw {
@@ -922,6 +1019,8 @@ impl<S: Storage> Applet<Fs<S>> for OathApplet<'_> {
             res.push(1);
             res.push(ALG_HMAC_SHA1);
         }
+        // A new SELECT abandons any pending LIST / CALCULATE ALL page.
+        self.chain = Chain::None;
         // With a code set, every new SELECT must start locked: protected
         // commands work only after VALIDATE (or VERIFY PIN).
         self.validated = !code_set;
@@ -931,6 +1030,11 @@ impl<S: Storage> Applet<Fs<S>> for OathApplet<'_> {
     fn process(&mut self, apdu: &Apdu, fs: &mut Fs<S>, res: &mut ResBuf) -> Sw {
         if apdu.cla != 0x00 {
             return Sw::CLA_NOT_SUPPORTED;
+        }
+        // A fresh command abandons any half-read LIST / CALCULATE ALL page; only
+        // SEND REMAINING continues one.
+        if apdu.ins != INS_SEND_REMAINING {
+            self.chain = Chain::None;
         }
         match apdu.ins {
             INS_PUT => self.cmd_put(apdu, fs),
@@ -942,8 +1046,13 @@ impl<S: Storage> Applet<Fs<S>> for OathApplet<'_> {
             INS_CALCULATE => self.cmd_calculate(apdu, fs, res),
             INS_VALIDATE => self.cmd_validate(apdu, fs, res),
             INS_CALC_ALL => self.cmd_calculate_all(apdu, fs, res),
-            // Responses fit one CCID block; nothing is ever left pending.
-            INS_SEND_REMAINING => Sw::OK,
+            // YKOATH response chaining: continue the LIST / CALCULATE ALL page
+            // whose previous frame returned 61xx. No pending page => empty OK.
+            INS_SEND_REMAINING => match self.chain {
+                Chain::List { .. } => self.list_page(fs, res),
+                Chain::CalcAll { .. } => self.calc_all_page(fs, res),
+                Chain::None => Sw::OK,
+            },
             INS_VERIFY_CODE => self.cmd_verify_code(apdu, fs),
             INS_VERIFY_PIN => self.cmd_verify_otp_pin(apdu, fs),
             INS_CHANGE_PIN => self.cmd_change_otp_pin(apdu, fs),
@@ -995,23 +1104,29 @@ fn calculate(truncate: bool, key: &[u8], chal: &[u8], res: &mut ResBuf) -> Optio
     Some(())
 }
 
-/// FIDs of every present OATH credential (slots `EF_OATH_CRED..`), gathered in a
-/// single storage pass; returns the count written to `out`. Iterating these is
-/// O(present). The old `for i in 0..MAX_OATH_CRED { fs.read/delete/has_data }`
-/// probe was O(255·items): a read of an *absent* slot rescans all of flash, so
-/// sweeping the whole 255-slot range cost tens of seconds on a busy store. See
-/// the anti-pattern note on [`rsk_fs::Fs::for_each_key`].
+/// FIDs of every present OATH credential (slots `EF_OATH_CRED..`), in ascending
+/// FID order; returns the count written to `out`. Reads occupancy straight from
+/// the in-RAM present index via [`rsk_fs::Fs::present_slots`] — O(255) bit tests,
+/// no flash access — instead of a whole-partition [`for_each_key`] scan on every
+/// LIST / CALCULATE ALL (which cost tens of ms on a busy store: the exact
+/// anti-pattern fixed for FIDO's `slot_map`). Occupancy-equivalent — both derive
+/// from the boot [`scan`](rsk_fs::Fs::scan) seed kept live by every put/delete —
+/// and ascending by construction, so enumeration output stays byte-identical to
+/// the old sorted `for_each_key` sweep. A stale present bit at worst costs one
+/// skipped `seal_read` at the call site; the absent direction keeps the bulk
+/// pass's torn-migration semantics (no new false-absent).
+///
+/// [`for_each_key`]: rsk_fs::Fs::for_each_key
 fn present_creds<S: Storage>(fs: &mut Fs<S>, out: &mut [u16; MAX_OATH_CRED as usize]) -> usize {
+    let mut occ = [false; MAX_OATH_CRED as usize];
+    fs.present_slots(EF_OATH_CRED, &mut occ);
     let mut n = 0;
-    fs.for_each_key(&mut |fid| {
-        if (EF_OATH_CRED..EF_OATH_CRED + MAX_OATH_CRED).contains(&fid) && n < out.len() {
-            out[n] = fid;
+    for (i, &present) in occ.iter().enumerate() {
+        if present {
+            out[n] = EF_OATH_CRED + i as u16;
             n += 1;
         }
-    });
-    // for_each_key yields storage order; sort to the old FID-order sweep so LIST /
-    // CALCULATE ALL responses stay byte-identical to the previous behavior.
-    out[..n].sort_unstable();
+    }
     n
 }
 
@@ -1190,16 +1305,13 @@ fn reseal_if_plaintext<S: Storage>(
     }
 }
 
+/// Lowest unused credential slot for a new PUT, or `None` if all 255 are taken.
+/// Reads occupancy from the in-RAM present index (see [`present_creds`]) — no flash
+/// scan on the PUT path. A live slot always carries a set present bit after the boot
+/// scan, so this cannot hand out an occupied slot in normal operation.
 fn free_slot<S: Storage>(fs: &mut Fs<S>) -> Option<u16> {
     let mut used = [false; MAX_OATH_CRED as usize];
-    fs.for_each_key(&mut |fid| {
-        let Some(i) = fid.checked_sub(EF_OATH_CRED) else {
-            return;
-        };
-        if (i as usize) < used.len() {
-            used[i as usize] = true;
-        }
-    });
+    fs.present_slots(EF_OATH_CRED, &mut used);
     used.iter()
         .position(|&u| !u)
         .map(|i| EF_OATH_CRED + i as u16)

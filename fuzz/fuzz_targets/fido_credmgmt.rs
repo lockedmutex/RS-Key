@@ -34,7 +34,7 @@ fuzz_target!(|data: &[u8]| {
         serial_id: &[1, 2, 3, 4, 5, 6, 7, 8],
         otp_key: None,
     };
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut rng = SeqRng(1);
     let _ = ensure_seed(&dev, &mut fs, &mut rng);
 
@@ -71,6 +71,7 @@ fuzz_target!(|data: &[u8]| {
                 &rp_hash,
                 "a.co",
                 &[1, 2],
+                &[],
             );
         }
     }

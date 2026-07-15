@@ -33,7 +33,7 @@ const SERIAL_ID: [u8; 8] = [0xAA, 0xBB, 0xCC, 0xDD, 5, 6, 7, 8];
 const SERIAL_HASH: [u8; 32] = [0x22; 32];
 
 fn setup() -> Fs<RamStorage> {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     fs.scan();
     let dev = Device {
         serial_hash: &SERIAL_HASH,

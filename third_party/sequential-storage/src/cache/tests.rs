@@ -1,0 +1,346 @@
+#[cfg(test)]
+mod queue_tests {
+    use crate::{
+        AlignedBuf,
+        cache::{
+            Cache, CacheImpl, Uncached,
+            page_pointers::ArrayPagePointers,
+            page_states::{ArrayPageStates, CalculatedPageStates},
+        },
+        mock_flash::{self, FlashStatsResult, WriteCountCheck},
+        queue::{QueueConfig, QueueStorage},
+    };
+
+    use futures_test::test;
+
+    const NUM_PAGES: usize = 4;
+    const LOOP_COUNT: usize = 2000;
+
+    #[test]
+    async fn no_cache() {
+        assert_eq!(
+            run_test(Cache::new_uncached()).await,
+            FlashStatsResult {
+                erases: 149,
+                reads: 165009,
+                writes: 6299,
+                bytes_read: 651212,
+                bytes_written: 53299
+            }
+        );
+    }
+
+    #[test]
+    async fn calculated_page_state_cache() {
+        assert_eq!(
+            run_test(Cache::new(
+                CalculatedPageStates::new(NUM_PAGES),
+                Uncached,
+                Uncached
+            ))
+            .await,
+            FlashStatsResult {
+                erases: 149,
+                reads: 68111,
+                writes: 6299,
+                bytes_read: 554314,
+                bytes_written: 53299
+            }
+        );
+    }
+
+    #[test]
+    async fn array_page_state_cache() {
+        assert_eq!(
+            run_test(Cache::new(
+                ArrayPageStates::<NUM_PAGES>::new(),
+                Uncached,
+                Uncached
+            ))
+            .await,
+            FlashStatsResult {
+                erases: 149,
+                reads: 68037,
+                writes: 6299,
+                bytes_read: 554240,
+                bytes_written: 53299
+            }
+        );
+    }
+
+    #[test]
+    async fn array_page_pointer_cache() {
+        assert_eq!(
+            run_test(Cache::new(
+                Uncached,
+                ArrayPagePointers::<NUM_PAGES>::new(),
+                Uncached
+            ))
+            .await,
+            FlashStatsResult {
+                erases: 149,
+                reads: 106931,
+                writes: 6299,
+                bytes_read: 186588,
+                bytes_written: 53299
+            }
+        );
+    }
+
+    #[test]
+    async fn all_cache() {
+        assert_eq!(
+            run_test(Cache::new(
+                ArrayPageStates::<NUM_PAGES>::new(),
+                ArrayPagePointers::<NUM_PAGES>::new(),
+                Uncached
+            ))
+            .await,
+            FlashStatsResult {
+                erases: 149,
+                reads: 9959,
+                writes: 6299,
+                bytes_read: 89616,
+                bytes_written: 53299
+            }
+        );
+    }
+
+    async fn run_test(cache: impl CacheImpl<()>) -> FlashStatsResult {
+        let mut storage = QueueStorage::new(
+            mock_flash::MockFlashBase::<NUM_PAGES, 1, 256>::new(WriteCountCheck::Twice, None, true),
+            const { QueueConfig::new(0x00..0x400) },
+            cache,
+        );
+        let mut data_buffer = AlignedBuf([0; 1024]);
+
+        let start_snapshot = storage.flash().stats_snapshot();
+
+        for i in 0..LOOP_COUNT {
+            // println!("{i}");
+            let data = vec![i as u8; i % 20 + 1];
+
+            // println!("PUSH");
+            storage.push(&data, true).await.unwrap();
+            assert_eq!(
+                storage.peek(&mut data_buffer).await.unwrap().unwrap(),
+                &data,
+                "At {i}"
+            );
+            // println!("POP");
+            assert_eq!(
+                storage.pop(&mut data_buffer).await.unwrap().unwrap(),
+                &data,
+                "At {i}"
+            );
+            // println!("PEEK");
+            assert_eq!(
+                storage.peek(&mut data_buffer).await.unwrap(),
+                None,
+                "At {i}"
+            );
+            // println!("DONE");
+        }
+
+        start_snapshot.compare_to(storage.flash().stats_snapshot())
+    }
+}
+
+#[cfg(test)]
+mod map_tests {
+    use crate::{
+        AlignedBuf,
+        cache::{
+            Cache, CacheImpl, Uncached,
+            key_pointers::ArrayKeyPointers,
+            page_pointers::ArrayPagePointers,
+            page_states::{ArrayPageStates, CalculatedPageStates},
+        },
+        map::{MapConfig, MapStorage},
+        mock_flash::{self, FlashStatsResult, WriteCountCheck},
+    };
+
+    use futures_test::test;
+
+    const NUM_PAGES: usize = 4;
+
+    #[test]
+    async fn no_cache() {
+        assert_eq!(
+            run_test(Cache::new_uncached()).await,
+            FlashStatsResult {
+                erases: 198,
+                reads: 233786,
+                writes: 5201,
+                bytes_read: 1837101,
+                bytes_written: 50401
+            }
+        );
+    }
+
+    #[test]
+    async fn calculated_page_state_cache() {
+        assert_eq!(
+            run_test(Cache::new(
+                CalculatedPageStates::new(NUM_PAGES),
+                Uncached,
+                Uncached
+            ))
+            .await,
+            FlashStatsResult {
+                erases: 198,
+                reads: 181262,
+                writes: 5201,
+                bytes_read: 1784577,
+                bytes_written: 50401
+            }
+        );
+    }
+
+    #[test]
+    async fn array_page_state_cache() {
+        assert_eq!(
+            run_test(Cache::new(
+                ArrayPageStates::<NUM_PAGES>::new(),
+                Uncached,
+                Uncached
+            ))
+            .await,
+            FlashStatsResult {
+                erases: 198,
+                reads: 181162,
+                writes: 5201,
+                bytes_read: 1784477,
+                bytes_written: 50401
+            }
+        );
+    }
+
+    #[test]
+    async fn array_page_pointer_cache() {
+        assert_eq!(
+            run_test(Cache::new(
+                Uncached,
+                ArrayPagePointers::<NUM_PAGES>::new(),
+                Uncached
+            ))
+            .await,
+            FlashStatsResult {
+                erases: 198,
+                reads: 215897,
+                writes: 5201,
+                bytes_read: 1693989,
+                bytes_written: 50401
+            }
+        );
+    }
+
+    #[test]
+    async fn key_pointer_cache_half() {
+        assert_eq!(
+            run_test(Cache::new(
+                Uncached,
+                Uncached,
+                ArrayKeyPointers::<u16, 12>::new(),
+            ))
+            .await,
+            FlashStatsResult {
+                erases: 198,
+                reads: 191876,
+                writes: 5201,
+                bytes_read: 1484871,
+                bytes_written: 50401
+            }
+        );
+    }
+
+    #[test]
+    async fn key_pointer_cache_full() {
+        assert_eq!(
+            run_test(Cache::new(
+                Uncached,
+                Uncached,
+                ArrayKeyPointers::<u16, 24>::new(),
+            ))
+            .await,
+            FlashStatsResult {
+                erases: 198,
+                reads: 52403,
+                writes: 5201,
+                bytes_read: 313708,
+                bytes_written: 50401
+            }
+        );
+    }
+
+    #[test]
+    async fn all_cache() {
+        assert_eq!(
+            run_test(Cache::new(
+                ArrayPageStates::<NUM_PAGES>::new(),
+                ArrayPagePointers::<NUM_PAGES>::new(),
+                ArrayKeyPointers::<u16, 24>::new(),
+            ))
+            .await,
+            FlashStatsResult {
+                erases: 198,
+                reads: 14510,
+                writes: 5201,
+                bytes_read: 150592,
+                bytes_written: 50401
+            }
+        );
+    }
+
+    async fn run_test(cache: impl CacheImpl<u16>) -> FlashStatsResult {
+        let mut storage = MapStorage::new(
+            mock_flash::MockFlashBase::<NUM_PAGES, 1, 256>::new(WriteCountCheck::Twice, None, true),
+            const { MapConfig::new(0x00..0x400) },
+            cache,
+        );
+        let mut data_buffer = AlignedBuf([0; 128]);
+
+        const LENGHT_PER_KEY: [usize; 24] = [
+            11, 13, 6, 13, 13, 10, 2, 3, 5, 36, 1, 65, 4, 6, 1, 15, 10, 7, 3, 15, 9, 3, 4, 5,
+        ];
+
+        let start_snapshot = storage.flash().stats_snapshot();
+
+        for _ in 0..100 {
+            const WRITE_ORDER: [usize; 24] = [
+                15, 0, 4, 22, 18, 11, 19, 8, 14, 23, 5, 1, 16, 10, 6, 12, 20, 17, 3, 9, 7, 13, 21,
+                2,
+            ];
+
+            for i in WRITE_ORDER {
+                storage
+                    .store_item(
+                        &mut data_buffer,
+                        &(i as u16),
+                        &vec![i as u8; LENGHT_PER_KEY[i]].as_slice(),
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            const READ_ORDER: [usize; 24] = [
+                8, 22, 21, 11, 16, 23, 13, 15, 19, 7, 6, 2, 12, 1, 17, 4, 20, 14, 10, 5, 9, 3, 18,
+                0,
+            ];
+
+            for i in READ_ORDER {
+                let item = storage
+                    .fetch_item::<&[u8]>(&mut data_buffer, &(i as u16))
+                    .await
+                    .unwrap()
+                    .unwrap();
+
+                // println!("Fetched {item:?}");
+
+                assert_eq!(item, vec![i as u8; LENGHT_PER_KEY[i]]);
+            }
+        }
+
+        start_snapshot.compare_to(storage.flash().stats_snapshot())
+    }
+}

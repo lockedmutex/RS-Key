@@ -31,7 +31,7 @@ impl UserPresence for StubPresence {
 const SERIAL: [u8; 8] = [0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0];
 
 fn new_fs() -> Fs<RamStorage> {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     fs.scan();
     fs
 }
@@ -426,6 +426,62 @@ fn cred_secret_is_sealed_on_flash() {
     );
     // The seal round-trips — the RFC 6238 SHA-1 vector still computes.
     assert_eq!(calc_code(&mut app, &mut fs, b"acct", 1, 8), 94287082);
+}
+
+/// `present_creds` (now the in-RAM `present_slots` bitmap) must return exactly the
+/// same ascending FID set a fresh `for_each_key` scan of the OATH range yields —
+/// including across a deletion gap — so LIST / CALCULATE ALL stay byte-identical.
+#[test]
+fn present_creds_matches_for_each_key_occupancy() {
+    let mut fs = new_fs();
+    let rng = RefCell::new(CountRng(7));
+    let touch = RefCell::new(AlwaysConfirm);
+    let mut app = OathApplet::new(SERIAL, [0x22; 32], None, &rng, &touch);
+
+    for name in [b"aa".as_slice(), b"bb", b"cc", b"dd"] {
+        assert_eq!(
+            put(
+                &mut app,
+                &mut fs,
+                &put_data(name, 0x21, 6, SECRET_SHA1, false, None)
+            ),
+            Sw::OK
+        );
+    }
+    // Delete the second credential so the live set has an interior gap.
+    assert_eq!(
+        run(
+            &mut app,
+            &mut fs,
+            &apdu(INS_DELETE, 0, 0, &tlv(TAG_NAME, b"bb"))
+        )
+        .0,
+        Sw::OK
+    );
+
+    let mut fids = [0u16; MAX_OATH_CRED as usize];
+    let n = present_creds(&mut fs, &mut fids);
+
+    // Independent occupancy oracle: a fresh whole-partition scan of the range.
+    let mut want = Vec::new();
+    fs.for_each_key(&mut |fid| {
+        if (EF_OATH_CRED..EF_OATH_CRED + MAX_OATH_CRED).contains(&fid) {
+            want.push(fid);
+        }
+    });
+    want.sort_unstable();
+
+    assert_eq!(
+        &fids[..n],
+        want.as_slice(),
+        "present_creds != for_each_key occupancy"
+    );
+    assert!(
+        fids[..n].windows(2).all(|w| w[0] < w[1]),
+        "present_creds not strictly ascending"
+    );
+    // free_slot must land on the freed interior slot, not append past the tail.
+    assert_eq!(free_slot(&mut fs), Some(EF_OATH_CRED + 1));
 }
 
 #[test]
@@ -1382,4 +1438,112 @@ fn slots_fill_and_report_full() {
         ),
         Sw::FILE_FULL
     );
+}
+
+/// The firmware hands OATH a `RESP_CAP - 2 = 2036`-byte response slice
+/// (firmware/src/ccid_handler.rs); the generic `run()` above uses 2048, which
+/// truncates at a slightly different count. Reproduce the exact on-device
+/// capacity so the enumeration cap matches the hardware.
+const FW_RESP_CAP: usize = 2036;
+
+fn run_fw(app: &mut OathApplet, fs: &mut Fs<RamStorage>, raw: &[u8]) -> (Sw, Vec<u8>) {
+    let mut out = [0u8; FW_RESP_CAP];
+    let mut res = ResBuf::new(&mut out);
+    let apdu = Apdu::parse(raw).unwrap();
+    let sw = Applet::process(app, &apdu, fs, &mut res);
+    (sw, res.as_slice().to_vec())
+}
+
+/// Count short-form TLVs with `tag` in a response body.
+fn count_tag(body: &[u8], tag: u8) -> usize {
+    let (mut i, mut n) = (0usize, 0usize);
+    while i + 2 <= body.len() {
+        let len = body[i + 1] as usize;
+        if body[i] == tag {
+            n += 1;
+        }
+        i += 2 + len;
+    }
+    n
+}
+
+/// A distinct 12-byte account name `b"acct000000NNN"` (ykman-length), no alloc-fmt.
+fn acct_name(i: u16) -> Vec<u8> {
+    let mut n = b"acct00000000".to_vec();
+    let mut v = i as u32;
+    for p in (4..12).rev() {
+        n[p] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    n
+}
+
+/// Drive a LIST / CALCULATE ALL across YKOATH SEND REMAINING (0xA5) pages,
+/// concatenating each `61xx` frame's body until the final page returns OK.
+fn enumerate_all(app: &mut OathApplet, fs: &mut Fs<RamStorage>, first: &[u8]) -> (usize, Vec<u8>) {
+    let (mut sw, mut body) = run_fw(app, fs, first);
+    let mut pages = 1;
+    while sw == Sw::BYTES_REMAINING_00 {
+        let (s, b) = run_fw(app, fs, &apdu(INS_SEND_REMAINING, 0, 0, &[]));
+        sw = s;
+        body.extend(b);
+        pages += 1;
+    }
+    assert_eq!(sw, Sw::OK);
+    (pages, body)
+}
+
+/// Regression for the OATH enumeration cap (HW-found 2026-07-15): a full store
+/// (255 credentials) exceeds the single 2036-byte response frame, so LIST and
+/// CALCULATE ALL used to silently `break` and return `Sw::OK` — a host saw only
+/// ~135 / ~94 of them. With YKOATH `61xx` + SEND REMAINING pagination every
+/// credential now surfaces across pages, the way ykman / Yubico Authenticator
+/// already read a real YubiKey.
+#[test]
+fn list_and_calc_all_paginate_the_full_store() {
+    let mut fs = new_fs();
+    let rng = RefCell::new(CountRng(7));
+    let touch = RefCell::new(AlwaysConfirm);
+    let mut app = OathApplet::new(SERIAL, [0x22; 32], None, &rng, &touch);
+    for i in 0..MAX_OATH_CRED {
+        assert_eq!(
+            put(
+                &mut app,
+                &mut fs,
+                &put_data(&acct_name(i), 0x21, 6, SECRET_SHA1, false, None)
+            ),
+            Sw::OK,
+            "slot {i}"
+        );
+    }
+
+    // LIST spans multiple frames and enumerates all 255 — including the late
+    // account the pre-fix single frame truncated out.
+    let (pages, body) = enumerate_all(&mut app, &mut fs, &apdu(INS_LIST, 0, 0, &[]));
+    assert!(pages >= 2, "255 names cannot fit one 2036-byte frame");
+    assert_eq!(count_tag(&body, TAG_NAME_LIST), MAX_OATH_CRED as usize);
+    let late = acct_name(MAX_OATH_CRED - 1);
+    assert!(
+        body.windows(late.len()).any(|w| w == &late[..]),
+        "the last account is now enumerated"
+    );
+
+    // CALCULATE ALL likewise pages through all 255.
+    let chal = tlv(TAG_CHALLENGE, &1u64.to_be_bytes());
+    let (pages, body) = enumerate_all(&mut app, &mut fs, &apdu(INS_CALC_ALL, 0, 0x01, &chal));
+    assert!(pages >= 2);
+    assert_eq!(count_tag(&body, TAG_NAME), MAX_OATH_CRED as usize);
+
+    // Any command other than SEND REMAINING abandons a half-read page: after a
+    // LIST returns 61xx, an unrelated CALCULATE clears the cursor, so the next
+    // SEND REMAINING is an empty OK, not a stale resumed frame.
+    let (sw, _) = run_fw(&mut app, &mut fs, &apdu(INS_LIST, 0, 0, &[]));
+    assert_eq!(sw, Sw::BYTES_REMAINING_00);
+    let mut d = tlv(TAG_CHALLENGE, &1u64.to_be_bytes());
+    d.extend(tlv(TAG_NAME, &acct_name(0)));
+    let (sw, _) = run_fw(&mut app, &mut fs, &apdu(INS_CALCULATE, 0, 0x01, &d));
+    assert_eq!(sw, Sw::OK);
+    let (sw, body) = run_fw(&mut app, &mut fs, &apdu(INS_SEND_REMAINING, 0, 0, &[]));
+    assert_eq!(sw, Sw::OK);
+    assert!(body.is_empty(), "abandoned page must not resume");
 }

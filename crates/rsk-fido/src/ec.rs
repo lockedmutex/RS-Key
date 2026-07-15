@@ -156,6 +156,54 @@ impl Drop for CredKey {
     }
 }
 
+/// Build a boxed ML-DSA-44 credential key from the ratchet seed. `#[inline(never)]`
+/// is load-bearing: `MlDsa44::from_seed` has a ~100 KiB matrix-expansion frame, and
+/// folding it into [`CredKey::from_raw`] would size that function's frame for the
+/// lattice worst case on EVERY curve — a P-256 getAssertion would then reserve
+/// ~100 KiB it never uses and overflow the worker stack (a hard, replug-only wedge).
+#[inline(never)]
+fn mldsa44_from_raw(raw: &[u8]) -> Option<CredKey> {
+    let mut xi = [0u8; 32];
+    xi.copy_from_slice(raw.get(..32)?);
+    let key = Box::new(rsk_crypto::MlDsa44::from_seed(&xi));
+    xi.zeroize();
+    Some(CredKey::MlDsa44(key))
+}
+
+/// Boxed ML-DSA-65 credential key from the ratchet seed — same
+/// stack-isolation rationale as [`mldsa44_from_raw`].
+#[inline(never)]
+fn mldsa65_from_raw(raw: &[u8]) -> Option<CredKey> {
+    let mut xi = [0u8; 32];
+    xi.copy_from_slice(raw.get(..32)?);
+    let key = Box::new(rsk_crypto::MlDsa65::from_seed(&xi));
+    xi.zeroize();
+    Some(CredKey::MlDsa65(key))
+}
+
+/// Hedged FIPS 204 ML-DSA-44 signing (32 fresh RNG bytes per signature), kept
+/// `#[inline(never)]` for the same reason as [`mldsa44_from_raw`]: the streaming
+/// sign has a ~50 KiB frame that must not be folded into [`CredKey::sign`]'s frame
+/// — which every EC assertion pays.
+#[inline(never)]
+fn mldsa44_sign<R: Rng>(k: &rsk_crypto::MlDsa44, msg: &[u8], rng: &mut R, out: &mut [u8]) -> usize {
+    let mut rnd = [0u8; 32];
+    rng.fill(&mut rnd);
+    let n = k.sign(msg, &rnd, out).unwrap_or(0);
+    rnd.zeroize();
+    n
+}
+
+/// ML-DSA-65 counterpart of [`mldsa44_sign`].
+#[inline(never)]
+fn mldsa65_sign<R: Rng>(k: &rsk_crypto::MlDsa65, msg: &[u8], rng: &mut R, out: &mut [u8]) -> usize {
+    let mut rnd = [0u8; 32];
+    rng.fill(&mut rnd);
+    let n = k.sign(msg, &rnd, out).unwrap_or(0);
+    rnd.zeroize();
+    n
+}
+
 impl CredKey {
     /// Build the key for `curve` (a `CURVE_*` id) from the ratchet output
     /// `raw`: read the curve's scalar byte length, masking the P-521 top byte
@@ -203,27 +251,13 @@ impl CredKey {
                 seed.zeroize();
                 Some(Self::Ed25519(key))
             }
-            c if c == CURVE_MLDSA44 as i64 => {
-                // The ratchet's first 32 bytes are the FIPS 204 keygen seed ξ;
-                // expansion is deterministic, so the same credential id always
-                // rebuilds the same lattice keypair (as the EC schemes do).
-                // Boxed onto the heap so the ~13 KB keypair is off the worker
-                // stack before the stack-heavy `sign` runs (see the variant doc).
-                let mut xi = [0u8; 32];
-                xi.copy_from_slice(raw.get(..32)?);
-                let key = Box::new(rsk_crypto::MlDsa44::from_seed(&xi));
-                xi.zeroize();
-                Some(Self::MlDsa44(key))
-            }
-            c if c == CURVE_MLDSA65 as i64 => {
-                // Same 32-byte-seed derivation as -44, the ML-DSA-65 parameter
-                // set. Boxed off the worker stack (see the variant doc).
-                let mut xi = [0u8; 32];
-                xi.copy_from_slice(raw.get(..32)?);
-                let key = Box::new(rsk_crypto::MlDsa65::from_seed(&xi));
-                xi.zeroize();
-                Some(Self::MlDsa65(key))
-            }
+            // The lattice keygen (`from_seed`) has a ~100 KiB matrix-expansion
+            // frame; keep it behind an `#[inline(never)]` call so it is NOT folded
+            // into `from_raw`'s own frame, which would otherwise reserve that
+            // ~100 KiB on EVERY credential — even a P-256 getAssertion — and
+            // overflow the worker stack. See [`mldsa44_from_raw`].
+            c if c == CURVE_MLDSA44 as i64 => mldsa44_from_raw(raw),
+            c if c == CURVE_MLDSA65 as i64 => mldsa65_from_raw(raw),
             _ => None,
         }
     }
@@ -299,21 +333,10 @@ impl CredKey {
                 let s: ed25519_dalek::Signature = k.sign(msg);
                 put(&s.to_bytes(), out)
             }
-            Self::MlDsa44(k) => {
-                // Hedged FIPS 204 signing: 32 fresh RNG bytes per signature.
-                let mut rnd = [0u8; 32];
-                rng.fill(&mut rnd);
-                let n = k.sign(msg, &rnd, out).unwrap_or(0);
-                rnd.zeroize();
-                n
-            }
-            Self::MlDsa65(k) => {
-                let mut rnd = [0u8; 32];
-                rng.fill(&mut rnd);
-                let n = k.sign(msg, &rnd, out).unwrap_or(0);
-                rnd.zeroize();
-                n
-            }
+            // Kept behind `#[inline(never)]` so the ~50 KiB streaming-sign frame is
+            // not folded into this function's frame (paid by every EC assertion).
+            Self::MlDsa44(k) => mldsa44_sign(k, msg, rng, out),
+            Self::MlDsa65(k) => mldsa65_sign(k, msg, rng, out),
         }
     }
 
@@ -369,6 +392,81 @@ impl CredKey {
             Self::MlDsa44(k) => cose_key_akp(enc, ALG_MLDSA44, &k.public_key()),
             Self::MlDsa65(k) => cose_key_akp(enc, ALG_MLDSA65, &k.public_key()),
         }
+    }
+
+    /// The uncompressed public point for the EC schemes we cache in the EF_CRED
+    /// record (SEC1 `04 ‖ x ‖ y` for the NIST/secp curves, the raw 32-byte key
+    /// for Ed25519), written into `out`; returns its length. `None` for the
+    /// lattice schemes, whose public keys are far too large for the record (they
+    /// keep deriving per enumeration). The point is already computed for authData
+    /// at makeCredential, so caching it there costs no extra scalar mul.
+    pub fn public_point(&self, out: &mut [u8]) -> Option<usize> {
+        fn put(bytes: &[u8], out: &mut [u8]) -> Option<usize> {
+            out.get_mut(..bytes.len())?.copy_from_slice(bytes);
+            Some(bytes.len())
+        }
+        match self {
+            Self::P256(k) => put(k.verifying_key().to_encoded_point(false).as_bytes(), out),
+            Self::P384(k) => put(k.verifying_key().to_encoded_point(false).as_bytes(), out),
+            Self::K256(k) => put(k.verifying_key().to_encoded_point(false).as_bytes(), out),
+            Self::P521(d) => {
+                use p521::elliptic_curve::sec1::ToEncodedPoint;
+                put(
+                    comb_mul(d).to_affine().to_encoded_point(false).as_bytes(),
+                    out,
+                )
+            }
+            Self::Ed25519(k) => put(&k.verifying_key().to_bytes(), out),
+            Self::MlDsa44(_) | Self::MlDsa65(_) => None,
+        }
+    }
+}
+
+/// Byte length of the cached uncompressed public point for `curve`, or `None`
+/// for a scheme we do not cache (the lattice schemes). Credential enumeration
+/// validates a stored trailer against this before emitting it.
+pub fn cached_point_len(curve: i64) -> Option<usize> {
+    Some(match curve {
+        c if c == CURVE_P256 as i64 || c == CURVE_P256K1 as i64 => 65,
+        c if c == CURVE_P384 as i64 => 97,
+        c if c == CURVE_P521 as i64 => 133,
+        c if c == CURVE_ED25519 as i64 => 32,
+        _ => return None,
+    })
+}
+
+/// Encode the COSE public key from a cached uncompressed point (produced by
+/// [`CredKey::public_point`]) for `curve` — byte-identical to
+/// [`CredKey::cose_public`] but with NO scalar multiplication. The caller
+/// validates the point length against [`cached_point_len`] first; the guards
+/// here are defensive (a mismatch yields an encode error, not a bad key).
+pub fn cose_public_from_point<W: Write>(
+    curve: i64,
+    point: &[u8],
+    enc: &mut Encoder<W>,
+) -> Result<(), CborError<W::Error>> {
+    fn ec2<W: Write>(
+        enc: &mut Encoder<W>,
+        alg: i64,
+        crv: u8,
+        point: &[u8],
+        f: usize,
+    ) -> Result<(), CborError<W::Error>> {
+        let body = point
+            .strip_prefix(&[0x04])
+            .filter(|b| b.len() == 2 * f)
+            .ok_or(CborError::message("bad cached point"))?;
+        cose_key_ec2_var(enc, alg, crv, &body[..f], &body[f..])
+    }
+    match curve {
+        c if c == CURVE_P256 as i64 => ec2(enc, ALG_ES256, CURVE_P256, point, 32),
+        c if c == CURVE_P384 as i64 => ec2(enc, ALG_ES384, CURVE_P384, point, 48),
+        c if c == CURVE_P521 as i64 => ec2(enc, ALG_ES512, CURVE_P521, point, 66),
+        c if c == CURVE_P256K1 as i64 => ec2(enc, ALG_ES256K, CURVE_P256K1, point, 32),
+        c if c == CURVE_ED25519 as i64 && point.len() == 32 => {
+            cose_key_okp_var(enc, ALG_EDDSA, CURVE_ED25519, point)
+        }
+        _ => Err(CborError::message("uncacheable curve")),
     }
 }
 

@@ -34,7 +34,10 @@ use embedded_storage_async::nor_flash::{ErrorType, MultiwriteNorFlash, NorFlash,
 use libfuzzer_sys::fuzz_target;
 use rsk_fs::{EF_META, Fs, Storage};
 use rsk_sdk::error::{Error, Result};
-use sequential_storage::cache::{KeyCacheImpl, KeyPointerCache};
+use sequential_storage::cache::key_pointers::ArrayKeyPointers;
+use sequential_storage::cache::page_pointers::ArrayPagePointers;
+use sequential_storage::cache::page_states::ArrayPageStates;
+use sequential_storage::cache::{Cache, CacheImpl};
 use sequential_storage::map::{MapConfig, MapStorage};
 use sequential_storage::mock_flash::{MockFlashBase, MockFlashError, Operation, WriteCountCheck};
 
@@ -47,8 +50,8 @@ const COUNTER_RANGE: core::ops::Range<u32> = (8 * 4096)..(12 * 4096);
 const KV_BUF: usize = 2048;
 const META_MAX: usize = 1024;
 
-type MainCache = KeyPointerCache<8, u16, 32>;
-type CounterCache = KeyPointerCache<4, u16, 4>;
+type MainCache = Cache<ArrayPageStates<8>, ArrayPagePointers<8>, ArrayKeyPointers<u16, 32>, u16>;
+type CounterCache = Cache<ArrayPageStates<4>, ArrayPagePointers<4>, ArrayKeyPointers<u16, 4>, u16>;
 
 // Five main-partition FIDs plus the three counter-routed ones from
 // firmware/src/flash_storage.rs::is_counter_fid — both partitions get torn.
@@ -123,8 +126,24 @@ struct TortureStorage {
 impl TortureStorage {
     fn new(flash: SharedMock) -> Self {
         Self {
-            main: MapStorage::new(flash.clone(), MapConfig::new(MAIN_RANGE), MainCache::new()),
-            counter: MapStorage::new(flash, MapConfig::new(COUNTER_RANGE), CounterCache::new()),
+            main: MapStorage::new(
+                flash.clone(),
+                MapConfig::new(MAIN_RANGE),
+                MainCache::new(
+                    ArrayPageStates::new(),
+                    ArrayPagePointers::new(),
+                    ArrayKeyPointers::new(),
+                ),
+            ),
+            counter: MapStorage::new(
+                flash,
+                MapConfig::new(COUNTER_RANGE),
+                CounterCache::new(
+                    ArrayPageStates::new(),
+                    ArrayPagePointers::new(),
+                    ArrayKeyPointers::new(),
+                ),
+            ),
             buf: [0; KV_BUF],
         }
     }
@@ -171,7 +190,7 @@ impl Storage for TortureStorage {
     }
 }
 
-fn for_each_in<C: KeyCacheImpl<u16>>(
+fn for_each_in<C: CacheImpl<u16>>(
     map: &mut MapStorage<u16, SharedMock, C>,
     buf: &mut [u8],
     f: &mut dyn FnMut(u16),
@@ -206,7 +225,7 @@ fn reboot_verify(
 ) {
     loop {
         shared.dead.set(false);
-        *fs = Fs::new(TortureStorage::new(shared.clone()), &[]);
+        *fs = Fs::new(TortureStorage::new(shared.clone()));
         fs.scan();
         if shared.dead.get() {
             continue; // the cut landed inside the mount/repair — die again
@@ -331,7 +350,7 @@ fuzz_target!(|data: &[u8]| {
         flash: flash.clone(),
         dead: dead.clone(),
     };
-    let mut fs = Fs::new(TortureStorage::new(shared.clone()), &[]);
+    let mut fs = Fs::new(TortureStorage::new(shared.clone()));
     fs.scan();
 
     let mut val: HashMap<u16, Vec<u8>> = HashMap::new();

@@ -25,10 +25,11 @@ use crate::consts::{
 };
 use crate::credential::{
     CRED_BOX_MAX, CRED_REC_MAX, CRED_RESIDENT_LEN, CredInput, RECORD_PREFIX, RP_PREFIX, RP_REC_MAX,
-    USER_NAME_MAX, credential_create, credential_load, derive_large_blob_key, resident_key_input,
-    slot_map, truncate_utf8, unseal_rp_id,
+    USER_NAME_MAX, compose_cred_record, cred_record_box, cred_record_pubkey, credential_create,
+    credential_load, derive_large_blob_key, remaining_rk, resident_key_input, slot_map,
+    truncate_utf8, unseal_rp_id,
 };
-use crate::ec::CredKey;
+use crate::ec::{CredKey, cached_point_len, cose_public_from_point};
 use crate::error::{CtapError, CtapResult};
 use crate::keyderiv::fido_load_key;
 use crate::state::{FidoState, PERM_CM};
@@ -252,7 +253,7 @@ fn creds_metadata<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, out: &mut [u8]) -> Ct
     let mut occupied = [false; MAX_RESIDENT_CREDENTIALS as usize];
     slot_map(ctx.fs, EF_CRED, &mut occupied);
     let existing = occupied.iter().filter(|&&b| b).count() as u16;
-    let remaining = MAX_RESIDENT_CREDENTIALS - existing;
+    let remaining = remaining_rk(ctx.fs, existing);
     let mut enc = Encoder::new(Cursor::new(out));
     enc.map(2)
         .and_then(|e| e.u8(1)?.u16(existing))
@@ -271,12 +272,12 @@ fn enumerate_rps<S: Storage, R: Rng>(
     if begin {
         ctx.state.cm.rp_counter = 1;
         ctx.state.cm.rp_total = 0;
+        ctx.state.cm.rp_next_slot = 0;
     } else if ctx.state.cm.rp_counter > ctx.state.cm.rp_total {
         return Err(CtapError::NotAllowed);
     }
     let target = ctx.state.cm.rp_counter;
 
-    let mut skip = 0u16;
     let mut total = 0u16;
     let mut found = false;
     let mut rp = [0u8; RP_REC_MAX];
@@ -284,7 +285,10 @@ fn enumerate_rps<S: Storage, R: Rng>(
     let mut buf = [0u8; RP_REC_MAX];
     let mut occupied = [false; MAX_RESIDENT_CREDENTIALS as usize];
     slot_map(ctx.fs, EF_RP, &mut occupied);
-    for i in 0..MAX_RESIDENT_CREDENTIALS {
+    // Resume at rp_next_slot (0 on Begin, past the last match on getNext) so a
+    // getNext is O(gap-to-next) not O(scan-from-0); Begin still makes one full
+    // pass to count rp_total.
+    for i in ctx.state.cm.rp_next_slot..MAX_RESIDENT_CREDENTIALS {
         if !occupied[i as usize] {
             continue;
         }
@@ -293,11 +297,11 @@ fn enumerate_rps<S: Storage, R: Rng>(
         };
         let n = n.min(buf.len());
         if n >= RP_PREFIX && buf[0] > 0 {
-            skip = skip.saturating_add(1);
-            if skip == target && !found {
+            if !found {
                 found = true;
                 rp[..n].copy_from_slice(&buf[..n]);
                 rp_len = n;
+                ctx.state.cm.rp_next_slot = i + 1;
                 if !begin {
                     break;
                 }
@@ -349,12 +353,12 @@ fn enumerate_creds<S: Storage, R: Rng>(
     if begin {
         ctx.state.cm.cred_counter = 1;
         ctx.state.cm.cred_total = 0;
+        ctx.state.cm.cred_next_slot = 0;
     } else if ctx.state.cm.cred_counter > ctx.state.cm.cred_total {
         return Err(CtapError::NotAllowed);
     }
     let target = ctx.state.cm.cred_counter;
 
-    let mut skip = 0u16;
     let mut total = 0u16;
     let mut found = false;
     let mut rec = [0u8; CRED_REC_MAX];
@@ -362,7 +366,10 @@ fn enumerate_creds<S: Storage, R: Rng>(
     let mut buf = [0u8; CRED_REC_MAX];
     let mut occupied = [false; MAX_RESIDENT_CREDENTIALS as usize];
     slot_map(ctx.fs, EF_CRED, &mut occupied);
-    for i in 0..MAX_RESIDENT_CREDENTIALS {
+    // Resume at cred_next_slot (0 on Begin, past the last match on getNext) so a
+    // getNext is O(gap-to-next) not O(scan-from-0); Begin still makes one full
+    // pass to count cred_total for this rp.
+    for i in ctx.state.cm.cred_next_slot..MAX_RESIDENT_CREDENTIALS {
         if !occupied[i as usize] {
             continue;
         }
@@ -371,11 +378,11 @@ fn enumerate_creds<S: Storage, R: Rng>(
         };
         let n = n.min(buf.len());
         if n >= RECORD_PREFIX && buf[..32] == *rp_id_hash {
-            skip = skip.saturating_add(1);
-            if skip == target && !found {
+            if !found {
                 found = true;
                 rec[..n].copy_from_slice(&buf[..n]);
                 rec_len = n;
+                ctx.state.cm.cred_next_slot = i + 1;
                 if !begin {
                     break;
                 }
@@ -411,8 +418,9 @@ fn enumerate_creds_response(
     out: &mut [u8],
 ) -> CtapResult {
     let resident_id = &rec[32..RECORD_PREFIX];
-    let cred_box = &rec[RECORD_PREFIX..];
-    // The enumerated pubkey must be the one getAssertion signs with: a v2
+    let cred_box = cred_record_box(rec);
+    let cached_pubkey = cred_record_pubkey(rec);
+    // The enumerated pubkey must be the one getAssertion signs with: a v2/v3
     // credential keys off its stable resident id, so both agree across a reseal.
     let key_input = resident_key_input(cred_box, Some(resident_id));
 
@@ -420,9 +428,18 @@ fn enumerate_creds_response(
     let cred =
         credential_load(seed, cred_box, rp_id_hash, &mut scratch).ok_or(CtapError::NotAllowed)?;
 
-    let mut raw = fido_load_key(seed, key_input).ok_or(CtapError::NotAllowed)?;
-    let key = CredKey::from_raw(cred.curve, &raw).ok_or(CtapError::NotAllowed)?;
-    raw.zeroize();
+    // A v3 record caches the public point (validated against the credential's
+    // curve): emit it and skip the per-call d·G — the dominant enumerate cost on
+    // this MCU's software EC. A v1/v2 record (or an uncacheable curve) derives it.
+    let use_cache = cached_pubkey.is_some_and(|p| cached_point_len(cred.curve) == Some(p.len()));
+    let key = if use_cache {
+        None
+    } else {
+        let mut raw = fido_load_key(seed, key_input).ok_or(CtapError::NotAllowed)?;
+        let k = CredKey::from_raw(cred.curve, &raw).ok_or(CtapError::NotAllowed)?;
+        raw.zeroize();
+        Some(k)
+    };
 
     let user_fields = u64::from(!cred.user_id.is_empty())
         + u64::from(!cred.user_name.is_empty())
@@ -479,7 +496,11 @@ fn enumerate_creds_response(
         .and_then(|e| e.str("type")?.str("public-key"))
         .map_err(|_| CtapError::Other)?;
     enc.u8(8).map_err(|_| CtapError::Other)?;
-    key.cose_public(&mut enc).map_err(|_| CtapError::Other)?;
+    match &key {
+        Some(k) => k.cose_public(&mut enc),
+        None => cose_public_from_point(cred.curve, cached_pubkey.unwrap_or_default(), &mut enc),
+    }
+    .map_err(|_| CtapError::Other)?;
 
     // 0x09 totalCredentials — Begin only.
     if begin {
@@ -646,7 +667,10 @@ fn reseal_user<S: Storage, R: Rng>(
     let mut rp_id_hash = [0u8; 32];
     rp_id_hash.copy_from_slice(&record[..32]);
     let resident_id = &record[32..RECORD_PREFIX];
-    let cred_box = &record[RECORD_PREFIX..];
+    let cred_box = cred_record_box(record);
+    // The cached public point is stable across a reseal (v2/v3 keys off the
+    // preserved resident id), so carry the trailer forward verbatim.
+    let cached_pubkey = cred_record_pubkey(record).unwrap_or_default();
 
     let mut scratch = [0u8; CRED_REC_MAX];
     let cred =
@@ -679,15 +703,16 @@ fn reseal_user<S: Storage, R: Rng>(
     let len = credential_create(seed, &ctx.dev, &input, &rp_id_hash, &iv, &mut new_box)
         .map_err(|_| CtapError::NotAllowed)?;
 
-    // Rewrite the slot: rp_id_hash ‖ (preserved) resident_id ‖ new box.
-    let total = RECORD_PREFIX + len;
+    // Rewrite the slot: rp_id_hash ‖ (preserved) resident_id ‖ [pubkey] ‖ new box.
     let mut rec = [0u8; CRED_REC_MAX];
-    if total > rec.len() {
-        return Err(CtapError::KeyStoreFull);
-    }
-    rec[..32].copy_from_slice(&rp_id_hash);
-    rec[32..RECORD_PREFIX].copy_from_slice(resident_id);
-    rec[RECORD_PREFIX..total].copy_from_slice(&new_box[..len]);
+    let total = compose_cred_record(
+        &rp_id_hash,
+        resident_id,
+        cached_pubkey,
+        &new_box[..len],
+        &mut rec,
+    )
+    .ok_or(CtapError::KeyStoreFull)?;
     ctx.fs
         .put(EF_CRED + slot, &rec[..total])
         .map_err(|_| CtapError::NotAllowed)?;

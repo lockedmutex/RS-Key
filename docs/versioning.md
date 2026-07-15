@@ -3,7 +3,7 @@
 
 # Versions
 
-What the firmware advertises itself as, per protocol — the place to look when a
+What the firmware advertises itself as, per protocol: the place to look when a
 host tool gates a feature on a version number. The build knobs that change any of
 this are documented in [Build options](build.md); what has actually been checked
 against real host software is in the [Interop matrix](interop.md).
@@ -40,19 +40,19 @@ mechanics in [Build options](build.md)):
 | PIV | 3DES management keys + RSA-1024 import allowed | same | new 3DES management keys + RSA-1024 refused |
 
 - **PQC capability is on in every build.** `advertise-pqc` only controls whether
-  ML-DSA-65 (−49) and ML-DSA-44 (−48) appear in the getInfo `algorithms` list — it
+  ML-DSA-65 (−49) and ML-DSA-44 (−48) appear in the getInfo `algorithms` list. It
   is off by default because released Firefox aborts the entire getInfo parse on an
   unknown COSE id. makeCredential negotiates −49 / −48 from the request's
   `pubKeyCredParams` regardless (−49 outranks −48 under the PQC-priority policy).
   −49 / −50 (ML-DSA-65 / 87) are recognised but have no enabled backend.
-- `fips-profile` is a locked policy, **not** a FIPS validation — see the
+- `fips-profile` is a locked policy, **not** a FIPS validation. See the
   [FIPS-style profile](guides/fips.md) guide.
 
 ## Toolchain
 
 The project tracks the latest stable Rust, pinned hermetically rather than to a
 declared MSRV. `nix develop` / `nix build` take the toolchain from the flake
-(fenix `stable`, frozen in `flake.lock` — currently rustc 1.96), on Rust edition
+(fenix `stable`, frozen in `flake.lock`, currently rustc 1.96), on Rust edition
 2024. `rust-toolchain.toml` (`channel = "stable"`) is only the fallback for the
 non-Nix rustup path. "Which Rust built this image" is answered by the committed
 `flake.lock`, so there is no separate minimum-version commitment to drift.

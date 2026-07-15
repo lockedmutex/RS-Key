@@ -83,7 +83,7 @@ impl Platform for FakePlatform {
 }
 
 fuzz_target!(|data: &[u8]| {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     fs.scan();
     let rng = RefCell::new(CountRng(0));
     let platform = RefCell::new(FakePlatform {

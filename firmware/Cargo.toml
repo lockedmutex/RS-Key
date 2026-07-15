@@ -68,7 +68,7 @@ embedded-alloc = "0.6"
 # embassy-rp's blocking Flash is adapted to async via embassy-embedded-hal's
 # BlockingAsync (the futures resolve immediately — flash ops block the executor,
 # the accepted RP2350 XIP-stall caveat).
-sequential-storage = "7"
+sequential-storage = "8"
 embassy-embedded-hal = { workspace = true }
 # The async NorFlash traits (the same 0.4 sequential-storage uses) for `SharedFlash`,
 # the adapter that lets the main + counter partitions share the one Flash peripheral.
@@ -110,6 +110,13 @@ ea-conformance-rpid = ["rsk-fido/ea-conformance-rpid"]
 # so a WebAuthn login is a single touch. Build `--features strict-up` to demand a
 # touch on every assertion (an allowList login then asks for two touches).
 strict-up = ["rsk-fido/strict-up"]
+# Ship with the CTAP 2.1 `alwaysUv` option enabled by default (see rsk-fido's feature
+# docs): every makeCredential / getAssertion demands user verification out of the box,
+# with no post-flash `ykman fido config toggle-always-uv`. OFF by default. Build
+# `--features always-uv`. Set a PIN after flashing — with alwaysUv on and no PIN, FIDO
+# operations return PUAT_REQUIRED until you do (the platform is prompted to set one).
+# Still runtime-toggleable; an authenticatorReset returns it to this compiled default.
+always-uv = ["rsk-fido/always-uv"]
 # Trusted-display build for a screen+touch board (Waveshare RP2350-Touch-LCD-2.8):
 # on-screen Approve/Deny showing the relying party, on-device PIN entry, lock, and
 # settings. OFF by default and entirely `dep:`-gated, so a standard key without a

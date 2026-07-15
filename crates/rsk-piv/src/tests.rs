@@ -25,7 +25,7 @@ impl Rng for TestRng {
 }
 
 fn new_fs() -> Fs<RamStorage> {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     fs.scan();
     fs
 }
@@ -981,6 +981,112 @@ fn mgm_3des_roundtrip() {
     let mut expect = host_chal;
     rsk_crypto::des3_encrypt_block(&key24, &mut expect);
     assert_eq!(&resp[4..12], &expect);
+}
+
+#[test]
+fn ec_metadata_point_is_cached_and_derive_fallback_matches() {
+    let rng = RefCell::new(TestRng(7));
+    let pres = RefCell::new(AlwaysConfirm);
+    let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
+    let mut fs = new_fs();
+    select(&mut app, &mut fs);
+    auth_mgm(&mut app, &mut fs);
+    verify_pin(&mut app, &mut fs);
+    let (sw, _resp) = run(
+        &mut app,
+        &mut fs,
+        INS_ASYM_KEYGEN,
+        0,
+        0x9A,
+        &gen_template(ALGO_ECCP256),
+    );
+    assert_eq!(sw, Sw::OK);
+
+    // The slot's meta record now carries the public point after the 4-byte head.
+    let mut meta = [0u8; 4 + MAX_EC_POINT];
+    let n = fs.meta_find(key_fid(0x9A).get(), &mut meta).unwrap();
+    assert!(
+        n > 4,
+        "a generated EC slot caches its public point in the meta record"
+    );
+
+    // GET METADATA emits exactly that cached point (no d·G).
+    let (sw, md) = run(&mut app, &mut fs, INS_GET_METADATA, 0, 0x9A, &[]);
+    assert_eq!(sw, Sw::OK);
+    let cached = find_tag(find_tag(&md, 0x04).unwrap(), 0x86)
+        .unwrap()
+        .to_vec();
+    assert_eq!(&meta[4..n], &cached[..]);
+
+    // Keygen also writes the per-slot pubkey cache file (read first, O(1) at any
+    // slot count).
+    assert!(
+        fs.has_data(pubkey_fid(0x9A)),
+        "keygen caches the point per-slot"
+    );
+
+    // Strip BOTH caches to model a key made by pre-cache firmware: GET METADATA
+    // derives the point and must return the same bytes.
+    fs.delete(pubkey_fid(0x9A)).unwrap();
+    fs.meta_add(key_fid(0x9A).get(), &meta[..4]).unwrap();
+    let (sw, md2) = run(&mut app, &mut fs, INS_GET_METADATA, 0, 0x9A, &[]);
+    assert_eq!(sw, Sw::OK);
+    let derived = find_tag(find_tag(&md2, 0x04).unwrap(), 0x86)
+        .unwrap()
+        .to_vec();
+    assert_eq!(cached, derived, "derive fallback matches the cached point");
+}
+
+#[test]
+fn ec_metadata_cache_is_best_effort_under_meta_pressure() {
+    let rng = RefCell::new(TestRng(7));
+    let pres = RefCell::new(AlwaysConfirm);
+    let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
+    let mut fs = new_fs();
+    select(&mut app, &mut fs);
+    auth_mgm(&mut app, &mut fs);
+    verify_pin(&mut app, &mut fs);
+
+    // Stuff EF_META (META_MAX=1024, reserve=256) so a new EC slot has no room to
+    // cache its ~65-byte point but ample room for its 4-byte head. Filler fid is
+    // outside the PIV key_fid range (0xD1xx), so GET METADATA never reads it.
+    let filler = [0u8; 740]; // record 744; point-budget (768) free = 24 < a P-256 record
+    fs.meta_add(0xABCD, &filler).unwrap();
+
+    let (sw, _resp) = run(
+        &mut app,
+        &mut fs,
+        INS_ASYM_KEYGEN,
+        0,
+        0x9A,
+        &gen_template(ALGO_ECCP256),
+    );
+    assert_eq!(
+        sw,
+        Sw::OK,
+        "key still provisions when its point cannot be cached"
+    );
+
+    // Under the reserve the slot stored only its essential 4-byte head, no point.
+    let mut meta = [0u8; 4 + MAX_EC_POINT];
+    let n = fs.meta_find(key_fid(0x9A).get(), &mut meta).unwrap();
+    assert_eq!(n, 4, "best-effort: no point cached under meta pressure");
+    assert_eq!(
+        meta[0], ALGO_ECCP256,
+        "the algo head is intact for the gate"
+    );
+
+    // Under EF_META pressure the point is cached in the per-slot file instead, so
+    // GET METADATA stays O(1) (no d·G) and still returns the correct public key.
+    assert!(
+        fs.has_data(pubkey_fid(0x9A)),
+        "the per-slot pubkey file caches the point when EF_META is full"
+    );
+    let (sw, md) = run(&mut app, &mut fs, INS_GET_METADATA, 0, 0x9A, &[]);
+    assert_eq!(sw, Sw::OK);
+    let point = find_tag(find_tag(&md, 0x04).unwrap(), 0x86).unwrap();
+    assert_eq!(point.len(), 65, "uncompressed P-256 point");
+    assert_eq!(point[0], 0x04);
 }
 
 #[test]

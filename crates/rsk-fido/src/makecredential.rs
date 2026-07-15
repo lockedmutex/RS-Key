@@ -29,16 +29,16 @@ use crate::cert;
 use crate::consts::{
     AAGUID, ALG_ED25519, ALG_EDDSA, ALG_ES256, ALG_ES256K, ALG_ES384, ALG_ES512, ALG_ESP256,
     ALG_ESP384, ALG_ESP512, ALG_MLDSA44, ALG_MLDSA65, CRED_PROT_UV_REQUIRED, CURVE_ED25519,
-    CURVE_MLDSA44, CURVE_MLDSA65, CURVE_P256, CURVE_P256K1, CURVE_P384, CURVE_P521, EF_ALWAYS_UV,
-    EF_ATT_CHAIN, EF_EA_ENABLED, EF_EE_DEV, EF_MINPINLEN, EF_PIN, FLAG_AT, FLAG_ED, FLAG_UP,
-    FLAG_UV, MAX_CREDBLOB_LENGTH, MAX_CREDENTIAL_COUNT_IN_LIST, MAX_MIN_PIN_RPIDS,
-    MAX_RESIDENT_CREDENTIALS, PREFER_PQC,
+    CURVE_MLDSA44, CURVE_MLDSA65, CURVE_P256, CURVE_P256K1, CURVE_P384, CURVE_P521, EF_ATT_CHAIN,
+    EF_EA_ENABLED, EF_EE_DEV, EF_MINPINLEN, EF_PIN, FLAG_AT, FLAG_ED, FLAG_UP, FLAG_UV,
+    MAX_CREDBLOB_LENGTH, MAX_CREDENTIAL_COUNT_IN_LIST, MAX_MIN_PIN_RPIDS, MAX_RESIDENT_CREDENTIALS,
+    PREFER_PQC,
 };
 use crate::credential::{
-    CRED_BOX_MAX, CRED_REC_MAX, CRED_RESIDENT_LEN, CredExt, CredInput, Credential, RECORD_PREFIX,
-    RP_ID_MAX, USER_ID_MAX, USER_NAME_MAX, credential_create, credential_load, credential_store,
-    derive_large_blob_key, derive_resident, is_resident, resident_key_input, slot_map,
-    truncate_utf8,
+    CRED_BOX_MAX, CRED_PUBKEY_MAX, CRED_REC_MAX, CRED_RESIDENT_LEN, CredExt, CredInput, Credential,
+    RECORD_PREFIX, RP_ID_MAX, USER_ID_MAX, USER_NAME_MAX, cred_record_box, credential_create,
+    credential_load, credential_store, derive_large_blob_key, derive_resident, is_resident,
+    resident_key_input, slot_map, truncate_utf8,
 };
 use crate::ec::{CredKey, MAX_SIG_LEN, P256Key};
 use crate::error::{CtapError, CtapResult};
@@ -456,7 +456,7 @@ fn enforce_pin<S: Storage, R: Rng>(
         }
         // §8.1: a configured PIN must be exercised. alwaysUv additionally forces
         // user verification even when no PIN is set (CTAP 2.1 alwaysUv).
-        None if pin_set || ctx.fs.has_data(EF_ALWAYS_UV) => Err(CtapError::PuatRequired),
+        None if pin_set || crate::config::always_uv_enabled(ctx.fs) => Err(CtapError::PuatRequired),
         None => Ok(false),
     }
 }
@@ -517,6 +517,12 @@ fn make_credential_inner<S: Storage, R: Rng>(
     let mut raw = fido_load_key(seed, key_input).ok_or(CtapError::Other)?;
     let key = CredKey::from_raw(req.sel_curve, &raw).ok_or(CtapError::Other)?;
     raw.zeroize();
+
+    // Cache the public point in the resident record so enumeration emits it
+    // instead of recomputing d·G per call. `key` already holds it (it is the
+    // point encoded into authData below); empty for an uncacheable curve.
+    let mut cached_pubkey = [0u8; CRED_PUBKEY_MAX];
+    let cached_pubkey_len = key.public_point(&mut cached_pubkey).unwrap_or(0);
 
     // hmac-secret-mc output (an hmac-secret evaluation at registration time).
     let mut hs = [0u8; SALT_ENC_MAX];
@@ -684,6 +690,7 @@ fn make_credential_inner<S: Storage, R: Rng>(
             rp_id_hash,
             req.rp_id,
             req.user_id,
+            &cached_pubkey[..cached_pubkey_len],
         )
         .is_err()
     {
@@ -793,7 +800,7 @@ fn exclude_hit<S: Storage>(
             };
             let n = n.min(rec.len());
             if n >= RECORD_PREFIX && rec[..32] == *rp_id_hash && rec[32..RECORD_PREFIX] == *id {
-                return credential_load(seed, &rec[RECORD_PREFIX..n], rp_id_hash, &mut scratch)
+                return credential_load(seed, cred_record_box(&rec[..n]), rp_id_hash, &mut scratch)
                     .map(|c| visible(&c))
                     .unwrap_or(false);
             }

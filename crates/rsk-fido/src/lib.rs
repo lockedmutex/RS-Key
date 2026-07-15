@@ -195,7 +195,7 @@ pub fn process_cbor<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, data: &[u8], out: &
                 min_pin,
                 force,
                 ctx.fs.has_data(consts::EF_EA_ENABLED),
-                ctx.fs.has_data(consts::EF_ALWAYS_UV),
+                config::always_uv_enabled(ctx.fs),
                 ctx.presence.uv_available(),
                 remaining_rk,
                 &mut out[1..],

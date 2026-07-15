@@ -165,6 +165,42 @@ fn store_generated_cert<S: Storage>(
     store_slot_cert(fs, rng, slot, algo, spki, signer)
 }
 
+/// Build the metadata record for an EC key slot into `out`: the 4-byte
+/// `[algo, pin_policy, touch_policy, origin]` head with the uncompressed public
+/// `point` appended, so GET METADATA emits it (tag 0x04) instead of recomputing
+/// `d·G` per probe. An empty `point` writes just the head (uncacheable path).
+/// Returns the record length; `out` must be `>= 4 + point.len()`.
+fn ec_slot_meta(algo: u8, pol: [u8; 2], origin: u8, point: &[u8], out: &mut [u8]) -> usize {
+    out[0] = algo;
+    out[1] = pol[0];
+    out[2] = pol[1];
+    out[3] = origin;
+    out[4..4 + point.len()].copy_from_slice(point);
+    4 + point.len()
+}
+
+/// EF_META bytes kept free for every slot's essential 4-byte head, so an optional
+/// cached public point can never crowd a head out. Well above the max PIV meta
+/// record count (4 active + 20 retired + card-mgmt + attestation slots) times the
+/// 8-byte head record, so every slot's head — and thus provisioning — always fits.
+pub(crate) const META_POINT_RESERVE: usize = 256;
+
+/// Store a slot's meta record best-effort. `rec` is the 4-byte
+/// `[algo, pin_pol, touch_pol, origin]` head, optionally followed by the cached
+/// public point ([`ec_slot_meta`]). The head is essential (GET METADATA and the
+/// PIN/touch gate read it); the point is only a GET METADATA speed-up. If the full
+/// record would leave too little room for other slots' heads, store just the head
+/// — GET METADATA then derives the point on the fly, exactly as for a key made by
+/// pre-cache firmware. So the optional cache can never fail provisioning or leave a
+/// key without its metadata, and EF_META stays bounded regardless of slot count.
+pub(crate) fn meta_add_slot<S: Storage>(fs: &mut Fs<S>, fid: u16, rec: &[u8]) -> Result<(), Sw> {
+    if fs.meta_add_reserve(fid, rec, META_POINT_RESERVE).is_ok() {
+        return Ok(());
+    }
+    fs.meta_add(fid, &rec[..rec.len().min(4)])
+        .map_err(|_| Sw::MEMORY_FAILURE)
+}
+
 /// The EC / Ed25519 / X25519 arm of GENERATE; RSA goes through
 /// [`crate::PivApplet::rsa_generate_finish`] (the firmware runs the dual-core
 /// prime search, CCID keepalives flowing meanwhile) or the blocking fallback
@@ -194,15 +230,15 @@ pub(crate) fn generate_ec<S: Storage>(
     if let Err(e) = seal::store_ec_key(dev, fs, rng, key_fid(slot), &key) {
         return e;
     }
+    // Cache the public point in its own per-slot file so GET METADATA stays O(1) at
+    // any slot count — the shared EF_META cache fills after ~10 EC slots and the
+    // rest would recompute d·G. Best-effort: on failure GET METADATA derives it.
+    let _ = fs.put(pubkey_fid(slot), &point[..plen]);
     let pol = resolved_policies(slot, req.pin_policy, req.touch_policy);
-    if fs
-        .meta_add(
-            key_fid(slot).get(),
-            &[req.algo, pol[0], pol[1], ORIGIN_GENERATED],
-        )
-        .is_err()
-    {
-        return Sw::MEMORY_FAILURE;
+    let mut mbuf = [0u8; 4 + MAX_EC_POINT];
+    let mlen = ec_slot_meta(req.algo, pol, ORIGIN_GENERATED, &point[..plen], &mut mbuf);
+    if let Err(e) = meta_add_slot(fs, key_fid(slot).get(), &mbuf[..mlen]) {
+        return e;
     }
     let mut out = [0u8; 110];
     let n = make_ec_pubkey_do(&point[..plen], &mut out);
@@ -311,11 +347,9 @@ pub(crate) fn generate_retired_ec<S: Storage>(
     store_generated_cert(fs, rng, slot, algo, curve, &point[..plen], &key)?;
     seal::store_ec_key(dev, fs, rng, key_fid(slot), &key)?;
     let pol = resolved_policies(slot, None, None);
-    fs.meta_add(
-        key_fid(slot).get(),
-        &[algo, pol[0], pol[1], ORIGIN_GENERATED],
-    )
-    .map_err(|_| Sw::MEMORY_FAILURE)
+    let mut mbuf = [0u8; 4 + MAX_EC_POINT];
+    let mlen = ec_slot_meta(algo, pol, ORIGIN_GENERATED, &point[..plen], &mut mbuf);
+    meta_add_slot(fs, key_fid(slot).get(), &mbuf[..mlen])
 }
 
 /// Persist a display-generated RSA key into an empty retired slot — the RSA companion
@@ -495,14 +529,26 @@ pub(crate) fn import<S: Storage>(
         return sw;
     }
     let pol = resolved_policies(slot, pin_policy, touch_policy);
-    if fs
-        .meta_add(
-            key_fid(slot).get(),
-            &[algo, pol[0], pol[1], ORIGIN_IMPORTED],
-        )
-        .is_err()
-    {
-        return Sw::MEMORY_FAILURE;
+    // Cache the public point for EC slots (import is not a hot path, so derive it
+    // once from the freshly sealed key); RSA keeps the bare 4-byte record.
+    let mut mbuf = [0u8; 4 + MAX_EC_POINT];
+    let mlen = if matches!(
+        algo,
+        ALGO_ECCP256 | ALGO_ECCP384 | ALGO_ED25519 | ALGO_X25519
+    ) {
+        let mut point = [0u8; MAX_EC_POINT];
+        match seal::load_ec_key(dev, fs, key_fid(slot)).and_then(|k| k.public_point(&mut point)) {
+            Ok(plen) => {
+                let _ = fs.put(pubkey_fid(slot), &point[..plen]);
+                ec_slot_meta(algo, pol, ORIGIN_IMPORTED, &point[..plen], &mut mbuf)
+            }
+            Err(_) => ec_slot_meta(algo, pol, ORIGIN_IMPORTED, &[], &mut mbuf),
+        }
+    } else {
+        ec_slot_meta(algo, pol, ORIGIN_IMPORTED, &[], &mut mbuf)
+    };
+    if let Err(e) = meta_add_slot(fs, key_fid(slot).get(), &mbuf[..mlen]) {
+        return e;
     }
     Sw::OK
 }

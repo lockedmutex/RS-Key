@@ -26,7 +26,7 @@ impl crate::UserPresence for Fixed {
 }
 
 fn run(presence: &mut dyn crate::UserPresence) -> CtapResult {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut rng = SeqRng(1);
     let mut state = FidoState::new();
     let dev = Device {

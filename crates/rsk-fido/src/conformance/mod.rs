@@ -85,7 +85,7 @@ struct Authr {
 impl Authr {
     /// A freshly-provisioned authenticator: seed ensured, no PIN, no credentials.
     fn fresh() -> Self {
-        let mut fs = Fs::new(RamStorage::new(), &[]);
+        let mut fs = Fs::new(RamStorage::new());
         let mut rng = SeqRng(1);
         crate::seed::ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
         Authr {

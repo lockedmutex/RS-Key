@@ -67,3 +67,13 @@ strict-up = []
 # (it would grant enterprise attestation to a FIDO test domain). Shipping
 # firmware's type-1 list is empty.
 ea-conformance-rpid = ["fido-conformance"]
+# Enable the CTAP 2.1 `alwaysUv` option BY DEFAULT — out of the box and after every
+# authenticatorReset — so the device demands user verification for every
+# makeCredential / getAssertion with no post-flash `ykman fido config
+# toggle-always-uv`. OFF by default (the shipped image leaves alwaysUv off until a
+# platform toggles it). Still runtime-toggleable: `toggleAlwaysUv` writes an explicit
+# override (`EF_ALWAYS_UV` = `[1]`/`[0]`) that outlives reboots but not a reset, which
+# clears it back to this compiled default. With alwaysUv on and no PIN set (and no
+# built-in UV), makeCredential / getAssertion return CTAP2_ERR_PUAT_REQUIRED until a
+# PIN is configured — the standard alwaysUv cue for the platform to set one.
+always-uv = []

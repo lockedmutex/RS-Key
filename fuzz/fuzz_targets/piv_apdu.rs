@@ -77,7 +77,7 @@ fuzz_target!(|data: &[u8]| {
     let rng = RefCell::new(CountRng(0));
     let pres = RefCell::new(AlwaysConfirm);
     let mut app = PivApplet::new([1, 2, 3, 4, 5, 6, 7, 8], [0x22; 32], None, &rng, &pres);
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     fs.scan();
 
     // SELECT to initialize the default files.

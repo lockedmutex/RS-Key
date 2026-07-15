@@ -58,7 +58,7 @@ fn otp_dev() -> Device<'static> {
 }
 
 fn fs() -> Fs<RamStorage> {
-    Fs::new(RamStorage::new(), &[])
+    Fs::new(RamStorage::new())
 }
 
 #[test]

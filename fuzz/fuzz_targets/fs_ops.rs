@@ -26,7 +26,7 @@ use rsk_fs::{EF_META, Fs};
 const META_MAX: usize = 1024;
 
 fuzz_target!(|data: &[u8]| {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     fs.scan();
     let mut model: HashMap<u16, Vec<u8>> = HashMap::new();
     let mut meta: HashMap<u16, Vec<u8>> = HashMap::new();
@@ -112,7 +112,7 @@ fuzz_target!(|data: &[u8]| {
                 // Reboot: rebuild the Fs over the same image and rescan; both
                 // models must keep matching afterwards.
                 let storage = fs.into_storage();
-                fs = Fs::new(storage, &[]);
+                fs = Fs::new(storage);
                 fs.scan();
             }
             _ => {

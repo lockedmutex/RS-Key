@@ -29,7 +29,10 @@ use std::rc::Rc;
 use embassy_futures::block_on;
 use embedded_storage_async::nor_flash::{ErrorType, MultiwriteNorFlash, NorFlash, ReadNorFlash};
 use libfuzzer_sys::fuzz_target;
-use sequential_storage::cache::KeyPointerCache;
+use sequential_storage::cache::Cache as SsCache;
+use sequential_storage::cache::key_pointers::ArrayKeyPointers;
+use sequential_storage::cache::page_pointers::ArrayPagePointers;
+use sequential_storage::cache::page_states::ArrayPageStates;
 use sequential_storage::map::{MapConfig, MapStorage};
 use sequential_storage::mock_flash::{MockFlashBase, MockFlashError, Operation, WriteCountCheck};
 
@@ -38,7 +41,7 @@ const PAGE_WORDS: usize = 1024;
 type Mock = MockFlashBase<8, WORD, PAGE_WORDS>;
 const RANGE: core::ops::Range<u32> = 0..(8 * 4096);
 const KV_BUF: usize = 2048;
-type Cache = KeyPointerCache<8, u16, 16>;
+type Cache = SsCache<ArrayPageStates<8>, ArrayPagePointers<8>, ArrayKeyPointers<u16, 16>, u16>;
 
 // Key 0 is the "hot" key (EF_META analog); the rest are cold occupants that make
 // migration copy real data.
@@ -107,7 +110,15 @@ fn reboot_verify(
 ) {
     loop {
         shared.dead.set(false);
-        let mut store = Store::new(shared.clone(), MapConfig::new(RANGE), Cache::new());
+        let mut store = Store::new(
+            shared.clone(),
+            MapConfig::new(RANGE),
+            Cache::new(
+                ArrayPageStates::new(),
+                ArrayPagePointers::new(),
+                ArrayKeyPointers::new(),
+            ),
+        );
         let mut buf = [0u8; KV_BUF];
 
         // Resolve the interrupted op from what the flash actually holds.
@@ -174,7 +185,15 @@ fuzz_target!(|data: &[u8]| {
     )));
     let dead = Rc::new(Cell::new(false));
     let shared = SharedMock { flash, dead };
-    let mut store = Store::new(shared.clone(), MapConfig::new(RANGE), Cache::new());
+    let mut store = Store::new(
+        shared.clone(),
+        MapConfig::new(RANGE),
+        Cache::new(
+            ArrayPageStates::new(),
+            ArrayPagePointers::new(),
+            ArrayKeyPointers::new(),
+        ),
+    );
     let mut buf = [0u8; KV_BUF];
 
     let mut committed: HashMap<u16, Vec<u8>> = HashMap::new();
@@ -226,14 +245,30 @@ fuzz_target!(|data: &[u8]| {
             _ => {
                 // Clean reboot — full re-mount and durability check.
                 reboot_verify(&shared, &mut committed, None);
-                store = Store::new(shared.clone(), MapConfig::new(RANGE), Cache::new());
+                store = Store::new(
+                    shared.clone(),
+                    MapConfig::new(RANGE),
+                    Cache::new(
+                        ArrayPageStates::new(),
+                        ArrayPagePointers::new(),
+                        ArrayKeyPointers::new(),
+                    ),
+                );
                 continue;
             }
         }
 
         if shared.dead.get() {
             reboot_verify(&shared, &mut committed, pending);
-            store = Store::new(shared.clone(), MapConfig::new(RANGE), Cache::new());
+            store = Store::new(
+                shared.clone(),
+                MapConfig::new(RANGE),
+                Cache::new(
+                    ArrayPageStates::new(),
+                    ArrayPagePointers::new(),
+                    ArrayKeyPointers::new(),
+                ),
+            );
         }
     }
 });

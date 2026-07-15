@@ -138,7 +138,7 @@ fn select_reports_identity() {
         KV_TOTAL,
         FLASH_SIZE,
     );
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut buf = [0u8; 64];
     let mut res = ResBuf::new(&mut buf);
     let sw = Applet::<Fs<RamStorage>>::select(&mut app, false, &mut fs, &mut res);
@@ -164,7 +164,7 @@ fn cla_is_checked() {
         KV_TOTAL,
         FLASH_SIZE,
     );
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let (sw, _) = run(&mut app, &mut fs, &apdu(0x00, INS_READ, 0x03, 0, &[]));
     assert_eq!(sw, Sw::CLA_NOT_SUPPORTED);
 }
@@ -198,7 +198,7 @@ fn otp_lock_writes_once_then_idempotent() {
     let platform = RefCell::new(FakePlatform::default()); // lock_raw = Some(0)
     let presence = RefCell::new(AlwaysConfirm);
     let mut app = lock_app(&rng, &platform, &presence, Some([0x11; 32]));
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
 
     let (sw, _) = run(&mut app, &mut fs, &lock_apdu());
     assert_eq!(sw, Sw::OK);
@@ -220,7 +220,7 @@ fn otp_lock_refused_without_provisioned_keys() {
     let platform = RefCell::new(FakePlatform::default());
     let presence = RefCell::new(AlwaysConfirm);
     let mut app = lock_app(&rng, &platform, &presence, None); // no MKEK
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let (sw, _) = run(&mut app, &mut fs, &lock_apdu());
     assert_eq!(sw, Sw::CONDITIONS_NOT_SATISFIED);
     assert_eq!(platform.borrow().lock_writes, 0);
@@ -232,7 +232,7 @@ fn otp_lock_rejects_bad_guards() {
     let platform = RefCell::new(FakePlatform::default());
     let presence = RefCell::new(AlwaysConfirm);
     let mut app = lock_app(&rng, &platform, &presence, Some([0x11; 32]));
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
 
     // wrong P1 (not the page number)
     let (sw, _) = run(
@@ -269,7 +269,7 @@ fn otp_lock_refuses_foreign_lock_value() {
     });
     let presence = RefCell::new(AlwaysConfirm);
     let mut app = lock_app(&rng, &platform, &presence, Some([0x11; 32]));
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let (sw, _) = run(&mut app, &mut fs, &lock_apdu());
     assert_eq!(sw, Sw::CONDITIONS_NOT_SATISFIED);
     assert_eq!(
@@ -289,7 +289,7 @@ fn otp_lock_read_error_is_exec_error() {
     });
     let presence = RefCell::new(AlwaysConfirm);
     let mut app = lock_app(&rng, &platform, &presence, Some([0x11; 32]));
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let (sw, _) = run(&mut app, &mut fs, &lock_apdu());
     assert_eq!(sw, Sw::EXEC_ERROR);
     assert_eq!(platform.borrow().lock_writes, 0);
@@ -313,7 +313,7 @@ fn rollback_require_burns_once_then_idempotent() {
     let platform = RefCell::new(secure_platform());
     let presence = RefCell::new(AlwaysConfirm);
     let mut app = lock_app(&rng, &platform, &presence, None); // no MKEK needed for this one
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
 
     let (sw, _) = run(&mut app, &mut fs, &rollback_apdu());
     assert_eq!(sw, Sw::OK);
@@ -337,7 +337,7 @@ fn rollback_require_needs_secure_boot() {
     let platform = RefCell::new(FakePlatform::default()); // secure boot off
     let presence = RefCell::new(AlwaysConfirm);
     let mut app = lock_app(&rng, &platform, &presence, Some([0x11; 32]));
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let (sw, _) = run(&mut app, &mut fs, &rollback_apdu());
     assert_eq!(sw, Sw::CONDITIONS_NOT_SATISFIED);
     assert_eq!(platform.borrow().rollback_writes, 0);
@@ -349,7 +349,7 @@ fn rollback_require_rejects_bad_guards() {
     let platform = RefCell::new(secure_platform());
     let presence = RefCell::new(AlwaysConfirm);
     let mut app = lock_app(&rng, &platform, &presence, Some([0x11; 32]));
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
 
     // wrong magic (including the *other* P1's magic)
     let (sw, _) = run(
@@ -396,7 +396,7 @@ fn rollback_require_read_error_is_exec_error() {
     });
     let presence = RefCell::new(AlwaysConfirm);
     let mut app = lock_app(&rng, &platform, &presence, Some([0x11; 32]));
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let (sw, _) = run(&mut app, &mut fs, &rollback_apdu());
     assert_eq!(sw, Sw::EXEC_ERROR);
     assert_eq!(platform.borrow().rollback_writes, 0);
@@ -422,7 +422,7 @@ fn rollback_state_read() {
     });
     let presence = RefCell::new(AlwaysConfirm);
     let mut app = lock_app(&rng, &platform, &presence, None);
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let (sw, body) = run(&mut app, &mut fs, &apdu(0x80, INS_READ, 0x06, 0, &[]));
     assert_eq!(sw, Sw::OK);
     assert_eq!(body, vec![1, 4, rollback::VERSION_CAPACITY]);
@@ -460,7 +460,7 @@ fn keydev_sign_verifies_and_key_persists() {
         KV_TOTAL,
         FLASH_SIZE,
     );
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
 
     let (sw, pubkey) = run(
         &mut app,
@@ -517,7 +517,7 @@ fn keydev_cert_upload() {
         KV_TOTAL,
         FLASH_SIZE,
     );
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let cert = [0x30u8, 0x82, 0x01, 0x00, 0xAA, 0xBB];
     let (sw, _) = run(
         &mut app,
@@ -553,7 +553,7 @@ fn phy_write_read_roundtrip() {
         KV_TOTAL,
         FLASH_SIZE,
     );
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
 
     // Virgin device: READ phy returns just the zero OPTS TLV.
     let (sw, body) = run(&mut app, &mut fs, &apdu(0x80, INS_READ, 0x01, 0, &[]));
@@ -588,7 +588,7 @@ fn flash_info_layout() {
         KV_TOTAL,
         FLASH_SIZE,
     );
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     fs.put(0x1111, &[0u8; 10]).unwrap();
     fs.put(0x2222, &[0u8; 6]).unwrap();
 
@@ -622,7 +622,7 @@ fn secure_boot_status() {
         KV_TOTAL,
         FLASH_SIZE,
     );
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let (sw, body) = run(&mut app, &mut fs, &apdu(0x80, INS_READ, 0x03, 0, &[]));
     assert_eq!(sw, Sw::OK);
     assert_eq!(body, vec![1, 0, 2]);
@@ -644,7 +644,7 @@ fn time_set_and_get_both_forms() {
         KV_TOTAL,
         FLASH_SIZE,
     );
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
 
     // Before set: 6985.
     let (sw, _) = run(&mut app, &mut fs, &apdu(0x80, INS_READ, 0x04, 0x02, &[]));
@@ -695,7 +695,7 @@ fn reboot_requests() {
         KV_TOTAL,
         FLASH_SIZE,
     );
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
 
     let (sw, _) = run(
         &mut app,
@@ -735,7 +735,7 @@ fn secure_ins_is_not_supported() {
         KV_TOTAL,
         FLASH_SIZE,
     );
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let (sw, _) = run(&mut app, &mut fs, &apdu(0x80, 0x1D, 0x00, 0, &[]));
     assert_eq!(sw, Sw::INS_NOT_SUPPORTED);
     assert!(platform.borrow().reboots.is_empty());
@@ -757,7 +757,7 @@ fn privileged_ops_require_user_presence() {
         KV_TOTAL,
         FLASH_SIZE,
     );
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
 
     // Attestation sign / cert write / phy write / reboot-to-BOOTSEL are all
     // refused without a confirmation, and none take effect.
@@ -814,7 +814,7 @@ fn otp_fuse_writes_require_user_presence() {
         KV_TOTAL,
         FLASH_SIZE,
     );
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let (sw, _) = run(&mut app, &mut fs, &lock_apdu());
     assert_eq!(sw, Sw::CONDITIONS_NOT_SATISFIED);
     assert_eq!(platform.borrow().lock_writes, 0, "no burn without presence");
@@ -833,7 +833,7 @@ fn otp_fuse_writes_require_user_presence() {
         KV_TOTAL,
         FLASH_SIZE,
     );
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let (sw, _) = run(&mut app, &mut fs, &rollback_apdu());
     assert_eq!(sw, Sw::CONDITIONS_NOT_SATISFIED);
     assert_eq!(

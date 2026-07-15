@@ -128,7 +128,7 @@ fn parse_mc(resp: &[u8]) -> (std::vec::Vec<u8>, [u8; 32], [u8; 32]) {
 }
 
 fn setup() -> (Fs<RamStorage>, SeqRng) {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut rng = SeqRng(1);
     ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
     (fs, rng)
@@ -328,6 +328,59 @@ fn enumerate_credentials_returns_matching_pubkey() {
     assert!(got.contains(&(xb, yb)));
 
     // Exhausted → NotAllowed.
+    assert_eq!(
+        run(&mut fs, &mut state, &cm_next(0x05), &mut out),
+        Err(CtapError::NotAllowed)
+    );
+}
+
+#[test]
+fn rp_and_credential_cursors_are_independent_when_interleaved() {
+    // The slot cursors for the RP and credential walks are separate, so
+    // interleaving getNextRP and getNextCredential must advance each walk without
+    // corrupting the other (a regression guard for the cursor optimization).
+    let (mut fs, mut rng) = setup();
+    register(&mut fs, &mut rng, "example.com", &[1, 1], "alice");
+    register(&mut fs, &mut rng, "example.com", &[2, 2], "bob");
+    register(&mut fs, &mut rng, "other.com", &[3, 3], "carol");
+    let rp_hash = sha256(b"example.com");
+    let mut state = armed(PERM_CM);
+    let mut out = [0u8; 512];
+
+    // Begin both walks (2 RPs; 2 creds for example.com).
+    let n = run(
+        &mut fs,
+        &mut state,
+        &cm_request(0x02, None, &TOKEN),
+        &mut out,
+    )
+    .unwrap();
+    let (rp1, _, rp_total) = parse_rp(&out[..n], true);
+    assert_eq!(rp_total, Some(2));
+    let n = run(
+        &mut fs,
+        &mut state,
+        &cm_request(0x04, Some(&subpara_rpidhash(&rp_hash)), &TOKEN),
+        &mut out,
+    )
+    .unwrap();
+    let (cu1, _, _, cred_total) = parse_cred(&out[..n], true);
+    assert_eq!(cred_total, Some(2));
+
+    // Interleave the Next calls: RP walk and credential walk advance independently.
+    let n = run(&mut fs, &mut state, &cm_next(0x03), &mut out).unwrap();
+    let (rp2, _, _) = parse_rp(&out[..n], false);
+    let n = run(&mut fs, &mut state, &cm_next(0x05), &mut out).unwrap();
+    let (cu2, _, _, _) = parse_cred(&out[..n], false);
+
+    // Each walk returned two distinct entries — no cursor skipped or repeated.
+    assert_ne!(rp1, rp2);
+    assert_ne!(cu1, cu2);
+    // Both are exhausted.
+    assert_eq!(
+        run(&mut fs, &mut state, &cm_next(0x03), &mut out),
+        Err(CtapError::NotAllowed)
+    );
     assert_eq!(
         run(&mut fs, &mut state, &cm_next(0x05), &mut out),
         Err(CtapError::NotAllowed)
@@ -757,7 +810,7 @@ fn rp_present(fs: &mut Fs<RamStorage>, state: &mut FidoState, rp_hash: &[u8; 32]
 
 #[test]
 fn missing_param_is_puat_required() {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut state = armed(PERM_CM);
     let mut out = [0u8; 64];
     // {1: 1} — getCredsMetadata with no pinUvAuthParam.
@@ -1203,7 +1256,7 @@ fn enum_largeblobkey(resp: &[u8]) -> Option<std::vec::Vec<u8>> {
 fn update_preserves_signing_key_end_to_end() {
     let (mut fs, mut rng) = setup();
     let (id, x, y) = register(&mut fs, &mut rng, "example.com", &[1, 1], "alice");
-    assert_eq!(id[8], 1, "new resident credential carries the v2 marker");
+    assert_eq!(id[8], 2, "new resident credential carries the v3 marker");
     let rp_hash = sha256(b"example.com");
 
     // Before the update, getAssertion already signs under the registered key.

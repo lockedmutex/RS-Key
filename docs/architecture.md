@@ -1,13 +1,13 @@
 # Architecture
 
-How the firmware is put together — for contributors and the curious. For what
+How the firmware is put together, for contributors and the curious. For what
 the design does and does not defend against, see the
 [threat model](threat-model.md).
 
 ## The big picture
 
 A composite USB device with three interfaces, seven smart-card applets and
-one storage layer. Day to day everything runs on one RP2350 core — the
+one storage layer. Day to day everything runs on one RP2350 core. The
 second wakes only to parallelize RSA keygen (below):
 
 ```mermaid
@@ -28,18 +28,18 @@ flowchart TD
 ```
 
 **Two executors.** USB and the transports live on a high-priority
-`InterruptExecutor`; the applet dispatch lives on the low-priority thread
-executor in a single *worker* task that owns the flash and the TRNG outright.
-Long synchronous work — on-card RSA generation, flash compaction, a touch
-wait — blocks only the worker, while the interrupt executor keeps the bus
+`InterruptExecutor`. The applet dispatch lives on the low-priority thread
+executor, in a single *worker* task that owns the flash and the TRNG outright.
+Long synchronous work (on-card RSA generation, flash compaction, a touch
+wait) blocks only the worker, while the interrupt executor keeps the bus
 enumerated, streams CCID/CTAPHID keepalives, and animates the LED. No
 mutexes: ownership does the synchronization.
 
 **Why (mostly) one core.** The async executor provides the *concurrency* that
 the upstream design used a second core and hand-rolled queues for. Core 1 is
 kept out of the transport path and has exactly one job: during on-card RSA
-generation both cores race the prime search — independent random candidates,
-each core with its own DRBG stream, feeding one shared two-prime pool
+generation both cores race the prime search. Independent random candidates,
+each core with its own DRBG stream, feed one shared two-prime pool
 (`firmware/src/core1.rs`). Measured, RSA-2048 generation drops from ~8.9 s to
 ~4.3 s mean (2.07×).
 
@@ -61,11 +61,11 @@ erase/program, so its XIP fetches never collide with flash writes.
 
 Getting to that runtime state has a strict order. The bootrom verifies the
 signed image, then the firmware provisions and recovers **all** persistent state
-— OTP keys, the KV store, the phy record, the TRNG, the seal migrations and the
-one-shot at-rest scrub — *before* it asserts the USB pull-up. That ordering is
+(OTP keys, the KV store, the phy record, the TRNG, the seal migrations and the
+one-shot at-rest scrub) *before* it asserts the USB pull-up. That ordering is
 load-bearing: `builder.build()` starts host enumeration, and the task that
 answers control transfers must be spawned with no blocking work in between, or
-the host enumerates a mute device and times out — the "blink red / not
+the host enumerates a mute device and times out. That is the "blink red / not
 recognised until several replugs" report that motivated attaching to the bus
 only after everything else is ready.
 
@@ -75,7 +75,7 @@ only after everything else is ready.
 
 The workspace splits along a strict dependency gradient: the `firmware` binary
 is thin glue over the applet crates, which build on a handful of host-tested
-platform libraries. The per-crate detail is in the table; the shape is:
+platform libraries. The per-crate detail is in the table. The shape is:
 
 ![Crate dependency layers — the firmware binary on top, then the seven applet crates (fido, openpgp, piv, oath, otp, mgmt, rescue), then the platform libraries (sdk, fs, crypto, usb, rsa-asm, led); each tier depends on the one below, with piv→openpgp, otp→mgmt and openpgp→rsa-asm as the cross-edges](images/crate-graph.svg)
 
@@ -107,29 +107,29 @@ suite on the host ([testing.md](testing.md)).
 
 Two KV partitions at fixed offsets (`firmware/memory.x`): the main store, and
 a small separate partition for the per-operation counters so their churn
-never forces compaction of long-lived records. Files are 16-bit ids; each
+never forces compaction of long-lived records. Files are 16-bit ids. Each
 applet owns disjoint ranges (FIDO `0x10xx/0xCxxx/0xCFxx/0xD0xx`, OpenPGP DO
 mirrors, PIV `0xD1xx/0xD2xx`, OTP slots `0xBBxx`, phy/rescue `0xE0xx`) and a
-reset wipes exactly its own predicate — never a range shared with another
+reset wipes exactly its own predicate, never a range shared with another
 applet.
 
 Key sealing at rest: `kbase = HKDF(serial_hash, otp_master_key)` keys
 AES-CBC for the FIDO seed (tagged formats: plain vs OTP-rooted generation)
-and AES-GCM for PIV keys; OpenPGP keys sit under the PIN-wrapped DEK chain.
+and AES-GCM for PIV keys. OpenPGP keys sit under the PIN-wrapped DEK chain.
 When the OTP master key gets provisioned later in a device's life, a boot
 pass and lazy PIN-verify hooks migrate every sealed object to the new root
 without losing data. Until that burn the root derives from on-chip state
-alone, which an attacker with full flash and chip access could reconstruct —
+alone, which an attacker with full flash and chip access could reconstruct.
 [threat-model.md](threat-model.md) covers what at-rest sealing does and does
 not buy before provisioning.
 
-One sealed object worth spelling out is the FIDO credential box — it doubles as
+One sealed object worth spelling out is the FIDO credential box. It doubles as
 the opaque credential ID a relying party stores, so its size caps the reported
 `maxCredentialIdLength` (748):
 
 ![FIDO credential box — proto(4) iv(12) then a variable CBOR body, poly1305 tag(16) and silent tag(16); the four framing pieces are 48 bytes and the whole box is at most 748. Below it, the 42-byte resident id returned to the relying party](images/cred-box.svg)
 
-The 42-byte resident id carries a **version byte** at offset 8 — a reserved
+The 42-byte resident id carries a **version byte** at offset 8, a reserved
 header byte outside the `[10..42]` HMAC chain, so it never changes the id's
 entropy. It is `1` (v2) for every resident credential created since RS-Key
 `0x0806`: a v2 credential derives its signing key, hmac-secret and largeBlobKey
@@ -141,23 +141,23 @@ compatible across the upgrade.
 
 ## Capacity — why the flash is mostly empty
 
-The KV store is a fixed 1.5 MB whatever the `FLASH_SIZE` ([build.md](build.md));
-a larger flash only grows the code region, most of which no firmware writes. That
+The KV store is a fixed 1.5 MB whatever the `FLASH_SIZE` ([build.md](build.md)).
+A larger flash only grows the code region, most of which no firmware writes. That
 is deliberate. A security key's maximum *logical* state is small and hard-capped:
 `MAX_RESIDENT_CREDENTIALS` (256 passkeys), `MAX_DYNAMIC_FILES` (256 files across
-all applets), `MAX_OATH_CRED` (255), plus a handful of OpenPGP/PIV slots — so a
+all applets), `MAX_OATH_CRED` (255), plus a handful of OpenPGP/PIV slots. So a
 fully provisioned device fills only a few hundred KB, well under the 1408 KB main
 partition. Growing the store to "fill" a 16 MB board would buy nothing usable: it
 lengthens the `sequential-storage` scan behind every cold boot and absent-key
 probe (the present cache exists to dodge exactly that full-partition ~0.2 s cost),
-and forces the logical caps — and the RAM/stack buffers sized to them — up for
+and forces the logical caps (and the RAM/stack buffers sized to them) up for
 capacity no one reaches. Empty flash here is headroom, not waste.
 
 ## Device identity
 
 USB VID/PID, product strings and the reported firmware version are
 compile-time knobs ([build.md](build.md)). The default is RS-Key's own
-identity — VID:PID `0x1209:0x0001` (pid.codes), manufacturer "RS-Key",
+identity: VID:PID `0x1209:0x0001` (pid.codes), manufacturer "RS-Key",
 product "RS-Key Security Key" (the `RSKey` preset). An opt-in `VIDPID=Yubikey5`
 preset builds the Yubico interop flavor (`0x1050:0x0407`, reader name "Yubico
 YubiKey") for the tools that auto-recognize the device purely by that reader
@@ -168,11 +168,11 @@ reader name.
 
 ## User presence
 
-One presence button (BOOTSEL by default, or `PRESENCE_PIN`), shared by all 
-applets through a `UserPresence` trait the firmware implements once: FIDO 
-operations, OpenPGP UIF, PIV touch policies, OATH touch accounts, and OTP slot 
-typing (1–4 presses select the slot) all gate on it. The no-touch build 
-(`--features no-touch`) auto-confirms — for test rigs, not for daily use.
+One presence button (BOOTSEL by default, or `PRESENCE_PIN`), shared by all
+applets through a `UserPresence` trait the firmware implements once: FIDO
+operations, OpenPGP UIF, PIV touch policies, OATH touch accounts, and OTP slot
+typing (1–4 presses select the slot) all gate on it. The no-touch build
+(`--features no-touch`) auto-confirms. For test rigs, not for daily use.
 
 ## Provenance
 
@@ -191,5 +191,5 @@ replacing the C HAL/runtime/transport stack with embassy and RustCrypto:
 
 Where the two implementations deliberately differ (at-rest sealing, seed
 PIN-wrapping, OTP provisioning policy, several upstream bugs not carried
-over), the divergence is a documented design decision — see
+over), the divergence is a documented design decision. See
 [threat-model.md](threat-model.md) and the crate docs.

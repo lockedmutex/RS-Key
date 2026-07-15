@@ -16,7 +16,7 @@ impl Rng for SeqRng {
 
 // Run process_cbor with a fresh context (empty flash).
 fn dispatch(data: &[u8], out: &mut [u8]) -> usize {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let dev = Device {
         serial_hash: &[0xAB; 32],
         serial_id: &[1, 2, 3, 4, 5, 6, 7, 8],

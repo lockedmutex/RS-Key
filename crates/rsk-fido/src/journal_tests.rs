@@ -52,7 +52,7 @@ fn reference_head(entries: &[[u8; ENTRY_LEN]]) -> [u8; 32] {
 
 #[test]
 fn append_wrap_folds_and_head_matches_reference() {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut state = FidoState::new();
     state.audit_boot_logged = true; // keep the reference list exact
 
@@ -74,7 +74,7 @@ fn append_wrap_folds_and_head_matches_reference() {
 
 #[test]
 fn boot_entry_logged_once_per_cycle() {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut state = FidoState::new();
     run_ctx(&mut fs, &mut state, |ctx| {
         append(ctx, EV_MAKE_CRED, 0, &[0xAA; 8]);
@@ -89,7 +89,7 @@ fn boot_entry_logged_once_per_cycle() {
 
 #[test]
 fn fold_and_scrub_keeps_chain_and_deletes_details() {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut state = FidoState::new();
     state.audit_boot_logged = true;
 
@@ -137,7 +137,7 @@ fn checkpoint_requires_devk_and_signature_verifies() {
     use p256::ecdsa::signature::Verifier;
     use p256::ecdsa::{Signature, VerifyingKey};
 
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut state = FidoState::new();
     let mut out = [0u8; 512];
 
@@ -186,7 +186,7 @@ fn checkpoint_requires_devk_and_signature_verifies() {
 
 #[test]
 fn read_exports_window_that_folds_to_head() {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut state = FidoState::new();
     let mut out = [0u8; 4096];
     let n = run_ctx(&mut fs, &mut state, |ctx| {
@@ -219,7 +219,7 @@ fn read_exports_window_that_folds_to_head() {
 
 #[test]
 fn for_each_event_visits_newest_first_and_counts() {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     let mut state = FidoState::new();
     run_ctx(&mut fs, &mut state, |ctx| {
         // EV_BOOT is auto-logged first, then these three.

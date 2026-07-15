@@ -73,7 +73,7 @@ fn dev<'a>(serial_id: &'a [u8; 8], serial_hash: &'a [u8; 32]) -> Device<'a> {
 /// A fresh RAM-backed OpenPGP filesystem provisioned under `serial` — writes the
 /// default PIN verifiers + DEK bound to that serial's derivation.
 fn provision(serial_id: &[u8; 8], serial_hash: &[u8; 32]) -> Fs<RamStorage> {
-    let mut fs = Fs::new(RamStorage::new(), &[]);
+    let mut fs = Fs::new(RamStorage::new());
     fs.scan();
     scan_files(&dev(serial_id, serial_hash), &mut fs, &mut CountRng(0)).unwrap();
     fs

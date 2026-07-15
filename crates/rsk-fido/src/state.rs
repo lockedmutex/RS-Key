@@ -104,6 +104,13 @@ pub struct CredMgmtState {
     pub cred_counter: u16,
     pub cred_total: u16,
     pub rp_id_hash: [u8; 32],
+    /// Enumerate cursor: the EF_RP / EF_CRED slot to resume the sweep from on the
+    /// next getNextRP / getNextCredential, so each getNext is O(gap-to-next-match)
+    /// rather than re-scanning from slot 0 (which made a full walk O(n^2)). The
+    /// matching Begin resets it to 0. RP and credential enumerations keep separate
+    /// cursors so an interleaved walk of both does not corrupt either.
+    pub rp_next_slot: u16,
+    pub cred_next_slot: u16,
 }
 
 impl CredMgmtState {
@@ -114,6 +121,8 @@ impl CredMgmtState {
             cred_counter: 1,
             cred_total: 0,
             rp_id_hash: [0; 32],
+            rp_next_slot: 0,
+            cred_next_slot: 0,
         }
     }
 }
