@@ -2,7 +2,7 @@
 // Copyright (C) 2026 RS-Key contributors
 
 use super::*;
-use crate::consts::ALG_ES256;
+use crate::consts::{ALG_ES256, EF_ALWAYS_UV};
 use crate::makecredential::make_credential;
 use crate::seed::ensure_seed;
 use minicbor::Decoder;

@@ -149,12 +149,29 @@ fn toggle_always_uv_flips_state() {
     let mut fs = Fs::new(RamStorage::new());
     let mut state = armed(PERM_ACFG);
     let req = config_request(CONFIG_TOGGLE_ALWAYS_UV as u8, &[], &TOKEN);
-    // Off by default; first toggle enables, second disables.
-    assert!(!fs.has_data(EF_ALWAYS_UV));
+    // Starts at the compiled default; each toggle flips the effective state and a
+    // round trip restores it. Asserted through the tri-state helper (not raw
+    // `has_data`) so it stays meaningful on both the default and `always-uv` builds.
+    assert_eq!(always_uv_enabled(&mut fs), DEFAULT_ALWAYS_UV);
     assert_eq!(run_fs(&mut fs, &mut state, &req), Ok(0));
-    assert!(fs.has_data(EF_ALWAYS_UV));
+    assert_eq!(always_uv_enabled(&mut fs), !DEFAULT_ALWAYS_UV);
     assert_eq!(run_fs(&mut fs, &mut state, &req), Ok(0));
-    assert!(!fs.has_data(EF_ALWAYS_UV));
+    assert_eq!(always_uv_enabled(&mut fs), DEFAULT_ALWAYS_UV);
+}
+
+#[test]
+fn always_uv_read_prefers_explicit_override() {
+    // No record → the compile-time default (off on a normal build, on with
+    // `--features always-uv`). An explicit override wins in either direction, and
+    // clearing it (what authenticatorReset does) returns to the default.
+    let mut fs = Fs::new(RamStorage::new());
+    assert_eq!(always_uv_enabled(&mut fs), DEFAULT_ALWAYS_UV);
+    fs.put(EF_ALWAYS_UV, &[1]).unwrap();
+    assert!(always_uv_enabled(&mut fs));
+    fs.put(EF_ALWAYS_UV, &[0]).unwrap();
+    assert!(!always_uv_enabled(&mut fs));
+    fs.delete(EF_ALWAYS_UV).unwrap();
+    assert_eq!(always_uv_enabled(&mut fs), DEFAULT_ALWAYS_UV);
 }
 
 #[test]

@@ -18,8 +18,8 @@ use rsk_fs::Storage;
 
 use crate::cbordec::{cbor, def_arr, def_map};
 use crate::consts::{
-    CRED_PROT_UV_OPTIONAL_WITH_LIST, CRED_PROT_UV_REQUIRED, CURVE_P256, EF_ALWAYS_UV, EF_CRED,
-    EF_PIN, FLAG_ED, FLAG_UP, FLAG_UV, MAX_CREDENTIAL_COUNT_IN_LIST, MAX_RESIDENT_CREDENTIALS,
+    CRED_PROT_UV_OPTIONAL_WITH_LIST, CRED_PROT_UV_REQUIRED, CURVE_P256, EF_CRED, EF_PIN, FLAG_ED,
+    FLAG_UP, FLAG_UV, MAX_CREDENTIAL_COUNT_IN_LIST, MAX_RESIDENT_CREDENTIALS,
 };
 use crate::credential::{
     CRED_BOX_MAX, CRED_REC_MAX, CRED_RESIDENT_LEN, Credential, RECORD_PREFIX, USER_ID_MAX,
@@ -355,7 +355,7 @@ fn enforce_pin<S: Storage, R: Rng>(
         }
         // alwaysUv forces user verification (CTAP 2.1 alwaysUv); otherwise an
         // absent param simply yields an assertion without the uv flag.
-        None if ctx.fs.has_data(EF_ALWAYS_UV) => Err(CtapError::PuatRequired),
+        None if crate::config::always_uv_enabled(ctx.fs) => Err(CtapError::PuatRequired),
         None => Ok(false),
     }
 }

@@ -13,6 +13,26 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+### Added
+
+- **`always-uv` build feature — ship with CTAP 2.1 `alwaysUv` on by default.** A new
+  opt-in cargo feature (`cargo build --release -p firmware --features always-uv`) bakes
+  the `alwaysUv` option on, so the key demands user verification for every
+  makeCredential / getAssertion out of the box — no post-flash `ykman fido config
+  toggle-always-uv`. OFF by default; the shipped image is unchanged (its alwaysUv still
+  starts off until a platform toggles it). The stored state is now tri-state — an
+  explicit `toggleAlwaysUv` override (`EF_ALWAYS_UV` = `[1]`/`[0]`, survives reboots,
+  cleared by `authenticatorReset`) over the compile-time default — so the feature build
+  stays fully runtime-toggleable and a reset returns alwaysUv to the compiled default.
+  On a normal build the on/off representation is the same `[1]`/absent pair as before
+  (no on-flash change). With alwaysUv on and no PIN set, FIDO operations return
+  `CTAP2_ERR_PUAT_REQUIRED` until a PIN is configured — the standard cue for the platform
+  (Windows, Chrome) to prompt for one. Whenever alwaysUv is on (via this default or a
+  runtime `toggleAlwaysUv`) the **CTAP1/U2F interface is now disabled** (CTAP 2.1 §7.2.4):
+  U2F only proves presence, so leaving it live would bypass the always-require-UV
+  guarantee — register / authenticate return `CONDITIONS_NOT_SATISFIED`, matching a
+  YubiKey. WebAuthn / CTAP2 is unaffected. bcdDevice → `0x081A`. See docs/build.md.
+
 ### Changed
 
 - **`sequential-storage` 7.2.0 → 8.0.0.** The flash key/value backend's cache API was

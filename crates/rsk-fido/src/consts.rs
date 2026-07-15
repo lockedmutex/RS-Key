@@ -223,7 +223,10 @@ pub const EF_ATT_KEY: KeyFid = KeyFid::new(0xCE10); // org attestation P-256 sca
 pub const EF_ATT_CHAIN: u16 = 0xCE11; // packed DER chain: count ‖ (len LE ‖ der)*
 /// `enableEnterpriseAttestation` — persists until reset (CTAP 2.1), hence flash.
 pub const EF_EA_ENABLED: u16 = 0xCE12;
-/// `alwaysUv` state — present = enabled. Persists until reset (CTAP 2.1), flash.
+/// `alwaysUv` state, read via [`crate::config::always_uv_enabled`] — tri-state:
+/// absent = the compile default (`DEFAULT_ALWAYS_UV`), `[1]` = on, `[0]` = explicit
+/// off. Do NOT probe with `has_data` (a present `[0]` would read as on). Persists
+/// until authenticatorReset (flash, CTAP 2.1).
 pub const EF_ALWAYS_UV: u16 = 0xCE13;
 /// Set (`[1]`) once the post-OTP-provisioning at-rest hardening pass has run:
 /// the seal migrations re-key secrets from the chip-serial root to the OTP root

@@ -2,6 +2,7 @@
 // Copyright (C) 2026 RS-Key contributors
 
 use super::*;
+use crate::consts::EF_ALWAYS_UV;
 use crate::seed::ensure_seed;
 use minicbor::Decoder;
 use p256::EncodedPoint;

@@ -34,6 +34,15 @@ pub fn process_u2f<S: Storage, R: Rng>(
         return (Sw::CLA_NOT_SUPPORTED, 0);
     }
     match apdu.ins {
+        // CTAP 2.1 §7.2.4: while alwaysUv is enabled the CTAP1/U2F interface is
+        // disabled. U2F performs only user *presence*, never verification, so
+        // honoring register/authenticate would mint and use credentials on a bare
+        // touch — bypassing the always-require-UV guarantee the CTAP2 side enforces
+        // (matching how a YubiKey drops U2F under alwaysUv). VERSION, a capability
+        // query that touches no credential, stays live.
+        CTAP_REGISTER | CTAP_AUTHENTICATE if crate::config::always_uv_enabled(ctx.fs) => {
+            (Sw::CONDITIONS_NOT_SATISFIED, 0)
+        }
         CTAP_REGISTER => cmd_register(ctx, apdu, out),
         CTAP_AUTHENTICATE => cmd_authenticate(ctx, apdu, out),
         CTAP_VERSION => {

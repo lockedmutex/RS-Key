@@ -2,6 +2,7 @@
 // Copyright (C) 2026 RS-Key contributors
 
 use super::*;
+use crate::consts::EF_ALWAYS_UV;
 use crate::seed::ensure_seed;
 use p256::EncodedPoint;
 use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
@@ -96,6 +97,54 @@ fn register_without_touch_is_refused() {
     };
     assert_eq!(sw, Sw::CONDITIONS_NOT_SATISFIED);
     assert_eq!(n, 0);
+}
+
+#[test]
+fn u2f_disabled_when_always_uv() {
+    // CTAP 2.1 §7.2.4: with alwaysUv on, the CTAP1/U2F interface is disabled —
+    // register and authenticate are refused even with a willing touch
+    // (AlwaysConfirm), so U2F cannot bypass the always-require-UV guarantee the
+    // CTAP2 side enforces.
+    let mut fs = Fs::new(RamStorage::new());
+    let mut rng = SeqRng(1);
+    ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
+    fs.put(EF_ALWAYS_UV, &[1]).unwrap();
+
+    let mut reg_data = std::vec::Vec::new();
+    reg_data.extend_from_slice(&CHAL);
+    reg_data.extend_from_slice(&APP);
+    let reg_bytes = ext_apdu(CTAP_REGISTER, 0, &reg_data);
+    let reg = Apdu::parse(&reg_bytes).unwrap();
+
+    let mut auth_data = std::vec::Vec::new();
+    auth_data.extend_from_slice(&CHAL);
+    auth_data.extend_from_slice(&APP);
+    auth_data.push(64);
+    auth_data.extend_from_slice(&[0u8; 64]);
+    let auth_bytes = ext_apdu(CTAP_AUTHENTICATE, U2F_AUTH_ENFORCE, &auth_data);
+    let auth = Apdu::parse(&auth_bytes).unwrap();
+
+    let mut state = crate::FidoState::new();
+    let mut presence = crate::AlwaysConfirm;
+    let mut ctx = Ctx {
+        presence: &mut presence,
+        dev: dev(),
+        fs: &mut fs,
+        rng: &mut rng,
+        state: &mut state,
+        now_ms: 0,
+    };
+    let mut out = [0u8; 1024];
+    assert_eq!(
+        process_u2f(&mut ctx, &reg, &mut out).0,
+        Sw::CONDITIONS_NOT_SATISFIED,
+        "U2F register must be refused under alwaysUv"
+    );
+    assert_eq!(
+        process_u2f(&mut ctx, &auth, &mut out).0,
+        Sw::CONDITIONS_NOT_SATISFIED,
+        "U2F authenticate must be refused under alwaysUv"
+    );
 }
 
 #[test]

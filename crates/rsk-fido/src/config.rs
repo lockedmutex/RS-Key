@@ -9,7 +9,7 @@
 //! permission; the soft-lock pair additionally requires a physical touch.
 
 use minicbor::Decoder;
-use rsk_fs::{Sealed, Storage};
+use rsk_fs::{Fs, Sealed, Storage};
 use zeroize::Zeroize;
 
 use rsk_crypto::pinproto::PinProto;
@@ -223,18 +223,42 @@ fn set_phy<S: Storage, R: Rng>(
     Ok(0)
 }
 
+/// Compile-time default for the CTAP 2.1 `alwaysUv` option, before any explicit
+/// `toggleAlwaysUv`. Off on a normal build; `--features always-uv` makes it on, so
+/// the device requires user verification for every makeCredential / getAssertion
+/// out of the box and again after an authenticatorReset. CTAP 2.1 §7.2 lets the
+/// default be authenticator-specific.
+const DEFAULT_ALWAYS_UV: bool = cfg!(feature = "always-uv");
+
+/// Effective `alwaysUv` state. An explicit override in `EF_ALWAYS_UV` wins (`[1]` =
+/// on, `[0]` = off); with no record the [`DEFAULT_ALWAYS_UV`] compile default
+/// applies. authenticatorReset deletes the record, so a reset returns to that
+/// default. Used by getInfo (`options.alwaysUv`) and the makeCredential /
+/// getAssertion UV gate.
+pub(crate) fn always_uv_enabled<S: Storage>(fs: &mut Fs<S>) -> bool {
+    let mut v = [0u8; 1];
+    match fs.read(EF_ALWAYS_UV, &mut v) {
+        Some(n) if n >= 1 => v[0] != 0,
+        _ => DEFAULT_ALWAYS_UV,
+    }
+}
+
 /// `toggleAlwaysUv` (CTAP 2.1 §6.11): flip the alwaysUv state. While enabled,
 /// every makeCredential / getAssertion requires user verification (a verified
 /// pinUvAuthToken), not merely user presence — enforced in those commands'
 /// `enforce_pin`. Disabling is supported, so the conformance toggle test
-/// (AuthenticatorConfig P-2) observes the opposite value. State is the presence of
-/// `EF_ALWAYS_UV`; it persists until authenticatorReset (flash, CTAP 2.1).
+/// (AuthenticatorConfig P-2) observes the opposite value. The flipped value is
+/// stored explicitly, except that toggling back to [`DEFAULT_ALWAYS_UV`] clears the
+/// record instead — so a normal build's on/off is the same `[1]`/absent pair as
+/// before and only an `always-uv` build ever writes the `[0]` explicit-off. State
+/// persists until authenticatorReset (flash, CTAP 2.1).
 fn toggle_always_uv<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>) -> CtapResult {
-    if ctx.fs.has_data(EF_ALWAYS_UV) {
+    let next = !always_uv_enabled(ctx.fs);
+    if next == DEFAULT_ALWAYS_UV {
         ctx.fs.delete(EF_ALWAYS_UV).map_err(|_| CtapError::Other)?;
     } else {
         ctx.fs
-            .put(EF_ALWAYS_UV, &[1])
+            .put(EF_ALWAYS_UV, &[next as u8])
             .map_err(|_| CtapError::Other)?;
     }
     journal::append(ctx, journal::EV_CFG_ALWAYS_UV, 0, &[]);
