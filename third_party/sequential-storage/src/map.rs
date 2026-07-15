@@ -1098,7 +1098,16 @@ impl<K: Key, S: NorFlash, C: CacheImpl<K>> MapItemIter<'_, K, S, C> {
                         );
                         break;
                     }
-                    _ => continue,
+                    // RS-Key: an Open page has nothing to warm — skip it. An
+                    // interrupted-erase page (Corrupted) is a fully-migrated source
+                    // whose live items already sit forward, so skipping it keeps the
+                    // enumeration complete. But a genuine flash read fault (any other
+                    // Err) could hide a still-live page, so abort the walk here — that
+                    // leaves the cache dirty rather than reaching the None terminator
+                    // and unmarking a partial warm as trusted.
+                    Ok(PageState::Open) => continue,
+                    Err(Error::Corrupted { .. }) => continue,
+                    Err(e) => return Err(e),
                 }
             }
         };

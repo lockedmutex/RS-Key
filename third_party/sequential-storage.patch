@@ -1,10 +1,21 @@
-# One local change to sequential-storage 8.0.0, applied to the vendored copy under
+# Local changes to sequential-storage 8.0.0, applied to the vendored copy under
 # third_party/sequential-storage/ and wired in via [patch.crates-io] in the root
-# and fuzz Cargo.toml. MapItemIter::next warms the key-pointer cache from the
-# full-store scan the boot already runs, so the first credential enumeration after
-# a power-cycle is O(1) per key instead of a cold backward ring-scan (~9 s at 256
-# passkeys). The dirty-flag completion gate keeps a torn walk from caching a stale
-# pointer. Upstream idea: https://github.com/tweedegolf/sequential-storage/issues/105
+# and fuzz Cargo.toml. All confined to MapItemIter::next; the rest of the tree is
+# byte-identical to the published 8.0.0 (verified: diff -rq against the crates.io
+# source reports only src/map.rs differs).
+#
+# 1. Warm the key-pointer cache from the full-store scan the boot already runs, so
+#    the first credential enumeration after a power-cycle is O(1) per key instead of
+#    a cold backward ring-scan (~9 s at 256 passkeys). The dirty-flag completion gate
+#    (unmark_dirty only at the None terminator) keeps a torn walk from caching a stale
+#    pointer. Upstream idea: https://github.com/tweedegolf/sequential-storage/issues/105
+# 2. Make that gate honest against a flash read fault: the upstream page-advance loop
+#    swallowed a page-state Err via `_ => continue`, so a skipped page still reached
+#    the None terminator and unmarked a partial warm. Now an interrupted-erase page
+#    (Corrupted — a fully-migrated source, safe to skip, keeps enumeration complete)
+#    still continues, but any other Err (a genuine read fault that could hide a live
+#    page) aborts the walk, leaving the cache dirty so fetch_item's is_dirty() guard
+#    discards the partial warm.
 #
 # Regenerate: diff -u <pristine 8.0.0>/src/map.rs third_party/sequential-storage/src/map.rs
 
@@ -41,7 +52,25 @@
                      return Ok(None);
                  }
  
-@@ -1101,6 +1107,16 @@
+@@ -1092,7 +1098,16 @@
+                         );
+                         break;
+                     }
+-                    _ => continue,
++                    // RS-Key: an Open page has nothing to warm — skip it. An
++                    // interrupted-erase page (Corrupted) is a fully-migrated source
++                    // whose live items already sit forward, so skipping it keeps the
++                    // enumeration complete. But a genuine flash read fault (any other
++                    // Err) could hide a still-live page, so abort the walk here — that
++                    // leaves the cache dirty rather than reaching the None terminator
++                    // and unmarking a partial warm as trusted.
++                    Ok(PageState::Open) => continue,
++                    Err(Error::Corrupted { .. }) => continue,
++                    Err(e) => return Err(e),
+                 }
+             }
+         };
+@@ -1101,6 +1116,16 @@
          let (key, key_len) = K::deserialize_from(item.data())?;
          let (value, _value_len) = V::deserialize_from(&data_buffer[..data_len][key_len..])
              .map_err(Error::SerializationError)?;

@@ -39,6 +39,24 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Fixed
 
+- **Run-20 audit hardening (no exploitable defect; defense-in-depth on the perf delta
+  above).** Three follow-ups from the security review:
+  - The boot cache-warm no longer trusts a partial walk after a flash *read* fault. The
+    vendored `sequential-storage` page-advance loop swallowed a page-state error and
+    still cleared the "dirty" flag at the walk's end, so a read fault that skipped a
+    live page could leave a stale key→address entry marked clean. It now skips only an
+    interrupted-erase page (always a fully-migrated source, so enumeration stays
+    complete) and aborts the walk on any other error, leaving the cache dirty for the
+    existing `is_dirty` guard to discard. No observable change on RP2350 (in-range flash
+    reads don't fault); the update is in `third_party/sequential-storage.patch`, and the
+    vendored tree is verified byte-identical to published 8.0.0 apart from that one file.
+  - `MAIN_CACHE_KEYS` is raised 1280 → 1281 (`MAX_DYNAMIC_FILES + 1`) so the one live
+    main-partition key the dynamic-file budget does not count (`EF_META`) can never fall
+    off the key-pointer cache on a fully-provisioned device.
+  - PIV MOVE to the `0xFF` delete sentinel no longer writes an unread `0xD4FF` orphan
+    public-point file: the per-slot pubkey carry is skipped when there is no destination
+    slot (the source slot's cache is still dropped).
+  No wire or on-flash change. bcdDevice → `0x0819`.
 - **The first credential enumeration after a power-cycle is no longer slow: the boot
   scan warms the flash key-pointer cache it was already reading.** `sequential-storage`
   keeps a RAM cache mapping each key to its flash address so a read is O(1); it starts

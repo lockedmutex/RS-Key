@@ -63,9 +63,12 @@ const SCRUB_FILLER: [u8; 1024] = [0xA5; 1024];
 /// and a multi-second migration. Main must cover EVERY live main-partition file, so
 /// keep it `>= rsk_fs::MAX_DYNAMIC_FILES`: sized for the full applet union (256
 /// passkeys + 256 EF_RP + 256 nicks + PIV key/cert pairs + OATH creds + OpenPGP DOs)
-/// so a fully-provisioned device never demotes to the cliff. Counter only needs its
+/// so a fully-provisioned device never demotes to the cliff. The `+ 1` covers
+/// `EF_META`, the one live main-partition key `scan` does NOT count against the
+/// dynamic-file budget — without it a maxed device holds 1281 main keys against a
+/// 1280-slot cache and one key pays the O(flash) first fetch. Counter only needs its
 /// few keys.
-const MAIN_CACHE_KEYS: usize = 1280;
+const MAIN_CACHE_KEYS: usize = rsk_fs::MAX_DYNAMIC_FILES + 1;
 const COUNTER_CACHE_KEYS: usize = 16;
 
 pub type AsyncFlash = BlockingAsync<Flash<'static, FLASH, Blocking, FLASH_SIZE>>;

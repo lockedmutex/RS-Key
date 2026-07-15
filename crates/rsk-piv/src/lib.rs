@@ -893,11 +893,15 @@ impl PivApplet<'_> {
                 }
             }
         }
-        // Carry the cached public point to the destination slot (best-effort),
-        // then drop the source's — MOVE relocates the whole slot.
-        let mut pk = [0u8; MAX_EC_POINT];
-        if let Some(pn) = fs.read(pubkey_fid(from), &mut pk) {
-            let _ = fs.put(pubkey_fid(to), &pk[..pn.min(pk.len())]);
+        // Carry the cached public point to the destination slot (best-effort), then
+        // drop the source's — MOVE relocates the whole slot. Skip the carry when
+        // `to == 0xFF` (the delete sentinel): there is no destination slot, so a put
+        // to `pubkey_fid(0xFF)` would only strand an unread `0xD4FF` orphan file.
+        if to != 0xFF {
+            let mut pk = [0u8; MAX_EC_POINT];
+            if let Some(pn) = fs.read(pubkey_fid(from), &mut pk) {
+                let _ = fs.put(pubkey_fid(to), &pk[..pn.min(pk.len())]);
+            }
         }
         blob.zeroize();
         let _ = fs.delete_key(key_fid(from));
