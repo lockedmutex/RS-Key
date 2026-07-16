@@ -27,6 +27,20 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Changed
 
+- **FIDO2 signature counters are now per-credential (privacy).** Each resident
+  credential (passkey) keeps its own counter in a new packed `EF_CRED_CTR` flash
+  file, starting at 0 and advancing only on its own assertions — colluding relying
+  parties can no longer read a shared global counter to correlate how much the key
+  is used across sites (WebAuthn §6.1.1). Non-resident (second-factor) credentials
+  keep no device state and report signCount 0; legacy U2F keeps its global monotonic
+  counter. Migration is forward-safe for passkeys: a credential created before
+  `EF_CRED_CTR` seeds its counter from the frozen global value on first use, so the
+  reported count never decreases. A pre-existing non-resident credential now reports
+  0, which a site that strictly enforced counter monotonicity may treat as reason to
+  re-register. Found by the RS-Key ↔ YubiKey differential harness (finding #4:
+  RS-Key's shared counter at ~105 vs a real YubiKey's per-credential counter).
+  `bcdDevice` → `0x081D`.
+
 - **getInfo no longer advertises `U2F_V2` while `alwaysUv` is on.** CTAP 2.1 §7.2.4
   disables the CTAP1/U2F interface whenever alwaysUv is enabled (via the `always-uv`
   build feature or the runtime `toggleAlwaysUv`), and the `versions` list now drops

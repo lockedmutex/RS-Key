@@ -45,7 +45,7 @@ use crate::error::{CtapError, CtapResult};
 use crate::hmacsecret::{self, HmacSecretReq, SALT_ENC_MAX};
 use crate::journal;
 use crate::keyderiv::fido_load_key;
-use crate::seed::{bump_sign_counter, get_sign_counter, load_att_key};
+use crate::seed::load_att_key;
 use crate::state::PERM_MC;
 use crate::{Ctx, Rng};
 
@@ -564,7 +564,11 @@ fn make_credential_inner<S: Storage, R: Rng>(
     // Worst case (ML-DSA-65): AUTH_DATA_HEADER(55) + CRED_BOX_MAX(748) +
     // COSE_AKP_MLDSA65_MAX(1962) + MC_EXT_MAX(192) + clientDataHash(32) = 2989,
     // statically bounded by AD_BUF above.
-    let ctr = get_sign_counter(ctx.fs);
+    // A new credential's signature counter starts at 0 (CTAP2 counters are
+    // per-credential now; `credential_store` seeds this credential's counter so its
+    // first assertion reports 1). Non-resident credentials keep no on-device state
+    // and stay at 0 forever.
+    let ctr = 0u32;
     let mut ad = [0u8; AD_BUF];
     let mut p = 0;
     ad[p..p + 32].copy_from_slice(rp_id_hash);
@@ -696,7 +700,6 @@ fn make_credential_inner<S: Storage, R: Rng>(
     {
         return Err(CtapError::KeyStoreFull);
     }
-    bump_sign_counter(ctx.fs).map_err(|_| CtapError::Other)?;
     journal::append(ctx, journal::EV_MAKE_CRED, 0, &rp_id_hash[..8]);
     Ok(resp_len)
 }

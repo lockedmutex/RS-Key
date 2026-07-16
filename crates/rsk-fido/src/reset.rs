@@ -9,7 +9,7 @@ use rsk_fs::Storage;
 
 use crate::consts::{
     EF_ALWAYS_UV, EF_ATT_CHAIN, EF_ATT_KEY, EF_AUTHTOKEN, EF_BACKUP_SEALED, EF_COUNTER, EF_CRED,
-    EF_DEVICE_PIN, EF_EA_ENABLED, EF_EE_DEV, EF_KEY_DEV, EF_KEY_DEV_ENC, EF_LARGEBLOB,
+    EF_CRED_CTR, EF_DEVICE_PIN, EF_EA_ENABLED, EF_EE_DEV, EF_KEY_DEV, EF_KEY_DEV_ENC, EF_LARGEBLOB,
     EF_MINPINLEN, EF_PAUTHTOKEN, EF_PIN, EF_RP, EF_RPNICK, MAX_RESIDENT_CREDENTIALS,
 };
 use crate::error::{CtapError, CtapResult};
@@ -71,6 +71,7 @@ fn is_fido_fid(fid: u16) -> bool {
             EF_BACKUP_SEALED
                 | EF_EE_DEV
                 | EF_COUNTER
+                | EF_CRED_CTR
                 | EF_PIN
                 | EF_AUTHTOKEN
                 | EF_PAUTHTOKEN
