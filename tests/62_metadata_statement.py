@@ -157,11 +157,15 @@ def check_conformance_variant(stmt):
     print("conformance variant OK — shipping statement minus EdDSA (-8)")
 
 
-def _norm(gi):
-    """Drop stateful fields so the static surface can be compared."""
+def _norm(gi, drop_u2f=False):
+    """Drop stateful fields so the static surface can be compared. When the live
+    device has alwaysUv on, CTAP 2.1 §7.2.4 disables CTAP1/U2F so U2F_V2 legitimately
+    drops from versions — harmonize both sides on that projection."""
     out = {k: v for k, v in gi.items() if k not in STATEFUL}
     if "options" in out:
         out["options"] = {k: v for k, v in out["options"].items() if k not in STATEFUL_OPTIONS}
+    if drop_u2f and "versions" in out:
+        out["versions"] = [v for v in out["versions"] if v != "U2F_V2"]
     return out
 
 
@@ -226,8 +230,9 @@ def part_b(stmt):
         print("NOTE: live device is a fido-conformance build (no EdDSA -8); "
               "comparing against the conformance variant.")
 
-    want = _norm(ref["authenticatorGetInfo"])
-    got = _norm(live)
+    always_uv_on = bool(live.get("options", {}).get("alwaysUv"))
+    want = _norm(ref["authenticatorGetInfo"], drop_u2f=always_uv_on)
+    got = _norm(live, drop_u2f=always_uv_on)
     if want != got:
         for k in sorted(set(want) | set(got)):
             if want.get(k) != got.get(k):

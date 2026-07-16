@@ -371,6 +371,31 @@ fn always_uv_reflects_state() {
 }
 
 #[test]
+fn u2f_v2_dropped_when_always_uv() {
+    // §7.2.4: alwaysUv disables the CTAP1/U2F interface, so getInfo must not keep
+    // advertising U2F_V2 while it is on; the CTAP2 versions are unaffected.
+    let cases: [(bool, &[&str]); 2] = [
+        (
+            false,
+            &["U2F_V2", "FIDO_2_0", "FIDO_2_1", "FIDO_2_2", "FIDO_2_3"],
+        ),
+        (true, &["FIDO_2_0", "FIDO_2_1", "FIDO_2_2", "FIDO_2_3"]),
+    ];
+    for (always_uv, want) in cases {
+        let mut buf = [0u8; 512];
+        let n = get_info(true, 4, false, false, always_uv, false, 256, &mut buf).unwrap();
+        let mut d = Decoder::new(&buf[..n]);
+        d.map().unwrap();
+        assert_eq!(d.u8().unwrap(), 0x01);
+        let nv = d.array().unwrap().unwrap();
+        assert_eq!(nv as usize, want.len());
+        for &v in want {
+            assert_eq!(d.str().unwrap(), v);
+        }
+    }
+}
+
+#[test]
 fn get_info_buffer_too_small() {
     let mut tiny = [0u8; 8];
     assert_eq!(

@@ -13,6 +13,15 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+### Changed
+
+- **getInfo no longer advertises `U2F_V2` while `alwaysUv` is on.** CTAP 2.1 §7.2.4
+  disables the CTAP1/U2F interface whenever alwaysUv is enabled (via the `always-uv`
+  build feature or the runtime `toggleAlwaysUv`), and the `versions` list now drops
+  `U2F_V2` to match — a platform is no longer told CTAP1 is available while every U2F
+  request is refused. The CTAP2 versions and the default (alwaysUv-off) advertisement
+  are unchanged.
+
 ## [0.3.6] — 2026-07-16
 
 ### Added
