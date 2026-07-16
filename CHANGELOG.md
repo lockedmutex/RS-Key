@@ -13,6 +13,18 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+### Added
+
+- **Differential interop harness — diff RS-Key against a real YubiKey.** New
+  `tests/interop/{capture,diff,divergences,normalize,parity}.py`: capture a
+  read-only snapshot of each key (both can stay plugged; an identity guard keys
+  off the `RSK` marker and the FIDO AAGUID), then classify every field against a
+  known-divergence allow-list so a fidelity gap stands out from the ~160 fields
+  that legitimately differ. Host-testable engine (`python -m pytest
+  tests/interop/test_diff.py`). A first macOS run against a YubiKey 5C NFC found
+  85 identical / 76 expected-divergence / 1 unexpected field (see
+  [docs/interop.md](docs/interop.md) → "Differential against a real YubiKey").
+
 ### Changed
 
 - **getInfo no longer advertises `U2F_V2` while `alwaysUv` is on.** CTAP 2.1 §7.2.4
@@ -21,6 +33,17 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   `U2F_V2` to match — a platform is no longer told CTAP1 is available while every U2F
   request is refused. The CTAP2 versions and the default (alwaysUv-off) advertisement
   are unchanged.
+
+### Fixed
+
+- **READ CONFIG now clamps `USB_ENABLED` to the supported capabilities.** The
+  management DeviceInfo (`0x1D`) echoed a host-written `EF_DEV_CONF` blob verbatim,
+  so a persisted enabled-applications mask wider than `SUPPORTED_CAPS` (e.g. a newer
+  `ykman` that knows capability bits this firmware lacks) was reported as-is —
+  `enabled ⊄ supported`, which a real YubiKey never does. `config_tlv` now masks the
+  `USB_ENABLED` TLV down to `SUPPORTED_CAPS` on read, healing already-persisted
+  devices without a rewrite. Found by the new RS-Key ↔ YubiKey differential harness
+  (`enabled = 0x3A3B` vs `supported = 0x023B` on a live board). `bcdDevice` → `0x081C`.
 
 ## [0.3.6] — 2026-07-16
 
