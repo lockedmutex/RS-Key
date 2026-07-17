@@ -66,6 +66,17 @@ fn main() {
     println!("cargo:rustc-env=PK_LED_PIN={led_pin}");
     println!("cargo:rerun-if-env-changed=LED_PIN");
 
+    // Optional LED power-enable GPIO (`LED_POWER_PIN`): a pin driven HIGH at boot to
+    // power a gated LED rail (e.g. the Seeed XIAO RP2350's WS2812, powered by GP23).
+    // Encoded as an enabled flag + pin so `main` decodes both with its const parser.
+    let (led_power_enabled, led_power_pin) = resolve_led_power_pin();
+    println!(
+        "cargo:rustc-env=PK_LED_POWER_ENABLED={}",
+        if led_power_enabled { 1 } else { 0 }
+    );
+    println!("cargo:rustc-env=PK_LED_POWER_PIN={led_power_pin}");
+    println!("cargo:rerun-if-env-changed=LED_POWER_PIN");
+
     // User-presence source: default BOOTSEL, or `PRESENCE_PIN=<gpio>` for an
     // active-low GPIO button (internal pull-up). Encoded as two numeric envs so
     // `main` can parse them with the existing const decimal parser.
@@ -224,6 +235,27 @@ fn resolve_led_pin() -> u8 {
         .unwrap_or_else(|_| panic!("LED_PIN={raw:?} must be a GPIO number 0..=29"));
     assert!(v <= 29, "LED_PIN={v} out of range 0..=29 (RP2350A GPIOs)");
     v
+}
+
+/// Resolve `LED_POWER_PIN` — an optional GPIO driven HIGH at boot to enable a
+/// gated LED power rail (e.g. the Seeed XIAO RP2350's onboard WS2812, whose power
+/// sits behind GP23). Unset / empty / `none` = no such pin (the default); any
+/// `0..=29` selects one. `main` rejects a collision with the LED or presence pin
+/// at compile time. Returns `(enabled, pin)`.
+fn resolve_led_power_pin() -> (bool, u8) {
+    let raw = env::var("LED_POWER_PIN").unwrap_or_default();
+    let v = raw.trim().to_ascii_lowercase();
+    if v.is_empty() || v == "none" {
+        return (false, 0);
+    }
+    let pin = v
+        .parse::<u8>()
+        .unwrap_or_else(|_| panic!("LED_POWER_PIN={raw:?} must be `none` or a GPIO number 0..=29"));
+    assert!(
+        pin <= 29,
+        "LED_POWER_PIN={pin} out of range 0..=29 (RP2350A GPIOs)"
+    );
+    (true, pin)
 }
 
 /// Resolve `PRESENCE_PIN` to either BOOTSEL (unset / `bootsel`) or a GPIO

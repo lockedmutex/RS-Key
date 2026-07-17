@@ -13,6 +13,17 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+### Added
+
+- **`LED_POWER_PIN` build knob — support boards whose LED is power-gated.** A new
+  compile-time env knob names an optional GPIO the firmware drives **high at boot**
+  to power a gated LED rail, then holds for the device's lifetime. This is what the
+  **Seeed Studio XIAO RP2350** needs: its onboard WS2812 data is on GP22 but its
+  power sits behind GP23, so the LED stayed dark ([#36](https://github.com/TheMaxMur/RS-Key/issues/36)).
+  Build it `LED_PIN=22 LED_ORDER=grb LED_POWER_PIN=23`. Off by default; the pin
+  must differ from `LED_PIN` and a GPIO `PRESENCE_PIN` (rejected at compile time).
+  See [docs/hardware.md](docs/hardware.md) and [docs/build.md](docs/build.md).
+
 ## [0.3.7] - 2026-07-17
 
 ### Added
