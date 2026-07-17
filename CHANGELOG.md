@@ -24,6 +24,17 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   must differ from `LED_PIN` and a GPIO `PRESENCE_PIN` (rejected at compile time).
   See [docs/hardware.md](docs/hardware.md) and [docs/build.md](docs/build.md).
 
+### Fixed
+
+- **PIV stays detectable by OpenSC after the OpenPGP applet has been used.** The
+  PIV `SELECT` application property template placed the NIST RID directly under
+  tag `79` instead of the required nested `4F`. OpenSC's `piv_match_card` then
+  failed to re-detect PIV whenever another applet was selected first (e.g. by
+  `gpg`/`scdaemon`), so `p11tool` / Chrome mTLS saw only OpenPGP until a
+  `ykman piv info` forced PIV back — a real YubiKey re-detects PIV fine. The
+  template now matches NIST SP 800-73-4 (and a YubiKey's response) for tags
+  `4F` / `79`.
+
 ## [0.3.7] - 2026-07-17
 
 ### Added
