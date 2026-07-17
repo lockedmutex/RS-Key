@@ -13,6 +13,8 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-07-17
+
 ### Added
 
 - **`rsk-tui` cockpit — richer applet reads, a passkey count, LED preview, and
@@ -1724,7 +1726,8 @@ family that keeps the "enterprise" features in the open tree.
   signature of it, and a CycloneDX SBOM. See
   [docs/releases.md](docs/releases.md) to verify a download.
 
-[Unreleased]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.6...HEAD
+[Unreleased]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.7...HEAD
+[0.3.7]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.3...v0.3.4
