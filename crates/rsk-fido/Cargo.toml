@@ -14,16 +14,19 @@ p384 = { workspace = true }
 p521 = { workspace = true }
 k256 = { workspace = true }
 ed25519-dalek = { workspace = true }
+rfc6979 = { workspace = true }
 rsk-crypto = { workspace = true }
 rsk-fs = { workspace = true }
 rsk-led = { workspace = true }
 rsk-mgmt = { workspace = true }
 rsk-rescue = { workspace = true }
 rsk-sdk = { workspace = true }
+sha2 = { workspace = true }
 zeroize = { workspace = true }
 
 [build-dependencies]
-# Host-side P-521 arithmetic to generate the fixed-base comb table (build.rs).
+# Host-side P-256 / P-521 arithmetic to generate the fixed-base comb tables (build.rs).
+p256 = { workspace = true }
 p521 = { workspace = true }
 
 [dev-dependencies]

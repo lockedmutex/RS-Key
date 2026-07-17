@@ -83,6 +83,10 @@ ml-kem = { version = "0.3.2", default-features = false, features = ["zeroize"] }
 sha1 = { version = "0.10", default-features = false }
 sha2 = { version = "0.10", default-features = false }
 hmac = { version = "0.12", default-features = false }
+# RFC 6979 deterministic ECDSA nonces — already in the tree transitively via
+# `ecdsa`; a direct dep so `ec.rs` can derive `k` itself and swap the crate's
+# generic `k·G` for the fixed-base comb while keeping byte-identical signatures.
+rfc6979 = { version = "0.4", default-features = false }
 hkdf = { version = "0.12", default-features = false }
 # `zeroize` wipes the expanded round keys when a cipher instance drops.
 aes = { version = "0.8", default-features = false, features = ["zeroize"] }

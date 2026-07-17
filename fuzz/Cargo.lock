@@ -1353,12 +1353,14 @@ dependencies = [
  "p256",
  "p384",
  "p521",
+ "rfc6979",
  "rsk-crypto",
  "rsk-fs",
  "rsk-led",
  "rsk-mgmt",
  "rsk-rescue",
  "rsk-sdk",
+ "sha2",
  "zeroize",
 ]
 

@@ -27,6 +27,21 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Changed
 
+- **Faster P-256 ECDSA signing (fixed-base comb + no wasted public-key derivation).**
+  Two changes to the P-256 credential path, both leaving the RFC 6979 deterministic
+  signature **byte-for-byte unchanged** (a KAT test pins the result to the `p256`
+  crate's output), so this is a pure speedup with no wire or behaviour change:
+  (1) the ephemeral `k·G` now uses a precomputed width-4 Lim–Lee comb table — the
+  fixed-base technique already used for P-521 — instead of the crate's generic
+  `mul_by_generator`; (2) a P-256 credential key is held as the bare scalar (like
+  P-521), so getAssertion no longer builds a `SigningKey` that eagerly derives the
+  public key `d·G` — a second fixed-base mul it never uses when only signing (the
+  public key it does need, at makeCredential, comes from the same comb). Measured on
+  the RP2350: a silent `up:false` P-256 assertion drops from ~303 ms to ~241 ms
+  (about 20 % — the removed `d·G` was ~40 ms, the comb ~22 ms). Costs ~1 KB of flash
+  for the table (`build.rs`-generated). P-384 / secp256k1 / P-521 are unchanged
+  (P-521 keeps its comb + random nonce). `bcdDevice` → `0x081F`.
+
 - **FIDO2 signature counters are now per-credential (privacy).** Each resident
   credential (passkey) keeps its own counter in a new packed `EF_CRED_CTR` flash
   file, starting at 0 and advancing only on its own assertions — colluding relying
