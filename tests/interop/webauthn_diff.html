@@ -1,0 +1,168 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 RS-Key contributors -->
+<!doctype html>
+<meta charset="utf-8">
+<title>RS-Key WebAuthn tests</title>
+<style>
+  body { font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; max-width: 900px;
+         margin: 2rem auto; padding: 0 1rem; color: #ddd; background: #1b1d22; }
+  h1 { font-size: 1.1rem; } label { display: inline-block; margin: .2rem .6rem .2rem 0; }
+  button { font: inherit; padding: .4rem .8rem; margin: .3rem .3rem 0 0; cursor: pointer;
+           background: #2b6cb0; color: #fff; border: 0; border-radius: 4px; }
+  button.alt { background: #444; }
+  select, input { font: inherit; background: #23252b; color: #ddd; border: 1px solid #444; border-radius: 3px; }
+  pre { background: #111318; border: 1px solid #333; border-radius: 6px; padding: 1rem;
+        overflow-x: auto; white-space: pre; }
+  .row { margin: .5rem 0; } .hint { color: #9aa; }
+</style>
+
+<h1>RS-Key — WebAuthn capture &amp; diff</h1>
+<p class="hint">Plug ONE key. Register, then Authenticate. Download the JSON. Swap keys, repeat.
+Then diff the two files (or paste both below). rpId = <code>localhost</code>.</p>
+
+<div class="row">
+  <label>Label: <input id="label" value="rsk" size="8"></label>
+  <label>Attestation:
+    <select id="att"><option>none</option><option>direct</option><option>indirect</option></select></label>
+  <label>UV:
+    <select id="uv"><option>preferred</option><option>required</option><option>discouraged</option></select></label>
+  <label>Resident key:
+    <select id="rk"><option>discouraged</option><option>preferred</option><option>required</option></select></label>
+</div>
+<div class="row hint">pubKeyCredParams requested (same on both keys — watch which alg each returns):
+  ES256(-7), EdDSA(-8), ES384(-35), ES512(-36), RS256(-257)</div>
+<div class="row">
+  <button id="reg">1 · Register (create)</button>
+  <button id="auth" class="alt">2 · Authenticate (get)</button>
+  <button id="dl" class="alt">⬇ Download JSON</button>
+  <button id="clr" class="alt">clear</button>
+</div>
+<pre id="out">ready.</pre>
+
+<script>
+const $ = id => document.getElementById(id);
+const out = $("out");
+let capture = { register: null, authenticate: null };
+let lastCredId = null;
+
+const b64u = buf => btoa(String.fromCharCode(...new Uint8Array(buf)))
+  .replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+const fromB64u = s => Uint8Array.from(atob(s.replace(/-/g,'+').replace(/_/g,'/')), c => c.charCodeAt(0));
+const hex = buf => [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2,'0')).join('');
+const log = obj => out.textContent = JSON.stringify(obj, null, 2);
+
+// --- minimal CBOR decoder (maps -> Map to keep int/negative keys) ---
+function cbor(u8, p = {i:0}) {
+  const b = u8[p.i++], mt = b >> 5, ai = b & 0x1f;
+  const len = () => {
+    if (ai < 24) return ai;
+    if (ai === 24) return u8[p.i++];
+    if (ai === 25) { const v = (u8[p.i]<<8)|u8[p.i+1]; p.i+=2; return v; }
+    if (ai === 26) { let v=0; for(let k=0;k<4;k++) v=v*256+u8[p.i++]; return v; }
+    if (ai === 27) { let v=0; for(let k=0;k<8;k++) v=v*256+u8[p.i++]; return v; }
+    throw "cbor len";
+  };
+  switch (mt) {
+    case 0: return len();
+    case 1: return -1 - len();
+    case 2: { const n = len(), s = u8.slice(p.i, p.i+n); p.i += n; return s; }
+    case 3: { const n = len(), s = u8.slice(p.i, p.i+n); p.i += n; return new TextDecoder().decode(s); }
+    case 4: { const n = len(), a = []; for (let k=0;k<n;k++) a.push(cbor(u8,p)); return a; }
+    case 5: { const n = len(), m = new Map(); for (let k=0;k<n;k++){ const key=cbor(u8,p); m.set(key,cbor(u8,p)); } return m; }
+    case 6: { len(); return cbor(u8,p); }            // tag: ignore, decode content
+    case 7: return ai===20?false: ai===21?true: ai===22?null: ai;
+    default: throw "cbor mt";
+  }
+}
+
+const COSE_ALG = {'-7':'ES256','-8':'EdDSA','-35':'ES384','-36':'ES512','-257':'RS256',
+                  '-258':'RS384','-259':'RS512','-37':'PS256','-48':'ML-DSA-44','-49':'ML-DSA-65'};
+const COSE_KTY = {1:'OKP',2:'EC2',3:'RSA'};
+const COSE_CRV = {1:'P-256',2:'P-384',3:'P-521',6:'Ed25519'};
+
+function coseKey(m) {
+  const g = k => m.get(k);
+  const o = { kty: COSE_KTY[g(1)] || g(1), alg: COSE_ALG[String(g(3))] || g(3) };
+  if (g(1) === 2 || g(1) === 1) { o.crv = COSE_CRV[g(-1)] || g(-1); o.x = g(-2) && hex(g(-2)); if (g(-3)) o.y = hex(g(-3)); }
+  if (g(1) === 3) { o.n_len = g(-1) && g(-1).length; o.e = g(-2) && hex(g(-2)); }
+  return o;
+}
+
+function parseAuthData(ad) {
+  const dv = new DataView(ad.buffer, ad.byteOffset, ad.byteLength);
+  const flags = ad[32];
+  const o = {
+    rpIdHash: hex(ad.slice(0,32)),
+    flags: { raw: '0x'+flags.toString(16).padStart(2,'0'),
+             UP:!!(flags&0x01), UV:!!(flags&0x04), BE:!!(flags&0x08),
+             BS:!!(flags&0x10), AT:!!(flags&0x40), ED:!!(flags&0x80) },
+    signCount: dv.getUint32(33),
+  };
+  let i = 37;
+  if (flags & 0x40) {                              // attested credential data
+    o.aaguid = [...ad.slice(i,i+16)].map(b=>b.toString(16).padStart(2,'0')).join('')
+                 .replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/,'$1-$2-$3-$4-$5');
+    i += 16;
+    const clen = (ad[i]<<8)|ad[i+1]; i += 2;
+    o.credentialId = b64u(ad.slice(i, i+clen)); o.credIdLen = clen; i += clen;
+    o.credentialPublicKey = coseKey(cbor(ad, {i}));
+  }
+  return o;
+}
+
+async function register() {
+  const challenge = crypto.getRandomValues(new Uint8Array(32));
+  const params = [-7,-8,-35,-36,-257].map(alg => ({type:'public-key', alg}));
+  const opts = { publicKey: {
+    challenge, rp: { id: 'localhost', name: 'RSK WebAuthn diff' },
+    user: { id: crypto.getRandomValues(new Uint8Array(16)), name: 'rsk-ceremony', displayName: 'rsk-ceremony' },
+    pubKeyCredParams: params, timeout: 60000,
+    attestation: $('att').value,
+    authenticatorSelection: { userVerification: $('uv').value, residentKey: $('rk').value,
+                              requireResidentKey: $('rk').value === 'required' },
+    extensions: { credProps: true },
+  }};
+  out.textContent = 'touch the key…';
+  const c = await navigator.credentials.create(opts);
+  const r = c.response;
+  const att = cbor(new Uint8Array(r.attestationObject));
+  const fmt = att.get('fmt'), attStmt = att.get('attStmt'), authData = att.get('authData');
+  const stmt = {}; if (attStmt) for (const [k,v] of attStmt) stmt[k] = (v instanceof Uint8Array) ? (k==='x5c'?`<cert ${v.length}B>`:hex(v)) : (Array.isArray(v)?`<${v.length} cert(s)>`:v);
+  lastCredId = new Uint8Array(c.rawId);
+  capture.register = {
+    id: c.id, type: c.type, authenticatorAttachment: c.authenticatorAttachment,
+    transports: r.getTransports ? r.getTransports() : null,
+    clientExtensionResults: c.getClientExtensionResults(),
+    clientData: JSON.parse(new TextDecoder().decode(r.clientDataJSON)),
+    attestation: { fmt, attStmt: stmt, authData: parseAuthData(authData) },
+  };
+  log(capture);
+}
+
+async function authenticate() {
+  const challenge = crypto.getRandomValues(new Uint8Array(32));
+  const allow = lastCredId ? [{ type:'public-key', id: lastCredId }] : [];
+  out.textContent = 'touch the key…';
+  const c = await navigator.credentials.get({ publicKey: {
+    challenge, rpId: 'localhost', allowCredentials: allow, timeout: 60000, userVerification: $('uv').value }});
+  const r = c.response;
+  capture.authenticate = {
+    id: c.id, authenticatorAttachment: c.authenticatorAttachment,
+    clientData: JSON.parse(new TextDecoder().decode(r.clientDataJSON)),
+    authData: parseAuthData(new Uint8Array(r.authenticatorData)),
+    signatureLen: r.signature.byteLength,
+    userHandle: r.userHandle ? b64u(r.userHandle) : null,
+  };
+  log(capture);
+}
+
+$('reg').onclick = () => register().catch(e => out.textContent = 'ERROR (register): ' + e);
+$('auth').onclick = () => authenticate().catch(e => out.textContent = 'ERROR (authenticate): ' + e);
+$('clr').onclick = () => { capture = {register:null,authenticate:null}; lastCredId=null; out.textContent='cleared.'; };
+$('dl').onclick = () => {
+  const name = `webauthn_${$('label').value || 'key'}_${$('att').value}.json`;
+  const blob = new Blob([JSON.stringify({ label: $('label').value, browser: navigator.userAgent, ...capture }, null, 2)],
+                        { type: 'application/json' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; a.click();
+};
+</script>
