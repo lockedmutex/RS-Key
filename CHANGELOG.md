@@ -27,6 +27,14 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Changed
 
+- **Faster PIV SELECT — skip the redundant default-file scan after the first.**
+  `scan_files` provisions the PIV defaults (PIN/PUK/retry/management/attestation)
+  on the first SELECT and re-probed all five on every subsequent SELECT. Those
+  files only ever go away by a path that recreates them (PIV reset) or reboots
+  (trusted-display factory wipe), and `authenticatorReset` leaves them, so a RAM
+  guard now runs the scan once per power-cycle and the wire response (the APT) is
+  byte-identical. Shaves the five flash probes off every re-SELECT (`ykman`,
+  OpenSC, `age-plugin-yubikey`, PIV sign).
 - **Faster SHA-512 on the Cortex-M33 (the FIDO key-derivation ratchet).** SHA-512
   and SHA-384 now come from a new `rsk-sha512` crate instead of the `sha2`
   soft backend, leaving every digest **byte-for-byte unchanged** — the compression
