@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["firmware", "rsk-wipe", "crates/rsk-sdk", "crates/rsk-fs", "crates/rsk-usb", "crates/rsk-crypto", "crates/rsk-fido", "crates/rsk-openpgp", "crates/rsk-rsa-asm", "crates/rsk-mgmt", "crates/rsk-oath", "crates/rsk-otp", "crates/rsk-piv", "crates/rsk-rescue", "crates/rsk-led", "crates/rsk-ui", "crates/rsk-bip39", "crates/rsk-slip39", "crates/rsk-mldsa"]
+members = ["firmware", "rsk-wipe", "crates/rsk-sdk", "crates/rsk-fs", "crates/rsk-usb", "crates/rsk-crypto", "crates/rsk-fido", "crates/rsk-openpgp", "crates/rsk-rsa-asm", "crates/rsk-sha512", "crates/rsk-mgmt", "crates/rsk-oath", "crates/rsk-otp", "crates/rsk-piv", "crates/rsk-rescue", "crates/rsk-led", "crates/rsk-ui", "crates/rsk-bip39", "crates/rsk-slip39", "crates/rsk-mldsa"]
 
 # Embassy crates are versioned together; pin them all to the same git source so
 # they stay mutually compatible. We track `branch = "main"`, not a crates.io
@@ -29,6 +29,10 @@ rsk-crypto = { path = "crates/rsk-crypto" }
 rsk-fido = { path = "crates/rsk-fido" }
 rsk-openpgp = { path = "crates/rsk-openpgp" }
 rsk-rsa-asm = { path = "crates/rsk-rsa-asm" }
+# Fast byte-identical SHA-512/384 for the Cortex-M33 — a compact rolled
+# compression that fits the XIP cache, replacing `sha2`'s ~28 KB unrolled soft
+# backend on the FIDO key-derivation ratchet without changing any credential key.
+rsk-sha512 = { path = "crates/rsk-sha512" }
 rsk-mgmt = { path = "crates/rsk-mgmt" }
 rsk-oath = { path = "crates/rsk-oath" }
 rsk-otp = { path = "crates/rsk-otp" }
@@ -82,7 +86,14 @@ ml-kem = { version = "0.3.2", default-features = false, features = ["zeroize"] }
 # SHA-1 is for the YKOATH HOTP/TOTP PRF only (RFC 4226 mandates HMAC-SHA1).
 sha1 = { version = "0.10", default-features = false }
 sha2 = { version = "0.10", default-features = false }
+# The digest 0.10 core_api surface `rsk-sha512` implements its Sha512/Sha384
+# cores on (same resolved 0.10.7 sha2/hmac/hkdf already pin — no new version).
+digest = { version = "0.10", default-features = false, features = ["core-api"] }
 hmac = { version = "0.12", default-features = false }
+# RFC 6979 deterministic ECDSA nonces — already in the tree transitively via
+# `ecdsa`; a direct dep so `ec.rs` can derive `k` itself and swap the crate's
+# generic `k·G` for the fixed-base comb while keeping byte-identical signatures.
+rfc6979 = { version = "0.4", default-features = false }
 hkdf = { version = "0.12", default-features = false }
 # `zeroize` wipes the expanded round keys when a cipher instance drops.
 aes = { version = "0.8", default-features = false, features = ["zeroize"] }
@@ -115,6 +126,15 @@ opt-level = "s"    # our crates stay size-optimized…
 # at "s"). opt-level 3 here fixes that without bloating our glue.
 [profile.release.package."*"]
 opt-level = 3
+
+# rsk-sha512 is the ONE crate where size IS speed: at "s" its SHA-512 compression
+# stays a compact rolled loop that fits the RP2350 XIP cache; at "3" it unrolls to
+# ~28 KB and thrashes the cache (~40× slower — exactly the `sha2` problem it
+# replaces). Workspace members already default to "s", but pin it so the property
+# survives any future base-profile change. (Inverse of the EC crates above, where
+# unrolling wins.)
+[profile.release.package.rsk-sha512]
+opt-level = "s"
 
 [profile.dev]
 opt-level = "s"    # embassy/HAL needs some opt even in dev to fit/behave

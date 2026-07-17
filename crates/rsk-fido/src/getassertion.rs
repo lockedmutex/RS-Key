@@ -31,7 +31,7 @@ use crate::error::{CtapError, CtapResult};
 use crate::hmacsecret::{self, HmacSecretReq, SALT_AUTH_MAX, SALT_ENC_MAX};
 use crate::journal;
 use crate::keyderiv::{KEY_HANDLE_LEN, fido_load_key, verify_key};
-use crate::seed::{bump_sign_counter, get_sign_counter};
+use crate::seed::{cred_sign_counter, get_sign_counter, set_cred_sign_counter};
 use crate::state::{AssertionState, MAX_ASSERTION_CREDS, PERM_GA};
 use crate::{Ctx, Rng};
 use rsk_crypto::pinproto::PinProto;
@@ -183,6 +183,10 @@ struct Best {
     /// credentialId returned to the platform. Kept verbatim rather than
     /// re-derived from the box so it survives an updateUserInformation reseal.
     resident_id: [u8; CRED_RESIDENT_LEN],
+    /// The winning credential's EF_CRED slot, keying its per-credential signature
+    /// counter. `None` for a non-resident (allowList box) credential, which keeps
+    /// no on-device state and reports signCount 0.
+    slot: Option<u16>,
     user: [u8; MAX_USER_ID],
     user_len: usize,
     // name / displayName, returned only on a multi-credential resident discovery.
@@ -202,6 +206,7 @@ impl Best {
             created: 0,
             resident: false,
             resident_id: [0; CRED_RESIDENT_LEN],
+            slot: None,
             user: [0; MAX_USER_ID],
             user_len: 0,
             name: [0; MAX_USER_NAME],
@@ -224,6 +229,7 @@ impl Best {
         rp_id_hash: &[u8; 32],
         cand: &[u8],
         resident_id: Option<&[u8]>,
+        slot: Option<u16>,
         uv: bool,
         has_allow: bool,
         scratch: &mut [u8],
@@ -244,9 +250,10 @@ impl Best {
         if !self.any || c.created >= self.created {
             self.any = true;
             self.created = c.created;
-            // A resident candidate carries its stored 42-byte id; a non-resident
-            // (allowList box) carries none.
+            // A resident candidate carries its stored 42-byte id + EF_CRED slot; a
+            // non-resident (allowList box) carries neither.
             self.resident = resident_id.is_some();
+            self.slot = slot;
             if let Some(rid) = resident_id {
                 let m = rid.len().min(CRED_RESIDENT_LEN);
                 self.resident_id[..m].copy_from_slice(&rid[..m]);
@@ -312,6 +319,13 @@ pub fn get_assertion<S: Storage, R: Rng>(
     result
 }
 
+/// Whether this getAssertion asserts user presence: honor `up:false` (the
+/// platform's silent pre-flight) unless the `strict-up` build forces a touch on
+/// every assertion. Shared by the alwaysUv gate and `get_assertion_inner`.
+fn want_up(req: &Request) -> bool {
+    cfg!(feature = "strict-up") || req.up
+}
+
 /// CTAP2.1 PIN/UV enforcement (§6.1): verifies a `pinUvAuthParam` against the
 /// token and reports whether to set the `uv` flag.
 /// Unlike makeCredential, an absent param is allowed (the assertion just lacks UV).
@@ -353,9 +367,15 @@ fn enforce_pin<S: Storage, R: Rng>(
             }
             Ok(true)
         }
-        // alwaysUv forces user verification (CTAP 2.1 alwaysUv); otherwise an
-        // absent param simply yields an assertion without the uv flag.
-        None if crate::config::always_uv_enabled(ctx.fs) => Err(CtapError::PuatRequired),
+        // alwaysUv forces UV only for an assertion that asserts presence; the
+        // platform's silent up:false pre-flight (credential discovery, e.g.
+        // ssh-sk) is exempt — CTAP 2.1 §6.2.2 step 5 guards the PUAT_REQUIRED
+        // path on the `up` option being present and true. Without the exemption
+        // the probe fails and OpenSSH reports "device not found". strict-up
+        // asserts presence on every call, so there the exemption disappears.
+        None if want_up(req) && crate::config::always_uv_enabled(ctx.fs) => {
+            Err(CtapError::PuatRequired)
+        }
         None => Ok(false),
     }
 }
@@ -417,6 +437,7 @@ fn resolve_from_allowlist<S: Storage, R: Rng>(
                         rp_id_hash,
                         cred_record_box(&rec[..n]),
                         Some(&rec[32..RECORD_PREFIX]),
+                        Some(i),
                         uv,
                         true,
                         &mut scratch,
@@ -425,7 +446,7 @@ fn resolve_from_allowlist<S: Storage, R: Rng>(
                 }
             }
         } else {
-            best.consider(seed, rp_id_hash, id, None, uv, true, &mut scratch);
+            best.consider(seed, rp_id_hash, id, None, None, uv, true, &mut scratch);
         }
     }
 }
@@ -464,6 +485,7 @@ fn resolve_by_discovery<S: Storage, R: Rng>(
                 rp_id_hash,
                 cred_record_box(&rec[..n]),
                 Some(&rec[32..RECORD_PREFIX]),
+                Some(i),
                 uv,
                 false,
                 &mut scratch,
@@ -543,10 +565,10 @@ fn get_assertion_inner<S: Storage, R: Rng>(
     uv: bool,
     out: &mut [u8],
 ) -> CtapResult {
-    // User-presence decision for the whole call: honor `up:false` (the platform's
-    // silent pre-flight) unless the `strict-up` build forces a touch on every
-    // assertion. getNextAssertion reuses it via `gna.up`.
-    let want_up = cfg!(feature = "strict-up") || req.up;
+    // User-presence decision for the whole call (see `want_up`): honor `up:false`
+    // (the platform's silent pre-flight) unless `strict-up` forces a touch on
+    // every assertion. getNextAssertion reuses it via `gna.up`.
+    let want_up = want_up(req);
     let mut best = Best::new();
     resolve_credential(ctx, req, rp_id_hash, seed, uv, want_up, &mut best);
 
@@ -644,7 +666,15 @@ fn get_assertion_inner<S: Storage, R: Rng>(
     }
 
     // authData = rpIdHash | flags([UP][,UV][,ED]) | counter [| ext] — no attestedCredentialData.
-    let ctr = get_sign_counter(ctx.fs);
+    // Per-credential signature counter: a resident credential reports (and then
+    // advances) its own EF_CRED_CTR entry, so an RP can't correlate this key's
+    // usage with any OTHER credential. A credential from before EF_CRED_CTR existed
+    // has no entry yet and seeds from the frozen global counter (never decreasing).
+    // A non-resident credential keeps no on-device state and reports 0.
+    let ctr = match best.slot {
+        Some(slot) => cred_sign_counter(ctx.fs, slot).unwrap_or_else(|| get_sign_counter(ctx.fs)),
+        None => 0,
+    };
     let mut ad = [0u8; 37 + 320 + 32];
     ad[..32].copy_from_slice(rp_id_hash);
     let up_flag = if want_up { FLAG_UP } else { 0 };
@@ -726,7 +756,11 @@ fn get_assertion_inner<S: Storage, R: Rng>(
     }
     let resp_len = enc.writer().position();
 
-    bump_sign_counter(ctx.fs).map_err(|_| CtapError::Other)?;
+    // Advance the per-credential counter AFTER building the response (so a torn
+    // write leaves the old value and never double-reports) — resident only.
+    if let Some(slot) = best.slot {
+        set_cred_sign_counter(ctx.fs, slot, ctr.wrapping_add(1)).map_err(|_| CtapError::Other)?;
+    }
     Ok(resp_len)
 }
 
@@ -808,6 +842,7 @@ pub fn get_next_assertion<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, out: &mut [u8
         ctx,
         cred_record_box(&rec[..n]),
         &resident_id,
+        slot,
         &rp_id_hash,
         &client_data_hash,
         uv,
@@ -830,6 +865,7 @@ fn next_assertion_response<S: Storage, R: Rng>(
     ctx: &mut Ctx<S, R>,
     cred_box: &[u8],
     resident_id: &[u8],
+    slot: u16,
     rp_id_hash: &[u8; 32],
     client_data_hash: &[u8; 32],
     uv: bool,
@@ -895,7 +931,10 @@ fn next_assertion_response<S: Storage, R: Rng>(
     let key = CredKey::from_raw(curve, &raw).ok_or(CtapError::Other)?;
     raw.zeroize();
 
-    let ctr = get_sign_counter(ctx.fs);
+    // getNextAssertion only ever walks resident discovery, so every credential
+    // here has an EF_CRED slot and its own signature counter (a legacy credential
+    // seeds from the frozen global). See [`get_assertion_inner`].
+    let ctr = cred_sign_counter(ctx.fs, slot).unwrap_or_else(|| get_sign_counter(ctx.fs));
     let mut ad = [0u8; 37 + 320];
     ad[..32].copy_from_slice(rp_id_hash);
     let up_flag = if up { FLAG_UP } else { 0 };
@@ -936,7 +975,7 @@ fn next_assertion_response<S: Storage, R: Rng>(
             .map_err(|_| CtapError::Other)?;
     }
     let resp_len = enc.writer().position();
-    bump_sign_counter(ctx.fs).map_err(|_| CtapError::Other)?;
+    set_cred_sign_counter(ctx.fs, slot, ctr.wrapping_add(1)).map_err(|_| CtapError::Other)?;
     Ok(resp_len)
 }
 

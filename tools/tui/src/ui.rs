@@ -11,6 +11,7 @@ use ratatui::widgets::{
 };
 
 use crate::app::{App, AppMode, Modal, Search};
+use crate::device::COLORS;
 use crate::model::*;
 use crate::theme::{Theme, bold, dim};
 
@@ -193,6 +194,35 @@ fn head(text: &str) -> Line<'static> {
     Line::from(Span::styled(text.to_string(), bold()))
 }
 
+/// The firmware's 8-colour wheel index → a terminal colour. Named ANSI colours
+/// (not the brand palette) so the swatch matches the LED's actual colour and
+/// adapts to the user's terminal; `0` = off = a muted block.
+fn led_color(idx: u8) -> Color {
+    match idx {
+        1 => Color::Red,
+        2 => Color::Green,
+        3 => Color::Blue,
+        4 => Color::Yellow,
+        5 => Color::Magenta,
+        6 => Color::Cyan,
+        7 => Color::White,
+        _ => Color::DarkGray,
+    }
+}
+
+/// One LED status row: a solid colour swatch (background fill, so it shows with
+/// no glyph support) plus the colour name (the always-legible signal).
+fn led_row(name: &str, idx: u8) -> Line<'static> {
+    Line::from(vec![
+        Span::raw(format!(" {name:<13}")),
+        Span::styled("   ", Style::default().bg(led_color(idx))),
+        Span::raw(format!(
+            "  {}",
+            COLORS.get(idx as usize).copied().unwrap_or("?")
+        )),
+    ])
+}
+
 fn opt(s: &Option<String>) -> String {
     s.clone().unwrap_or_else(|| "—".into())
 }
@@ -289,17 +319,45 @@ fn section_status_lines(app: &App, theme: Theme) -> Vec<Line<'static>> {
                 theme,
                 Health::NotApplicable,
                 "credentials",
-                "PIN-gated count — `rsk fido list-passkeys`",
+                "run “Count resident passkeys” (PIN · credMgmt)",
             ));
         }
         Section::OpenPgp => {
             out.push(head("OpenPGP card"));
             let (h, v) = present_health(s.applets.openpgp);
             out.push(row(theme, h, "applet", v));
+            if let Some(p) = &s.pgp {
+                if let Some(sn) = &p.serial {
+                    out.push(row(theme, Health::Ok, "serial", sn.clone()));
+                }
+                if let Some(r) = p.pin_retries {
+                    let h = if r[0] == 0 || r[2] == 0 {
+                        Health::Warn
+                    } else {
+                        Health::Ok
+                    };
+                    out.push(row(
+                        theme,
+                        h,
+                        "PIN retries",
+                        format!("PW1 {}  RC {}  PW3 {}", r[0], r[1], r[2]),
+                    ));
+                }
+                out.push(row(
+                    theme,
+                    if p.keys_present > 0 {
+                        Health::Ok
+                    } else {
+                        Health::Unknown
+                    },
+                    "keys",
+                    format!("{} of 3 slots populated", p.keys_present),
+                ));
+            }
             out.push(row(
                 theme,
                 Health::NotApplicable,
-                "card data",
+                "full data",
                 "gpg --card-status",
             ));
         }
@@ -307,10 +365,34 @@ fn section_status_lines(app: &App, theme: Theme) -> Vec<Line<'static>> {
             out.push(head("PIV applet"));
             let (h, v) = present_health(s.applets.piv);
             out.push(row(theme, h, "applet", v));
+            if let Some(p) = s.piv_meta {
+                let h = if p.pin_left == 0 {
+                    Health::Error
+                } else if p.pin_default {
+                    Health::Warn
+                } else {
+                    Health::Ok
+                };
+                out.push(row(
+                    theme,
+                    h,
+                    "PIN",
+                    format!(
+                        "{}/{} tries{}",
+                        p.pin_left,
+                        p.pin_total,
+                        if p.pin_default {
+                            " · still default"
+                        } else {
+                            ""
+                        }
+                    ),
+                ));
+            }
             out.push(row(
                 theme,
                 Health::NotApplicable,
-                "card data",
+                "full data",
                 "ykman piv info",
             ));
         }
@@ -374,12 +456,26 @@ fn section_status_lines(app: &App, theme: Theme) -> Vec<Line<'static>> {
         }
         Section::Led => {
             out.push(head("LED"));
-            out.push(row(
-                theme,
-                Health::NotApplicable,
-                "state",
-                "run “Read LED state” to query the device",
-            ));
+            match &s.led {
+                Some(led) => {
+                    out.push(row(
+                        theme,
+                        Health::Ok,
+                        "mode",
+                        if led.steady { "steady" } else { "blink" },
+                    ));
+                    out.push(led_row("idle", led.idle));
+                    out.push(led_row("processing", led.processing));
+                    out.push(led_row("touch", led.touch));
+                    out.push(led_row("boot", led.boot));
+                }
+                None => out.push(row(
+                    theme,
+                    Health::NotApplicable,
+                    "state",
+                    "refresh with a device present, or run “Read LED state”",
+                )),
+            }
             out.push(Line::from(""));
             out.push(Line::from(Span::styled(
                 "Cycle steps the idle color through the 7-color wheel; it persists in flash.",
@@ -554,7 +650,9 @@ fn keybinds(app: &App) -> String {
         AppMode::Modal(Modal::Reveal { .. }) => {
             " write it down   any key clears the screen ".into()
         }
-        AppMode::Modal(Modal::Message { .. }) => " any key closes ".into(),
+        AppMode::Modal(Modal::Message { .. }) => {
+            " ↑↓/jk scroll   PgUp/PgDn page   ↵/esc/q close ".into()
+        }
     }
 }
 
@@ -667,23 +765,38 @@ fn modal(f: &mut Frame, theme: Theme, m: &Modal) {
                 r,
             );
         }
-        Modal::Message { title, body, level } => {
+        Modal::Message {
+            title,
+            body,
+            level,
+            scroll,
+        } => {
+            let total = body.lines().count() as u16;
             // Never clamp(min, max) with max<min: a short terminal makes the
             // available height smaller than the preferred minimum.
-            let lines: u16 = (body.lines().count() as u16 + 4)
-                .min(area.height.saturating_sub(2))
-                .max(3);
+            let lines: u16 = (total + 4).min(area.height.saturating_sub(2)).max(3);
             let r = centered(area, 84, lines);
             f.render_widget(Clear, r);
             let style = theme.log_style(*level);
+            // Inner text height = box minus the top+bottom border; clamp the offset
+            // so the last page sits at the bottom instead of scrolling into blank.
+            let view = r.height.saturating_sub(2);
+            let max_scroll = total.saturating_sub(view);
+            let off = (*scroll).min(max_scroll);
+            let title = if max_scroll > 0 {
+                format!("{title}  [{}/{}]", off + 1, max_scroll + 1)
+            } else {
+                title.clone()
+            };
             f.render_widget(
                 Paragraph::new(
                     body.lines()
                         .map(|l| Line::from(Span::styled(format!(" {l}"), style)))
                         .collect::<Vec<_>>(),
                 )
-                .block(titled(theme, title))
-                .wrap(Wrap { trim: false }),
+                .block(titled(theme, &title))
+                .wrap(Wrap { trim: false })
+                .scroll((off, 0)),
                 r,
             );
         }

@@ -1734,6 +1734,7 @@ dependencies = [
  "ml-kem",
  "p256",
  "rsk-mldsa",
+ "rsk-sha512",
  "sha1",
  "sha2",
  "zeroize",
@@ -1748,6 +1749,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsk-sha512"
+version = "0.1.0"
+dependencies = [
+ "digest 0.10.7",
+]
+
+[[package]]
 name = "rsk-slip39"
 version = "0.1.0"
 dependencies = [
@@ -1757,7 +1765,7 @@ dependencies = [
 
 [[package]]
 name = "rsk-tui"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "aes",
  "bip39",

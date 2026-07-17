@@ -243,6 +243,37 @@ fn print_once(s: &model::DeviceSnapshot) {
         applet(s.applets.oath),
         applet(s.applets.otp),
     );
+    if let Some(p) = &s.pgp {
+        let serial = p
+            .serial
+            .as_ref()
+            .map(|x| format!("  serial {}", sanitize(x)))
+            .unwrap_or_default();
+        let retries = p
+            .pin_retries
+            .map(|r| format!("  retries PW1 {} RC {} PW3 {}", r[0], r[1], r[2]))
+            .unwrap_or_default();
+        println!("openpgp    : {} keys{serial}{retries}", p.keys_present);
+    }
+    if let Some(p) = s.piv_meta {
+        println!(
+            "piv        : PIN {}/{} tries{}",
+            p.pin_left,
+            p.pin_total,
+            if p.pin_default { " (default)" } else { "" }
+        );
+    }
+    if let Some(l) = s.led {
+        let name = |i: u8| device::COLORS.get(i as usize).copied().unwrap_or("?");
+        println!(
+            "led        : {}  idle {}  processing {}  touch {}  boot {}",
+            if l.steady { "steady" } else { "blink" },
+            name(l.idle),
+            name(l.processing),
+            name(l.touch),
+            name(l.boot),
+        );
+    }
     for e in &s.errors {
         println!("note       : {e}");
     }

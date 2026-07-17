@@ -61,7 +61,10 @@
     shellHook = ''
       # the Gnuk-derived OpenPGP card suite (third_party/) dlopens libgcrypt
       export DYLD_FALLBACK_LIBRARY_PATH="${pkgs.lib.getLib pkgs.libgcrypt}/lib''${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}"
-      export LD_LIBRARY_PATH="${pkgs.lib.getLib pkgs.libgcrypt}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+      # The dev-shell `rsk-tui` is a bare `cargo run` (no nix RPATH), so its
+      # DT_NEEDED libudev/libpcsclite must be on the loader path at run time —
+      # pkg-config only satisfies them at build time.
+      export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath ([ pkgs.libgcrypt ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.systemd pkgs.pcsclite ])}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
       # Install repo git hooks (idempotent; symlinked so edits take effect).
       if [ -d .git ] && [ -f scripts/hooks/pre-commit ]; then

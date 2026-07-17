@@ -101,6 +101,18 @@ Legacy **U2F** (CTAP1, `U2F_V2`) works the same way for older 2FA setups: the
 register/authenticate pair is non-resident, with a monotonic signature counter,
 attested by the device's end-entity certificate.
 
+## Signature counters
+
+Every assertion carries a signature counter, the tripwire a relying party watches
+for a cloned key. RS-Key keeps one **per resident credential**: a passkey starts at
+0 and only its own logins advance it, so colluding sites can't read a shared global
+counter to gauge how much you use the key elsewhere (WebAuthn §6.1.1). A non-resident
+second-factor credential stores nothing on the device, so it reports 0. Legacy U2F
+keeps the single monotonic counter that protocol expects.
+
+Upgrading an existing key is forward-safe for passkeys: each seeds its counter from
+the old global value on first use, so the reported number never counts backwards.
+
 ## Advertised algorithms
 
 getInfo advertises these COSE algorithms. A relying party picks one in its

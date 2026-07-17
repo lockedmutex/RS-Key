@@ -123,13 +123,16 @@ pub fn config_tlv<S: Storage>(serial: &[u8; 4], fs: &mut Fs<S>, res: &mut ResBuf
     let mut conf = [0u8; EF_DEV_CONF_MAX];
     match fs.read(EF_DEV_CONF, &mut conf) {
         Some(full) if full > 0 => {
-            // A host wrote an enabled-applications config — return it verbatim.
-            // `Storage::read` reports the value's *full* length even when it
-            // exceeds the buffer, so clamp before slicing: WRITE CONFIG caps new
-            // writes, but a blob persisted by an older build or a corrupt flash
-            // could still be over-length and must not slice past `conf`/`buf`.
+            // A host wrote an enabled-applications config — echo it back. Two
+            // clamps: (1) `Storage::read` reports the value's *full* length even
+            // when it exceeds the buffer, so bound `len` before slicing — WRITE
+            // CONFIG caps new writes, but a blob from an older build or corrupt
+            // flash could be over-length and must not slice past `conf`/`buf`;
+            // (2) mask any USB_ENABLED bits down to what this firmware actually
+            // supports, so READ CONFIG never reports enabled ⊄ supported.
             let len = full.min(conf.len()).min(buf.len().saturating_sub(n));
             buf[n..n + len].copy_from_slice(&conf[..len]);
+            clamp_usb_enabled(&mut buf[n..n + len]);
             n += len;
         }
         _ => {
@@ -251,6 +254,28 @@ impl<S: Storage> Applet<Fs<S>> for ManagementApplet<'_> {
             INS_RESET => Sw::INS_NOT_SUPPORTED,
             _ => Sw::INS_NOT_SUPPORTED,
         }
+    }
+}
+
+/// Clamp any USB_ENABLED (`0x03`) TLV in a persisted config blob to
+/// `SUPPORTED_CAPS`, so READ CONFIG never reports an enabled capability this
+/// firmware does not implement. A real YubiKey guarantees enabled ⊆ supported;
+/// RS-Key echoes the host-written `EF_DEV_CONF` blob, which could carry a wider
+/// mask (a newer host that knows capability bits we lack). Walks short-form
+/// TLVs in place; a malformed length stops the walk, leaving the rest untouched.
+fn clamp_usb_enabled(blob: &mut [u8]) {
+    let mut i = 0;
+    while i + 2 <= blob.len() {
+        let len = blob[i + 1] as usize;
+        if i + 2 + len > blob.len() {
+            break;
+        }
+        if blob[i] == TAG_USB_ENABLED && len == 2 {
+            let masked =
+                (u16::from_be_bytes([blob[i + 2], blob[i + 3]]) & SUPPORTED_CAPS).to_be_bytes();
+            blob[i + 2..i + 4].copy_from_slice(&masked);
+        }
+        i += 2 + len;
     }
 }
 

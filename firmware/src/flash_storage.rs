@@ -147,10 +147,11 @@ pub struct FlashStorage {
 
 /// Route the hot per-operation counters to the dedicated counter partition so their
 /// churn never reclaims a credential/key page in the main partition. Values are
-/// `EF_COUNTER` (FIDO 0xC000), `EF_SIG_COUNT` (OpenPGP 0x0093) and the vendor
-/// test counter (0xCC01).
+/// `EF_COUNTER` (FIDO 0xC000), `EF_CRED_CTR` (FIDO per-credential signature counters,
+/// 0xC001 — rewritten on every getAssertion), `EF_SIG_COUNT` (OpenPGP 0x0093) and the
+/// vendor test counter (0xCC01).
 fn is_counter_fid(fid: u16) -> bool {
-    matches!(fid, 0xC000 | 0x0093 | 0xCC01)
+    matches!(fid, 0xC000 | 0xC001 | 0x0093 | 0xCC01)
 }
 
 impl FlashStorage {

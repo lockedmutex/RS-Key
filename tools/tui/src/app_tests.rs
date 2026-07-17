@@ -196,6 +196,37 @@ fn cancel_zeroizes_and_returns_to_normal() {
 }
 
 #[test]
+fn cred_count_gates_pin() {
+    let mut a = app(); // mock has client_pin = true
+    assert_eq!(a.begin_action(Action::CredCount), Flow::Continue);
+    match &mut a.mode {
+        AppMode::Modal(Modal::Input { mask, buf, .. }) => {
+            assert!(*mask, "credMgmt count must prompt for the PIN, masked");
+            *buf = "1234".into();
+        }
+        _ => panic!("expected PIN input"),
+    }
+    assert_eq!(a.submit_modal(), Flow::Run(Action::CredCount));
+    assert_eq!(a.staging.pin.as_deref().map(String::as_str), Some("1234"));
+}
+
+#[test]
+fn message_modal_scrolls_and_clamps() {
+    let mut a = app();
+    a.open_message("t".into(), "l0\nl1\nl2\nl3".into(), LogLevel::Info); // 4 lines
+    let scroll = |a: &App| match &a.mode {
+        AppMode::Modal(Modal::Message { scroll, .. }) => *scroll,
+        _ => panic!("expected message modal"),
+    };
+    a.scroll_message(-1); // up at the top stays put
+    assert_eq!(scroll(&a), 0);
+    a.scroll_message(2);
+    assert_eq!(scroll(&a), 2);
+    a.scroll_message(100); // clamps to lines-1
+    assert_eq!(scroll(&a), 3);
+}
+
+#[test]
 fn search_filters_actions() {
     let all = App::search_results("");
     assert_eq!(all.len(), Action::ALL.len());

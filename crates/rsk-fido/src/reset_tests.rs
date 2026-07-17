@@ -45,6 +45,9 @@ fn reset_wipes_state_and_regenerates() {
     bump_sign_counter(&mut fs).unwrap();
     bump_sign_counter(&mut fs).unwrap();
     assert_eq!(get_sign_counter(&mut fs), 2);
+    // A per-credential signature-counter entry must also be wiped by reset.
+    crate::seed::set_cred_sign_counter(&mut fs, 0, 7).unwrap();
+    assert_eq!(crate::seed::cred_sign_counter(&mut fs, 0), Some(7));
 
     let mut state = FidoState::new();
     state.paut.permissions = 0x07;
@@ -73,6 +76,7 @@ fn reset_wipes_state_and_regenerates() {
         "OpenPGP files must survive a FIDO reset"
     );
     assert_eq!(get_sign_counter(&mut fs), 0);
+    assert_eq!(crate::seed::cred_sign_counter(&mut fs, 0), None);
     assert!(load_keydev(&dev(), &mut fs).is_some());
     // Large blob wiped and re-initialised to the CTAP2.1 default.
     let mut lb = [0u8; 64];

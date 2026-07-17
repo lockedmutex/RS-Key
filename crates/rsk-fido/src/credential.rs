@@ -715,6 +715,12 @@ pub fn credential_store<S: Storage>(
         .ok_or(Error::NoMemory)?;
     fs.put(EF_CRED + slot, &rec[..total])?;
 
+    // A freshly created (or re-registered) credential restarts its per-credential
+    // signature counter: makeCredential reported signCount 0, so the next
+    // operation reports 1. This also clears any stale entry a prior occupant of a
+    // reused slot may have left in the packed EF_CRED_CTR file.
+    crate::seed::set_cred_sign_counter(fs, slot, 1)?;
+
     if new_record {
         bump_rp(fs, seed, rp_id_hash, rp_id)?;
     }

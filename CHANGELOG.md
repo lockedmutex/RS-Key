@@ -13,6 +13,137 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-07-17
+
+### Added
+
+- **`rsk-tui` cockpit — richer applet reads, a passkey count, LED preview, and
+  scrollable output (`0.3.0`).** Four host-only additions, no firmware change:
+  the FIDO section can **count resident passkeys** over credMgmt
+  `getCredsMetadata` (PIN-gated — the count needs the FIDO2 PIN, but not the
+  enumeration); OpenPGP and PIV surface real metadata pulled in the same gather —
+  OpenPGP parses its `6E` DO (card serial, PW1/RC/PW3 retry counters, populated
+  key slots) and PIV reads the PIN GET METADATA (retries + default-PIN flag); the
+  LED section paints a live colour swatch per state; and long **message modals**
+  (audit journal, verify report) now scroll (arrows / `PgUp` / `PgDn` / `Home` /
+  `End`). The new fields also appear in `rsk-tui --once` / `--json`. See
+  [docs/guides/tui.md](docs/guides/tui.md).
+- **Differential interop harness — diff RS-Key against a real YubiKey.** New
+  `tests/interop/{capture,diff,divergences,normalize,parity}.py`: capture a
+  read-only snapshot of each key (both can stay plugged; an identity guard keys
+  off the `RSK` marker and the FIDO AAGUID), then classify every field against a
+  known-divergence allow-list so a fidelity gap stands out from the ~160 fields
+  that legitimately differ. Host-testable engine (`python -m pytest
+  tests/interop/test_diff.py`). A first macOS run against a YubiKey 5C NFC found
+  85 identical / 76 expected-divergence / 1 unexpected field (see
+  [docs/interop.md](docs/interop.md) → "Differential against a real YubiKey").
+
+### Changed
+
+- **Faster PIV SELECT — skip the redundant default-file scan after the first.**
+  `scan_files` provisions the PIV defaults (PIN/PUK/retry/management/attestation)
+  on the first SELECT and re-probed all five on every subsequent SELECT. Those
+  files only ever go away by a path that recreates them (PIV reset) or reboots
+  (trusted-display factory wipe), and `authenticatorReset` leaves them, so a RAM
+  guard now runs the scan once per power-cycle and the wire response (the APT) is
+  byte-identical. Shaves the five flash probes off every re-SELECT (`ykman`,
+  OpenSC, `age-plugin-yubikey`, PIV sign).
+- **Faster SHA-512 on the Cortex-M33 (the FIDO key-derivation ratchet).** SHA-512
+  and SHA-384 now come from a new `rsk-sha512` crate instead of the `sha2`
+  soft backend, leaving every digest **byte-for-byte unchanged** — the compression
+  function is the only thing swapped, so `hmac`/`hkdf` compose over it identically
+  and no stored credential key changes. On-device profiling had found the FIDO
+  getAssertion ratchet (8× HKDF-SHA512, ~96 SHA-512 blocks) dominating every
+  assertion at ~191 ms of ~241 ms: `sha2` fully unrolls SHA-512 into a ~28 KB
+  straight-line body that overflows the RP2350 XIP cache and re-fetches over QSPI
+  flash on every block. The replacement compiles to an ~866-byte rolled loop that
+  fits the cache. Output identity is gated on the host by a randomized differential
+  against `sha2`/`hmac`/`hkdf` plus NIST/RFC 4231 KATs; SHA-256/SHA-1 stay on
+  `sha2` (already fast on the M33) and Ed25519 (dalek) is unaffected.
+  `bcdDevice` → `0x0820`.
+
+- **Faster P-256 ECDSA signing (fixed-base comb + no wasted public-key derivation).**
+  Two changes to the P-256 credential path, both leaving the RFC 6979 deterministic
+  signature **byte-for-byte unchanged** (a KAT test pins the result to the `p256`
+  crate's output), so this is a pure speedup with no wire or behaviour change:
+  (1) the ephemeral `k·G` now uses a precomputed width-4 Lim–Lee comb table — the
+  fixed-base technique already used for P-521 — instead of the crate's generic
+  `mul_by_generator`; (2) a P-256 credential key is held as the bare scalar (like
+  P-521), so getAssertion no longer builds a `SigningKey` that eagerly derives the
+  public key `d·G` — a second fixed-base mul it never uses when only signing (the
+  public key it does need, at makeCredential, comes from the same comb). Measured on
+  the RP2350: a silent `up:false` P-256 assertion drops from ~303 ms to ~241 ms
+  (about 20 % — the removed `d·G` was ~40 ms, the comb ~22 ms). Costs ~1 KB of flash
+  for the table (`build.rs`-generated). P-384 / secp256k1 / P-521 are unchanged
+  (P-521 keeps its comb + random nonce). `bcdDevice` → `0x081F`.
+
+- **FIDO2 signature counters are now per-credential (privacy).** Each resident
+  credential (passkey) keeps its own counter in a new packed `EF_CRED_CTR` flash
+  file, starting at 0 and advancing only on its own assertions — colluding relying
+  parties can no longer read a shared global counter to correlate how much the key
+  is used across sites (WebAuthn §6.1.1). Non-resident (second-factor) credentials
+  keep no device state and report signCount 0; legacy U2F keeps its global monotonic
+  counter. Migration is forward-safe for passkeys: a credential created before
+  `EF_CRED_CTR` seeds its counter from the frozen global value on first use, so the
+  reported count never decreases. A pre-existing non-resident credential now reports
+  0, which a site that strictly enforced counter monotonicity may treat as reason to
+  re-register. Found by the RS-Key ↔ YubiKey differential harness (finding #4:
+  RS-Key's shared counter at ~105 vs a real YubiKey's per-credential counter).
+  `bcdDevice` → `0x081D`.
+
+- **getInfo no longer advertises `U2F_V2` while `alwaysUv` is on.** CTAP 2.1 §7.2.4
+  disables the CTAP1/U2F interface whenever alwaysUv is enabled (via the `always-uv`
+  build feature or the runtime `toggleAlwaysUv`), and the `versions` list now drops
+  `U2F_V2` to match — a platform is no longer told CTAP1 is available while every U2F
+  request is refused. The CTAP2 versions and the default (alwaysUv-off) advertisement
+  are unchanged.
+
+### Fixed
+
+- **`alwaysUv` no longer breaks the silent credential-discovery pre-flight (fixes
+  `ssh -i` "device not found" on an `always-uv` build).** `getAssertion` rejected
+  every request without a `pinUvAuthParam` under `alwaysUv` with
+  `CTAP2_ERR_PUAT_REQUIRED` — including the platform's silent `up:false` probe that
+  OpenSSH's `ssh-sk` middleware (and WebAuthn platforms) use to locate which
+  credential/device to sign with. CTAP 2.1 §6.2.2 step 5 guards that error on the
+  `up` option being *present and true*, so the silent probe must be exempt (it
+  returns a silent assertion or `NO_CREDENTIALS`); a real YubiKey and pico-fido do
+  exactly that. The `alwaysUv` gate now keys on `want_up` (honoring `up:false`,
+  and — under the `strict-up` build — still demanding UV on every call), so a
+  silent pre-flight succeeds while an interactive `up:true` request without UV is
+  still refused. The real assertion then correctly prompts for the PIN each use
+  (`alwaysUv` as designed). `makeCredential` is unchanged: registration can't be
+  silent (§6.1.2 has no `up` guard). Reported in
+  [#34](https://github.com/TheMaxMur/RS-Key/issues/34). `bcdDevice` → `0x0823`.
+
+- **`EF_CRED_CTR` per-credential counter now churns the counter partition, not the
+  secret one.** The per-credential signature counter file (`0xC001`) is rewritten on
+  every getAssertion, but `is_counter_fid` routed only the global `EF_COUNTER`
+  (`0xC000`) to the dedicated counter partition, so the new file appended to the
+  **main** partition — the one holding sealed credentials and keys, which the
+  two-partition split deliberately keeps off the per-operation hot path to avoid a
+  multi-second cold-migration stall during authentication. Adding `0xC001` to the
+  predicate restores that isolation. Internal routing only (no wire, key, or
+  signCount change), and fixed before the per-credential counter shipped, so no
+  provisioned device re-seeds. `bcdDevice` → `0x0821`.
+
+- **`rsk-tui` starts in the Linux dev shell again.** The dev-shell launcher is a
+  bare `cargo run` of `tools/tui`, whose binary carries no nix RPATH, so its
+  `DT_NEEDED` `libudev.so.1` / `libpcsclite.so.1` were only satisfied at build
+  time (pkg-config) and missing at run time — `error while loading shared
+  libraries: libudev.so.1`. The shell now also exports `systemd` (libudev) and
+  `pcsclite` on `LD_LIBRARY_PATH` on Linux. Host-only; `nix run .#rsk-tui` was
+  unaffected. Reported in [#31](https://github.com/TheMaxMur/RS-Key/issues/31).
+
+- **READ CONFIG now clamps `USB_ENABLED` to the supported capabilities.** The
+  management DeviceInfo (`0x1D`) echoed a host-written `EF_DEV_CONF` blob verbatim,
+  so a persisted enabled-applications mask wider than `SUPPORTED_CAPS` (e.g. a newer
+  `ykman` that knows capability bits this firmware lacks) was reported as-is —
+  `enabled ⊄ supported`, which a real YubiKey never does. `config_tlv` now masks the
+  `USB_ENABLED` TLV down to `SUPPORTED_CAPS` on read, healing already-persisted
+  devices without a rewrite. Found by the new RS-Key ↔ YubiKey differential harness
+  (`enabled = 0x3A3B` vs `supported = 0x023B` on a live board). `bcdDevice` → `0x081C`.
+
 ## [0.3.6] — 2026-07-16
 
 ### Added
@@ -1595,7 +1726,8 @@ family that keeps the "enterprise" features in the open tree.
   signature of it, and a CycloneDX SBOM. See
   [docs/releases.md](docs/releases.md) to verify a download.
 
-[Unreleased]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.6...HEAD
+[Unreleased]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.7...HEAD
+[0.3.7]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.3...v0.3.4

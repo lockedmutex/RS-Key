@@ -46,6 +46,11 @@ const CTAP_VENDOR: u8 = 0x41;
 const CTAP2_ERR_PIN_REQUIRED: u8 = 0x36;
 const MSG_PIN_REQUIRED: &str = "device requires a PIN (set one and retry)";
 const PERM_ACFG: i64 = 0x20;
+const PERM_CREDMGMT: i64 = 0x04;
+/// authenticatorCredentialManagement (0x0A) getCredsMetadata (0x01) — the
+/// PIN-gated resident-credential count. Response: {1: existing, 2: remaining}.
+const CTAP_CREDENTIAL_MGMT: u8 = 0x0A;
+const CM_GET_CREDS_METADATA: u8 = 0x01;
 
 const VENDOR_AID: &[u8] = &[0xF0, 0x00, 0x00, 0x00, 0x01];
 const RESCUE_AID: &[u8] = &[0xA0, 0x58, 0x3F, 0xC1, 0x9B, 0x7E, 0x4F, 0x21];
@@ -144,6 +149,14 @@ impl DeviceProvider for HardwareProvider {
         match action {
             // Refresh is handled by the caller (it just re-snapshots).
             Action::Refresh => ActionResult::Ok("status refreshed".into()),
+            Action::CredCount => match cred_count(pin) {
+                Ok((existing, remaining)) => ActionResult::Ok(format!(
+                    "{existing} resident passkey{} · ~{remaining} slot{} free",
+                    if existing == 1 { "" } else { "s" },
+                    if remaining == 1 { "" } else { "s" },
+                )),
+                Err(e) => ActionResult::Failed(format!("credMgmt failed: {e}")),
+            },
             Action::LedGet => match led_get() {
                 Ok(s) => ActionResult::Report {
                     title: "LED state".into(),
@@ -611,11 +624,111 @@ fn read_ccid(snap: &mut DeviceSnapshot) {
         snap.transport.ccid = Link::Error;
     }
 
-    // Applet presence — a plain SELECT is a read with no state change.
-    snap.applets.openpgp = Some(ccid.select(OPENPGP_AID).is_ok());
-    snap.applets.piv = Some(ccid.select(PIV_AID).is_ok());
+    // Applet presence — a plain SELECT is a read with no state change. Where the
+    // applet answers, pull the cheap unauthenticated metadata while it is still
+    // the selected applet (OpenPGP `6E`, PIV PIN GET METADATA).
+    let openpgp = ccid.select(OPENPGP_AID).is_ok();
+    snap.applets.openpgp = Some(openpgp);
+    if openpgp {
+        snap.pgp = read_pgp_info(&mut ccid);
+    }
+    let piv = ccid.select(PIV_AID).is_ok();
+    snap.applets.piv = Some(piv);
+    if piv {
+        snap.piv_meta = read_piv_meta(&mut ccid);
+    }
     snap.applets.oath = Some(ccid.select(OATH_AID).is_ok());
     snap.applets.otp = Some(ccid.select(OTP_AID).is_ok());
+
+    // LED colours (VENDOR_AID) — last, since selecting it deselects the applets
+    // probed above.
+    if ccid.select(VENDOR_AID).is_ok()
+        && let Ok((d, stride)) = led_read_config(&mut ccid)
+    {
+        snap.led = parse_led(&d, stride);
+    }
+}
+
+/// Find the value of the first top-level BER-TLV with `tag` (1- or 2-byte tag,
+/// short / `0x81` / `0x82` length). Enough for the OpenPGP `6E` template and the
+/// PIV metadata TLVs; a malformed length just ends the walk (returns `None`).
+fn ber_find(mut d: &[u8], tag: u16) -> Option<&[u8]> {
+    while !d.is_empty() {
+        let (t, rest) = if d[0] & 0x1F == 0x1F {
+            if d.len() < 2 {
+                return None;
+            }
+            ((u16::from(d[0]) << 8) | u16::from(d[1]), &d[2..])
+        } else {
+            (u16::from(d[0]), &d[1..])
+        };
+        let (len, val) = match rest.split_first() {
+            Some((&n, r)) if n < 0x80 => (n as usize, r),
+            Some((&0x81, r)) => (*r.first()? as usize, &r[1..]),
+            Some((&0x82, r)) => (((*r.first()? as usize) << 8) | *r.get(1)? as usize, &r[2..]),
+            _ => return None,
+        };
+        if val.len() < len {
+            return None;
+        }
+        if t == tag {
+            return Some(&val[..len]);
+        }
+        d = &val[len..];
+    }
+    None
+}
+
+/// OpenPGP application-related data from the `6E` GET DATA template: card serial,
+/// the three PIN retry counters (`C4`), and how many key slots are populated
+/// (`C5`). Every field is optional — a card that omits one just leaves it unset.
+fn read_pgp_info(c: &mut Ccid) -> Option<PgpInfo> {
+    let d = c.get_data_full(0x00, 0x6E).ok()?;
+    let inner = ber_find(&d, 0x6E).unwrap_or(&d);
+    let mut info = PgpInfo::default();
+    // 4F AID: D276 0001 2401 vvvv mmmm ssssssss 0000 — serial is bytes 10..14.
+    if let Some(aid) = ber_find(inner, 0x4F)
+        && aid.len() >= 14
+    {
+        info.serial = Some(hex(&aid[10..14]));
+    }
+    // C4 PW status: [validity, pw1max, rcmax, pw3max, pw1tries, rctries, pw3tries].
+    if let Some(c4) = ber_find(inner, 0xC4)
+        && c4.len() >= 7
+    {
+        info.pin_retries = Some([c4[4], c4[5], c4[6]]);
+    }
+    // C5 fingerprints: 3 x 20 bytes (sig/dec/auth); an all-zero block = no key.
+    if let Some(c5) = ber_find(inner, 0xC5)
+        && c5.len() >= 60
+    {
+        info.keys_present = (0..3)
+            .filter(|k| c5[k * 20..k * 20 + 20].iter().any(|&b| b != 0))
+            .count() as u8;
+    }
+    Some(info)
+}
+
+/// PIV PIN metadata (GET METADATA, INS 0xF7 / P2 0x80): retry counters + whether
+/// the PIN is still the factory default. Unauthenticated.
+fn read_piv_meta(c: &mut Ccid) -> Option<PivInfo> {
+    let (d, s1, s2) = c.apdu(&[0x00, 0xF7, 0x00, 0x80, 0x00]).ok()?;
+    if (s1, s2) != SW_OK {
+        return None;
+    }
+    let mut info = PivInfo::default();
+    if let Some(def) = ber_find(&d, 0x05)
+        && !def.is_empty()
+    {
+        info.pin_default = def[0] != 0;
+    }
+    if let Some(r) = ber_find(&d, 0x06)
+        && r.len() >= 2
+    {
+        info.pin_total = r[0];
+        info.pin_left = r[1];
+    }
+    Some(info)
 }
 
 // ===========================================================================
@@ -690,11 +803,47 @@ impl Ccid {
         }
         Ok(())
     }
+
+    /// GET DATA (00 CA P1 P2) with 61xx GET RESPONSE chaining, so a DO larger than
+    /// one APDU (the OpenPGP `6E` template) comes back whole.
+    fn get_data_full(&mut self, p1: u8, p2: u8) -> Result<Vec<u8>, String> {
+        let (mut out, mut s1, mut s2) = self.apdu(&[0x00, 0xCA, p1, p2, 0x00])?;
+        while s1 == 0x61 {
+            let (more, ns1, ns2) = self.apdu(&[0x00, 0xC0, 0x00, 0x00, s2])?;
+            out.extend_from_slice(&more);
+            (s1, s2) = (ns1, ns2);
+        }
+        if (s1, s2) != SW_OK {
+            return Err(format!("GET DATA {s1:02X}{s2:02X}"));
+        }
+        Ok(out)
+    }
 }
 
 // ===========================================================================
 // LED / reboot (native, unauthenticated)
 // ===========================================================================
+
+/// Extract the four status colours (indices into [`COLORS`]) from a raw
+/// EF_LED_CONF record + its per-status stride, mirroring the offsets in
+/// [`led_get`]: `d[0]` is the steady flag, then four `stride`-byte blocks whose
+/// colour byte is at `+1` for stride ≥ 3 (effect-prefixed) or `+0` otherwise.
+fn parse_led(d: &[u8], stride: usize) -> Option<LedState> {
+    if d.len() < 1 + 4 * stride {
+        return None;
+    }
+    let color = |i: usize| {
+        let off = 1 + i * stride;
+        if stride >= 3 { d[off + 1] } else { d[off] }
+    };
+    Some(LedState {
+        steady: d[0] != 0,
+        idle: color(0),
+        processing: color(1),
+        touch: color(2),
+        boot: color(3),
+    })
+}
 
 /// Send GET LED and return the raw EF_LED_CONF record plus its per-status stride.
 fn led_read_config(c: &mut Ccid) -> Result<(Vec<u8>, usize), String> {
@@ -972,6 +1121,19 @@ fn client_pin(dev: &hidapi::HidDevice, cid: [u8; 4], fields: Value) -> Option<Va
 
 /// clientPIN protocol-two pinUvAuthToken with the acfg permission.
 fn acfg_token(dev: &hidapi::HidDevice, cid: [u8; 4], pin: &str) -> Result<[u8; 32], String> {
+    pin_uv_token(dev, cid, pin, PERM_ACFG)
+}
+
+/// clientPIN protocol-two pinUvAuthToken bound to `perm` (a `PERM_*` mask). The
+/// audit/verify flows request `PERM_ACFG`; the credMgmt count requests
+/// `PERM_CREDMGMT`. The crypto (ECDH → HKDF → AES-CBC) is HW-verified — do not
+/// alter the algorithm.
+fn pin_uv_token(
+    dev: &hidapi::HidDevice,
+    cid: [u8; 4],
+    pin: &str,
+    perm: i64,
+) -> Result<[u8; 32], String> {
     let ka = client_pin(dev, cid, Value::Map(vec![(iv(1), iv(2)), (iv(2), iv(2))]))
         .ok_or("getKeyAgreement failed")?;
     let auth = map_get(&ka, 1).ok_or("no keyAgreement")?;
@@ -987,7 +1149,7 @@ fn acfg_token(dev: &hidapi::HidDevice, cid: [u8; 4], pin: &str) -> Result<[u8; 3
         (iv(2), iv(9)),
         (iv(3), cose_key(&px, &py)),
         (iv(6), Value::Bytes(enc)),
-        (iv(9), iv(PERM_ACFG)),
+        (iv(9), iv(perm)),
     ]);
     let resp = client_pin(dev, cid, req).ok_or("getPinUvAuthToken failed (wrong PIN?)")?;
     let enc_tok = match map_get(&resp, 2) {
@@ -1039,6 +1201,40 @@ fn gate_param(token: Option<&[u8; 32]>, subcmd: u8, raw_subpara: &[u8]) -> Optio
     msg.extend_from_slice(&[CTAP_VENDOR, subcmd]);
     msg.extend_from_slice(raw_subpara);
     Some((iv(2), Value::Bytes(hmac256(token, &msg))))
+}
+
+/// credMgmt getCredsMetadata — the resident-passkey count. Always PIN-gated
+/// (credMgmt has no touch fallback), so `pin` is required. Returns
+/// `(existing, remaining)`. The pinUvAuthParam over the standard command is
+/// `authenticate(token, [subCommand])` — no `0xff` prefix, unlike the vendor
+/// gating in [`gate_param`].
+pub fn cred_count(pin: Option<&str>) -> Result<(u16, u16), String> {
+    let pin = pin.ok_or("a FIDO PIN is required to count resident passkeys")?;
+    let dev = hid_open().ok_or("no FIDO device")?;
+    let cid = ctaphid_init(&dev).ok_or("CTAPHID init failed")?;
+    let token = pin_uv_token(&dev, cid, pin, PERM_CREDMGMT)?;
+    let auth = hmac256(&token, &[CM_GET_CREDS_METADATA]);
+    let req = Value::Map(vec![
+        (iv(1), iv(CM_GET_CREDS_METADATA as i64)),
+        (iv(3), iv(2)),
+        (iv(4), Value::Bytes(auth)),
+    ]);
+    let mut payload = vec![CTAP_CREDENTIAL_MGMT];
+    payload.extend_from_slice(&cbor(&req));
+    let r = send_cbor(&dev, cid, &payload, EXCHANGE_TIMEOUT_MS);
+    match r.first() {
+        Some(0) => {}
+        Some(&CTAP2_ERR_PIN_REQUIRED) => return Err(MSG_PIN_REQUIRED.into()),
+        Some(0x33) | Some(0x31) => return Err("PIN authentication failed (wrong PIN?)".into()),
+        Some(s) => return Err(format!("credMgmt status {s:#x}")),
+        None => return Err("no response".into()),
+    }
+    let v: Value = ciborium::de::from_reader(&r[1..]).map_err(|_| "decode failed")?;
+    let existing = map_get(&v, 1)
+        .and_then(as_u32)
+        .ok_or("no count in response")? as u16;
+    let remaining = map_get(&v, 2).and_then(as_u32).unwrap_or(0) as u16;
+    Ok((existing, remaining))
 }
 
 /// Export the 32-byte seed and return it as a 24-word BIP-39 phrase.
@@ -1285,6 +1481,23 @@ impl DeviceProvider for MockProvider {
                 oath: Some(true),
                 otp: Some(true),
             },
+            led: Some(LedState {
+                steady: true,
+                idle: self.idle_color as u8,
+                processing: 3, // blue
+                touch: 2,      // green
+                boot: 7,       // white
+            }),
+            pgp: Some(PgpInfo {
+                serial: Some("2a1b3c4d".into()),
+                pin_retries: Some([3, 0, 3]),
+                keys_present: 2,
+            }),
+            piv_meta: Some(PivInfo {
+                pin_left: 3,
+                pin_total: 3,
+                pin_default: true,
+            }),
             errors: Vec::new(),
             demo: true,
         }
@@ -1293,6 +1506,9 @@ impl DeviceProvider for MockProvider {
     fn run(&mut self, action: Action, _input: &ActionInput) -> ActionResult {
         match action {
             Action::Refresh => ActionResult::Ok("status refreshed".into()),
+            Action::CredCount => {
+                ActionResult::Ok("[demo] 12 resident passkeys · ~120 slots free".into())
+            }
             Action::LedGet => ActionResult::Report {
                 title: "LED state".into(),
                 body: format!(
@@ -1353,3 +1569,7 @@ impl DeviceProvider for MockProvider {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "device_tests.rs"]
+mod tests;

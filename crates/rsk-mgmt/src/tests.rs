@@ -130,6 +130,47 @@ fn write_then_read_config_roundtrips() {
 }
 
 #[test]
+fn read_config_clamps_enabled_to_supported() {
+    // A host can persist a USB_ENABLED mask wider than SUPPORTED_CAPS (a newer
+    // ykman that knows capability bits this firmware lacks). READ CONFIG must
+    // report enabled ⊆ supported, as a real YubiKey does, not echo the wider
+    // mask verbatim. This models the exact blob a differential run found on a
+    // live board: enabled = 0x3A3B while supported = 0x023B.
+    let presence = RefCell::new(AlwaysConfirm);
+    let mut app = ManagementApplet::new([0; 8], &presence);
+    let mut fs = fs();
+    // An opaque host tag (0x0C), then USB_ENABLED = 0x3A3B (bits outside
+    // SUPPORTED_CAPS), then two more host tags — the exact blob a live board had.
+    let blob = [
+        0x0C,
+        0x00,
+        TAG_USB_ENABLED,
+        0x02,
+        0x3A,
+        0x3B,
+        0x06,
+        0x02,
+        0x00,
+        0x00,
+        0x07,
+        0x01,
+        0x00,
+    ];
+    fs.put(EF_DEV_CONF, &blob).unwrap();
+    let (sw, body) = process(&mut app, &mut fs, &[0x00, INS_READ_CONFIG, 0, 0, 0x00]);
+    assert_eq!(sw, Sw::OK);
+    let tlv = &body[1..];
+    // enabled clamped: 0x3A3B & 0x023B == 0x023B == SUPPORTED_CAPS.
+    assert_eq!(
+        tlv_get(tlv, TAG_USB_ENABLED),
+        Some(&SUPPORTED_CAPS.to_be_bytes()[..])
+    );
+    // Other host-written tags are still echoed verbatim.
+    assert_eq!(tlv_get(tlv, 0x0C), Some(&[][..]));
+    assert_eq!(tlv_get(tlv, 0x06), Some(&[0x00, 0x00][..]));
+}
+
+#[test]
 fn write_config_rejects_oversized_blob() {
     // An inner blob larger than the read buffer must be refused, so it can
     // never become a sticky DoS that panics every later READ CONFIG.

@@ -63,7 +63,7 @@ action is prefixed `[demo]`; it never pretends to touch hardware.
 `--json` and `--once` are the scriptable paths. Both gather one snapshot and
 exit, so they fit a health check or a CI probe. `--json` emits a stable,
 explicit object (`identity`, `fido`, `backup`, `secure_boot`, `rollback`,
-`applets`, `errors`, ...); `--once` is the same data formatted for a human. Either
+`applets`, `led`, `pgp`, `piv_meta`, `errors`, ...); `--once` is the same data formatted for a human. Either
 honours `--demo`, so you can shape a pipeline against the mock first:
 
 ```sh
@@ -93,6 +93,9 @@ secure boot: ENABLED (not locked)  (enabled=true locked=false bootkey=0x1)
 rollback   : not required  boot version 0/48
 org attest : not installed
 applets    : OpenPGP present  PIV present  OATH present  OTP present
+openpgp    : 2 keys  serial 2a1b3c4d  retries PW1 3 RC 0 PW3 3
+piv        : PIN 3/3 tries (default)
+led        : steady  idle cyan  processing blue  touch green  boot white
 ```
 
 <!-- TODO(docs): a screenshot of the interactive cockpit could live in docs/assets/,
@@ -140,8 +143,10 @@ hammer the CCID bus mid-task.
 
 Inside a modal the keys narrow to that modal: a text/PIN input takes characters +
 `Backspace`, `Enter` submits, `Esc` cancels (and wipes the buffer); a yes/no
-prompt takes `y`/`n` or `Enter`/`Esc`; a reveal or message panel dismisses on any
-key. The `/` palette filters by a case-insensitive substring of the action label
+prompt takes `y`/`n` or `Enter`/`Esc`; a reveal panel dismisses on any key (a
+shoulder-surfed secret clears fast); a message panel (audit output, LED state, a
+verify report) scrolls with the arrows / `j` `k` / `PgUp` / `PgDn` / `Home` /
+`End` and closes on `Enter`, `Esc`, `q`, or space. The `/` palette filters by a case-insensitive substring of the action label
 as you type, `↑`/`↓` pick, `Enter` jumps to that action's section and starts it.
 
 ## Sections and what they do
@@ -149,21 +154,24 @@ as you type, `↑`/`↓` pick, `Enter` jumps to that action's section and starts
 | Section | Reads (safe) | In-band actions |
 |---------|--------------|-----------------|
 | Overview | identity (serial, fw, bcdDevice, sdk, aaguid), transports, backup/lock/secure-boot/rollback/attestation/flash | Refresh, Verify identity |
-| FIDO | CTAPHID presence, versions, clientPIN, options | — |
-| OpenPGP | applet presence | — |
-| PIV | applet presence | — |
+| FIDO | CTAPHID presence, versions, clientPIN, options | Count resident passkeys (PIN · credMgmt) |
+| OpenPGP | applet presence, card serial, PIN retries, populated key slots (from `6E`) | — |
+| PIV | applet presence, PIN retries + default-PIN flag (from GET METADATA) | — |
 | OATH / OTP | applet presence | — |
 | Backup | seed / sealed / lock state | Export (BIP-39 · SLIP-39 2-of-3), Restore, Finalize |
-| LED | LED mode + per-state color/brightness | Read state, Cycle idle color |
+| LED | LED mode + per-state color/brightness, with a live colour swatch | Read state, Cycle idle color |
 | Audit | journal head + checkpoint key hint | Read journal, Verify identity |
 | Reboot / Maintenance | device summary | Reboot → app, Reboot → BOOTSEL |
 | Help | key bindings, section guide, safety model | — |
 
-The applet sections (OpenPGP, PIV, OATH, OTP) show **presence only**: whether
-the applet answered `SELECT`. Reading their contents (keys, accounts, retry
-counters) needs the applet's own tooling, so those rows point you at the command
-instead: `gpg --card-status` ([openpgp.md](openpgp.md)), `ykman piv info`,
-`ykman oath accounts`, and so on.
+OpenPGP and PIV show a little more than presence, from unauthenticated reads in
+the same gather: OpenPGP parses its `6E` application-related data (card serial,
+the PW1/RC/PW3 retry counters, and how many of the three key slots hold a key);
+PIV reads the PIN's GET METADATA (retries left, and whether the PIN is still the
+factory default). OATH and OTP stay **presence only**. The full card contents
+(individual keys, accounts) still need the applet's own tooling, so those rows
+point you at it: `gpg --card-status` ([openpgp.md](openpgp.md)), `ykman piv
+info`, `ykman oath accounts`, and so on.
 
 **Verify identity** issues a fresh 16-byte challenge, has the device sign it
 with its DEVK-derived P-256 attestation key (vendor `AUDIT_CHECKPOINT`), and
@@ -185,7 +193,9 @@ signed head lives in `rsk audit verify`.
 
 **LED** reads the four LED states the firmware drives (`idle`, `processing`,
 `touch`, `boot`), each with a color and brightness, plus whether the idle LED is
-steady or blinking. *Cycle idle color* steps the idle color through the palette
+steady or blinking. The section paints a colour swatch beside each state — a
+background-filled block, so it shows with no block-glyph support, and the colour
+name is printed too — refreshed live with the status. *Cycle idle color* steps the idle color through the palette
 (`red → green → blue → yellow → magenta → cyan → white`, then wraps) and writes
 it back; it is a cosmetic, unauthenticated setting, not a security control.
 
@@ -218,8 +228,11 @@ to run. They are never performed from the cockpit:
   secure-boot staging, OTP fuses. See [production.md](../production.md) and
   [otp-fuses.md](../otp-fuses.md)
 
-Credential and passkey counts are not shown because there is no unauthenticated
-way to read them; use `rsk fido list-passkeys --pin …`.
+The FIDO section's **Count resident passkeys** action reads the count over
+credMgmt `getCredsMetadata`. It needs the FIDO2 PIN — there is no unauthenticated
+way to read it — and reports how many passkeys are stored plus roughly how many
+slots remain. Enumerating the passkeys themselves stays in the CLI: `rsk fido
+list-passkeys --pin …`.
 
 ## Safety model — what is and is not logged
 

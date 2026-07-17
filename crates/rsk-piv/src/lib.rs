@@ -142,6 +142,11 @@ pub struct PivApplet<'a> {
     rng: &'a RefCell<dyn Rng>,
     presence: &'a RefCell<dyn UserPresence>,
     sess: Session,
+    /// Set once `scan_files` has provisioned the default files this power-cycle,
+    /// so a re-SELECT skips its five flash probes. Only ever cleared by the fresh
+    /// struct a reboot builds — nothing removes those files mid-power-cycle
+    /// without a reboot (see `select`).
+    files_ensured: bool,
 }
 
 impl<'a> PivApplet<'a> {
@@ -161,6 +166,7 @@ impl<'a> PivApplet<'a> {
             rng,
             presence,
             sess: Session::default(),
+            files_ensured: false,
         }
     }
 
@@ -247,15 +253,24 @@ impl<S: Storage> Applet<Fs<S>> for PivApplet<'_> {
 
     fn select(&mut self, _reselect: bool, fs: &mut Fs<S>, res: &mut ResBuf) -> Sw {
         self.sess.reset();
-        let (serial_hash, serial_id, otp_key) = self.device_ids();
-        let dev = Device {
-            serial_hash: &serial_hash,
-            serial_id: &serial_id,
-            otp_key: otp_key.as_ref(),
-        };
-        let mut rng = self.rng.borrow_mut();
-        if files::scan_files(&dev, fs, &mut *rng).is_err() {
-            return Sw::MEMORY_FAILURE;
+        // The default PIN/PUK/retry/mgmt/attestation files are provisioned once
+        // and afterwards only ever removed by a path that recreates them (PIV
+        // `reset_files`) or reboots (trusted-display factory wipe → `sys_reset`);
+        // `authenticatorReset` leaves them. So past the first SELECT this
+        // power-cycle they are present — skip the five flash `has_data` probes
+        // scan_files would otherwise repeat on every re-SELECT.
+        if !self.files_ensured {
+            let (serial_hash, serial_id, otp_key) = self.device_ids();
+            let dev = Device {
+                serial_hash: &serial_hash,
+                serial_id: &serial_id,
+                otp_key: otp_key.as_ref(),
+            };
+            let mut rng = self.rng.borrow_mut();
+            if files::scan_files(&dev, fs, &mut *rng).is_err() {
+                return Sw::MEMORY_FAILURE;
+            }
+            self.files_ensured = true;
         }
         apt(res)
     }
@@ -467,6 +482,9 @@ impl PivApplet<'_> {
             return Sw::MEMORY_FAILURE;
         }
         self.sess.reset();
+        // reset_files re-provisions the defaults, so they stay present — keep the
+        // SELECT fast-path armed rather than forcing a re-scan next SELECT.
+        self.files_ensured = true;
         Sw::OK
     }
 

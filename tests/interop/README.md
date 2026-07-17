@@ -22,3 +22,53 @@ nix develop -c python tests/interop/run.py --json      # machine-readable
 Adding a probe: append to the `PROBES` table in `run.py` with a small
 `p_*(env)` function returning `(status, detail)`. Keep it read-only unless it
 is gated behind `--destructive`.
+
+## Differential against a real YubiKey
+
+`run.py` sweeps one device. The differential harness compares RS-Key **against a
+physically-present YubiKey** and flags anything that isn't a documented, expected
+divergence — so a fidelity gap stands out from the ~160 fields that legitimately
+differ (serial, AAGUID, form factor, the capacity constants, …).
+
+Both keys can stay plugged: the RS-Key `VIDPID=Yubikey5` build carries an `RSK`
+marker in its USB product string, FIDO HID descriptor and PC/SC reader name that
+a genuine YubiKey never has, and ykman cells target by `--device <serial>`.
+
+```sh
+# capture each device (read-only); an identity guard refuses a mislabeled snapshot
+nix develop -c python tests/interop/capture.py --label real --serial <yk-serial>  --out real.json
+nix develop -c python tests/interop/capture.py --label rsk  --serial <rsk-serial> --out rsk.json
+
+# classify every field: MATCH / ALLOWED / RULE_VIOLATION / UNEXPECTED
+nix develop -c python tests/interop/diff.py real.json rsk.json            # human report
+nix develop -c python tests/interop/diff.py real.json rsk.json --markdown # docs/interop.md block
+
+# crypto-parity: RS-Key's OATH engine vs the RFC 4226 known-answer (755224…)
+nix develop -c python tests/interop/parity.py --serial <serial>
+```
+
+- `divergences.py` is the allow-list: rules keyed by canonical field path
+  (`Ignore` / `Tolerance` / `ExpectDiff` / `Superset`), each with a reason. A
+  field that differs with **no** rule is an `UNEXPECTED` fidelity gap; a field a
+  rule matched but whose value drifted outside it is a `RULE_VIOLATION`.
+- `normalize.py` turns each tool's output into canonical dotted keys — precise
+  for the CTAP2 getInfo CBOR map and the mgmt DeviceInfo TLV, generic
+  `Label: value` scraping for ykman/gpg prose.
+- `test_diff.py` unit-tests the engine and the precise parsers with no hardware
+  (`python -m pytest tests/interop/test_diff.py`).
+
+macOS 27 note: the harness runs under the nix python (for `hid`/`pyscard`) but
+shells out to **Homebrew** `ykman`/`fido2-token`/`gpg`/`pkcs11-tool` — the nix
+ykman aborts under the macOS 27 libffi JIT, and the nix `PYTHONPATH` would
+otherwise sabotage Homebrew ykman's own interpreter. `capture.py` handles both
+(`_bin()` prefers `/opt/homebrew/bin`; every child runs with `PYTHONPATH`/`DYLD_*`
+scrubbed).
+
+Other platforms (move the two keys there and re-run the same three commands):
+
+- **Linux** — the nix `ykman` works, so `nix develop -c python
+  tests/interop/capture.py …` runs as-is. Needs `pcscd` + hidraw (both in the
+  dev shell); install `fido2-token`/OpenSC if you want those cells.
+- **Windows** — no nix: `pip install ykman pyscard hidapi cryptography`, then run
+  `python tests\interop\capture.py …`. PIV/WebAuthn ride the OS minidriver /
+  Windows Hello; those are the GUI stage, out of scope for this read-only sweep.

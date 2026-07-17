@@ -38,7 +38,8 @@ use rsk_sdk::error::{Error, Result};
 use crate::Rng;
 use crate::cert::build_attestation_cert;
 use crate::consts::{
-    EF_ATT_KEY, EF_COUNTER, EF_EE_DEV, EF_KEY_DEV, EF_KEY_DEV_ENC, EF_LARGEBLOB, LARGEBLOB_INITIAL,
+    EF_ATT_KEY, EF_COUNTER, EF_CRED_CTR, EF_EE_DEV, EF_KEY_DEV, EF_KEY_DEV_ENC, EF_LARGEBLOB,
+    LARGEBLOB_INITIAL, MAX_RESIDENT_CREDENTIALS,
 };
 use crate::ec::P256Key;
 
@@ -433,11 +434,62 @@ pub fn get_sign_counter<S: Storage>(fs: &mut Fs<S>) -> u32 {
 }
 
 /// Persist `counter+1`; returns the value *before* the bump — the value to
-/// report in the current operation.
+/// report in the current operation. Now used only by U2F authenticate (CTAP2
+/// signature counters are per-credential, see [`cred_sign_counter`]).
 pub fn bump_sign_counter<S: Storage>(fs: &mut Fs<S>) -> Result<u32> {
     let ctr = get_sign_counter(fs);
     fs.put(EF_COUNTER, &ctr.wrapping_add(1).to_le_bytes())?;
     Ok(ctr)
+}
+
+/// Packed EF_CRED_CTR length: one `u32` per resident slot.
+const CRED_CTR_LEN: usize = MAX_RESIDENT_CREDENTIALS as usize * 4;
+
+/// The per-credential signature counter stored for EF_CRED `slot`, or `None` when
+/// the slot has no LIVE entry — meaning "unmaterialized". `None` covers three
+/// cases that are all handled identically (seed from the frozen global): the
+/// packed file is absent, it is shorter than `slot`, OR the slot reads as **0**.
+///
+/// The zero case matters: a write to a HIGHER slot zero-extends the packed file
+/// across every lower slot, so a legacy slot below a freshly written one reads
+/// back a real `0` rather than staying short. A LIVE counter is always `>= 1`
+/// (`credential_store` seeds a new credential at 1; each assertion stores `ctr+1`;
+/// a migrated credential seeds from the global, which is `>= 1` whenever any
+/// resident credential exists), so `0` unambiguously marks an unmaterialized slot.
+/// The caller seeds a `None` from the frozen global counter so a migrated
+/// credential's signCount never DEcreases (see [`crate::getassertion`]).
+pub fn cred_sign_counter<S: Storage>(fs: &mut Fs<S>, slot: u16) -> Option<u32> {
+    let off = slot as usize * 4;
+    let mut buf = [0u8; CRED_CTR_LEN];
+    let n = fs.read(EF_CRED_CTR, &mut buf)?;
+    let end = off + 4;
+    if end > n.min(CRED_CTR_LEN) {
+        return None;
+    }
+    match u32::from_le_bytes(buf[off..end].try_into().unwrap()) {
+        0 => None, // a zero-filled gap slot is unmaterialized, not a live signCount 0
+        v => Some(v),
+    }
+}
+
+/// Persist EF_CRED `slot`'s per-credential signature counter, growing the packed
+/// EF_CRED_CTR file as needed. Entries below the current length are preserved;
+/// entries in the newly grown gap are left 0, which [`cred_sign_counter`] reads
+/// back as unmaterialized (so a legacy slot below this one still seeds from the
+/// global counter). `slot` is an EF_CRED index (`< MAX_RESIDENT_CREDENTIALS`).
+pub fn set_cred_sign_counter<S: Storage>(fs: &mut Fs<S>, slot: u16, value: u32) -> Result<()> {
+    let off = slot as usize * 4;
+    let end = off + 4;
+    if end > CRED_CTR_LEN {
+        return Err(Error::ExecError);
+    }
+    let mut buf = [0u8; CRED_CTR_LEN];
+    let n = fs
+        .read(EF_CRED_CTR, &mut buf)
+        .unwrap_or(0)
+        .min(CRED_CTR_LEN);
+    buf[off..end].copy_from_slice(&value.to_le_bytes());
+    fs.put(EF_CRED_CTR, &buf[..end.max(n)])
 }
 
 /// Test-only: build a legacy PIN-wrapped seed record (tag 0x03 pre-OTP / 0x13

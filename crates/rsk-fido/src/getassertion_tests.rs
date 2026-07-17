@@ -542,6 +542,65 @@ fn always_uv_requires_user_verification() {
     );
 }
 
+// alwaysUv on: the platform's silent up:false pre-flight (credential discovery)
+// must still succeed WITHOUT user verification — that is what lets ssh-sk / a
+// WebAuthn platform locate the credential before prompting for UV (CTAP 2.1
+// §6.2.2 step 5 guards the PUAT_REQUIRED path on up=true). The returned assertion
+// is silent (UP+UV flags clear); an interactive up:true request with no
+// pinUvAuthParam is still refused with PUAT_REQUIRED. Not run under strict-up,
+// where every assertion asserts presence so the exemption does not apply — a
+// mutation there would resurface as the up:true arm below still holding.
+#[cfg(not(feature = "strict-up"))]
+#[test]
+fn always_uv_allows_silent_up_false_preflight() {
+    let (mut fs, mut rng) = setup();
+    let cred_id = register_non_resident(&mut fs, &mut rng);
+    fs.put(EF_ALWAYS_UV, &[1]).unwrap();
+
+    // up:false pre-flight → a silent assertion with NO touch polled (a Decline
+    // presence would deny if the button were read), UP and UV flags clear.
+    let mut out = [0u8; 1024];
+    let n = {
+        let mut state = crate::FidoState::new();
+        let mut presence = Decline;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 20,
+        };
+        get_assertion(&mut ctx, &ga_request_up(&cred_id, false), &mut out)
+            .expect("alwaysUv still answers the silent up:false discovery probe")
+    };
+    let ad = assertion_auth_data(&out[..n]);
+    assert_eq!(
+        ad[32] & FLAG_UP,
+        0,
+        "up:false under alwaysUv → UP flag clear"
+    );
+    assert_eq!(ad[32] & FLAG_UV, 0, "silent probe carries no UV");
+
+    // up:true with no pinUvAuthParam is still refused before any credential work.
+    let mut out2 = [0u8; 256];
+    let mut state = crate::FidoState::new();
+    let mut presence = crate::AlwaysConfirm;
+    let mut ctx = Ctx {
+        presence: &mut presence,
+        dev: dev(),
+        fs: &mut fs,
+        rng: &mut rng,
+        state: &mut state,
+        now_ms: 30,
+    };
+    assert_eq!(
+        get_assertion(&mut ctx, &ga_request_up(&cred_id, true), &mut out2),
+        Err(CtapError::PuatRequired),
+        "an interactive up:true request under alwaysUv still demands UV",
+    );
+}
+
 #[test]
 fn u2f_handle_usable_via_ctap2_allowlist() {
     use crate::keyderiv::derive_new;
@@ -679,43 +738,209 @@ fn discovery_returns_stored_resident_id() {
     assert_eq!(cred_id_of(&ga), sentinel.to_vec());
 }
 
-#[test]
-fn login_counter_increments() {
-    let (mut fs, mut rng) = setup();
-    let mut out = [0u8; 1024];
-    let mc = {
-        let mut state = crate::FidoState::new();
-        let mut presence = crate::AlwaysConfirm;
-        let mut ctx = Ctx {
-            presence: &mut presence,
-            dev: dev(),
-            fs: &mut fs,
-            rng: &mut rng,
-            state: &mut state,
-            now_ms: 10,
-        };
-        let n = make_credential(&mut ctx, &mc_request(false), &mut out).unwrap();
-        out[..n].to_vec()
-    };
-    let (cred_id, _x, _y) = parse_mc(&mc);
+/// authData signCount (big-endian) from a getAssertion / getNextAssertion response.
+fn assertion_sign_count(resp: &[u8]) -> u32 {
+    let mut d = Decoder::new(resp);
+    d.map().unwrap();
+    assert_eq!(d.u8().unwrap(), 1);
+    d.skip().unwrap(); // 1: { id, type }
+    assert_eq!(d.u8().unwrap(), 2);
+    let ad = d.bytes().unwrap();
+    u32::from_be_bytes(ad[33..37].try_into().unwrap())
+}
 
-    let counter = |fs: &mut Fs<RamStorage>| crate::seed::get_sign_counter(fs);
-    let c0 = counter(&mut fs);
-    for _ in 0..2 {
-        let mut o = [0u8; 1024];
-        let mut state = crate::FidoState::new();
-        let mut presence = crate::AlwaysConfirm;
-        let mut ctx = Ctx {
-            presence: &mut presence,
-            dev: dev(),
-            fs: &mut fs,
-            rng: &mut rng,
-            state: &mut state,
-            now_ms: 30,
-        };
-        get_assertion(&mut ctx, &ga_request(Some(&cred_id)), &mut o).unwrap();
+/// A resident makeCredential request for `example.com` with the given user id (so
+/// two calls yield two DISTINCT discoverable credentials).
+fn mc_request_rk_uid(uid: &[u8]) -> std::vec::Vec<u8> {
+    let mut buf = [0u8; 512];
+    let n = {
+        let mut e = Encoder::new(Cursor::new(&mut buf[..]));
+        e.map(5).unwrap();
+        e.u8(1).unwrap().bytes(&CDH).unwrap();
+        e.u8(2)
+            .unwrap()
+            .map(1)
+            .unwrap()
+            .str("id")
+            .unwrap()
+            .str("example.com")
+            .unwrap();
+        e.u8(3).unwrap().map(2).unwrap();
+        e.str("id").unwrap().bytes(uid).unwrap();
+        e.str("name").unwrap().str("bob").unwrap();
+        e.u8(4).unwrap().array(1).unwrap().map(2).unwrap();
+        e.str("alg").unwrap().i64(ALG_ES256).unwrap();
+        e.str("type").unwrap().str("public-key").unwrap();
+        e.u8(7)
+            .unwrap()
+            .map(1)
+            .unwrap()
+            .str("rk")
+            .unwrap()
+            .bool(true)
+            .unwrap();
+        e.writer().position()
+    };
+    buf[..n].to_vec()
+}
+
+/// Drive one makeCredential over `fs`, returning the response bytes.
+fn run_make(fs: &mut Fs<RamStorage>, rng: &mut SeqRng, req: &[u8]) -> std::vec::Vec<u8> {
+    let mut out = [0u8; 1024];
+    let mut state = crate::FidoState::new();
+    let mut presence = crate::AlwaysConfirm;
+    let mut ctx = Ctx {
+        presence: &mut presence,
+        dev: dev(),
+        fs,
+        rng,
+        state: &mut state,
+        now_ms: 10,
+    };
+    let n = make_credential(&mut ctx, req, &mut out).unwrap();
+    out[..n].to_vec()
+}
+
+/// Drive one getAssertion over `fs`, returning the response bytes.
+fn run_assert(fs: &mut Fs<RamStorage>, rng: &mut SeqRng, req: &[u8]) -> std::vec::Vec<u8> {
+    let mut out = [0u8; 1024];
+    let mut state = crate::FidoState::new();
+    let mut presence = crate::AlwaysConfirm;
+    let mut ctx = Ctx {
+        presence: &mut presence,
+        dev: dev(),
+        fs,
+        rng,
+        state: &mut state,
+        now_ms: 30,
+    };
+    let n = get_assertion(&mut ctx, req, &mut out).unwrap();
+    out[..n].to_vec()
+}
+
+#[test]
+fn sign_count_is_per_credential() {
+    // The privacy fix (differential-harness finding #4): each resident credential
+    // keeps its OWN signature counter, so asserting one never advances another's —
+    // colluding RPs can't reconstruct this key's cross-site usage from a shared
+    // global counter. Registration reports 0; each assertion climbs the
+    // credential's own counter.
+    let (mut fs, mut rng) = setup();
+    let a = parse_mc(&run_make(
+        &mut fs,
+        &mut rng,
+        &mc_request_rk_uid(&[1, 1, 1, 1]),
+    ))
+    .0;
+    let b = parse_mc(&run_make(
+        &mut fs,
+        &mut rng,
+        &mc_request_rk_uid(&[2, 2, 2, 2]),
+    ))
+    .0;
+    assert_ne!(a, b, "distinct users get distinct resident ids");
+
+    // Credential A climbs 1, 2 on its own assertions.
+    let a1 = run_assert(&mut fs, &mut rng, &ga_request(Some(&a)));
+    let a2 = run_assert(&mut fs, &mut rng, &ga_request(Some(&a)));
+    assert_eq!(assertion_sign_count(&a1), 1);
+    assert_eq!(assertion_sign_count(&a2), 2);
+
+    // Credential B's FIRST assertion reports 1 — its OWN counter, not the shared
+    // global value (which under the old scheme would already read 3 here).
+    let b1 = run_assert(&mut fs, &mut rng, &ga_request(Some(&b)));
+    assert_eq!(assertion_sign_count(&b1), 1);
+
+    // A resumes its own sequence, unperturbed by B.
+    let a3 = run_assert(&mut fs, &mut rng, &ga_request(Some(&a)));
+    assert_eq!(assertion_sign_count(&a3), 3);
+}
+
+#[test]
+fn non_resident_sign_count_is_zero() {
+    // A non-resident credential keeps no on-device state, so it reports signCount 0
+    // on every assertion (nothing to correlate) and never touches EF_COUNTER.
+    let (mut fs, mut rng) = setup();
+    let cred_id = parse_mc(&run_make(&mut fs, &mut rng, &mc_request(false))).0;
+    let g0 = crate::seed::get_sign_counter(&mut fs);
+    for _ in 0..3 {
+        let resp = run_assert(&mut fs, &mut rng, &ga_request(Some(&cred_id)));
+        assert_eq!(assertion_sign_count(&resp), 0);
     }
-    assert_eq!(counter(&mut fs), c0 + 2);
+    assert_eq!(
+        crate::seed::get_sign_counter(&mut fs),
+        g0,
+        "global counter untouched by CTAP2 assertions"
+    );
+}
+
+#[test]
+fn legacy_resident_credential_seeds_from_global_counter() {
+    // A resident credential from before EF_CRED_CTR existed has no counter entry.
+    // Its first assertion must SEED from the frozen global counter so the signCount
+    // never DEcreases across the upgrade, then climb per-credential from there.
+    let (mut fs, mut rng) = setup();
+    let cred_id = parse_mc(&run_make(
+        &mut fs,
+        &mut rng,
+        &mc_request_rk_uid(&[3, 3, 3, 3]),
+    ))
+    .0;
+    // Recreate a pre-upgrade device: a non-trivial global counter and no per-cred entry.
+    fs.put(crate::consts::EF_COUNTER, &100u32.to_le_bytes())
+        .unwrap();
+    fs.delete(crate::consts::EF_CRED_CTR).unwrap();
+
+    let r1 = run_assert(&mut fs, &mut rng, &ga_request(Some(&cred_id)));
+    assert_eq!(
+        assertion_sign_count(&r1),
+        100,
+        "seeds from the frozen global"
+    );
+    let r2 = run_assert(&mut fs, &mut rng, &ga_request(Some(&cred_id)));
+    assert_eq!(assertion_sign_count(&r2), 101, "then climbs per-credential");
+}
+
+#[test]
+fn legacy_credential_survives_gap_zerofill() {
+    // Regression (adversarial review): writing a HIGHER slot zero-extends the packed
+    // EF_CRED_CTR file across lower legacy slots. Such a zero-filled slot must still
+    // read as unmaterialized (seed from the frozen global), NOT as a real signCount 0
+    // — otherwise a pre-upgrade credential regresses to 0 and trips an RP's clone
+    // alarm. Two resident creds: L lands in slot 0, H in slot 1.
+    let (mut fs, mut rng) = setup();
+    let l = parse_mc(&run_make(
+        &mut fs,
+        &mut rng,
+        &mc_request_rk_uid(&[4, 4, 4, 4]),
+    ))
+    .0;
+    let h = parse_mc(&run_make(
+        &mut fs,
+        &mut rng,
+        &mc_request_rk_uid(&[5, 5, 5, 5]),
+    ))
+    .0;
+    // Recreate a pre-upgrade device: a live global and NO per-credential file at all.
+    fs.put(crate::consts::EF_COUNTER, &50u32.to_le_bytes())
+        .unwrap();
+    fs.delete(crate::consts::EF_CRED_CTR).unwrap();
+
+    // Assert H (slot 1) first: this materializes slot 1 and zero-extends the packed
+    // file over slot 0.
+    let _ = run_assert(&mut fs, &mut rng, &ga_request(Some(&h)));
+
+    // L (slot 0) is now a zero-filled gap entry. It must seed from the global (50),
+    // never report 0.
+    let r = run_assert(&mut fs, &mut rng, &ga_request(Some(&l)));
+    assert_eq!(
+        assertion_sign_count(&r),
+        50,
+        "a zero-filled legacy slot seeds from the global, not signCount 0"
+    );
+    // And then climbs on its own from the seed.
+    let r2 = run_assert(&mut fs, &mut rng, &ga_request(Some(&l)));
+    assert_eq!(assertion_sign_count(&r2), 51);
 }
 
 #[test]
@@ -1074,6 +1299,58 @@ fn get_next_assertion_walks_resident_credentials() {
         get_next_assertion(&mut ctx, &mut o3),
         Err(CtapError::NotAllowed)
     );
+}
+
+#[test]
+fn get_next_assertion_uses_per_credential_counter() {
+    // The getNextAssertion path must advance the walked credential's OWN counter
+    // (keyed by its EF_CRED slot), not a shared one: two credentials returned by a
+    // single discovery both report signCount 1 on their first use, and each climbs
+    // independently on the next discovery.
+    let (mut fs, mut rng) = setup();
+    let mut state = crate::FidoState::new();
+    for (uid, t) in [(&[9u8, 8, 7, 6][..], 10u64), (&[1u8, 1, 1, 1][..], 20u64)] {
+        let mut out = [0u8; 1024];
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: t,
+        };
+        make_credential(&mut ctx, &mc_request_user(uid), &mut out).unwrap();
+    }
+
+    let discover =
+        |fs: &mut Fs<RamStorage>, rng: &mut SeqRng, state: &mut crate::FidoState, t: u64| {
+            let mut o1 = [0u8; 1024];
+            let mut o2 = [0u8; 1024];
+            let (n1, n2) = {
+                let mut presence = crate::AlwaysConfirm;
+                let mut ctx = Ctx {
+                    presence: &mut presence,
+                    dev: dev(),
+                    fs,
+                    rng,
+                    state,
+                    now_ms: t,
+                };
+                let n1 = get_assertion(&mut ctx, &ga_request(None), &mut o1).unwrap();
+                let n2 = get_next_assertion(&mut ctx, &mut o2).unwrap();
+                (n1, n2)
+            };
+            (
+                assertion_sign_count(&o1[..n1]),
+                assertion_sign_count(&o2[..n2]),
+            )
+        };
+
+    // First use of each credential → both report their own counter's 1.
+    assert_eq!(discover(&mut fs, &mut rng, &mut state, 30), (1, 1));
+    // Next discovery → each climbs independently to 2.
+    assert_eq!(discover(&mut fs, &mut rng, &mut state, 40), (2, 2));
 }
 
 #[test]

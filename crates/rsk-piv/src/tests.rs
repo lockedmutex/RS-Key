@@ -284,6 +284,36 @@ fn select_returns_apt() {
 }
 
 #[test]
+fn select_skips_rescan_after_first() {
+    let rng = RefCell::new(TestRng(7));
+    let pres = RefCell::new(AlwaysConfirm);
+    let mut app = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
+    let mut fs = new_fs();
+
+    // First SELECT provisions the default files.
+    select(&mut app, &mut fs);
+    assert!(fs.has_data(EF_PIN), "first SELECT provisions the defaults");
+
+    // Delete a default, then re-SELECT: the fast-path skips scan_files, so the
+    // deleted file is NOT recreated (nothing removes it mid-power-cycle without a
+    // reboot). On the pre-guard code scan_files would heal it and this fails.
+    fs.delete(EF_PIN).unwrap();
+    select(&mut app, &mut fs);
+    assert!(
+        !fs.has_data(EF_PIN),
+        "re-SELECT must skip scan_files (deleted default not recreated)"
+    );
+
+    // A power cycle (fresh applet over the same fs) re-provisions the defaults.
+    let mut app2 = PivApplet::new(SERIAL, HASH, None, &rng, &pres);
+    select(&mut app2, &mut fs);
+    assert!(
+        fs.has_data(EF_PIN),
+        "a fresh applet re-provisions the defaults"
+    );
+}
+
+#[test]
 fn version_and_serial() {
     let rng = RefCell::new(TestRng(7));
     let pres = RefCell::new(AlwaysConfirm);

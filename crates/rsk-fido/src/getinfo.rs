@@ -93,10 +93,16 @@ fn write_info<W: Write>(
     // CTAP2.3 module is the target (it requires `FIDO_2_3`); the deprecated 2.0
     // module size-checks ES512 at 64 bytes (a stale bug — P-521 is 66) and omits
     // hmac-secret-mc, both fixed in 2.1+/2.3.
-    enc.u8(0x01)?
-        .array(5)?
-        .str("U2F_V2")?
-        .str("FIDO_2_0")?
+    //
+    // U2F_V2 (CTAP1) drops off while alwaysUv is on: §7.2.4 disables the CTAP1/U2F
+    // interface (`process_u2f` refuses REGISTER/AUTHENTICATE), so getInfo must stop
+    // claiming it. The conformance run is alwaysUv-off, so the list stays all five.
+    let u2f = !always_uv;
+    enc.u8(0x01)?.array(4 + u64::from(u2f))?;
+    if u2f {
+        enc.str("U2F_V2")?;
+    }
+    enc.str("FIDO_2_0")?
         .str("FIDO_2_1")?
         .str("FIDO_2_2")?
         .str("FIDO_2_3")?;

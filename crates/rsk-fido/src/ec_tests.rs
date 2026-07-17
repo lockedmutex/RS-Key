@@ -86,6 +86,71 @@ fn p521_comb_matches_mul_by_generator() {
     }
 }
 
+#[test]
+fn p256_comb_matches_mul_by_generator() {
+    use p256::Scalar;
+    use p256::elliptic_curve::PrimeField;
+    use p256::elliptic_curve::ops::MulByGenerator;
+    use p256::elliptic_curve::sec1::ToEncodedPoint;
+
+    // Scalars exercising each 64-bit comb block, its start, the top bit, and a spread.
+    let mut reprs: std::vec::Vec<[u8; 32]> = std::vec::Vec::new();
+    reprs.push([0u8; 32]); // 0 → identity
+    let mut one = [0u8; 32];
+    one[31] = 1;
+    reprs.push(one); // 1 → G
+    for bitpos in [64usize, 128, 192, 255] {
+        let mut r = [0u8; 32];
+        r[31 - bitpos / 8] = 1 << (bitpos % 8);
+        reprs.push(r); // 2^bitpos → a comb base point / block boundary
+    }
+    let mut spread = [0u8; 32];
+    for (b, byte) in spread.iter_mut().enumerate() {
+        *byte = (b as u8).wrapping_mul(37).wrapping_add(1);
+    }
+    spread[0] = 0; // keep well below n so from_repr accepts
+    reprs.push(spread);
+
+    for r in reprs {
+        let fb = p256::FieldBytes::clone_from_slice(&r);
+        let k = Option::<Scalar>::from(Scalar::from_repr(fb)).expect("scalar in range");
+        let got = comb_mul_p256(&k).to_affine().to_encoded_point(false);
+        let want = p256::ProjectivePoint::mul_by_generator(&k)
+            .to_affine()
+            .to_encoded_point(false);
+        assert_eq!(got, want, "comb mismatch for scalar {r:?}");
+    }
+}
+
+#[test]
+fn p256_comb_sign_matches_crate() {
+    // The comb signer MUST be byte-for-byte the crate's RFC 6979 signature: same
+    // deterministic k, and comb_mul_p256 == mul_by_generator. A mismatch means a
+    // wrong k (bad order/z derivation) or a comb bug — either would be a silent
+    // wire-format regression for every P-256 credential.
+    use p256::ecdsa::{DerSignature, SigningKey, signature::Signer};
+
+    let msgs: &[&[u8]] = &[b"", b"authData||clientDataHash", &[0xABu8; 200]];
+    for seed in [0x01u8, 0x11, 0x7F, 0xC3, 0xFE] {
+        let scalar = [seed; 32];
+        let signing = match SigningKey::from_bytes(p256::FieldBytes::from_slice(&scalar)) {
+            Ok(s) => s,
+            Err(_) => continue, // out-of-range scalar
+        };
+        for msg in msgs {
+            let want: DerSignature = signing.sign(msg);
+            let mut got = [0u8; MAX_DER_SIG];
+            let n = sign_p256_comb(signing.as_nonzero_scalar(), msg, &mut got);
+            assert_eq!(
+                &got[..n],
+                want.as_bytes(),
+                "seed={seed:#x} msg_len={}",
+                msg.len()
+            );
+        }
+    }
+}
+
 struct SeqRng(u64);
 impl crate::Rng for SeqRng {
     fn fill(&mut self, buf: &mut [u8]) {

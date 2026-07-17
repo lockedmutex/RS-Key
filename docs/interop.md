@@ -120,6 +120,55 @@ accordingly:
 | `ykman otp info` | OTP slot state | no-touch (needs `VIDPID=Yubikey5`) | `tests/interop/run.py` | ✅ `0759` |
 | OTP keyboard (types the code) | USB-HID keyboard emulation | touch | manual (focus a text field) | ✅ `0759` (short-tap typed the static slot verbatim, `2026-06-13`) |
 
+## Differential against a real YubiKey
+
+The matrix above proves each RS-Key cell works. This layer asks a sharper
+question: run the same reads against RS-Key **and** a genuine YubiKey with the
+same fill, then diff every field. Anything that is not a documented, expected
+divergence is a fidelity gap. The harness lives in
+[`tests/interop/`](https://github.com/TheMaxMur/RS-Key/tree/main/tests/interop)
+(`capture.py` → snapshot, `diff.py` → classify against the `divergences.py`
+allow-list, `parity.py` → OATH crypto known-answer); see its README to run it.
+
+Both keys stay plugged: the `VIDPID=Yubikey5` build carries an `RSK` marker in
+its USB product string, FIDO HID descriptor and PC/SC reader name that a real
+key never has, and ykman cells target by `--device <serial>`. An identity guard
+refuses a snapshot whose FIDO AAGUID does not match its `--label`.
+
+**Result, 2026-07-16, macOS 27** — RS-Key `VIDPID=Yubikey5` vs a real **YubiKey
+5C NFC**, both fw `5.7.4`, 162 canonical fields. The first run
+(bcd `0x081b`) surfaced **1 unexpected** field — the `usbEnabled` mask, a real
+fidelity gap
+([fixed on `0x081C`](#read-config-usbenabled-clamped-to-supported--fixed-0x081c)).
+The re-run on the fixed build (bcd `0x081C`) is clean: **85 identical, 77
+expected-divergence, 0 rule-violations, 0 unexpected.** Representative expected
+divergences:
+
+| Field | Real | RS-Key | Why it is expected |
+|---|---|---|---|
+| `ccid.atr` | `3bfd13…5900` | *same* | RS-Key reproduces the YubiKey ATR byte-for-byte (a `MATCH`, not a diff) |
+| `fido.getinfo.aaguid` | (Yubico's model AAGUID) | `2479c7bf-…` | RS-Key self-assigns its AAGUID, deliberately not Yubico's |
+| `fido.getinfo.versions` | `…FIDO_2_1_PRE` | `…FIDO_2_2, FIDO_2_3` | RS-Key targets the final specs; drops the legacy `_PRE` |
+| `fido.getinfo.algorithms` / `extensions` | ES256/EdDSA/… | superset | RS-Key adds ES384/512 (+ML-DSA, credBlob, thirdPartyPayment) |
+| `fido.getinfo.maxMsgSize` etc. | 1536 | 7609 | RS-Key's buffers/capacities are larger |
+| `fido.getinfo.transports` | `nfc, usb` | `usb` | RS-Key is USB-only, no NFC |
+| `mgmt.formFactor` | USB-C (3) | USB-A (1) | RS-Key reports the 5A form factor; the reference is a 5C |
+| `mgmt.usbSupported` | `0x033f` | `0x023b` | the real 5C also has YubiHSM Auth, which RS-Key does not implement |
+| `openpgp.application_version` | `5.7.4` | `4.6.0` | RS-Key's OpenPGP app is pico-openpgp 4.6.x |
+| `usb.serialNumber` / `bcdDevice` | (none) / fw | `rs-key-0001` / `0x081b` | RS-Key's USB serial is fixed; bcdDevice is a build counter |
+
+Notable **matches** (not just structural, but exact): the CCID ATR, PIN retry
+budget (8), `minPINLength` (4), pinUvAuthProtocols (`[2, 1]`), the six USB
+capability bits, and every unprivileged FIDO option (`rk`, `up`, `clientPin`,
+`credMgmt`, `pinUvAuthToken`, …).
+
+**Crypto parity (OATH)** — `parity.py` provisions the RFC 4226 appendix-D
+known-answer credential and reads it back: RS-Key returns `755224 → 287082 →
+359152`, byte-identical to the RFC vector every conforming YubiKey produces, so
+the HMAC-SHA1 + dynamic-truncation engine matches. The same control could not run
+*on* the reference key here because its OATH store was full (64/64, the YubiKey
+5.7 cap) — itself a capacity divergence, RS-Key holds more.
+
 ## Suite triage
 
 Detail for the ⚠️ / multi-result cells above.
@@ -220,6 +269,26 @@ sequenceDiagram
     S->>F: 00 C0 …  (GET RESPONSE)
     F-->>S: 13 bytes + 9000
 ```
+
+### READ CONFIG `usbEnabled` clamped to supported — FIXED (`0x081C`)
+
+The two-device diff (2026-07-16) surfaced one unexpected divergence. The
+management applet READ CONFIG (`0x1D`) reported `usbEnabled = 0x3a3b` on the test
+board while `usbSupported = 0x023b` — the enabled mask carries bits (`0x3800`)
+the supported mask does not, so `enabled ⊄ supported`. A real YubiKey guarantees
+`enabled ⊆ supported` (both were `0x033f` on the reference).
+
+Root cause was not the default: `config_tlv` (`crates/rsk-mgmt/src/lib.rs`) sets
+the default `USB_ENABLED` to `SUPPORTED_CAPS` (`0x023b`), which is correct. But
+once a host had written an enabled-applications config, READ CONFIG echoed the
+persisted `EF_DEV_CONF` blob **verbatim** without clamping the mask. A host that
+once wrote a wider mask (a newer `ykman` that knows capability bits RS-Key lacks)
+left the device advertising enabled apps it does not support.
+
+**Fixed on `0x081C`:** `config_tlv` now masks the `USB_ENABLED` TLV against
+`SUPPORTED_CAPS` on read, so `enabled ⊆ supported` always holds and an
+already-provisioned board heals without a rewrite. The dated differential result
+above was recorded against `0x081b`, before the fix.
 
 ## How to run the CLI sweep
 

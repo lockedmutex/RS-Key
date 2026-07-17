@@ -3,7 +3,9 @@
 
 //! One-shot SHA-1 / SHA-256 / SHA-384 / SHA-512 helpers.
 
-use sha2::{Digest, Sha256, Sha384, Sha512};
+use sha2::{Digest, Sha256};
+// SHA-384/512 use the Cortex-M33-fast core (byte-identical to sha2::Sha384/512).
+use rsk_sha512::{Sha384, Sha512};
 
 /// One-shot SHA-1 — only for X.509 key identifiers (SKI/AKI, RFC 5280 method 1),
 /// never for new signatures.
