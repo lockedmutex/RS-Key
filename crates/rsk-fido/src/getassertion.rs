@@ -319,6 +319,13 @@ pub fn get_assertion<S: Storage, R: Rng>(
     result
 }
 
+/// Whether this getAssertion asserts user presence: honor `up:false` (the
+/// platform's silent pre-flight) unless the `strict-up` build forces a touch on
+/// every assertion. Shared by the alwaysUv gate and `get_assertion_inner`.
+fn want_up(req: &Request) -> bool {
+    cfg!(feature = "strict-up") || req.up
+}
+
 /// CTAP2.1 PIN/UV enforcement (§6.1): verifies a `pinUvAuthParam` against the
 /// token and reports whether to set the `uv` flag.
 /// Unlike makeCredential, an absent param is allowed (the assertion just lacks UV).
@@ -360,9 +367,15 @@ fn enforce_pin<S: Storage, R: Rng>(
             }
             Ok(true)
         }
-        // alwaysUv forces user verification (CTAP 2.1 alwaysUv); otherwise an
-        // absent param simply yields an assertion without the uv flag.
-        None if crate::config::always_uv_enabled(ctx.fs) => Err(CtapError::PuatRequired),
+        // alwaysUv forces UV only for an assertion that asserts presence; the
+        // platform's silent up:false pre-flight (credential discovery, e.g.
+        // ssh-sk) is exempt — CTAP 2.1 §6.2.2 step 5 guards the PUAT_REQUIRED
+        // path on the `up` option being present and true. Without the exemption
+        // the probe fails and OpenSSH reports "device not found". strict-up
+        // asserts presence on every call, so there the exemption disappears.
+        None if want_up(req) && crate::config::always_uv_enabled(ctx.fs) => {
+            Err(CtapError::PuatRequired)
+        }
         None => Ok(false),
     }
 }
@@ -552,10 +565,10 @@ fn get_assertion_inner<S: Storage, R: Rng>(
     uv: bool,
     out: &mut [u8],
 ) -> CtapResult {
-    // User-presence decision for the whole call: honor `up:false` (the platform's
-    // silent pre-flight) unless the `strict-up` build forces a touch on every
-    // assertion. getNextAssertion reuses it via `gna.up`.
-    let want_up = cfg!(feature = "strict-up") || req.up;
+    // User-presence decision for the whole call (see `want_up`): honor `up:false`
+    // (the platform's silent pre-flight) unless `strict-up` forces a touch on
+    // every assertion. getNextAssertion reuses it via `gna.up`.
+    let want_up = want_up(req);
     let mut best = Best::new();
     resolve_credential(ctx, req, rp_id_hash, seed, uv, want_up, &mut best);
 

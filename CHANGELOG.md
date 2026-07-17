@@ -98,6 +98,22 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Fixed
 
+- **`alwaysUv` no longer breaks the silent credential-discovery pre-flight (fixes
+  `ssh -i` "device not found" on an `always-uv` build).** `getAssertion` rejected
+  every request without a `pinUvAuthParam` under `alwaysUv` with
+  `CTAP2_ERR_PUAT_REQUIRED` — including the platform's silent `up:false` probe that
+  OpenSSH's `ssh-sk` middleware (and WebAuthn platforms) use to locate which
+  credential/device to sign with. CTAP 2.1 §6.2.2 step 5 guards that error on the
+  `up` option being *present and true*, so the silent probe must be exempt (it
+  returns a silent assertion or `NO_CREDENTIALS`); a real YubiKey and pico-fido do
+  exactly that. The `alwaysUv` gate now keys on `want_up` (honoring `up:false`,
+  and — under the `strict-up` build — still demanding UV on every call), so a
+  silent pre-flight succeeds while an interactive `up:true` request without UV is
+  still refused. The real assertion then correctly prompts for the PIN each use
+  (`alwaysUv` as designed). `makeCredential` is unchanged: registration can't be
+  silent (§6.1.2 has no `up` guard). Reported in
+  [#34](https://github.com/TheMaxMur/RS-Key/issues/34). `bcdDevice` → `0x0823`.
+
 - **`EF_CRED_CTR` per-credential counter now churns the counter partition, not the
   secret one.** The per-credential signature counter file (`0xC001`) is rewritten on
   every getAssertion, but `is_counter_fid` routed only the global `EF_COUNTER`

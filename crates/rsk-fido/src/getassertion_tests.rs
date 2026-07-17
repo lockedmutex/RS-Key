@@ -542,6 +542,65 @@ fn always_uv_requires_user_verification() {
     );
 }
 
+// alwaysUv on: the platform's silent up:false pre-flight (credential discovery)
+// must still succeed WITHOUT user verification — that is what lets ssh-sk / a
+// WebAuthn platform locate the credential before prompting for UV (CTAP 2.1
+// §6.2.2 step 5 guards the PUAT_REQUIRED path on up=true). The returned assertion
+// is silent (UP+UV flags clear); an interactive up:true request with no
+// pinUvAuthParam is still refused with PUAT_REQUIRED. Not run under strict-up,
+// where every assertion asserts presence so the exemption does not apply — a
+// mutation there would resurface as the up:true arm below still holding.
+#[cfg(not(feature = "strict-up"))]
+#[test]
+fn always_uv_allows_silent_up_false_preflight() {
+    let (mut fs, mut rng) = setup();
+    let cred_id = register_non_resident(&mut fs, &mut rng);
+    fs.put(EF_ALWAYS_UV, &[1]).unwrap();
+
+    // up:false pre-flight → a silent assertion with NO touch polled (a Decline
+    // presence would deny if the button were read), UP and UV flags clear.
+    let mut out = [0u8; 1024];
+    let n = {
+        let mut state = crate::FidoState::new();
+        let mut presence = Decline;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 20,
+        };
+        get_assertion(&mut ctx, &ga_request_up(&cred_id, false), &mut out)
+            .expect("alwaysUv still answers the silent up:false discovery probe")
+    };
+    let ad = assertion_auth_data(&out[..n]);
+    assert_eq!(
+        ad[32] & FLAG_UP,
+        0,
+        "up:false under alwaysUv → UP flag clear"
+    );
+    assert_eq!(ad[32] & FLAG_UV, 0, "silent probe carries no UV");
+
+    // up:true with no pinUvAuthParam is still refused before any credential work.
+    let mut out2 = [0u8; 256];
+    let mut state = crate::FidoState::new();
+    let mut presence = crate::AlwaysConfirm;
+    let mut ctx = Ctx {
+        presence: &mut presence,
+        dev: dev(),
+        fs: &mut fs,
+        rng: &mut rng,
+        state: &mut state,
+        now_ms: 30,
+    };
+    assert_eq!(
+        get_assertion(&mut ctx, &ga_request_up(&cred_id, true), &mut out2),
+        Err(CtapError::PuatRequired),
+        "an interactive up:true request under alwaysUv still demands UV",
+    );
+}
+
 #[test]
 fn u2f_handle_usable_via_ctap2_allowlist() {
     use crate::keyderiv::derive_new;
