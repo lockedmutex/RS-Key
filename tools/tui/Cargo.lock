@@ -1734,6 +1734,7 @@ dependencies = [
  "ml-kem",
  "p256",
  "rsk-mldsa",
+ "rsk-sha512",
  "sha1",
  "sha2",
  "zeroize",
@@ -1745,6 +1746,13 @@ version = "0.1.0"
 dependencies = [
  "sha3 0.10.9",
  "zeroize",
+]
+
+[[package]]
+name = "rsk-sha512"
+version = "0.1.0"
+dependencies = [
+ "digest 0.10.7",
 ]
 
 [[package]]

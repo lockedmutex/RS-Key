@@ -14,6 +14,9 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
 [dependencies]
 sha1 = { workspace = true }
 sha2 = { workspace = true }
+# SHA-512/384 come from rsk-sha512 (fast on the Cortex-M33, byte-identical to
+# sha2); SHA-256/SHA-1 stay on sha2 (already fast on the M33).
+rsk-sha512 = { workspace = true }
 hmac = { workspace = true }
 hkdf = { workspace = true }
 aes = { workspace = true }

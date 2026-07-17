@@ -27,6 +27,20 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Changed
 
+- **Faster SHA-512 on the Cortex-M33 (the FIDO key-derivation ratchet).** SHA-512
+  and SHA-384 now come from a new `rsk-sha512` crate instead of the `sha2`
+  soft backend, leaving every digest **byte-for-byte unchanged** — the compression
+  function is the only thing swapped, so `hmac`/`hkdf` compose over it identically
+  and no stored credential key changes. On-device profiling had found the FIDO
+  getAssertion ratchet (8× HKDF-SHA512, ~96 SHA-512 blocks) dominating every
+  assertion at ~191 ms of ~241 ms: `sha2` fully unrolls SHA-512 into a ~28 KB
+  straight-line body that overflows the RP2350 XIP cache and re-fetches over QSPI
+  flash on every block. The replacement compiles to an ~866-byte rolled loop that
+  fits the cache. Output identity is gated on the host by a randomized differential
+  against `sha2`/`hmac`/`hkdf` plus NIST/RFC 4231 KATs; SHA-256/SHA-1 stay on
+  `sha2` (already fast on the M33) and Ed25519 (dalek) is unaffected.
+  `bcdDevice` → `0x0820`.
+
 - **Faster P-256 ECDSA signing (fixed-base comb + no wasted public-key derivation).**
   Two changes to the P-256 credential path, both leaving the RFC 6979 deterministic
   signature **byte-for-byte unchanged** (a KAT test pins the result to the `p256`

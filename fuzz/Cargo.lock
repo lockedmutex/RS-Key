@@ -1338,6 +1338,7 @@ dependencies = [
  "ml-kem",
  "p256",
  "rsk-mldsa",
+ "rsk-sha512",
  "sha1",
  "sha2",
  "zeroize",
@@ -1495,6 +1496,13 @@ name = "rsk-sdk"
 version = "0.1.0"
 dependencies = [
  "zeroize",
+]
+
+[[package]]
+name = "rsk-sha512"
+version = "0.1.0"
+dependencies = [
+ "digest 0.10.7",
 ]
 
 [[package]]

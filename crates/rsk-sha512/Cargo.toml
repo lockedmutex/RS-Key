@@ -1,0 +1,31 @@
+[package]
+name = "rsk-sha512"
+version = "0.1.0"
+license = "AGPL-3.0-only"
+edition = "2024"
+publish = false
+
+# Fast SHA-512 / SHA-384 for the Cortex-M33, byte-identical to `sha2`. The
+# RustCrypto `sha2` soft backend fully unrolls SHA-512 into a ~28 KB body that
+# overflows the RP2350 XIP cache (~2 ms/block); this crate keeps the compression
+# a compact rolled loop (~0.9 KB) that fits the cache, ~4× faster end-to-end on a
+# FIDO getAssertion, with the identical digest. `Sha512`/`Sha384` are drop-in for
+# `sha2`'s, so `hmac`/`hkdf` compose over them byte-for-byte (the FIDO
+# key-derivation ratchet, whose output IS every credential key, is unchanged).
+# NOTE: the speedup depends on staying SMALL — keep this crate at `opt-level = "s"`
+# (pinned in the workspace profile); `opt-level = 3` would unroll the compression
+# and reintroduce the cache thrash. `cfg(kani)` guards the proof harnesses.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
+[dependencies]
+# digest 0.10 core_api: the block-buffer + trait surface `hmac`/`hkdf` build on.
+# Same resolved 0.10.7 the shipping sha2/hmac/hkdf already pin — no new version.
+digest = { workspace = true }
+
+# Host-only differential oracles: KAT this crate byte-for-byte against the
+# crates it replaces on the ratchet.
+[dev-dependencies]
+sha2 = { workspace = true }
+hmac = { workspace = true }
+hkdf = { workspace = true }
