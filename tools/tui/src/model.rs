@@ -235,6 +235,37 @@ pub struct Applets {
     pub otp: Option<bool>,
 }
 
+/// LED colour per device status, as an index into the firmware's 8-colour wheel
+/// (`0=off, 1=red, … 7=white`). Read live in the gather so the LED section can
+/// paint a swatch instead of only naming the colour.
+#[derive(Clone, Copy, Debug)]
+pub struct LedState {
+    pub steady: bool,
+    pub idle: u8,
+    pub processing: u8,
+    pub touch: u8,
+    pub boot: u8,
+}
+
+/// OpenPGP application-related data worth showing without shelling out to `gpg`:
+/// the card serial, the three PIN retry counters (PW1 / reset-code / PW3), and
+/// how many of the sig/dec/auth slots hold a key. Parsed from the `6E` DO.
+#[derive(Clone, Debug, Default)]
+pub struct PgpInfo {
+    pub serial: Option<String>,
+    pub pin_retries: Option<[u8; 3]>,
+    pub keys_present: u8,
+}
+
+/// PIV PIN metadata (GET METADATA of the PIN reference): retries remaining/total
+/// and whether the PIN is still the factory default.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PivInfo {
+    pub pin_left: u8,
+    pub pin_total: u8,
+    pub pin_default: bool,
+}
+
 /// Everything the dashboard knows about the device, all typed. Every field is
 /// an honest read: `None`/absent means "not observed", never a faked default.
 #[derive(Clone, Debug, Default)]
@@ -249,6 +280,12 @@ pub struct DeviceSnapshot {
     pub attestation: Option<AttestationState>,
     pub flash: Option<FlashState>,
     pub applets: Applets,
+    /// LED colours read live (idle/processing/touch/boot), for the LED preview.
+    pub led: Option<LedState>,
+    /// OpenPGP application-related data (parsed from the `6E` GET DATA template).
+    pub pgp: Option<PgpInfo>,
+    /// PIV PIN metadata (GET METADATA of the PIN reference).
+    pub piv_meta: Option<PivInfo>,
     pub errors: Vec<String>,
     /// True when the snapshot came from the mock provider (`--demo`).
     pub demo: bool,
@@ -540,6 +577,61 @@ impl DeviceSnapshot {
         );
         json_field(
             &mut out,
+            "led",
+            &self
+                .led
+                .map(|l| {
+                    format!(
+                        "{{\"steady\":{},\"idle\":{},\"processing\":{},\"touch\":{},\"boot\":{}}}",
+                        json_bool(l.steady),
+                        l.idle,
+                        l.processing,
+                        l.touch,
+                        l.boot
+                    )
+                })
+                .unwrap_or_else(|| "null".into()),
+            false,
+        );
+        json_field(
+            &mut out,
+            "pgp",
+            &self
+                .pgp
+                .as_ref()
+                .map(|p| {
+                    let retries = p
+                        .pin_retries
+                        .map(|r| format!("[{},{},{}]", r[0], r[1], r[2]))
+                        .unwrap_or_else(|| "null".into());
+                    format!(
+                        "{{\"serial\":{},\"pin_retries\":{},\"keys_present\":{}}}",
+                        json_opt_str(p.serial.as_deref()),
+                        retries,
+                        p.keys_present
+                    )
+                })
+                .unwrap_or_else(|| "null".into()),
+            false,
+        );
+        json_field(
+            &mut out,
+            "piv_meta",
+            &self
+                .piv_meta
+                .map(|p| {
+                    format!(
+                        "{{\"pin_left\":{},\"pin_total\":{},\"pin_default\":{}}}",
+                        p.pin_left,
+                        p.pin_total,
+                        json_bool(p.pin_default)
+                    )
+                })
+                .unwrap_or_else(|| "null".into()),
+            false,
+        );
+        json_field(
+            &mut out,
             "errors",
             &format!(
                 "[{}]",
@@ -609,6 +701,7 @@ impl Section {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action {
     Refresh,
+    CredCount,
     LedGet,
     LedCycle,
     BackupExport,
@@ -626,6 +719,7 @@ impl Action {
     pub fn label(self) -> &'static str {
         match self {
             Action::Refresh => "Refresh status",
+            Action::CredCount => "FIDO · count resident passkeys",
             Action::LedGet => "LED · read state",
             Action::LedCycle => "LED · cycle idle color",
             Action::BackupExport => "Backup · export (BIP-39)",
@@ -642,6 +736,7 @@ impl Action {
     pub fn section(self) -> Section {
         match self {
             Action::Refresh | Action::Verify => Section::Overview,
+            Action::CredCount => Section::Fido,
             Action::LedGet | Action::LedCycle => Section::Led,
             Action::BackupExport
             | Action::BackupExportSlip39
@@ -653,9 +748,10 @@ impl Action {
     }
 
     /// The whole catalog, for the `/` search palette.
-    pub const ALL: [Action; 11] = [
+    pub const ALL: [Action; 12] = [
         Action::Refresh,
         Action::Verify,
+        Action::CredCount,
         Action::LedGet,
         Action::LedCycle,
         Action::BackupExport,

@@ -27,6 +27,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Flow {
         Text,
         YesNo,
         Dismiss,
+        Message,
         Search,
     }
     let kind = match &app.mode {
@@ -34,6 +35,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Flow {
         AppMode::Search(_) => Kind::Search,
         AppMode::Modal(Modal::Input { .. }) | AppMode::Modal(Modal::Confirm { .. }) => Kind::Text,
         AppMode::Modal(Modal::YesNo { .. }) => Kind::YesNo,
+        // A Message modal scrolls (long audit output); Reveal dismisses on any key
+        // so a shoulder-surfed secret clears fast.
+        AppMode::Modal(Modal::Message { .. }) => Kind::Message,
         AppMode::Modal(_) => Kind::Dismiss,
     };
 
@@ -42,6 +46,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Flow {
         Kind::Text => text(app, key),
         Kind::YesNo => yesno(app, key),
         Kind::Dismiss => dismiss(app, key),
+        Kind::Message => message(app, key),
         Kind::Search => search(app, key),
     }
 }
@@ -119,8 +124,8 @@ fn yesno(app: &mut App, key: KeyEvent) -> Flow {
     }
 }
 
-/// Reveal / Message modals: any key dismisses (Enter routes through submit so a
-/// revealed secret is zeroized).
+/// Reveal modal: any key dismisses (Enter routes through submit so a revealed
+/// secret is zeroized).
 fn dismiss(app: &mut App, key: KeyEvent) -> Flow {
     if key.code == KeyCode::Esc {
         app.cancel_modal();
@@ -128,6 +133,25 @@ fn dismiss(app: &mut App, key: KeyEvent) -> Flow {
     } else {
         app.submit_modal()
     }
+}
+
+/// Message modal (audit journal, LED state, verify report): arrows / j / k /
+/// PageUp / PageDown / Home / End scroll long output; Enter, Esc, q, or Space
+/// close it.
+fn message(app: &mut App, key: KeyEvent) -> Flow {
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => app.scroll_message(-1),
+        KeyCode::Down | KeyCode::Char('j') => app.scroll_message(1),
+        KeyCode::PageUp => app.scroll_message(-10),
+        KeyCode::PageDown => app.scroll_message(10),
+        KeyCode::Home => app.scroll_message(-i32::MAX / 2),
+        KeyCode::End => app.scroll_message(i32::MAX / 2),
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char(' ') => {
+            app.cancel_modal()
+        }
+        _ => {}
+    }
+    Flow::Continue
 }
 
 fn search(app: &mut App, key: KeyEvent) -> Flow {

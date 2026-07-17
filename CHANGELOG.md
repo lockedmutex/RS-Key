@@ -15,6 +15,17 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Added
 
+- **`rsk-tui` cockpit — richer applet reads, a passkey count, LED preview, and
+  scrollable output (`0.3.0`).** Four host-only additions, no firmware change:
+  the FIDO section can **count resident passkeys** over credMgmt
+  `getCredsMetadata` (PIN-gated — the count needs the FIDO2 PIN, but not the
+  enumeration); OpenPGP and PIV surface real metadata pulled in the same gather —
+  OpenPGP parses its `6E` DO (card serial, PW1/RC/PW3 retry counters, populated
+  key slots) and PIV reads the PIN GET METADATA (retries + default-PIN flag); the
+  LED section paints a live colour swatch per state; and long **message modals**
+  (audit journal, verify report) now scroll (arrows / `PgUp` / `PgDn` / `Home` /
+  `End`). The new fields also appear in `rsk-tui --once` / `--json`. See
+  [docs/guides/tui.md](docs/guides/tui.md).
 - **Differential interop harness — diff RS-Key against a real YubiKey.** New
   `tests/interop/{capture,diff,divergences,normalize,parity}.py`: capture a
   read-only snapshot of each key (both can stay plugged; an identity guard keys

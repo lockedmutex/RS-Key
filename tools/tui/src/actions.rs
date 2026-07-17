@@ -70,6 +70,7 @@ fn mutates_state(action: Action) -> bool {
 fn working_message(action: Action) -> &'static str {
     match action {
         Action::Refresh => "refreshing…",
+        Action::CredCount => "counting passkeys — enter PIN…",
         Action::LedGet => "reading LED…",
         Action::LedCycle => "setting LED…",
         Action::BackupExport => "exporting — touch the device if it asks…",

@@ -69,11 +69,13 @@ pub enum Modal {
         title: String,
         body: Zeroizing<String>,
     },
-    /// Non-secret informational / result modal.
+    /// Non-secret informational / result modal. `scroll` is the first visible line
+    /// (0 = top); long output (the audit journal) scrolls with the arrow keys.
     Message {
         title: String,
         body: String,
         level: LogLevel,
+        scroll: u16,
     },
 }
 
@@ -261,6 +263,7 @@ impl App {
         match action {
             Action::Refresh | Action::LedGet | Action::LedCycle => Flow::Run(action),
             Action::Verify => self.gate_pin(Action::Verify),
+            Action::CredCount => self.gate_pin(Action::CredCount),
             Action::AuditRead => self.gate_pin(Action::AuditRead),
             Action::RebootApp => {
                 self.mode = AppMode::Modal(Modal::YesNo {
@@ -443,7 +446,22 @@ impl App {
     }
 
     pub fn open_message(&mut self, title: String, body: String, level: LogLevel) {
-        self.mode = AppMode::Modal(Modal::Message { title, body, level });
+        self.mode = AppMode::Modal(Modal::Message {
+            title,
+            body,
+            level,
+            scroll: 0,
+        });
+    }
+
+    /// Scroll the open Message modal by `delta` lines. Clamped to `[0, lines-1]`
+    /// so it never runs far past the content; the renderer clamps the tail to the
+    /// viewport. A no-op in any other mode.
+    pub fn scroll_message(&mut self, delta: i32) {
+        if let AppMode::Modal(Modal::Message { scroll, body, .. }) = &mut self.mode {
+            let max = body.lines().count().saturating_sub(1) as i32;
+            *scroll = (*scroll as i32 + delta).clamp(0, max.max(0)) as u16;
+        }
     }
 
     pub fn open_reveal(&mut self, title: String, body: Zeroizing<String>) {
@@ -516,6 +534,11 @@ fn menu_for(section: Section, snap: &DeviceSnapshot) -> Vec<MenuItem> {
         ],
         Section::Fido => vec![
             run("Refresh status", "re-read getInfo", Action::Refresh),
+            run(
+                "Count resident passkeys",
+                "PIN · credMgmt",
+                Action::CredCount,
+            ),
             note(
                 "Set / change PIN",
                 "CLI",

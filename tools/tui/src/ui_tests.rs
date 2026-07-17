@@ -34,6 +34,35 @@ fn renders_demo_overview() {
 }
 
 #[test]
+fn renders_new_metadata_sections_in_demo() {
+    let mut app = demo_app();
+    // LED preview: the idle colour name from the demo snapshot (idx 6 = cyan).
+    app.set_section(Section::Led);
+    let t = buffer_text(&app, 100, 40);
+    assert!(
+        t.contains("idle") && t.contains("cyan"),
+        "LED preview missing"
+    );
+    // OpenPGP: parsed serial + retry counters.
+    app.set_section(Section::OpenPgp);
+    let t = buffer_text(&app, 100, 40);
+    assert!(t.contains("2a1b3c4d"), "OpenPGP serial missing");
+    assert!(t.contains("PIN retries"), "OpenPGP retries missing");
+    // PIV: PIN tries from GET METADATA.
+    app.set_section(Section::Piv);
+    assert!(
+        buffer_text(&app, 100, 40).contains("tries"),
+        "PIV PIN missing"
+    );
+    // FIDO: the credMgmt count action is offered.
+    app.set_section(Section::Fido);
+    assert!(
+        buffer_text(&app, 100, 40).contains("Count resident passkeys"),
+        "credMgmt count action missing"
+    );
+}
+
+#[test]
 fn renders_at_tiny_size_without_panicking() {
     // Below the log / 2-line-status thresholds — must still paint.
     let app = demo_app();
