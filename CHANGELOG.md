@@ -79,6 +79,17 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Fixed
 
+- **`EF_CRED_CTR` per-credential counter now churns the counter partition, not the
+  secret one.** The per-credential signature counter file (`0xC001`) is rewritten on
+  every getAssertion, but `is_counter_fid` routed only the global `EF_COUNTER`
+  (`0xC000`) to the dedicated counter partition, so the new file appended to the
+  **main** partition — the one holding sealed credentials and keys, which the
+  two-partition split deliberately keeps off the per-operation hot path to avoid a
+  multi-second cold-migration stall during authentication. Adding `0xC001` to the
+  predicate restores that isolation. Internal routing only (no wire, key, or
+  signCount change), and fixed before the per-credential counter shipped, so no
+  provisioned device re-seeds. `bcdDevice` → `0x0821`.
+
 - **`rsk-tui` starts in the Linux dev shell again.** The dev-shell launcher is a
   bare `cargo run` of `tools/tui`, whose binary carries no nix RPATH, so its
   `DT_NEEDED` `libudev.so.1` / `libpcsclite.so.1` were only satisfied at build
