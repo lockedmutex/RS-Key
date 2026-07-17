@@ -79,6 +79,14 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Fixed
 
+- **`rsk-tui` starts in the Linux dev shell again.** The dev-shell launcher is a
+  bare `cargo run` of `tools/tui`, whose binary carries no nix RPATH, so its
+  `DT_NEEDED` `libudev.so.1` / `libpcsclite.so.1` were only satisfied at build
+  time (pkg-config) and missing at run time — `error while loading shared
+  libraries: libudev.so.1`. The shell now also exports `systemd` (libudev) and
+  `pcsclite` on `LD_LIBRARY_PATH` on Linux. Host-only; `nix run .#rsk-tui` was
+  unaffected. Reported in [#31](https://github.com/TheMaxMur/RS-Key/issues/31).
+
 - **READ CONFIG now clamps `USB_ENABLED` to the supported capabilities.** The
   management DeviceInfo (`0x1D`) echoed a host-written `EF_DEV_CONF` blob verbatim,
   so a persisted enabled-applications mask wider than `SUPPORTED_CAPS` (e.g. a newer
