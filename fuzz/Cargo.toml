@@ -21,6 +21,8 @@ rsk-oath = { path = "../crates/rsk-oath" }
 rsk-otp = { path = "../crates/rsk-otp" }
 rsk-piv = { path = "../crates/rsk-piv" }
 rsk-rescue = { path = "../crates/rsk-rescue" }
+# sha512_diff differential-fuzzes this fast SHA-512/384 against `sha2` below.
+rsk-sha512 = { path = "../crates/rsk-sha512" }
 # rsk-ui is the host-testable trusted-display logic; display_label fuzzes its
 # Label sanitizer + the confirm-screen renderer, which needs the DrawTarget trait.
 rsk-ui = { path = "../crates/rsk-ui" }
@@ -29,6 +31,12 @@ embedded-graphics = { version = "0.8", default-features = false }
 minicbor = { version = "2.2", default-features = false }
 # The piv_apdu seed runs the AES-192 management-key auth dance host-side.
 aes = { version = "0.8", default-features = false }
+# sha512_diff's differential reference — the exact `sha2` version rsk-sha512 is
+# byte-identical to; the shared digest 0.10 makes the `Digest` traits unify.
+sha2 = { version = "0.10", default-features = false }
+# openpgp_key_load reconstructs an RSA key from attacker MPIs and checks n == p*q
+# against a plain BigUint multiply — the same `rsa` 0.9 rsk-openpgp imports.
+rsa = { version = "0.9", default-features = false }
 # power_cut: the real on-device storage stack (pinned to the firmware's
 # version) over sequential-storage's power-cut-injecting mock flash (`_test`).
 sequential-storage = { version = "=8.0.0", features = ["_test"] }
@@ -360,6 +368,48 @@ bench = false
 [[bin]]
 name = "oath_otp_pin"
 path = "fuzz_targets/oath_otp_pin.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sha512_diff"
+path = "fuzz_targets/sha512_diff.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ccid_secure_pin"
+path = "fuzz_targets/ccid_secure_pin.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fido_audit_journal"
+path = "fuzz_targets/fido_audit_journal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "openpgp_key_load"
+path = "fuzz_targets/openpgp_key_load.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "piv_info_read"
+path = "fuzz_targets/piv_info_read.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "otp_ticket"
+path = "fuzz_targets/otp_ticket.rs"
 test = false
 doc = false
 bench = false
