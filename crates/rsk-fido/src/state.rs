@@ -11,7 +11,7 @@ use zeroize::Zeroize;
 use rsk_crypto::pinproto::{self, PinProto, public_xy};
 
 use crate::Rng;
-use crate::consts::{MAX_CREDENTIAL_COUNT_IN_LIST, MAX_LARGE_BLOB_SIZE};
+use crate::consts::{MAX_CREDENTIAL_COUNT_IN_LIST, MAX_LARGE_BLOB_SIZE, MAX_RESIDENT_CREDENTIALS};
 use crate::hmacsecret::{SALT_AUTH_MAX, SALT_ENC_MAX};
 
 // pinUvAuthToken permission bits.
@@ -111,6 +111,18 @@ pub struct CredMgmtState {
     /// cursors so an interleaved walk of both does not corrupt either.
     pub rp_next_slot: u16,
     pub cred_next_slot: u16,
+    /// Per-EF_CRED-slot cache of the credential's rpId-hash prefix (its first 4
+    /// bytes as LE `u32`), so `enumerateCredentials` filters slots in RAM and reads
+    /// flash only for the target rp — without it each per-rp Begin re-read every
+    /// slot, making a many-distinct-rp walk O(rps·creds). Built lazily on the first
+    /// enumerate and reused across the walk; `rp_index_gen` / `rp_index_valid` gate
+    /// staleness against [`Fs::write_gen`](rsk_fs::Fs::write_gen). Entries for empty
+    /// slots are don't-care (the occupancy bitmap skips them first), and a prefix
+    /// hit is always confirmed by the full 32-byte compare, so a 4-byte collision
+    /// only costs a read, never a wrong match.
+    pub rp_index: [u32; MAX_RESIDENT_CREDENTIALS as usize],
+    pub rp_index_gen: u32,
+    pub rp_index_valid: bool,
 }
 
 impl CredMgmtState {
@@ -123,6 +135,9 @@ impl CredMgmtState {
             rp_id_hash: [0; 32],
             rp_next_slot: 0,
             cred_next_slot: 0,
+            rp_index: [0; MAX_RESIDENT_CREDENTIALS as usize],
+            rp_index_gen: 0,
+            rp_index_valid: false,
         }
     }
 }

@@ -51,6 +51,19 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   never drift, and rejects a split that leaves under 1 MB for code with a fix hint.
   A fully provisioned key needs only a few hundred KB. See [docs/build.md](docs/build.md).
 
+### Changed
+
+- **Faster `authenticatorCredentialManagement` enumeration with many distinct RPs.**
+  `enumerateCredentials` re-read every resident-credential slot on each per-RP call,
+  so listing a store of *N* credentials spread over *N* distinct RPs was O(N²) flash
+  reads — on hardware a 256-passkey / 256-RP store took ~13 s (a store of the same
+  256 passkeys under one RP took ~1.3 s). The applet now builds a small in-RAM
+  slot→rpId-hash-prefix index once per enumeration (invalidated by a new `Fs`
+  mutation counter, so any add/delete rebuilds it) and reads flash only for the
+  target RP, making the walk O(N). Enumeration results and order are unchanged; a
+  4-byte prefix hit is still confirmed by the full rpId-hash compare. bcdDevice bump
+  only (no wire change).
+
 ### Fixed
 
 - **PIV stays detectable by OpenSC after the OpenPGP applet has been used.** The

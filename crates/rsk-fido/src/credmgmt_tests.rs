@@ -1382,3 +1382,183 @@ fn update_preserves_largeblobkey() {
         "largeBlobKey stable across updateUserInformation"
     );
 }
+
+// ---- enumerateCredentials RP index (slot→rpId-hash-prefix fast path) ----
+
+/// A `Storage` that counts `read` calls, so a test can assert the enumeration
+/// reads the store O(creds) times, not O(rps·creds).
+struct CountingStorage {
+    inner: RamStorage,
+    reads: std::rc::Rc<std::cell::Cell<usize>>,
+}
+impl Storage for CountingStorage {
+    fn read(&mut self, fid: u16, buf: &mut [u8]) -> Option<usize> {
+        self.reads.set(self.reads.get() + 1);
+        self.inner.read(fid, buf)
+    }
+    fn write(&mut self, fid: u16, data: &[u8]) -> rsk_sdk::error::Result<()> {
+        self.inner.write(fid, data)
+    }
+    fn remove(&mut self, fid: u16) -> rsk_sdk::error::Result<()> {
+        self.inner.remove(fid)
+    }
+    fn size(&mut self, fid: u16) -> Option<usize> {
+        self.inner.size(fid)
+    }
+    fn for_each_key(&mut self, f: &mut dyn FnMut(u16)) {
+        self.inner.for_each_key(f)
+    }
+}
+
+fn register_into<S: Storage>(fs: &mut Fs<S>, rng: &mut SeqRng, rp: &str, uid: &[u8], name: &str) {
+    let mut out = [0u8; 1024];
+    let mut state = FidoState::new();
+    let mut presence = crate::AlwaysConfirm;
+    let mut ctx = Ctx {
+        presence: &mut presence,
+        dev: dev(),
+        fs,
+        rng,
+        state: &mut state,
+        now_ms: 10,
+    };
+    make_credential(&mut ctx, &mc_request(rp, uid, name), &mut out).unwrap();
+}
+
+fn run_into<S: Storage>(
+    fs: &mut Fs<S>,
+    state: &mut FidoState,
+    req: &[u8],
+    out: &mut [u8],
+) -> CtapResult {
+    let mut rng = SeqRng(7);
+    let mut presence = crate::AlwaysConfirm;
+    let mut ctx = Ctx {
+        presence: &mut presence,
+        dev: dev(),
+        fs,
+        rng: &mut rng,
+        state,
+        now_ms: 100,
+    };
+    cred_mgmt(&mut ctx, req, out)
+}
+
+#[test]
+fn enumerate_credentials_many_distinct_rps_each_returns_its_own() {
+    // The worst case for the index: N distinct rps, one credential each. Every
+    // credential must still be found exactly once under its own rp.
+    let (mut fs, mut rng) = setup();
+    const N: usize = 40;
+    let mut hashes = std::vec::Vec::new();
+    for i in 0..N {
+        let rp = std::format!("rp{i:04}.example");
+        register(&mut fs, &mut rng, &rp, &[i as u8, 0], "u");
+        hashes.push(sha256(rp.as_bytes()));
+    }
+    let mut state = armed(PERM_CM);
+    let mut out = [0u8; 512];
+    for h in &hashes {
+        let n = run(
+            &mut fs,
+            &mut state,
+            &cm_request(0x04, Some(&subpara_rpidhash(h)), &TOKEN),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(parse_cred(&out[..n], true).3, Some(1));
+        // Exactly one credential for this rp — no next.
+        assert_eq!(
+            run(&mut fs, &mut state, &cm_next(0x05), &mut out),
+            Err(CtapError::NotAllowed)
+        );
+    }
+}
+
+#[test]
+fn enumerate_credentials_index_refreshes_after_a_write() {
+    // A credential added AFTER the index was built (in a prior enumerate) must be
+    // found — `Fs::write_gen` has to invalidate the cached index.
+    let (mut fs, mut rng) = setup();
+    register(&mut fs, &mut rng, "aaa.example", &[1], "a");
+    register(&mut fs, &mut rng, "bbb.example", &[2], "b");
+    let mut state = armed(PERM_CM);
+    let mut out = [0u8; 512];
+    let h_aaa = sha256(b"aaa.example");
+    // Build the index by enumerating aaa.
+    let n = run(
+        &mut fs,
+        &mut state,
+        &cm_request(0x04, Some(&subpara_rpidhash(&h_aaa)), &TOKEN),
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(parse_cred(&out[..n], true).3, Some(1));
+
+    // New rp added after the index was built → must be visible.
+    register(&mut fs, &mut rng, "ccc.example", &[3], "c");
+    let h_ccc = sha256(b"ccc.example");
+    let n = run(
+        &mut fs,
+        &mut state,
+        &cm_request(0x04, Some(&subpara_rpidhash(&h_ccc)), &TOKEN),
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(
+        parse_cred(&out[..n], true).3,
+        Some(1),
+        "credential added after the index was built must be found"
+    );
+
+    // A second credential under an existing rp bumps that rp's count.
+    register(&mut fs, &mut rng, "aaa.example", &[9], "a2");
+    let n = run(
+        &mut fs,
+        &mut state,
+        &cm_request(0x04, Some(&subpara_rpidhash(&h_aaa)), &TOKEN),
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(parse_cred(&out[..n], true).3, Some(2));
+}
+
+#[test]
+fn enumerate_credentials_reads_are_linear_not_quadratic() {
+    // N distinct rps × 1 credential. With the index the store is read ~O(N) times
+    // (one build pass + one confirmed read per rp); the pre-index code re-read all
+    // N slots on each of the N per-rp Begins, i.e. ~N² reads.
+    let reads = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let mut fs = Fs::new(CountingStorage {
+        inner: RamStorage::new(),
+        reads: reads.clone(),
+    });
+    let mut rng = SeqRng(1);
+    ensure_seed(&dev(), &mut fs, &mut rng).unwrap();
+    const N: usize = 32;
+    let mut hashes = std::vec::Vec::new();
+    for i in 0..N {
+        let rp = std::format!("rp{i:04}.example");
+        register_into(&mut fs, &mut rng, &rp, &[i as u8, 0], "u");
+        hashes.push(sha256(rp.as_bytes()));
+    }
+    let mut state = armed(PERM_CM);
+    let mut out = [0u8; 512];
+    reads.set(0);
+    for h in &hashes {
+        run_into(
+            &mut fs,
+            &mut state,
+            &cm_request(0x04, Some(&subpara_rpidhash(h)), &TOKEN),
+            &mut out,
+        )
+        .unwrap();
+    }
+    let total = reads.get();
+    assert!(
+        total <= 8 * N,
+        "enumerateCredentials read the store {total} times for N={N} rps; \
+         expected ~O(N), quadratic (pre-index) would be ~{}",
+        N * N
+    );
+}
