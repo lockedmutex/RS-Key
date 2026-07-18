@@ -31,6 +31,19 @@ fn test_key() -> RsaPrivateKey {
 }
 
 #[test]
+fn import_rejects_degenerate_primes() {
+    // A zero-valued prime MPI must be rejected, not panic num-bigint's unsigned
+    // subtraction inside from_p_q (a device-halt on import). The applet's
+    // is_empty() guard misses a non-empty `00`, so rsa_from_pqe fails closed itself.
+    let e = [0x01, 0x00, 0x01];
+    assert!(rsa_from_pqe(&e, &[], &hex(Q_HEX)).is_none());
+    assert!(rsa_from_pqe(&e, &hex(P_HEX), &[]).is_none());
+    assert!(rsa_from_pqe(&e, &[0x00], &hex(Q_HEX)).is_none());
+    assert!(rsa_from_pqe(&e, &hex(P_HEX), &[0x00]).is_none());
+    assert!(rsa_from_pqe(&e, &[0x01], &hex(Q_HEX)).is_none()); // p = 1 rejected too
+}
+
+#[test]
 fn import_recovers_modulus() {
     // from_p_q must reconstruct N = P·Q (the make_rsa_response modulus).
     let key = test_key();

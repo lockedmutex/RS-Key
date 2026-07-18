@@ -43,6 +43,14 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   `ykman piv info` forced PIV back — a real YubiKey re-detects PIV fine. The
   template now matches NIST SP 800-73-4 (and a YubiKey's response) for tags
   `4F` / `79`.
+- **OpenPGP RSA key import can no longer halt the device on a zero-valued prime.**
+  A `PUT DATA` key import (admin/PW3) whose `P` or `Q` prime MPI was present but
+  numerically zero (a non-empty `00` that the applet's `is_empty()` check let
+  through) reached `RsaPrivateKey::from_p_q`, where computing `(p-1)(q-1)`
+  underflowed num-bigint's unsigned subtraction and panicked. Under `panic-halt`
+  that wedged the authenticator until replug. `rsa_from_pqe` now rejects a
+  degenerate prime as a bad key (`EXEC_ERROR`). Found by the new `openpgp_key_load`
+  fuzz target.
 
 ## [0.3.7] - 2026-07-17
 
