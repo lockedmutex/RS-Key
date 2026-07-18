@@ -32,6 +32,24 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   Build it `LED_PIN=22 LED_ORDER=grb LED_POWER_PIN=23`. Off by default; the pin
   must differ from `LED_PIN` and a GPIO `PRESENCE_PIN` (rejected at compile time).
   See [docs/hardware.md](docs/hardware.md) and [docs/build.md](docs/build.md).
+- **`USR_LED_PIN` build knob — park a nuisance onboard LED off at boot.** A new
+  compile-time env knob names an optional GPIO wired to an onboard user/status LED
+  that comes up lit; the firmware drives it to the LED's **off** level at boot and
+  holds it. This is the **Seeed Studio XIAO RP2350**'s active-low USR LED on GP25,
+  which the board's weak pull-down otherwise keeps on ([#36](https://github.com/TheMaxMur/RS-Key/issues/36)).
+  Build it `USR_LED_PIN=25` (add `USR_LED_ACTIVE_HIGH=1` for an active-high LED).
+  Off by default and independent of the addressable LED, so it also works on a
+  `LED_KIND=none` build; the pin must differ from `LED_PIN`, `LED_POWER_PIN`, a GPIO
+  `PRESENCE_PIN`, and the display `WAKE_PIN` (rejected at compile time). See
+  [docs/hardware.md](docs/hardware.md) and [docs/build.md](docs/build.md).
+- **`KVMAIN` build knob — fit the firmware on a 2 MB flash.** The KV main partition
+  size is now a compile-time knob (default 1408K, the checked-in layout). A **2 MB**
+  board (Seeed XIAO RP2350, Waveshare RP2350-Zero-CM) can't fit the ~900K image under
+  the default KV store, so shrink it: `FLASH_SIZE=2M KVMAIN=896K` (896K creds + 128K
+  counters + 1024K code) ([#36](https://github.com/TheMaxMur/RS-Key/issues/36)). build.rs
+  bakes the size into both `memory.x` and `flash_storage.rs` so the two partitions
+  never drift, and rejects a split that leaves under 1 MB for code with a fix hint.
+  A fully provisioned key needs only a few hundred KB. See [docs/build.md](docs/build.md).
 
 ### Fixed
 

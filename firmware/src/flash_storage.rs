@@ -35,18 +35,20 @@ const SECTOR: usize = 4096;
 // The KV store is split into two flash partitions (see `memory.x`) so the hot
 // counters can't force the credential pages to migrate:
 //
-// * **main** (1408 KiB) — credentials, keys, OpenPGP data objects. Written only on
-//   registration / key generation / personalisation, so its pages fill slowly and a
-//   (cold, expensive) page migration is rare.
+// * **main** (KVMAIN, 1408 KiB by default) — credentials, keys, OpenPGP data objects.
+//   Written only on registration / key generation / personalisation, so its pages fill
+//   slowly and a (cold, expensive) page migration is rare. The `KVMAIN` build knob
+//   shrinks it to free code space on a small flash (a 2 MB board); the size is baked as
+//   `PK_KVMAIN_LEN` and MUST match `memory.x`'s KVMAIN LENGTH (build.rs writes both).
 // * **counter** (128 KiB) — the per-operation counters (FIDO `EF_COUNTER`, OpenPGP
 //   `EF_SIG_COUNT`, the vendor counter), rewritten on *every* signature/assertion.
 //   That churn is what fills flash; isolating it here means it reclaims only its own
 //   small pages (cheap — a handful of always-cached keys) instead of advancing the
 //   main partition's ring into the credential pages (a multi-second cold-migration
-//   stall).
-const MAIN_LEN: usize = 1408 * 1024;
+//   stall). Fixed size — the counters need their own churn-isolated pages on any board.
+const MAIN_LEN: usize = crate::env_u32(env!("PK_KVMAIN_LEN")) as usize;
 const COUNTER_LEN: usize = 128 * 1024;
-const MAIN_PAGES: usize = MAIN_LEN / SECTOR; // 352
+const MAIN_PAGES: usize = MAIN_LEN / SECTOR; // KVMAIN / SECTOR (352 at the 1408K default)
 const COUNTER_PAGES: usize = COUNTER_LEN / SECTOR; // 32
 
 /// Transient FID the [`Storage::compact`] lap churns to advance the main ring.

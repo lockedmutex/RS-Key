@@ -81,28 +81,30 @@ static buffer used by nothing else.
 *Safe alternative:* none; every embedded allocator initializes this way.
 *Containment:* one call, before any allocation can happen.
 
-### 5. GPIO pin type-erasure (presence button + LED power rail, ×2)
+### 5. GPIO pin type-erasure (presence button + LED power rail + USR-LED-off, ×3)
 
 ```rust
 let any = unsafe { AnyPin::steal(pin) };
 ```
 
-Two build-configurable GPIOs are chosen by *number* at build time rather than as
+Three build-configurable GPIOs are chosen by *number* at build time rather than as
 a concrete `PIN_n` type, so each must be converted to embassy's type-erased
 `AnyPin`: the optional `PRESENCE_PIN=<gpio>` presence button
-(`ButtonPresence::new_gpio`, `presence.rs`), and the optional `LED_POWER_PIN`
-enable pin driven high to power a gated LED rail (the LED block in `main.rs`).
-`AnyPin::steal` is `unsafe` because the caller must guarantee unique ownership of
-that hardware pin — a `match` over `p.PIN_0..=PIN_29` (as the LED *data* pin uses)
-is impossible here, since it would double-move the peripheral set the LED block
-already claims.
+(`ButtonPresence::new_gpio`, `presence.rs`), the optional `LED_POWER_PIN`
+enable pin driven high to power a gated LED rail (the LED block in `main.rs`), and
+the optional `USR_LED_PIN` driven to a nuisance onboard LED's OFF level and held
+(the boot block in `main.rs`). `AnyPin::steal` is `unsafe` because the caller must
+guarantee unique ownership of that hardware pin — a `match` over `p.PIN_0..=PIN_29`
+(as the LED *data* pin uses) is impossible here, since it would double-move the
+peripheral set the LED block already claims.
 *Safe alternative:* none for a runtime/number-selected GPIO; the safe
 constructors require a statically known pin type.
-*Containment:* both are gated by pin-range validation and the single-owner
-invariant from `main` — neither the presence pin nor the LED-power pin is ever
-handed to another driver, and a compile-time `assert!` rejects a build that
-collides `LED_POWER_PIN` with the LED data pin or a GPIO `PRESENCE_PIN` (as an
-LED/presence collision already panics at boot).
+*Containment:* each is gated by pin-range validation and the single-owner
+invariant from `main` — none of the presence pin, the LED-power pin, nor the
+USR-LED pin is ever handed to another driver, and compile-time `assert!`s reject a
+build that collides `LED_POWER_PIN` or `USR_LED_PIN` with the LED data pin or a GPIO
+`PRESENCE_PIN` (and refuse `USR_LED_PIN` outright on a display build, whose panel
+owns those pads), as an LED/presence collision already panics at boot.
 
 ## Firmware dual-core keygen (`firmware/src/core1.rs`)
 

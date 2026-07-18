@@ -11,25 +11,40 @@ use std::io::Write;
 use std::path::PathBuf;
 
 /// The Waveshare RP2350-One's flash, and the layout the checked-in `memory.x`
-/// encodes. A `FLASH_SIZE` equal to this writes that file byte-for-byte.
+/// encodes. A `FLASH_SIZE` equal to this (with the default `KVMAIN`) writes that
+/// file byte-for-byte.
 const DEFAULT_FLASH_SIZE: u32 = 4 * 1024 * 1024;
 
-/// Top-of-flash reserved for the rsk-fs KV store (KVMAIN 1408K + KVCNT 128K);
-/// must match `flash_storage.rs` (`MAIN_LEN` + `COUNTER_LEN`). Fixed across
-/// flash sizes — only the code region below it grows or shrinks.
-const KV_RESERVED: u32 = (1408 + 128) * 1024;
+/// Default KVMAIN — the rsk-fs main partition (creds/keys/DOs) the checked-in
+/// `memory.x` encodes. `KVMAIN` overrides it (shrink it to free code space on a
+/// small flash). Must match `flash_storage.rs` `MAIN_LEN`, which reads back the
+/// same baked `PK_KVMAIN_LEN`.
+const DEFAULT_KVMAIN: u32 = 1408 * 1024;
+
+/// KVCNT — the counter partition. Fixed across flash sizes and NOT overridable:
+/// the hot per-operation counters need their own churn-isolated pages regardless
+/// of board (see `flash_storage.rs` `COUNTER_LEN`).
+const KVCNT_LEN: u32 = 128 * 1024;
+
+/// Smallest code region the flash/KVMAIN split may leave. The shipping image is
+/// ~900 KiB; anything under this can't link, so [`assert_layout_fits`] rejects the
+/// split here with a fix hint instead of leaving a cryptic linker overflow.
+const MIN_CODE: u32 = 1024 * 1024;
 
 fn main() {
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
 
-    // memory.x: the checked-in script is the 4 MB layout; for any other
-    // FLASH_SIZE we splice a recomputed MEMORY block (code = flash − KV) into it.
+    // memory.x: the checked-in script is the default 4 MB / 1408K-KVMAIN layout;
+    // for any other FLASH_SIZE or KVMAIN we splice a recomputed MEMORY block
+    // (code = flash − KVMAIN − KVCNT) into it and keep the rest verbatim.
     let flash_size = resolve_flash_size();
+    let kvmain_len = resolve_kvmain_len();
+    assert_layout_fits(flash_size, kvmain_len);
     let template = std::fs::read_to_string("memory.x").expect("read memory.x");
-    let memory_x = if flash_size == DEFAULT_FLASH_SIZE {
+    let memory_x = if flash_size == DEFAULT_FLASH_SIZE && kvmain_len == DEFAULT_KVMAIN {
         template
     } else {
-        splice_memory_block(&template, flash_size)
+        splice_memory_block(&template, flash_size, kvmain_len)
     };
     File::create(out.join("memory.x"))
         .unwrap()
@@ -40,6 +55,8 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rustc-env=PK_FLASH_SIZE={flash_size}");
     println!("cargo:rerun-if-env-changed=FLASH_SIZE");
+    println!("cargo:rustc-env=PK_KVMAIN_LEN={kvmain_len}");
+    println!("cargo:rerun-if-env-changed=KVMAIN");
 
     let (vid, pid, manufacturer, product) = resolve_identity();
     println!("cargo:rustc-env=PK_USB_VID={vid}");
@@ -76,6 +93,23 @@ fn main() {
     );
     println!("cargo:rustc-env=PK_LED_POWER_PIN={led_power_pin}");
     println!("cargo:rerun-if-env-changed=LED_POWER_PIN");
+
+    // Optional user/status-LED-off GPIO (`USR_LED_PIN`): a plain pin some boards
+    // wire to a nuisance onboard LED (the Seeed XIAO RP2350's active-low USR LED on
+    // GP25 lights by default). Driven to its OFF level at boot and held. Encoded as
+    // enabled + pin + polarity so `main` decodes all three with its const parser.
+    let (usr_led_enabled, usr_led_pin) = resolve_usr_led_pin();
+    println!(
+        "cargo:rustc-env=PK_USR_LED_ENABLED={}",
+        if usr_led_enabled { 1 } else { 0 }
+    );
+    println!("cargo:rustc-env=PK_USR_LED_PIN={usr_led_pin}");
+    println!("cargo:rerun-if-env-changed=USR_LED_PIN");
+    println!(
+        "cargo:rustc-env=PK_USR_LED_ACTIVE_HIGH={}",
+        if resolve_usr_led_active_high() { 1 } else { 0 }
+    );
+    println!("cargo:rerun-if-env-changed=USR_LED_ACTIVE_HIGH");
 
     // User-presence source: default BOOTSEL, or `PRESENCE_PIN=<gpio>` for an
     // active-low GPIO button (internal pull-up). Encoded as two numeric envs so
@@ -155,7 +189,8 @@ fn main() {
 
 /// Resolve `FLASH_SIZE` to a byte count. Accepts a decimal byte count, `0xHEX`,
 /// or a `<n>K`/`<n>KB`/`<n>M`/`<n>MB` suffix; defaults to 4 MB. Must be
-/// sector-aligned, leave room for the KV store, and stay within 16 MB.
+/// sector-aligned and within 16 MB; [`assert_layout_fits`] then checks it leaves
+/// room for KVMAIN + KVCNT + code.
 fn resolve_flash_size() -> u32 {
     let raw = env::var("FLASH_SIZE").unwrap_or_else(|_| DEFAULT_FLASH_SIZE.to_string());
     let bytes = parse_size(raw.trim())
@@ -165,14 +200,49 @@ fn resolve_flash_size() -> u32 {
         "FLASH_SIZE={bytes} must be a multiple of 4096 (the QSPI erase sector)"
     );
     assert!(
-        bytes > KV_RESERVED,
-        "FLASH_SIZE={bytes} too small — {KV_RESERVED} bytes are reserved for the KV store"
-    );
-    assert!(
         bytes <= 16 * 1024 * 1024,
         "FLASH_SIZE={bytes} exceeds the supported 16 MiB"
     );
     bytes
+}
+
+/// Resolve `KVMAIN` — the KV main-partition size (creds/keys/OpenPGP DOs). Same
+/// syntax as `FLASH_SIZE` (bytes, `0xHEX`, `<n>K`/`<n>M`); defaults to 1408K, the
+/// checked-in layout. Shrink it to free code space on a small flash (a 2 MB Seeed
+/// XIAO RP2350 / Waveshare Zero-CM wants `FLASH_SIZE=2M KVMAIN=896K`). Sector-
+/// aligned; the baked `PK_KVMAIN_LEN` must equal `flash_storage.rs` `MAIN_LEN`,
+/// which reads it back.
+fn resolve_kvmain_len() -> u32 {
+    let raw = env::var("KVMAIN").unwrap_or_else(|_| DEFAULT_KVMAIN.to_string());
+    let bytes = parse_size(raw.trim())
+        .unwrap_or_else(|| panic!("KVMAIN={raw:?} — use a byte count, 0xHEX, or <n>K / <n>M"));
+    assert!(
+        bytes.is_multiple_of(4096),
+        "KVMAIN={bytes} must be a multiple of 4096 (the QSPI erase sector)"
+    );
+    assert!(
+        bytes >= 128 * 1024,
+        "KVMAIN={bytes} too small; the KV ring needs room to migrate (min 128K)"
+    );
+    bytes
+}
+
+/// Reject a flash / KVMAIN split that leaves too little room for code BEFORE the
+/// linker does, with a message that names the fix. KVCNT is fixed at the top;
+/// KVMAIN and the code region share what is left below it.
+fn assert_layout_fits(flash_size: u32, kvmain_len: u32) {
+    let kv = kvmain_len + KVCNT_LEN;
+    assert!(
+        flash_size > kv,
+        "FLASH_SIZE={flash_size} too small for KVMAIN + KVCNT ({kv} bytes)"
+    );
+    let code = flash_size - kv;
+    assert!(
+        code >= MIN_CODE,
+        "this FLASH_SIZE / KVMAIN split leaves only {code} bytes for code (< {MIN_CODE}); \
+         the firmware image is ~900K — reduce KVMAIN or raise FLASH_SIZE \
+         (a 2 MB board wants FLASH_SIZE=2M KVMAIN=896K)"
+    );
 }
 
 /// Parse `123`, `0x10000`, `512K`, `4M`, `4MB`, … into a byte count.
@@ -193,22 +263,24 @@ fn parse_size(s: &str) -> Option<u32> {
     base.checked_mul(mult)
 }
 
-/// Recompute the `MEMORY { … }` block for a non-default flash size and splice it
-/// into the template, keeping the rest (KV symbols, SECTIONS) verbatim. The KV
-/// store stays a fixed [`KV_RESERVED`] at the top; the code region is the rest.
-fn splice_memory_block(template: &str, flash_size: u32) -> String {
-    let code = flash_size - KV_RESERVED;
+/// Recompute the `MEMORY { … }` block for a non-default flash size or KVMAIN and
+/// splice it into the template, keeping the rest (KV symbols, SECTIONS) verbatim.
+/// KVCNT stays fixed at the top; KVMAIN sits below it; the code region is the rest.
+fn splice_memory_block(template: &str, flash_size: u32, kvmain_len: u32) -> String {
+    let code = flash_size - kvmain_len - KVCNT_LEN;
     let kvmain = 0x1000_0000 + code;
-    let kvcnt = kvmain + 1408 * 1024;
+    let kvcnt = kvmain + kvmain_len;
     let block = format!(
         "MEMORY {{\n    \
          FLASH  : ORIGIN = 0x10000000, LENGTH = {}K\n    \
-         KVMAIN : ORIGIN = {:#010X}, LENGTH = 1408K\n    \
-         KVCNT  : ORIGIN = {:#010X}, LENGTH = 128K\n    \
+         KVMAIN : ORIGIN = {:#010X}, LENGTH = {}K\n    \
+         KVCNT  : ORIGIN = {:#010X}, LENGTH = {}K\n    \
          RAM    : ORIGIN = 0x20000000, LENGTH = 512K\n}}",
         code / 1024,
         kvmain,
-        kvcnt
+        kvmain_len / 1024,
+        kvcnt,
+        KVCNT_LEN / 1024,
     );
     let start = template
         .find("MEMORY {")
@@ -256,6 +328,40 @@ fn resolve_led_power_pin() -> (bool, u8) {
         "LED_POWER_PIN={pin} out of range 0..=29 (RP2350A GPIOs)"
     );
     (true, pin)
+}
+
+/// Resolve `USR_LED_PIN` — an optional GPIO wired to a nuisance onboard user/status
+/// LED that the firmware drives to its OFF level at boot and holds (the Seeed XIAO
+/// RP2350's USR LED on GP25 is active-low, so it lights by default). Unset / empty /
+/// `none` = no such pin (the default); any `0..=29` selects one. `main` rejects a
+/// collision with the LED data pin, its power pin, a GPIO presence pin, or the
+/// display wake button at compile time. Returns `(enabled, pin)`.
+fn resolve_usr_led_pin() -> (bool, u8) {
+    let raw = env::var("USR_LED_PIN").unwrap_or_default();
+    let v = raw.trim().to_ascii_lowercase();
+    if v.is_empty() || v == "none" {
+        return (false, 0);
+    }
+    let pin = v
+        .parse::<u8>()
+        .unwrap_or_else(|_| panic!("USR_LED_PIN={raw:?} must be `none` or a GPIO number 0..=29"));
+    assert!(
+        pin <= 29,
+        "USR_LED_PIN={pin} out of range 0..=29 (RP2350A GPIOs)"
+    );
+    (true, pin)
+}
+
+/// Resolve `USR_LED_ACTIVE_HIGH` — the polarity of the `USR_LED_PIN` LED. Default
+/// `false` (active-low: off = drive HIGH, e.g. the XIAO's USR LED). `1`/`true`
+/// flips to active-high (off = drive LOW). Ignored without a `USR_LED_PIN`.
+fn resolve_usr_led_active_high() -> bool {
+    let raw = env::var("USR_LED_ACTIVE_HIGH").unwrap_or_default();
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "false" | "no" | "off" => false,
+        "1" | "true" | "yes" | "on" => true,
+        other => panic!("USR_LED_ACTIVE_HIGH={other:?} must be a boolean (0/1, true/false)"),
+    }
 }
 
 /// Resolve `PRESENCE_PIN` to either BOOTSEL (unset / `bootsel`) or a GPIO

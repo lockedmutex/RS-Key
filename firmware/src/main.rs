@@ -179,6 +179,42 @@ const _: () = assert!(
     !BUILD_WAKE_ENABLED || BUILD_WAKE_PIN < 10 || BUILD_WAKE_PIN > 18,
     "WAKE_PIN collides with an LCD/touch GPIO (10..=18) owned by the display build"
 );
+
+// Optional nuisance user/status LED to hold OFF at boot (`USR_LED_PIN`): a plain
+// GPIO some boards wire to an onboard LED that lights by default (the Seeed XIAO
+// RP2350's active-low USR LED on GP25). Independent of the addressable status LED,
+// so it applies on a `none` build too; driven to its OFF level and held for the
+// device's lifetime. Off unless `USR_LED_PIN` is set.
+const BUILD_USR_LED_ENABLED: bool = env_u16(env!("PK_USR_LED_ENABLED")) != 0;
+const BUILD_USR_LED_PIN: u8 = env_u16(env!("PK_USR_LED_PIN")) as u8;
+const BUILD_USR_LED_ACTIVE_HIGH: bool = env_u16(env!("PK_USR_LED_ACTIVE_HIGH")) != 0;
+
+// USR_LED_PIN must own its pad — reject a build that aims it at any pin another
+// driver already claims, each check gated to where that pin exists.
+#[cfg(not(feature = "display"))]
+const _: () = assert!(
+    !(BUILD_USR_LED_ENABLED && BUILD_PRESENCE_IS_GPIO && BUILD_USR_LED_PIN == BUILD_PRESENCE_PIN),
+    "USR_LED_PIN must not equal a GPIO PRESENCE_PIN"
+);
+#[cfg(not(led_kind = "none"))]
+const _: () = assert!(
+    !(BUILD_USR_LED_ENABLED && BUILD_USR_LED_PIN == BUILD_LED_PIN),
+    "USR_LED_PIN must not equal LED_PIN"
+);
+#[cfg(not(led_kind = "none"))]
+const _: () = assert!(
+    !(BUILD_USR_LED_ENABLED && BUILD_LED_POWER_ENABLED && BUILD_USR_LED_PIN == BUILD_LED_POWER_PIN),
+    "USR_LED_PIN must not equal LED_POWER_PIN"
+);
+// A display build has no onboard nuisance LED to silence — the panel replaces the
+// LED and already drives the LCD/touch GPIOs (10..=18) plus the GP25 wake button —
+// so USR_LED_PIN there is only a chance to double-claim a panel pad; refuse it.
+#[cfg(feature = "display")]
+const _: () = assert!(
+    !BUILD_USR_LED_ENABLED,
+    "USR_LED_PIN is not supported on a display build (the panel replaces the onboard LED)"
+);
+
 #[cfg(led_kind = "ws2812")]
 const BUILD_DRIVER: u8 = 3;
 #[cfg(led_kind = "gpio")]
@@ -207,6 +243,9 @@ static USB_HANDLER: StaticCell<led::StatusHandler> = StaticCell::new();
 // release the pad and let the gated LED rail fall (see the LED block below).
 #[cfg(not(led_kind = "none"))]
 static LED_PWR: StaticCell<embassy_rp::gpio::Output<'static>> = StaticCell::new();
+// Holds the USR-LED-off `Output` for the device's lifetime; dropping it would
+// release the pad and let a pulled nuisance LED light again (see the boot block).
+static USR_LED: StaticCell<embassy_rp::gpio::Output<'static>> = StaticCell::new();
 static FS: StaticCell<RefCell<Store>> = StaticCell::new();
 static FLASH_CELL: StaticCell<RefCell<flash_storage::AsyncFlash>> = StaticCell::new();
 static RNG_CELL: StaticCell<RefCell<FidoRng>> = StaticCell::new();
@@ -391,7 +430,7 @@ async fn main(spawner: Spawner) {
     config.max_power = 100;
     config.max_packet_size_0 = 64;
     // bcdDevice build counter; also surfaced on the trusted-display Firmware screen.
-    let device_release: u16 = 0x0827;
+    let device_release: u16 = 0x0828;
     config.device_release = device_release;
 
     let mut builder = Builder::new(
@@ -478,6 +517,25 @@ async fn main(spawner: Spawner) {
     }
     if let Some(kbd) = kbd {
         hp.spawn(otp_kbd::kbd_task(kbd).unwrap());
+    }
+
+    // Hold a nuisance onboard user LED off (`USR_LED_PIN`), independent of the
+    // addressable status LED so it also applies on a `none` build. Drive the pad to
+    // the LED's OFF level and park the `Output` for the device's lifetime — dropping
+    // it would release the pad back to its (pulled) reset state and relight the LED.
+    if BUILD_USR_LED_ENABLED {
+        use embassy_rp::gpio::{Level, Output};
+        // Active-low LED (default) is off when HIGH; active-high is off when LOW.
+        let off = if BUILD_USR_LED_ACTIVE_HIGH {
+            Level::Low
+        } else {
+            Level::High
+        };
+        // Safety: this runs only when USR_LED is enabled, which the const asserts
+        // above forbid on a display build; on every other build they prove the pin
+        // collides with no LED data/power pin nor a GPIO presence pin.
+        let any = unsafe { embassy_rp::gpio::AnyPin::steal(BUILD_USR_LED_PIN) };
+        USR_LED.init(Output::new(any, off));
     }
 
     // LED backend, selected at runtime from the phy record (PicoForge-compatible),

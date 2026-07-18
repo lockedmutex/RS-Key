@@ -43,9 +43,12 @@ flowchart TD
 | `USB_MANUFACTURER` / `USB_PRODUCT` | from preset | string | Raw override of the USB descriptor strings. The default is `RS-Key` / `RS-Key Security Key`; the Yubico VID instead bakes `Yubico` / `YubiKey RSK OTP+FIDO+CCID`. The project's own tools (`rsk`, `rsk-tui`) match the reader by the `RS-Key` (or `RSK`) token in the product string. |
 | `FW_VERSION` | `5.7.4` | `X.Y.Z` or `X.Y` | The firmware version reported everywhere a tool looks: management DeviceInfo (`ykman info`), FIDO getInfo, CTAPHID INIT, OATH/OTP/PIV version fields. Yubico tools gate features on it; 5.7.4 mimics a current YubiKey 5. Does **not** change the OpenPGP card version (3.4) or the USB `bcdDevice` (an internal build counter). |
 | `XOSC_DELAY_MULT` | `128` | `1..=1024` | Crystal-oscillator startup-delay multiplier ("delayed boot"). A longer settle wait is intended to harden the early-boot clock-switch window against glitch/fault injection. 128 is the embassy default. |
-| `FLASH_SIZE` | `4M` | bytes, `0xHEX`, or `<n>K`/`<n>M` | External QSPI flash size. build.rs regenerates `memory.x` from it. The KV store stays a fixed 1.5 MB at the top, the code region is the rest. `4M` reproduces the checked-in layout byte-for-byte. Use this for boards with a different flash chip (e.g. `8M`); must be ≥ ~2 MB and ≤ 16 MB. |
+| `FLASH_SIZE` | `4M` | bytes, `0xHEX`, or `<n>K`/`<n>M` | External QSPI flash size. build.rs regenerates `memory.x` from it. The KV store (`KVMAIN` + `KVCNT`) stays pinned at the top and the code region is the rest; `4M` with the default `KVMAIN` reproduces the checked-in layout byte-for-byte. Use this for boards with a different flash chip (e.g. `8M`); must be ≤ 16 MB and leave ≥ 1 MB for code after the KV store (a 2 MB board needs a smaller `KVMAIN`, below). |
+| `KVMAIN` | `1408K` | bytes, `0xHEX`, or `<n>K`/`<n>M` | Size of the KV **main** partition (credentials, keys, OpenPGP DOs). The default 1408K is the checked-in layout; shrink it to free code space on a small flash. A **2 MB** board (Seeed XIAO RP2350, Waveshare RP2350-Zero-CM) can't fit the firmware (~900K) under a 1408K KVMAIN, so build it `FLASH_SIZE=2M KVMAIN=896K` (896K creds + 128K counters + 1024K code). Sector-aligned, min 128K; the counter partition (`KVCNT`, 128K) is fixed. Baked into both `memory.x` and `flash_storage.rs` from one value, so the two never drift. **Set at build time only** — changing it on a provisioned device shifts the partition offsets and orphans the store. |
 | `LED_PIN` | `16` | `0..=29` | The status-LED GPIO for the `ws2812` and `gpio` backends (RP2350A). Default GPIO16 is the Waveshare RP2350-One. Point it at a free GPIO on boards that use 16 for something else; the indicator simply drives whatever pin you pick. (Unused by `pimoroni`, which has fixed PWM pins, and by `none`.) |
 | `LED_POWER_PIN` | `none` | `none` or `0..=29` | An optional GPIO driven **high at boot** to power a *gated* LED rail — some boards put the addressable LED behind a load switch. The **Seeed XIAO RP2350** is the case in point: its onboard WS2812 data is on GP22 but its power sits behind GP23, so the LED stays dark until GP23 is high (`LED_PIN=22 LED_ORDER=grb LED_POWER_PIN=23`). Held for the device's lifetime; must differ from `LED_PIN` and a GPIO `PRESENCE_PIN` (rejected at compile time). Boot-only, so it is **not** in the runtime `phy` record. Ignored by `LED_KIND=none`. |
+| `USR_LED_PIN` | `none` | `none` or `0..=29` | An optional GPIO wired to a *nuisance* onboard user/status LED that the firmware drives to its **OFF** level at boot and holds. The **Seeed XIAO RP2350**'s USR LED sits on GP25, is active-low, and comes up lit (weak pull-down); `USR_LED_PIN=25` parks it high so it stays dark. Independent of the addressable status LED, so it works on a `LED_KIND=none` build too. Held for the device's lifetime; must differ from `LED_PIN`, `LED_POWER_PIN`, and a GPIO `PRESENCE_PIN` (rejected at compile time), and is unsupported on a display build (the panel replaces the onboard LED). Boot-only, **not** in the runtime `phy` record. |
+| `USR_LED_ACTIVE_HIGH` | `0` | `0` / `1` | Polarity of the `USR_LED_PIN` LED. `0` (default) = active-low (lit when the pin is low, so OFF = drive **high** — the XIAO USR LED). `1` = active-high (lit when high, so OFF = drive **low**). Ignored without a `USR_LED_PIN`. |
 | `PRESENCE_PIN` | `bootsel` | `bootsel` or `0..=29` | User-presence input source. Default `bootsel` keeps the BOOTSEL hardware-button path. Set a GPIO number for a dedicated button (active-low with an internal pull-up by default; flip with `PRESENCE_ACTIVE_HIGH`). Example: `PRESENCE_PIN=0` for a button to ground on GPIO0. |
 | `PRESENCE_ACTIVE_HIGH` | `0` | `0` / `1` | GPIO presence-button polarity, only meaningful with a GPIO `PRESENCE_PIN`. `0` (default) = active-low: button to ground, internal pull-up, a press reads **low**. `1` = active-high: internal pull-down, a press reads **high**, for a capacitive touch sensor or a button to VCC. Ignored for the BOOTSEL default. |
 | `WAKE_PIN` | `25` | `none` or `0..=29` | **`display` builds only.** The button that wakes the panel from display sleep. Default `25` is the Waveshare RP2350-Touch-LCD-2.8's **BAT_PWR** button. `none` makes wake touch-only (no button); any other GPIO selects a different button. A value in the LCD/touch range (`10..=18`) is rejected at compile time. The display-sleep timeout itself is set on-device (Settings → Display sleep). |
@@ -77,10 +80,19 @@ built, so a stale entry can show an old value. Read the freshest one (or
 
 ## Flash size and the memory map
 
-`FLASH_SIZE` regenerates `memory.x`: the 1.5 MB KV store stays pinned to the top
+`FLASH_SIZE` regenerates `memory.x`: the KV store stays pinned to the top
 of flash and only the code region grows. A 16 MB board just gets more (unused)
 code headroom. The credential capacity is unchanged (why the flash is mostly
 empty by design: [architecture.md](architecture.md)).
+
+The KV store is 1.5 MB by default (`KVMAIN` 1408K + `KVCNT` 128K). On a **2 MB**
+board that leaves too little for the ~900K image, so the firmware can't link.
+`KVMAIN` shrinks the main partition to make room: build a 2 MB Seeed XIAO RP2350
+or Waveshare RP2350-Zero-CM with `FLASH_SIZE=2M KVMAIN=896K` (896K creds + 128K
+counters + 1024K code). build.rs bakes the size into both `memory.x` and
+`flash_storage.rs`, so the two partitions never disagree, and it rejects a split
+that leaves under 1 MB for code with a message that names the fix. A fully
+provisioned key needs only a few hundred KB, so 896K is ample.
 
 ![4 MB vs 16 MB flash layout: the KV store is identical on both; only the code region and the KV origin move with FLASH_SIZE](images/flash-map-sizes.svg)
 
