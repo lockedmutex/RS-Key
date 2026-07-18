@@ -588,6 +588,12 @@ impl Ui {
                 rsk_fido::PinEntry::Entered(n) => n.min(new.len()),
                 _ => break, // declined / timeout / host yield — nothing set
             };
+            // Refuse a guessable PIN before the confirm step, matching the host set path.
+            #[cfg(any(feature = "strong-pin", feature = "fips-profile"))]
+            if rsk_fido::passkeys::pin_is_trivial(&new[..n1]) {
+                new_caption = Some(PinCaption::TooWeak);
+                continue;
+            }
             let n2 = match self.collect_pin(
                 title,
                 Some(PinCaption::Reenter),

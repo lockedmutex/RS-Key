@@ -747,16 +747,80 @@ fn fips_min_pin_floor_is_six() {
         ),
         Err(CtapError::PinPolicyViolation)
     );
-    // …six pass.
+    // …a trivial six (an ascending run) is refused like the length floor…
+    assert_eq!(
+        run(
+            &mut fs,
+            &mut rng,
+            &mut state,
+            &plat.set_pin_req(b"123456"),
+            &mut out
+        ),
+        Err(CtapError::PinPolicyViolation)
+    );
+    // …and a non-trivial six passes.
     run(
         &mut fs,
         &mut rng,
         &mut state,
-        &plat.set_pin_req(b"123456"),
+        &plat.set_pin_req(b"135790"),
         &mut out,
     )
     .unwrap();
     assert!(fs.has_data(EF_PIN));
+}
+
+#[cfg(feature = "strong-pin")]
+#[test]
+fn strong_pin_floor_is_six() {
+    let (mut fs, mut rng) = setup();
+    let mut state = FidoState::new();
+    let plat = key_agreement(&mut fs, &mut rng, &mut state, PinProto::Two, 2);
+    let mut out = [0u8; 256];
+    // Four code points sit under the strong-pin floor.
+    assert_eq!(
+        run(
+            &mut fs,
+            &mut rng,
+            &mut state,
+            &plat.set_pin_req(b"1234"),
+            &mut out
+        ),
+        Err(CtapError::PinPolicyViolation)
+    );
+    // A non-trivial six-code-point PIN passes.
+    run(
+        &mut fs,
+        &mut rng,
+        &mut state,
+        &plat.set_pin_req(b"135790"),
+        &mut out,
+    )
+    .unwrap();
+    assert!(fs.has_data(EF_PIN));
+}
+
+#[cfg(feature = "strong-pin")]
+#[test]
+fn strong_pin_rejects_trivial() {
+    // A repeated digit, an ascending run, and a descending run are refused at length six.
+    for weak in [b"000000", b"123456", b"654321"] {
+        let (mut fs, mut rng) = setup();
+        let mut state = FidoState::new();
+        let plat = key_agreement(&mut fs, &mut rng, &mut state, PinProto::Two, 2);
+        let mut out = [0u8; 256];
+        assert_eq!(
+            run(
+                &mut fs,
+                &mut rng,
+                &mut state,
+                &plat.set_pin_req(weak),
+                &mut out
+            ),
+            Err(CtapError::PinPolicyViolation)
+        );
+        assert!(!fs.has_data(EF_PIN));
+    }
 }
 
 #[test]

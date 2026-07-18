@@ -15,6 +15,15 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Added
 
+- **`strong-pin` build feature — stronger PIN policy for the FIDO clientPIN.** A new
+  opt-in cargo feature that raises the clientPIN minimum to **6** code points (from
+  CTAP's default 4) and refuses trivially guessable PINs — a single repeated digit, or
+  a ±1 run like `123456` / `654321` — on both the host `setPIN`/`changePIN` path and the
+  trusted-display PIN pad. Off by default; the default build is unchanged. `fips-profile`
+  now bundles this same PIN policy. Motivated by the RP2350 BOOTSEL flash snapshot/restore
+  that rolls back the wrong-PIN counter ([#37](https://github.com/TheMaxMur/RS-Key/issues/37)):
+  with the retry ceiling removed, PIN entropy is the practical brute-force bound. See
+  [docs/build.md](docs/build.md) and [docs/threat-model.md](docs/threat-model.md).
 - **`LED_POWER_PIN` build knob — support boards whose LED is power-gated.** A new
   compile-time env knob names an optional GPIO the firmware drives **high at boot**
   to power a gated LED rail, then holds for the device's lifetime. This is what the

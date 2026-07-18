@@ -334,13 +334,16 @@ pub enum PinCaption {
     ChoosePin,
     /// The set flow's second step (`confirmpin`): a muted "Re-enter to confirm" prompt.
     Reenter,
+    /// The set flow refused a trivially guessable PIN (the `strong-pin` / `fips-profile`
+    /// policy): a danger-coloured re-prompt.
+    TooWeak,
 }
 
 impl PinCaption {
     /// Whether this caption is a rejection (danger-coloured) rather than an informational
     /// hint (muted) — the renderer colours the line by this.
     pub const fn is_rejection(self) -> bool {
-        matches!(self, Self::WrongPin { .. } | Self::Mismatch)
+        matches!(self, Self::WrongPin { .. } | Self::Mismatch | Self::TooWeak)
     }
 }
 

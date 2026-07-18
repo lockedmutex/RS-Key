@@ -23,6 +23,10 @@ use crate::credential::{
     credential_load, seal_nick, slot_map, unseal_nick, unseal_rp_id,
 };
 
+/// The trivial-PIN predicate the `strong-pin` / `fips-profile` builds enforce, re-exported
+/// so the display PIN pad rejects a guessable PIN at entry (the host path already does).
+#[cfg(any(feature = "strong-pin", feature = "fips-profile"))]
+pub use crate::clientpin::pin_is_trivial;
 /// The device-local PIN seam for a display-initiated action, re-exported here so the
 /// trusted display reaches the whole on-device Passkeys/PIN seam — read walks,
 /// [`delete_cred`], the PIN check ([`spend_and_verify_local_pin`]) and the on-device set/change
