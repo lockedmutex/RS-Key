@@ -281,6 +281,16 @@ async fn ccid_task(mut ccid: Ccid<'static, Drv, ClientCcid>) {
     ccid.run().await;
 }
 
+// The worker is spawned, not awaited at the tail of `main`, so `main` returns and
+// its ~95 KiB one-time init stack frame is reclaimed off the shared MSP before any
+// crypto runs. Awaiting it inline kept that frame live under every dispatch, which
+// left ML-DSA-65 keygen flush against the stack ceiling (it halted on the next
+// interrupt). Must stay on the thread executor, never `hp`, so keepalives keep flowing.
+#[embassy_executor::task]
+async fn worker_task(mut worker: Worker<'static>) {
+    worker.run().await;
+}
+
 unsafe extern "C" {
     static __kvmain_start: u32;
     static __kvmain_end: u32;
@@ -430,7 +440,7 @@ async fn main(spawner: Spawner) {
     config.max_power = 100;
     config.max_packet_size_0 = 64;
     // bcdDevice build counter; also surfaced on the trusted-display Firmware screen.
-    let device_release: u16 = 0x082A;
+    let device_release: u16 = 0x082B;
     config.device_release = device_release;
 
     let mut builder = Builder::new(
@@ -790,11 +800,6 @@ async fn main(spawner: Spawner) {
         spawner.spawn(display::status_task(ui).unwrap());
         ui
     };
-    // `spawner` is otherwise unused (the standard key spawns on the interrupt
-    // executor `hp`); consume it so `-D warnings` passes without the display task.
-    #[cfg(not(feature = "display"))]
-    let _ = spawner;
-
     core1::spawn(p.CORE1);
 
     // Standard key: BOOTSEL by default, or a dedicated `PRESENCE_PIN` GPIO button.
@@ -814,7 +819,7 @@ async fn main(spawner: Spawner) {
     let platform_ref = RESCUE_PLATFORM.init(RefCell::new(rescue_platform::RescuePlatform));
     let (kvm, kvc) = (kvmain_range(), kvcnt_range());
     let kv_total = (kvm.end - kvm.start) + (kvc.end - kvc.start);
-    let mut worker = Worker::new(
+    let worker = Worker::new(
         fs_ref,
         rng_ref,
         presence_ref,
@@ -825,5 +830,5 @@ async fn main(spawner: Spawner) {
         otp_devk,
         kv_total,
     );
-    worker.run().await;
+    spawner.spawn(worker_task(worker).unwrap());
 }

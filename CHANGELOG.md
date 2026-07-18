@@ -66,6 +66,17 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Fixed
 
+- **Post-quantum ML-DSA-65 `makeCredential` no longer hard-faults the device.**
+  Requesting an ML-DSA-65 (COSE alg `-49`) credential wedged the FIDO worker on the
+  RP2350: the compute worker ran nested under `main`'s ~95 KiB one-time init stack
+  frame (it was `await`ed at the tail of `#[embassy_executor::main]`), which left
+  ML-DSA-65's ~92 KiB keygen chain flush against the shared main-stack ceiling — the
+  next USB/keepalive interrupt overran it into the heap and halted the core. (ML-DSA-44
+  fit with ~27 KiB to spare and was unaffected, which is why only the larger parameter
+  set failed.) The worker now runs as its own thread-executor task, so `main` returns
+  and that init frame is reclaimed, restoring ~90 KiB of headroom. Firmware-only; no
+  wire-format or at-rest change. Latent in shipped builds (ML-DSA is not advertised
+  without `advertise-pqc`, so no platform requested it).
 - **`always-uv` and `strict-up` built together no longer break `ssh-sk`.** With both
   features on, `ssh -i` failed with "device not found": the platform's silent
   `up:false` pre-flight (credential discovery) was refused with `CTAP2_ERR_PUAT_REQUIRED`
