@@ -18,7 +18,7 @@ See [production.md](production.md) for that.
 
 | Layer | Artifact | What it proves |
 |---|---|---|
-| Reproducible build | the 8 `.uf2` flavors | the binary is a pure function of the source at the tag. Anyone can rebuild it |
+| Reproducible build | the 11 `.uf2` flavors | the binary is a pure function of the source at the tag. Anyone can rebuild it |
 | Repro **gate** | (CI, blocking) | the release job *fails* if any flavor doesn't rebuild bit-identical, so a non-reproducible image is never published |
 | Checksums + signature | `SHA256SUMS` + `SHA256SUMS.cosign.bundle` | the hashes were signed by this repo's release workflow (keyless cosign) |
 | Build provenance | a GitHub **attestation** (not a release file) | which reusable workflow, at which commit, on which runner built each `.uf2`. **SLSA v1 Build L3**, keyless via `attest-build-provenance` |
@@ -38,7 +38,7 @@ nix build .#firmware            # or .#firmware-pqc, .#firmware-fips, …
 sha256sum result/firmware.uf2   # compare against SHA256SUMS
 ```
 
-CI already enforces this: the release job rebuilds all eight flavors with
+CI already enforces this: the release job rebuilds all eleven flavors with
 `nix build --rebuild` and fails on any bit-level difference before publishing.
 
 ### 2. Checksum signature (keyless cosign)

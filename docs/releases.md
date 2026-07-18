@@ -7,8 +7,9 @@ It builds every artifact reproducibly, hashes it, and signs the manifest.
 
 ## What a release contains
 
-- **Eight firmware images**: `rs-key-<tag>-<flavor>.uf2`, the cross product of
-  the build flags (`no-touch` × `advertise-pqc` × `fips-profile`):
+- **Eleven firmware images**: `rs-key-<tag>-<flavor>.uf2`. Every published image
+  requires a physical touch; the `no-touch` test builds are never released (a
+  signed presence-bypass asset would remove the consent gate):
 
   | flavor | flags | use |
   |---|---|---|
@@ -16,10 +17,15 @@ It builds every artifact reproducibly, hashes it, and signs the manifest.
   | `pqc` | + advertise-pqc | advertises ML-DSA-65 and ML-DSA-44 in getInfo (breaks old Firefox) |
   | `fips` | + fips-profile | the locked FIPS-style policy ([guides/fips.md](guides/fips.md)) |
   | `fips-pqc` | + both | |
-  | `no-touch` | presence off | **test builds**: the automated suites can't press a button |
-  | `no-touch-pqc` / `no-touch-fips` / `no-touch-fips-pqc` | … | test variants |
+  | `strong-pin` | + strong-pin | 6-code-point PIN floor + trivial-PIN block ([build.md](build.md), [threat-model.md](threat-model.md)) |
+  | `strong-pin-pqc` | + both | |
+  | `always-uv` | + always-uv | bakes CTAP 2.1 `alwaysUv` on: user verification (a PIN) for every operation, U2F disabled. Set a PIN after flashing ([build.md](build.md)) |
+  | `always-uv-pqc` | + both | |
+  | `strict-up` | + strict-up | **not spec-conformant:** a touch on *every* assertion, so a WebAuthn `allowCredentials` login asks for two touches ([build.md](build.md)). Pick it only if you want that stricter stance |
+  | `strict-up-pqc` | + both | |
+  | `display` | + display | experimental trusted-display build (Waveshare RP2350-Touch-LCD-2.8, [guides/display.md](guides/display.md)) |
 
-  All eight present the default **RS-Key** USB identity (`0x1209:0x0001`). For the
+  All eleven present the default **RS-Key** USB identity (`0x1209:0x0001`). For the
   YubiKey-interop identity, build `VIDPID=Yubikey5` yourself ([build.md](build.md)).
 - **`SHA256SUMS`**: a checksum for every image and the SBOM.
 - **`SHA256SUMS.cosign.bundle`**: a keyless [cosign](https://docs.sigstore.dev/)

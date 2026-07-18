@@ -147,6 +147,9 @@ check the seal with `picotool`. The flavors mirror the
 | `.#firmware-no-touch` | `--features no-touch` (the test build) |
 | `.#firmware-fips` | `--features fips-profile` |
 | `.#firmware-pqc` | `--features advertise-pqc` |
+| `.#firmware-strong-pin` | `--features strong-pin` (6-code-point PIN floor + trivial-PIN block; also `.#firmware-strong-pin-pqc`) |
+| `.#firmware-always-uv` | `--features always-uv` (CTAP 2.1 `alwaysUv` on by default; also `.#firmware-always-uv-pqc`) |
+| `.#firmware-strict-up` | `--features strict-up` (touch on every assertion — **not spec-conformant** for `up:false`; also `.#firmware-strict-up-pqc`) |
 | `.#firmware-display` | `--features display`, `FLASH_SIZE=16M`, `LED_KIND=none` (experimental, Waveshare RP2350-Touch-LCD-2.8) |
 
 Two caveats:

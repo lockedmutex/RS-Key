@@ -6,8 +6,10 @@
 #             `nix develop -c ./scripts/check.sh` (docs/testing.md, "CI parity").
 #             Green locally means green here; no CI-only logic to drift.
 #   flavors — every feature combination of the firmware (no-touch ×
-#             advertise-pqc × fips-profile) plus the trusted-display build, each
-#             packaged as a downloadable firmware-<flavor>.uf2 artifact.
+#             advertise-pqc × fips-profile), the strong-pin / always-uv /
+#             strict-up behavior flavors (each with a pqc pair), and the
+#             trusted-display build, each packaged as a downloadable
+#             firmware-<flavor>.uf2 artifact.
 #   knobs   — build smokes for the compile-time env knobs (docs/build.md):
 #             all VIDPID presets, FW_VERSION, XOSC_DELAY_MULT, FAKE_* test
 #             keys, and a check that the default build bakes this project's own
@@ -71,6 +73,18 @@ jobs:
             args: "--features fips-profile"
           - name: fips-pqc
             args: "--features fips-profile,advertise-pqc"
+          - name: strong-pin
+            args: "--features strong-pin"
+          - name: strong-pin-pqc
+            args: "--features strong-pin,advertise-pqc"
+          - name: always-uv
+            args: "--features always-uv"
+          - name: always-uv-pqc
+            args: "--features always-uv,advertise-pqc"
+          - name: strict-up
+            args: "--features strict-up"
+          - name: strict-up-pqc
+            args: "--features strict-up,advertise-pqc"
           - name: no-touch
             args: "--features no-touch"
           - name: no-touch-pqc
