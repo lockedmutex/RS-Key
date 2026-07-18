@@ -371,11 +371,11 @@ fn enforce_pin<S: Storage, R: Rng>(
         // platform's silent up:false pre-flight (credential discovery, e.g.
         // ssh-sk) is exempt — CTAP 2.1 §6.2.2 step 5 guards the PUAT_REQUIRED
         // path on the `up` option being present and true. Without the exemption
-        // the probe fails and OpenSSH reports "device not found". strict-up
-        // asserts presence on every call, so there the exemption disappears.
-        None if want_up(req) && crate::config::always_uv_enabled(ctx.fs) => {
-            Err(CtapError::PuatRequired)
-        }
+        // the probe fails and OpenSSH reports "device not found". Key this on the
+        // raw `up`, NOT want_up: strict-up adds a button poll on the probe (below)
+        // but must not turn the probe into a PUAT_REQUIRED refusal — that re-broke
+        // ssh-sk whenever always-uv and strict-up combined (issue #34 follow-up).
+        None if req.up && crate::config::always_uv_enabled(ctx.fs) => Err(CtapError::PuatRequired),
         None => Ok(false),
     }
 }

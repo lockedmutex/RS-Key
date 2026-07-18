@@ -66,6 +66,14 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Fixed
 
+- **`always-uv` and `strict-up` built together no longer break `ssh-sk`.** With both
+  features on, `ssh -i` failed with "device not found": the platform's silent
+  `up:false` pre-flight (credential discovery) was refused with `CTAP2_ERR_PUAT_REQUIRED`
+  because the alwaysUv gate keyed on the `strict-up`-forced presence flag rather than the
+  request's raw `up` option. It now keys on `up` (CTAP 2.1 §6.2.2 step 5), so the probe is
+  exempt from the PUAT refusal regardless of `strict-up`. `strict-up` still polls the
+  button on the probe (its deliberate two-touch behavior); only the spurious refusal is
+  gone. Reported for v0.3.7 ([#34](https://github.com/TheMaxMur/RS-Key/issues/34)).
 - **PIV stays detectable by OpenSC after the OpenPGP applet has been used.** The
   PIV `SELECT` application property template placed the NIST RID directly under
   tag `79` instead of the required nested `4F`. OpenSC's `piv_match_card` then
