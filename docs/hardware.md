@@ -88,17 +88,21 @@ Most RP2350A boards work with at most a one-line change. Everything else
 
 ## Enclosures
 
-A bare board works fine, but a printed case makes it pocketable. Two community
+A bare board works fine, but a printed case makes it pocketable. Three community
 designs fit the boards above:
 
 - **[Waveshare RP2040-One / RP2350-One case](https://www.printables.com/model/1129764-waveshare-rp2040-one-and-rp2350-one-case)**
   by Patrick van der Leer. Sized for the reference board.
 - **[RP2350 USB case](https://www.printables.com/model/1248338-rp2350-usb-case)**
   by Vladimir Varzaru (a remix of Patrick's design). A slimmer USB-stick form.
+- **[Pico 2 Zero FIDO2 case (RP2350)](https://makerworld.com/en/models/2655625-pico-2-zero-fido2-case-rp2350)**
+  on MakerWorld. Fits the RP2350-Zero.
 
-Both are licensed **CC BY-SA 4.0**: print, sell, and remix them freely, as long
-as you credit the authors and keep any derivative under the same license. They
-are third-party designs, linked for convenience, not part of this project.
+The two Printables designs are licensed **CC BY-SA 4.0**: print, sell, and remix
+them freely, as long as you credit the authors and keep any derivative under the
+same license. Check the MakerWorld design's own license on its page before
+reusing it. All are third-party designs, linked for convenience, not part of
+this project.
 
 ## What the hardware does not give you
 

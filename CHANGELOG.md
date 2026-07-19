@@ -13,6 +13,59 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+## [0.3.10] - 2026-07-20
+
+### Fixed
+
+- **`authenticatorReset` could hang the device on a heavily-provisioned key.** The
+  FIDO factory reset wiped its files with `Fs::delete`, which skips the backend
+  removal when its in-RAM present-cache reads the key as absent. A torn-migration
+  false-absent key (live in flash, present bit clear) was therefore never removed,
+  yet the reset's `for_each_key` pass — which reads the backend directly — kept
+  re-finding it, so the wipe looped forever and the authenticator wedged until a
+  power cycle (the on-device LED froze). Reset now removes each FIDO file
+  unconditionally (`Fs::force_delete`, as the trusted-display factory wipe already
+  did) and aborts on a backend error rather than retrying it, so the wipe always
+  terminates. Surfaced on a well-worn test key; a fresh key was unaffected.
+  **bcdDevice → 0x0830.**
+
+### Security
+
+- **A `getAssertion` that matches no credential now asks for a touch before
+  reporting "no credentials".** Previously the authenticator returned
+  `CTAP2_ERR_NO_CREDENTIALS` immediately — the CTAP 2.1 §6.2.2 reference order,
+  which lists the disclosure before the user-presence step — so anyone holding the
+  plugged-in (PIN-locked) device could probe whether a credential exists for a
+  given RP, or for a specific credential id, without any user gesture: a fast
+  `0x2e` meant "absent", a touch prompt meant "present". An interactive request
+  (`up` true) now polls the button before disclosing the miss, for both
+  discoverable and allowList lookups, matching a genuine YubiKey (which does the
+  same and passes FIDO conformance). The platform's silent `up:false` pre-flight
+  (WebAuthn / ssh-sk credential discovery) stays touch-free and still fast-fails,
+  so login latency and ssh-sk are unaffected. **bcdDevice → 0x082F.**
+- **The FIDO `pinUvAuthToken` now expires instead of living for the whole power
+  cycle.** A minted PIN/UV auth token carried no usage timer (CTAP 2.1 §6.5.5.7
+  was unimplemented), so once issued it stayed valid until the next reboot. It
+  now runs the spec's usage timer, checked before every CBOR command: a **30 s
+  rolling inactivity window** — each token-authorized command (`makeCredential`,
+  `getAssertion`, `credentialManagement`, `largeBlobs` write, `authenticatorConfig`,
+  the vendor MSE channel) pushes the deadline out — bounded by a **10-minute
+  absolute cap** from issuance that fires even under constant use. Impact was low
+  — the token is RAM-only (a reboot always cleared it), it cannot be minted
+  without the PIN, and `makeCredential`/`getAssertion` still require a fresh
+  physical touch regardless; the practical exposure was a host that had already
+  captured the token driving touch-free `credentialManagement` enumeration or
+  deletion — but a bounded lifetime closes the gap. Found comparing the FIDO
+  clientPIN state machine against the upstream lineage's own token-expiry fix.
+  **bcdDevice → 0x082E.**
+- **`rsk lock enable --key-out` no longer leaves the lock key briefly
+  world-readable.** The key file was `chmod 0600`-ed only *after* the write
+  finished and the descriptor closed, so the 32-byte host lock key (it wraps the
+  FIDO seed) sat at the umask default in between, and the `chmod` followed a
+  symlink swapped in during the window. The file is now created `0600` atomically
+  with `O_EXCL`. Host-only (`rsk` → 0.3.13); `--key-out` is a test-only flag and
+  the normal flow only prints the key to stdout, so exposure was minor.
+
 ## [0.3.9] - 2026-07-19
 
 ### Fixed
@@ -1853,7 +1906,8 @@ family that keeps the "enterprise" features in the open tree.
   signature of it, and a CycloneDX SBOM. See
   [docs/releases.md](docs/releases.md) to verify a download.
 
-[Unreleased]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.9...HEAD
+[Unreleased]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.10...HEAD
+[0.3.10]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.9...v0.3.10
 [0.3.9]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.8...v0.3.9
 [0.3.8]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.7...v0.3.8
 [0.3.7]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.6...v0.3.7

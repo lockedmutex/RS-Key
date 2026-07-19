@@ -328,6 +328,20 @@ impl<S: Storage> Fs<S> {
         Ok(())
     }
 
+    /// Delete `fid`, removing it from the backend UNCONDITIONALLY (unlike
+    /// [`delete`](Self::delete), which skips the backend when the present-cache reads
+    /// absent). A torn-migration false-absent key — live in the backend, present bit
+    /// clear — is still removed; otherwise `authenticatorReset`'s re-enumerating wipe
+    /// (it reads the backend directly) keeps re-finding it and loops forever.
+    pub fn force_delete(&mut self, fid: u16) -> Result<()> {
+        let _ = self.meta_delete(fid);
+        self.storage.remove(fid)?;
+        self.mark_absent(fid);
+        self.dynamic.retain(|&f| f != fid);
+        self.write_gen = self.write_gen.wrapping_add(1);
+        Ok(())
+    }
+
     // ---- typed key-slot API ----
     // Secret key material reaches flash only through these. They delegate to the
     // plaintext primitives, but because a [`KeyFid`] is not a `u16` and

@@ -66,6 +66,30 @@ fn put_read_size() {
 }
 
 #[test]
+fn force_delete_removes_a_false_absent_key() {
+    const CRED: u16 = 0xCF05;
+    // A torn-migration false-absent key: live in the backend, present bit clear.
+    // Model it by writing through one Fs, extracting the backend, and re-wrapping
+    // WITHOUT a scan — the new Fs never learned the key is present.
+    let backend = || {
+        let mut seed = fs();
+        seed.put(CRED, &[0u8; 8]).unwrap();
+        seed.into_storage()
+    };
+
+    // delete() is gated on the (clear) present bit, so it skips the backend removal:
+    // the key survives (has_data probes the backend and finds it still there).
+    let mut a = Fs::new(backend());
+    a.delete(CRED).unwrap();
+    assert!(a.has_data(CRED), "delete skips a false-absent key");
+
+    // force_delete() removes it unconditionally.
+    let mut b = Fs::new(backend());
+    b.force_delete(CRED).unwrap();
+    assert!(!b.has_data(CRED), "force_delete removes a false-absent key");
+}
+
+#[test]
 fn factory_wipe_erases_all_but_preserved() {
     let mut fs = fs();
     fs.put(0x1080, b"pin").unwrap();

@@ -181,6 +181,10 @@ pub fn process_cbor<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, data: &[u8], out: &
         return 1;
     };
 
+    // Retire a pinUvAuthToken whose usage timer has elapsed before it can
+    // authorize this command (CTAP 2.1 §6.5.5.7).
+    ctx.state.expire_stale_token(ctx.now_ms);
+
     let result = match cmd {
         consts::CTAP_GET_INFO => {
             // minPINLength / forceChangePin come from EF_MINPINLEN ([len, force]).

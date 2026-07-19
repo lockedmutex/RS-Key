@@ -359,6 +359,7 @@ fn enforce_pin<S: Storage, R: Rng>(
             {
                 return Err(CtapError::PinAuthInvalid);
             }
+            ctx.state.mark_token_used(ctx.now_ms);
             // Bind an unscoped token to this rpId on first use (CTAP 2.1 §6.2.2),
             // as makeCredential does — else it stays reusable across RPs.
             if !ctx.state.paut.has_rp_id {
@@ -571,6 +572,12 @@ fn get_assertion_inner<S: Storage, R: Rng>(
     resolve_credential(ctx, req, rp_id_hash, seed, uv, &mut best);
 
     if !best.any {
+        // Poll presence BEFORE disclosing no-match so the device isn't a silent
+        // credential-existence oracle (matches YubiKey; §6.2.2 discloses first, but
+        // requiring the gesture is spec-permitted). up:false pre-flight stays silent.
+        if want_up {
+            ctx.require_presence(crate::Confirm::new("Sign in?", req.rp_id.as_bytes(), &[]))?;
+        }
         return Err(CtapError::NoCredentials);
     }
 

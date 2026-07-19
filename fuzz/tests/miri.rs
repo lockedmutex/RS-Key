@@ -543,7 +543,7 @@ fn miri_fido_credmgmt() {
         let mut state = FidoState::new();
         state.paut.token = [0x99; 32];
         state.paut.permissions = PERM_CM;
-        state.begin_using_token(false);
+        state.begin_using_token(false, 0);
         let mut out = [0u8; 2048];
         let mut presence = rsk_fido::AlwaysConfirm;
         let mut ctx = Ctx {
@@ -610,7 +610,7 @@ fn miri_fido_largeblobs() {
         let mut state = FidoState::new();
         state.paut.token = [0x99; 32];
         state.paut.permissions = PERM_LBW;
-        state.begin_using_token(false);
+        state.begin_using_token(false, 0);
         let mut out = [0u8; 2048];
         let mut presence = rsk_fido::AlwaysConfirm;
         let mut ctx = Ctx {
@@ -1512,7 +1512,7 @@ fn miri_fido_session() {
     let mut state = FidoState::new();
     state.paut.token = [0x99; 32];
     state.paut.permissions = PERM_MC | PERM_GA | PERM_CM | PERM_LBW | PERM_ACFG | PERM_PCMR;
-    state.begin_using_token(false);
+    state.begin_using_token(false, 0);
 
     // One session: token-armed queries, a reset mid-way, then getInfo must
     // still succeed against the wiped store.

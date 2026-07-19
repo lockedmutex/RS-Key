@@ -149,7 +149,7 @@ impl Authr {
         let token = [0x99u8; 32];
         self.state.paut.token = token;
         self.state.paut.permissions = permissions;
-        self.state.begin_using_token(false);
+        self.state.begin_using_token(false, self.clock);
         token
     }
 

@@ -543,6 +543,7 @@ fn pin_gate<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>, req: &Req) -> Result<(), Ct
         {
             return Err(CtapError::PinAuthInvalid);
         }
+        ctx.state.mark_token_used(ctx.now_ms);
     }
     Ok(())
 }
