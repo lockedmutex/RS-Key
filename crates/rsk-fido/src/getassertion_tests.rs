@@ -1022,10 +1022,106 @@ fn no_matching_credentials() {
         state: &mut state,
         now_ms: 0,
     };
-    // No credentials registered, no allowList → NoCredentials.
+    // No credentials registered → NoCredentials (a touch is polled first now; the
+    // AlwaysConfirm presence auto-confirms, so the disclosed result is unchanged).
     assert_eq!(
         get_assertion(&mut ctx, &ga_request(None), &mut out),
         Err(CtapError::NoCredentials)
+    );
+}
+
+// A up:true getAssertion that matches no credential polls the button BEFORE
+// returning NoCredentials, so a plugged-in device is not a silent
+// credential-existence oracle (matches a genuine YubiKey). A declined touch
+// surfaces as OperationDenied — proving the poll ran — for both a discoverable
+// walk and an allowList miss; the silent up:false pre-flight stays touch-free and
+// still fast-fails NoCredentials (ssh-sk credential discovery).
+#[cfg(not(feature = "strict-up"))]
+#[test]
+fn no_match_polls_presence_before_disclosing() {
+    let (mut fs, mut rng) = setup();
+    let fake = [0x5Au8; CRED_RESIDENT_LEN]; // a resident-length id that matches nothing
+    let mut out = [0u8; 256];
+
+    // (A) discoverable (no allowList), up:true default → button polled → declined.
+    {
+        let mut state = crate::FidoState::new();
+        let mut presence = Decline;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 10,
+        };
+        assert_eq!(
+            get_assertion(&mut ctx, &ga_request(None), &mut out),
+            Err(CtapError::OperationDenied),
+            "discoverable no-match must poll the button before NoCredentials",
+        );
+    }
+    // (B) allowList carrying an unknown id, up:true default → same.
+    {
+        let mut state = crate::FidoState::new();
+        let mut presence = Decline;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 20,
+        };
+        assert_eq!(
+            get_assertion(&mut ctx, &ga_request(Some(&fake)), &mut out),
+            Err(CtapError::OperationDenied),
+            "allowList miss must poll the button before NoCredentials",
+        );
+    }
+    // up:false silent pre-flight: no touch polled (Decline never fires) and the
+    // fast NoCredentials is preserved.
+    {
+        let mut state = crate::FidoState::new();
+        let mut presence = Decline;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 30,
+        };
+        assert_eq!(
+            get_assertion(&mut ctx, &ga_request_up(&fake, false), &mut out),
+            Err(CtapError::NoCredentials),
+            "up:false pre-flight must stay silent and fast-fail",
+        );
+    }
+}
+
+// strict-up build: even an up:false no-match polls the button (its opt-in
+// touch-on-every-assertion), so a declined touch denies before NoCredentials.
+#[cfg(feature = "strict-up")]
+#[test]
+fn strict_up_no_match_polls_presence_even_on_up_false() {
+    let (mut fs, mut rng) = setup();
+    let fake = [0x5Au8; CRED_RESIDENT_LEN];
+    let mut out = [0u8; 256];
+    let mut state = crate::FidoState::new();
+    let mut presence = Decline;
+    let mut ctx = Ctx {
+        presence: &mut presence,
+        dev: dev(),
+        fs: &mut fs,
+        rng: &mut rng,
+        state: &mut state,
+        now_ms: 10,
+    };
+    assert_eq!(
+        get_assertion(&mut ctx, &ga_request_up(&fake, false), &mut out),
+        Err(CtapError::OperationDenied),
+        "strict-up: even an up:false no-match polls the button",
     );
 }
 

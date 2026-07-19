@@ -15,6 +15,18 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ### Security
 
+- **A `getAssertion` that matches no credential now asks for a touch before
+  reporting "no credentials".** Previously the authenticator returned
+  `CTAP2_ERR_NO_CREDENTIALS` immediately — the CTAP 2.1 §6.2.2 reference order,
+  which lists the disclosure before the user-presence step — so anyone holding the
+  plugged-in (PIN-locked) device could probe whether a credential exists for a
+  given RP, or for a specific credential id, without any user gesture: a fast
+  `0x2e` meant "absent", a touch prompt meant "present". An interactive request
+  (`up` true) now polls the button before disclosing the miss, for both
+  discoverable and allowList lookups, matching a genuine YubiKey (which does the
+  same and passes FIDO conformance). The platform's silent `up:false` pre-flight
+  (WebAuthn / ssh-sk credential discovery) stays touch-free and still fast-fails,
+  so login latency and ssh-sk are unaffected. **bcdDevice → 0x082F.**
 - **The FIDO `pinUvAuthToken` now expires instead of living for the whole power
   cycle.** A minted PIN/UV auth token carried no usage timer (CTAP 2.1 §6.5.5.7
   was unimplemented), so once issued it stayed valid until the next reboot. It

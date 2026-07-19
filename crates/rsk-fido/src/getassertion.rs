@@ -572,6 +572,12 @@ fn get_assertion_inner<S: Storage, R: Rng>(
     resolve_credential(ctx, req, rp_id_hash, seed, uv, &mut best);
 
     if !best.any {
+        // Poll presence BEFORE disclosing no-match so the device isn't a silent
+        // credential-existence oracle (matches YubiKey; §6.2.2 discloses first, but
+        // requiring the gesture is spec-permitted). up:false pre-flight stays silent.
+        if want_up {
+            ctx.require_presence(crate::Confirm::new("Sign in?", req.rp_id.as_bytes(), &[]))?;
+        }
         return Err(CtapError::NoCredentials);
     }
 
