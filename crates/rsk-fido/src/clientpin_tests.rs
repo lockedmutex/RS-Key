@@ -1298,3 +1298,81 @@ fn pin_verify_fails_closed_when_the_retry_write_does_not_persist() {
         Err(CtapError::PinBlocked),
     );
 }
+
+// pinUvAuthToken rolling window (CTAP 2.1 §6.5.5.7): an unused token retires
+// once the inactivity window elapses, and not one tick sooner.
+#[test]
+fn pin_uv_auth_token_expires_after_inactivity_window() {
+    use crate::consts::PUAT_INITIAL_USAGE_LIMIT_MS as W;
+    let mut state = FidoState::new();
+    state.paut.permissions = crate::state::PERM_CM;
+    state.begin_using_token(false, 1_000);
+
+    // One millisecond short of the window: still live.
+    state.expire_stale_token(1_000 + W - 1);
+    assert!(state.paut.in_use);
+    assert!(state.user_verified());
+
+    // Window elapsed with no use: retired, flags/permissions cleared closed.
+    state.expire_stale_token(1_000 + W);
+    assert!(!state.paut.in_use);
+    assert_eq!(state.paut.permissions, 0);
+    assert!(!state.user_verified());
+    assert!(!state.user_present());
+}
+
+// Each use rolls the deadline forward; the token then dies one window after its
+// last use, not its issuance.
+#[test]
+fn pin_uv_auth_token_rolls_forward_on_use() {
+    use crate::consts::PUAT_INITIAL_USAGE_LIMIT_MS as W;
+    let mut state = FidoState::new();
+    state.begin_using_token(false, 0);
+
+    // Used near the end of the first window: deadline moves to (W - 5000) + W.
+    state.mark_token_used(W - 5_000);
+    state.expire_stale_token(W + 1_000); // 6000 since use < W -> alive
+    assert!(state.paut.in_use);
+
+    // Used again: deadline moves again, surviving well past 2× the window.
+    state.mark_token_used(W + 1_000);
+    state.expire_stale_token(2 * W); // 29000 since use < W -> alive
+    assert!(state.paut.in_use);
+
+    // Left idle from the last use: dies exactly one window later.
+    state.expire_stale_token(W + 1_000 + W);
+    assert!(!state.paut.in_use);
+}
+
+// The absolute lifetime cap retires the token even when it is still being used
+// inside the rolling window.
+#[test]
+fn pin_uv_auth_token_hard_capped_despite_use() {
+    use crate::consts::PUAT_MAX_USAGE_PERIOD_MS as MAX;
+    let mut state = FidoState::new();
+    state.begin_using_token(false, 0);
+
+    // A fresh use 1 s before the cap — the rolling window alone would keep it
+    // alive (since_use == 1000), but the cap from issuance retires it anyway.
+    state.mark_token_used(MAX - 1_000);
+    state.expire_stale_token(MAX);
+    assert!(!state.paut.in_use);
+}
+
+// The timer never touches an idle token, never expires early on clock wrap, and
+// mark_token_used on a not-in-use token is a no-op.
+#[test]
+fn pin_uv_auth_token_timer_ignores_idle_and_wrap() {
+    let mut state = FidoState::new();
+    state.expire_stale_token(u64::MAX);
+    assert!(!state.paut.in_use);
+
+    // `now` before issuance (clock wrap): saturating_sub -> 0, so no early expiry.
+    state.begin_using_token(false, 10_000);
+    state.expire_stale_token(0);
+    assert!(state.paut.in_use);
+
+    let mut idle = FidoState::new();
+    idle.mark_token_used(12_345);
+    assert_eq!(idle.paut.last_used_ms, 0);
+}

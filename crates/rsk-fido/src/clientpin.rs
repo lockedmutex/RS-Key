@@ -360,7 +360,7 @@ fn issue_token<S: Storage, R: Rng>(
         ctx.state.ppaut_token
     } else {
         ctx.state.reset_pin_uv_auth_token(ctx.rng);
-        ctx.state.begin_using_token(false);
+        ctx.state.begin_using_token(false, ctx.now_ms);
         ctx.state.paut.permissions = permissions;
         match rp_id {
             Some(rp) => {

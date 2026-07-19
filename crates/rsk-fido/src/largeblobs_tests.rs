@@ -35,7 +35,7 @@ fn armed(perms: u8) -> FidoState {
     let mut s = FidoState::new();
     s.paut.token = TOKEN;
     s.paut.permissions = perms;
-    s.begin_using_token(false);
+    s.begin_using_token(false, 0);
     s
 }
 

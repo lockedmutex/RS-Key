@@ -448,6 +448,7 @@ fn enforce_pin<S: Storage, R: Rng>(
             {
                 return Err(CtapError::PinAuthInvalid);
             }
+            ctx.state.mark_token_used(ctx.now_ms);
             if !ctx.state.paut.has_rp_id {
                 ctx.state.paut.rp_id_hash = *rp_id_hash;
                 ctx.state.paut.has_rp_id = true;

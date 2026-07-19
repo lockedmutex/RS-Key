@@ -669,7 +669,7 @@ fn arm_pin(fs: &mut Fs<RamStorage>, state: &mut crate::FidoState) -> [u8; 32] {
     let token = [0x99u8; 32];
     state.paut.token = token;
     state.paut.permissions = PERM_MC | crate::state::PERM_GA;
-    state.begin_using_token(false);
+    state.begin_using_token(false, 0);
     token
 }
 

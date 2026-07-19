@@ -171,6 +171,7 @@ pub fn authenticator_config<S: Storage, R: Rng>(
     {
         return Err(CtapError::PinAuthInvalid);
     }
+    ctx.state.mark_token_used(ctx.now_ms);
 
     match req.subcommand {
         CONFIG_ENABLE_EA => {

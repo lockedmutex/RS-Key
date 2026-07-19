@@ -274,6 +274,15 @@ pub const MIN_PIN_LENGTH: u8 = 4;
 #[cfg(any(feature = "fips-profile", feature = "strong-pin"))]
 pub const MIN_PIN_LENGTH: u8 = 6;
 
+/// pinUvAuthToken rolling inactivity window (CTAP 2.1 §6.5.5.7 initial usage
+/// time limit): each use of the token pushes its deadline out by this much; if
+/// the window elapses with no use, the token is retired. 30 s matches USB.
+pub const PUAT_INITIAL_USAGE_LIMIT_MS: u64 = 30_000;
+/// pinUvAuthToken absolute lifetime (CTAP 2.1 §6.5.5.7 max usage time period):
+/// the token can never outlive this from issuance, even under constant use, so
+/// it cannot linger for the whole power cycle.
+pub const PUAT_MAX_USAGE_PERIOD_MS: u64 = 600_000;
+
 // U2F authenticate control byte (P1) and flags.
 pub const U2F_AUTH_ENFORCE: u8 = 0x03; // enforce user presence and sign
 pub const U2F_AUTH_CHECK_ONLY: u8 = 0x07; // is this key handle ours?

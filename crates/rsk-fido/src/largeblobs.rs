@@ -166,6 +166,7 @@ fn write_fragment<S: Storage, R: Rng>(
     if !ctx.state.verify_token(proto, &vd, param) || ctx.state.paut.permissions & PERM_LBW == 0 {
         return Err(CtapError::PinAuthInvalid);
     }
+    ctx.state.mark_token_used(ctx.now_ms);
 
     if offset + set.len() > ctx.state.lba.expected_length {
         return Err(CtapError::InvalidParameter);

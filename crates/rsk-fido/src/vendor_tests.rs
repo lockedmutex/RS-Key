@@ -743,7 +743,7 @@ const ACFG_TOKEN: [u8; 32] = [0x77; 32];
 fn arm_acfg(st: &mut FidoState) {
     st.paut.token = ACFG_TOKEN;
     st.paut.permissions = PERM_ACFG;
-    st.begin_using_token(false);
+    st.begin_using_token(false, 0);
 }
 
 /// Build a MAC'd `authenticatorConfig` vendor request

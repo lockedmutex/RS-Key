@@ -144,7 +144,7 @@ fn arm_pin(fs: &mut Fs<RamStorage>, state: &mut crate::FidoState) -> [u8; 32] {
     let token = [0x99u8; 32];
     state.paut.token = token;
     state.paut.permissions = PERM_GA;
-    state.begin_using_token(false);
+    state.begin_using_token(false, 0);
     token
 }
 
@@ -1984,7 +1984,7 @@ fn reseal_credential(
     let mut state = crate::FidoState::new();
     state.paut.token = token;
     state.paut.permissions = crate::state::PERM_CM;
-    state.begin_using_token(false);
+    state.begin_using_token(false, 0);
     let req = cm_update_request(cred_id, uid, name, &token);
     let mut out = [0u8; 512];
     let mut presence = crate::AlwaysConfirm;

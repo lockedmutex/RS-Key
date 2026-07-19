@@ -13,6 +13,24 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+### Security
+
+- **The FIDO `pinUvAuthToken` now expires instead of living for the whole power
+  cycle.** A minted PIN/UV auth token carried no usage timer (CTAP 2.1 §6.5.5.7
+  was unimplemented), so once issued it stayed valid until the next reboot. It
+  now runs the spec's usage timer, checked before every CBOR command: a **30 s
+  rolling inactivity window** — each token-authorized command (`makeCredential`,
+  `getAssertion`, `credentialManagement`, `largeBlobs` write, `authenticatorConfig`,
+  the vendor MSE channel) pushes the deadline out — bounded by a **10-minute
+  absolute cap** from issuance that fires even under constant use. Impact was low
+  — the token is RAM-only (a reboot always cleared it), it cannot be minted
+  without the PIN, and `makeCredential`/`getAssertion` still require a fresh
+  physical touch regardless; the practical exposure was a host that had already
+  captured the token driving touch-free `credentialManagement` enumeration or
+  deletion — but a bounded lifetime closes the gap. Found comparing the FIDO
+  clientPIN state machine against the upstream lineage's own token-expiry fix.
+  **bcdDevice → 0x082E.**
+
 ## [0.3.9] - 2026-07-19
 
 ### Fixed

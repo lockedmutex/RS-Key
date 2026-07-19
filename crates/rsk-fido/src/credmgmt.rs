@@ -157,25 +157,28 @@ pub fn cred_mgmt<S: Storage, R: Rng>(
         return Err(CtapError::InvalidParameter);
     }
     let proto = PinProto::from_u64(req.proto).ok_or(CtapError::InvalidParameter)?;
+    let now = ctx.now_ms;
 
     match req.subcommand {
         CM_GET_CREDS_METADATA => {
-            verify_cm(
+            authorize_cm(
                 ctx.state,
                 proto,
                 &[CM_GET_CREDS_METADATA as u8],
                 param,
                 None,
+                now,
             )?;
             creds_metadata(ctx, out)
         }
         CM_ENUMERATE_RPS_BEGIN => {
-            verify_cm(
+            authorize_cm(
                 ctx.state,
                 proto,
                 &[CM_ENUMERATE_RPS_BEGIN as u8],
                 param,
                 None,
+                now,
             )?;
             enumerate_rps(ctx, true, out)
         }
@@ -189,14 +192,14 @@ pub fn cred_mgmt<S: Storage, R: Rng>(
             let mut pbuf = [0u8; 1 + MAX_RAW_SUBPARA];
             let payload =
                 payload_with_subpara(CM_ENUMERATE_CREDS_BEGIN, req.raw_subpara, &mut pbuf)?;
-            verify_cm(ctx.state, proto, payload, param, Some(&rp_id_hash))?;
+            authorize_cm(ctx.state, proto, payload, param, Some(&rp_id_hash), now)?;
             enumerate_creds(ctx, true, &rp_id_hash, out)
         }
         CM_DELETE_CREDENTIAL => {
             let cred_id = req.cred_id.ok_or(CtapError::MissingParameter)?;
             let mut pbuf = [0u8; 1 + MAX_RAW_SUBPARA];
             let payload = payload_with_subpara(CM_DELETE_CREDENTIAL, req.raw_subpara, &mut pbuf)?;
-            verify_cm(ctx.state, proto, payload, param, None)?;
+            authorize_cm(ctx.state, proto, payload, param, None, now)?;
             delete_credential(ctx, cred_id)
         }
         CM_UPDATE_USER_INFO => {
@@ -204,21 +207,23 @@ pub fn cred_mgmt<S: Storage, R: Rng>(
             let user_id = req.user_id.ok_or(CtapError::MissingParameter)?;
             let mut pbuf = [0u8; 1 + MAX_RAW_SUBPARA];
             let payload = payload_with_subpara(CM_UPDATE_USER_INFO, req.raw_subpara, &mut pbuf)?;
-            verify_cm(ctx.state, proto, payload, param, None)?;
+            authorize_cm(ctx.state, proto, payload, param, None, now)?;
             update_user(ctx, cred_id, user_id, req.user_name, req.user_display_name)
         }
         _ => Err(CtapError::InvalidParameter),
     }
 }
 
-/// Verify the pinUvAuthParam over `payload` and check the `cm` permission and
-/// rpId binding.
-fn verify_cm(
-    state: &FidoState,
+/// Verify the pinUvAuthParam over `payload`, check the `cm` permission and rpId
+/// binding, and on success refresh the token's rolling usage window. Named
+/// `authorize` (not `verify`) because that refresh mutates the usage timer.
+fn authorize_cm(
+    state: &mut FidoState,
     proto: PinProto,
     payload: &[u8],
     param: &[u8],
     rp_id_hash: Option<&[u8; 32]>,
+    now_ms: u64,
 ) -> Result<(), CtapError> {
     if !state.verify_token(proto, payload, param) || state.paut.permissions & PERM_CM == 0 {
         return Err(CtapError::PinAuthInvalid);
@@ -231,6 +236,7 @@ fn verify_cm(
             _ => return Err(CtapError::PinAuthInvalid),
         }
     }
+    state.mark_token_used(now_ms);
     Ok(())
 }
 

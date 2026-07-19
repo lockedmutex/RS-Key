@@ -11,7 +11,10 @@ use zeroize::Zeroize;
 use rsk_crypto::pinproto::{self, PinProto, public_xy};
 
 use crate::Rng;
-use crate::consts::{MAX_CREDENTIAL_COUNT_IN_LIST, MAX_LARGE_BLOB_SIZE, MAX_RESIDENT_CREDENTIALS};
+use crate::consts::{
+    MAX_CREDENTIAL_COUNT_IN_LIST, MAX_LARGE_BLOB_SIZE, MAX_RESIDENT_CREDENTIALS,
+    PUAT_INITIAL_USAGE_LIMIT_MS, PUAT_MAX_USAGE_PERIOD_MS,
+};
 use crate::hmacsecret::{SALT_AUTH_MAX, SALT_ENC_MAX};
 
 // pinUvAuthToken permission bits.
@@ -171,6 +174,12 @@ pub struct PinUvAuthToken {
     pub has_rp_id: bool,
     pub user_present: bool,
     pub user_verified: bool,
+    /// `now_ms` when the token was issued; the absolute-lifetime cap measures
+    /// from here and never moves.
+    pub issued_at_ms: u64,
+    /// `now_ms` of the token's most recent use; the rolling inactivity window
+    /// measures from here and is pushed out by [`FidoState::mark_token_used`].
+    pub last_used_ms: u64,
 }
 
 impl PinUvAuthToken {
@@ -183,6 +192,8 @@ impl PinUvAuthToken {
             has_rp_id: false,
             user_present: false,
             user_verified: false,
+            issued_at_ms: 0,
+            last_used_ms: 0,
         }
     }
 }
@@ -311,6 +322,8 @@ impl FidoState {
         self.paut.rp_id_hash = [0; 32];
         self.paut.user_present = false;
         self.paut.user_verified = false;
+        self.paut.issued_at_ms = 0;
+        self.paut.last_used_ms = 0;
     }
 
     /// `resetPersistentPinUvAuthToken`.
@@ -319,11 +332,49 @@ impl FidoState {
         self.ppaut_permissions = 0;
     }
 
-    /// `beginUsingPinUvAuthToken`.
-    pub fn begin_using_token(&mut self, user_is_present: bool) {
+    /// `beginUsingPinUvAuthToken` — marks the token in use and starts its usage
+    /// timer at `now_ms` (CTAP 2.1 §6.5.5.7).
+    pub fn begin_using_token(&mut self, user_is_present: bool, now_ms: u64) {
         self.paut.user_present = user_is_present;
         self.paut.user_verified = true;
         self.paut.in_use = true;
+        self.paut.issued_at_ms = now_ms;
+        self.paut.last_used_ms = now_ms;
+    }
+
+    /// Refresh the rolling inactivity window after a successful token use
+    /// (CTAP 2.1 §6.5.5.7): each use defers the inactivity deadline, bounded by
+    /// the absolute [`PUAT_MAX_USAGE_PERIOD_MS`] which `issued_at_ms` still caps.
+    pub fn mark_token_used(&mut self, now_ms: u64) {
+        if self.paut.in_use {
+            self.paut.last_used_ms = now_ms;
+        }
+    }
+
+    /// `stopUsingPinUvAuthToken` — drop the in-use state, permissions, and
+    /// presence/rpId binding. The token bytes stay put; `in_use == false` and
+    /// zero permissions make every downstream check fail closed.
+    pub fn stop_using_token(&mut self) {
+        self.paut.in_use = false;
+        self.paut.permissions = 0;
+        self.paut.has_rp_id = false;
+        self.paut.rp_id_hash = [0; 32];
+        self.paut.user_present = false;
+        self.paut.user_verified = false;
+    }
+
+    /// Expire an in-use token once its usage timer has run out (CTAP 2.1
+    /// §6.5.5.7), checked before every CBOR command. Retires on either the
+    /// rolling inactivity window or the absolute lifetime cap, whichever first.
+    pub fn expire_stale_token(&mut self, now_ms: u64) {
+        if !self.paut.in_use {
+            return;
+        }
+        let since_issue = now_ms.saturating_sub(self.paut.issued_at_ms);
+        let since_use = now_ms.saturating_sub(self.paut.last_used_ms);
+        if since_issue >= PUAT_MAX_USAGE_PERIOD_MS || since_use >= PUAT_INITIAL_USAGE_LIMIT_MS {
+            self.stop_using_token();
+        }
     }
 
     /// `getUserVerifiedFlagValue` — false unless a token is in use.

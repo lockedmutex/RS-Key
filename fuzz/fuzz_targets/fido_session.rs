@@ -110,7 +110,7 @@ fuzz_target!(|data: &[u8]| {
     let mut state = FidoState::new();
     state.paut.token = [0x99; 32];
     state.paut.permissions = PERM_MC | PERM_GA | PERM_CM | PERM_LBW | PERM_ACFG | PERM_PCMR;
-    state.begin_using_token(false);
+    state.begin_using_token(false, 0);
 
     let mut presence = rsk_fido::AlwaysConfirm;
     let mut out = [0u8; 2048];

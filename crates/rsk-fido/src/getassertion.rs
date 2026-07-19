@@ -359,6 +359,7 @@ fn enforce_pin<S: Storage, R: Rng>(
             {
                 return Err(CtapError::PinAuthInvalid);
             }
+            ctx.state.mark_token_used(ctx.now_ms);
             // Bind an unscoped token to this rpId on first use (CTAP 2.1 §6.2.2),
             // as makeCredential does — else it stays reusable across RPs.
             if !ctx.state.paut.has_rp_id {
