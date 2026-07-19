@@ -636,14 +636,46 @@ impl<S: NorFlash, C: CacheImpl<K>, K: Key> MapStorage<K, S, C> {
             self.inner.cache.invalidate_cache_state();
         }
 
-        // Search for the last used page. We're gonna erase from the one after this first.
-        // If we get an early shutoff or cancellation, this will make it so that we don't return
-        // an old version of the key on the next fetch.
-        let last_used_page = self
+        // Search for the last used page. We're gonna erase from the one after this first,
+        // so the newest copy is erased LAST — that is what stops a torn remove from
+        // returning an old version of the key on the next fetch.
+        //
+        // RS-Key fix: upstream `find_first_page(PartialOpen).unwrap_or_default()` fell back
+        // to page 0 whenever there is no partial-open page (the normal steady state: a closed
+        // frontier page + an open buffer page). That inverted the erase order — page 0 (oldest)
+        // was scheduled LAST instead of the true newest page — so a power cut mid-remove erased
+        // the newest copy first and left an OLDER copy live, which `fetch_item` then returned
+        // (a rollback past the committed value). Compute the last used page exactly the way
+        // `fetch_item_with_location` does, so remove and fetch agree on which page is newest.
+        let mut last_used_page = self
             .inner
             .find_first_page(0, PageState::PartialOpen)
-            .await?
-            .unwrap_or_default();
+            .await?;
+        if last_used_page.is_none() {
+            if let Some(first_open_page) = self.inner.find_first_page(0, PageState::Open).await? {
+                let previous_page = self.inner.previous_page(first_open_page);
+                if self
+                    .inner
+                    .get_page_state_cached(previous_page)
+                    .await?
+                    .is_closed()
+                {
+                    last_used_page = Some(previous_page);
+                } else {
+                    // All pages are open: there are no items at all, so nothing to remove.
+                    self.inner.cache.unmark_dirty();
+                    return Ok(());
+                }
+            } else {
+                // No open pages — everything is closed. Should never happen; report corruption
+                // (the caller recovers by erasing the flash), the same as `fetch`.
+                return Err(Error::Corrupted {
+                    #[cfg(feature = "_test")]
+                    backtrace: std::backtrace::Backtrace::capture(),
+                });
+            }
+        }
+        let last_used_page = last_used_page.unwrap();
 
         // Go through all the pages
         for page_index in self.inner.get_pages(self.inner.next_page(last_used_page)) {

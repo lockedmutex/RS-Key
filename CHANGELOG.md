@@ -13,6 +13,24 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+## [0.3.9] - 2026-07-19
+
+### Fixed
+
+- **KV store no longer rolls a key back to an older value on a power-cut mid-delete.**
+  The vendored `sequential-storage`'s `remove_item` erased a key's page copies starting
+  from `find_first_page(PartialOpen).unwrap_or_default()`, which falls back to page 0
+  whenever there is no partial-open page (the normal steady state: a closed frontier page
+  plus an open buffer page). That inverted the intended oldest-first erase order, so a
+  power loss during a delete could erase the newest copy first and leave an older copy
+  live — which the next read then returned (a rollback past the committed value). The
+  remove path now computes the newest page the same way the read path does, so the two
+  agree. On RS-Key this was fail-closed (every stored value is AEAD-sealed and read past a
+  length/tag gate, so a resurfaced stale/short blob is rejected, not used), but it is a
+  real durability defect in the store that holds all sealed secrets. Found by the
+  `kv_durability` fuzz target; an upstream `sequential-storage` bug (fix confined to the
+  vendored fork, `third_party/sequential-storage.patch` item 3). **bcdDevice → 0x082D.**
+
 ## [0.3.8] - 2026-07-19
 
 ### Added
@@ -1835,7 +1853,8 @@ family that keeps the "enterprise" features in the open tree.
   signature of it, and a CycloneDX SBOM. See
   [docs/releases.md](docs/releases.md) to verify a download.
 
-[Unreleased]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.8...HEAD
+[Unreleased]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.9...HEAD
+[0.3.9]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.8...v0.3.9
 [0.3.8]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.7...v0.3.8
 [0.3.7]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.5...v0.3.6

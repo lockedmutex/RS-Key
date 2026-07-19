@@ -1,8 +1,8 @@
 # Local changes to sequential-storage 8.0.0, applied to the vendored copy under
 # third_party/sequential-storage/ and wired in via [patch.crates-io] in the root
-# and fuzz Cargo.toml. All confined to MapItemIter::next; the rest of the tree is
-# byte-identical to the published 8.0.0 (verified: diff -rq against the crates.io
-# source reports only src/map.rs differs).
+# and fuzz Cargo.toml. All confined to src/map.rs (MapItemIter::next and
+# remove_item_inner); the rest of the tree is byte-identical to the published 8.0.0
+# (verified: diff -rq against the crates.io source reports only src/map.rs differs).
 #
 # 1. Warm the key-pointer cache from the full-store scan the boot already runs, so
 #    the first credential enumeration after a power-cycle is O(1) per key instead of
@@ -16,11 +16,73 @@
 #    still continues, but any other Err (a genuine read fault that could hide a live
 #    page) aborts the walk, leaving the cache dirty so fetch_item's is_dirty() guard
 #    discards the partial warm.
+# 3. Fix a torn-remove rollback (an upstream durability bug, found by the kv_durability
+#    fuzz target): remove_item_inner erased pages starting from
+#    find_first_page(PartialOpen).unwrap_or_default(), which falls back to page 0 when
+#    there is no partial-open page (the normal steady state of a closed frontier page +
+#    an open buffer page). That inverted the intended oldest-first erase order, so a
+#    power cut mid-remove erased the NEWEST copy first and left an OLDER copy live —
+#    fetch_item then returned that stale value (a rollback past the committed value).
+#    Compute the last-used page exactly the way fetch_item_with_location already does,
+#    so remove and fetch agree on which page is newest. Worth reporting upstream.
 #
 # Regenerate: diff -u <pristine 8.0.0>/src/map.rs third_party/sequential-storage/src/map.rs
 
 --- a/src/map.rs
 +++ b/src/map.rs
+@@ -636,14 +636,46 @@ impl<S: NorFlash, C: CacheImpl<K>, K: Key> MapStorage<K, S, C> {
+             self.inner.cache.invalidate_cache_state();
+         }
+
+-        // Search for the last used page. We're gonna erase from the one after this first.
+-        // If we get an early shutoff or cancellation, this will make it so that we don't return
+-        // an old version of the key on the next fetch.
+-        let last_used_page = self
++        // Search for the last used page. We're gonna erase from the one after this first,
++        // so the newest copy is erased LAST — that is what stops a torn remove from
++        // returning an old version of the key on the next fetch.
++        //
++        // RS-Key fix: upstream `find_first_page(PartialOpen).unwrap_or_default()` fell back
++        // to page 0 whenever there is no partial-open page (the normal steady state: a closed
++        // frontier page + an open buffer page). That inverted the erase order — page 0 (oldest)
++        // was scheduled LAST instead of the true newest page — so a power cut mid-remove erased
++        // the newest copy first and left an OLDER copy live, which `fetch_item` then returned
++        // (a rollback past the committed value). Compute the last used page exactly the way
++        // `fetch_item_with_location` does, so remove and fetch agree on which page is newest.
++        let mut last_used_page = self
+             .inner
+             .find_first_page(0, PageState::PartialOpen)
+-            .await?
+-            .unwrap_or_default();
++            .await?;
++        if last_used_page.is_none() {
++            if let Some(first_open_page) = self.inner.find_first_page(0, PageState::Open).await? {
++                let previous_page = self.inner.previous_page(first_open_page);
++                if self
++                    .inner
++                    .get_page_state_cached(previous_page)
++                    .await?
++                    .is_closed()
++                {
++                    last_used_page = Some(previous_page);
++                } else {
++                    // All pages are open: there are no items at all, so nothing to remove.
++                    self.inner.cache.unmark_dirty();
++                    return Ok(());
++                }
++            } else {
++                // No open pages — everything is closed. Should never happen; report corruption
++                // (the caller recovers by erasing the flash), the same as `fetch`.
++                return Err(Error::Corrupted {
++                    #[cfg(feature = "_test")]
++                    backtrace: std::backtrace::Backtrace::capture(),
++                });
++            }
++        }
++        let last_used_page = last_used_page.unwrap();
+
+         // Go through all the pages
+         for page_index in self.inner.get_pages(self.inner.next_page(last_used_page)) {
 @@ -1053,14 +1053,16 @@
          data_buffer: &'a mut [u8],
      ) -> Result<Option<(K, V)>, Error<S::Error>> {
