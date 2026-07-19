@@ -44,7 +44,10 @@ pub fn reset<S: Storage, R: Rng>(ctx: &mut Ctx<S, R>) -> CtapResult {
             break;
         }
         for &fid in &keys[..n] {
-            let _ = ctx.fs.delete(fid);
+            // force_delete (unconditional), not delete: a false-absent key would be
+            // skipped yet re-yielded by for_each_key every pass — an infinite loop.
+            // Propagate a backend error rather than retry it, so the wipe progresses.
+            ctx.fs.force_delete(fid).map_err(|_| CtapError::Other)?;
         }
     }
     ctx.state.reset();

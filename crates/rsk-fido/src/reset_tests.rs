@@ -128,3 +128,43 @@ fn reset_aborts_without_touch() {
     // A declined touch wipes nothing.
     assert!(fs.has_data(EF_PIN));
 }
+
+#[test]
+fn reset_wipes_false_absent_credential_without_looping() {
+    // A torn-migration false-absent resident credential: live in the backend but
+    // with a clear present bit (build the store, then wrap it WITHOUT a scan). The
+    // pre-fix reset removed FIDO files with the present-cache-gated `delete`, which
+    // skipped such a key while `for_each_key` (reading the backend directly) kept
+    // re-yielding it — an infinite wipe loop that hung the device. `force_delete`
+    // removes unconditionally, so the wipe terminates. Reaching the asserts below
+    // (rather than hanging) IS the regression check.
+    let cred = EF_CRED + 3;
+    let ram = {
+        let mut seed_fs = Fs::new(RamStorage::new());
+        let mut rng = SeqRng(1);
+        ensure_seed(&dev(), &mut seed_fs, &mut rng).unwrap();
+        seed_fs.put(cred, &[0u8; 100]).unwrap();
+        seed_fs.into_storage()
+    };
+    let mut fs = Fs::new(ram); // no scan → every file, incl. the cred, is false-absent
+    let mut rng = SeqRng(2);
+    let mut state = FidoState::new();
+    {
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 0,
+        };
+        reset(&mut ctx).unwrap();
+    }
+    assert!(
+        !fs.has_data(cred),
+        "reset must wipe even a false-absent credential"
+    );
+    // And it still fully re-provisions afterwards.
+    assert!(load_keydev(&dev(), &mut fs).is_some());
+}

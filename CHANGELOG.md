@@ -13,6 +13,20 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+### Fixed
+
+- **`authenticatorReset` could hang the device on a heavily-provisioned key.** The
+  FIDO factory reset wiped its files with `Fs::delete`, which skips the backend
+  removal when its in-RAM present-cache reads the key as absent. A torn-migration
+  false-absent key (live in flash, present bit clear) was therefore never removed,
+  yet the reset's `for_each_key` pass — which reads the backend directly — kept
+  re-finding it, so the wipe looped forever and the authenticator wedged until a
+  power cycle (the on-device LED froze). Reset now removes each FIDO file
+  unconditionally (`Fs::force_delete`, as the trusted-display factory wipe already
+  did) and aborts on a backend error rather than retrying it, so the wipe always
+  terminates. Surfaced on a well-worn test key; a fresh key was unaffected.
+  **bcdDevice → 0x0830.**
+
 ### Security
 
 - **A `getAssertion` that matches no credential now asks for a touch before
