@@ -13,6 +13,8 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+## [0.3.10] - 2026-07-20
+
 ### Fixed
 
 - **`authenticatorReset` could hang the device on a heavily-provisioned key.** The
@@ -1904,7 +1906,8 @@ family that keeps the "enterprise" features in the open tree.
   signature of it, and a CycloneDX SBOM. See
   [docs/releases.md](docs/releases.md) to verify a download.
 
-[Unreleased]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.9...HEAD
+[Unreleased]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.10...HEAD
+[0.3.10]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.9...v0.3.10
 [0.3.9]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.8...v0.3.9
 [0.3.8]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.7...v0.3.8
 [0.3.7]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.6...v0.3.7
