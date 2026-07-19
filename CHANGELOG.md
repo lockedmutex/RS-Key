@@ -113,6 +113,12 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   that wedged the authenticator until replug. `rsa_from_pqe` now rejects a
   degenerate prime as a bad key (`EXEC_ERROR`). Found by the new `openpgp_key_load`
   fuzz target.
+- **The TUI cockpit can no longer be hung by a counterfeit device.** `rsk-tui`'s CCID
+  `get_data_full` chained `61xx` GET RESPONSE with no bound, so a device that answered
+  every GET RESPONSE with a bare `61 00` spun the synchronous event loop forever (and a
+  data-carrying variant grew memory without limit) — reached unauthenticated on startup
+  and on every 5 s refresh. The chaining is now bounded by a round and byte cap.
+  Host-tool only (`tools/tui` → 0.3.1); found by an internal security review.
 
 ## [0.3.7] - 2026-07-17
 

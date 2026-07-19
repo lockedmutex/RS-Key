@@ -807,17 +807,39 @@ impl Ccid {
     /// GET DATA (00 CA P1 P2) with 61xx GET RESPONSE chaining, so a DO larger than
     /// one APDU (the OpenPGP `6E` template) comes back whole.
     fn get_data_full(&mut self, p1: u8, p2: u8) -> Result<Vec<u8>, String> {
-        let (mut out, mut s1, mut s2) = self.apdu(&[0x00, 0xCA, p1, p2, 0x00])?;
-        while s1 == 0x61 {
-            let (more, ns1, ns2) = self.apdu(&[0x00, 0xC0, 0x00, 0x00, s2])?;
-            out.extend_from_slice(&more);
-            (s1, s2) = (ns1, ns2);
-        }
-        if (s1, s2) != SW_OK {
-            return Err(format!("GET DATA {s1:02X}{s2:02X}"));
-        }
-        Ok(out)
+        chain_get_response(|apdu| self.apdu(apdu), p1, p2)
     }
+}
+
+/// Drive `00 CA` GET DATA plus its `61xx` GET RESPONSE chaining over `send`, BOUNDED
+/// so a hostile/counterfeit device that streams `61xx` forever can neither hang the
+/// synchronous TUI event loop (a bare `61 00` adds no bytes, so a size cap alone never
+/// fires — the round cap is what stops the spin) nor grow `out` without limit.
+fn chain_get_response(
+    mut send: impl FnMut(&[u8]) -> Result<(Vec<u8>, u8, u8), String>,
+    p1: u8,
+    p2: u8,
+) -> Result<Vec<u8>, String> {
+    const MAX_CHAIN: usize = 64; // no legitimate DO needs this many GET RESPONSE rounds
+    const MAX_DO_LEN: usize = 8 * 1024; // nor this many bytes
+    let (mut out, mut s1, mut s2) = send(&[0x00, 0xCA, p1, p2, 0x00])?;
+    let mut rounds = 0usize;
+    while s1 == 0x61 {
+        rounds += 1;
+        if rounds > MAX_CHAIN {
+            return Err("GET RESPONSE chain too long (hostile device?)".into());
+        }
+        let (more, ns1, ns2) = send(&[0x00, 0xC0, 0x00, 0x00, s2])?;
+        out.extend_from_slice(&more);
+        if out.len() > MAX_DO_LEN {
+            return Err("data object too large (hostile device?)".into());
+        }
+        (s1, s2) = (ns1, ns2);
+    }
+    if (s1, s2) != SW_OK {
+        return Err(format!("GET DATA {s1:02X}{s2:02X}"));
+    }
+    Ok(out)
 }
 
 // ===========================================================================

@@ -60,3 +60,54 @@ fn parse_led_stride2_and_stride3() {
     // Too short for four blocks → None, never an index panic.
     assert!(parse_led(&[1, 6], 2).is_none());
 }
+
+#[test]
+fn chain_get_response_reassembles_a_normal_chain() {
+    // 4 data bytes then a 3-byte tail: 61 03 → C0 gives the rest and 90 00.
+    let mut step = 0;
+    let out = chain_get_response(
+        |_apdu| {
+            step += 1;
+            Ok(match step {
+                1 => (vec![0xDE, 0xAD, 0xBE, 0xEF], 0x61, 0x03),
+                _ => (vec![0x01, 0x02, 0x03], 0x90, 0x00),
+            })
+        },
+        0x00,
+        0x6E,
+    )
+    .unwrap();
+    assert_eq!(out, [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03]);
+}
+
+#[test]
+fn chain_get_response_bounds_a_hostile_endless_61_00_stream() {
+    // A counterfeit device that answers every GET RESPONSE with a bare 61 00
+    // (no data) used to spin the synchronous TUI forever. The round cap must
+    // stop it with an Err — a size cap alone can't (out never grows).
+    let mut calls = 0u64;
+    let r = chain_get_response(
+        |_apdu| {
+            calls += 1;
+            Ok((vec![], 0x61, 0x00))
+        },
+        0x00,
+        0x6E,
+    );
+    assert!(
+        r.is_err(),
+        "endless 61 00 stream must be rejected, not looped"
+    );
+    assert!(
+        calls < 1000,
+        "loop must be bounded, not spinning (got {calls} calls)"
+    );
+}
+
+#[test]
+fn chain_get_response_bounds_a_hostile_oversized_stream() {
+    // A device that keeps sending full 255-byte bodies with 61 FF must be cut off
+    // before out grows without bound.
+    let r = chain_get_response(|_apdu| Ok((vec![0xAA; 255], 0x61, 0xFF)), 0x00, 0x6E);
+    assert!(r.is_err(), "unbounded data stream must be rejected");
+}
