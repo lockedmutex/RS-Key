@@ -607,8 +607,10 @@ fn always_uv_allows_silent_up_false_preflight() {
 // PUAT_REQUIRED in enforce_pin — that re-broke ssh-sk ("device not found") when
 // the two features combined (issue #34 follow-up). strict-up still polls the
 // button on the probe (its kept two-touch behavior), so a Decline denies with
-// OPERATION_DENIED and a confirmed touch returns a real assertion — either way,
-// never PUAT_REQUIRED, which is what enforce_pin returned before the fix.
+// OPERATION_DENIED and a confirmed touch returns an assertion — either way, never
+// PUAT_REQUIRED. Crucially the returned assertion stays INERT (UP=0): emitting UP=1
+// here would let an up:false probe defeat alwaysUv (a usable no-UV assertion on a
+// stolen key), so the emitted UP flag keys on the raw `up`, not the button poll.
 #[cfg(feature = "strict-up")]
 #[test]
 fn always_uv_strict_up_preflight_polls_button_not_puat() {
@@ -637,8 +639,9 @@ fn always_uv_strict_up_preflight_polls_button_not_puat() {
         );
     }
 
-    // A confirmed touch returns a real assertion (the probe's own touch, UP set),
-    // so ssh-sk's pre-flight proceeds instead of failing "device not found".
+    // A confirmed touch returns an assertion so ssh-sk's pre-flight proceeds instead
+    // of failing "device not found" — but the probe stays inert (UP flag clear even
+    // though the button was polled), so it can't be relayed as a real login.
     let mut out2 = [0u8; 1024];
     let n = {
         let mut state = crate::FidoState::new();
@@ -657,8 +660,8 @@ fn always_uv_strict_up_preflight_polls_button_not_puat() {
     let ad = assertion_auth_data(&out2[..n]);
     assert_eq!(
         ad[32] & FLAG_UP,
-        FLAG_UP,
-        "strict-up up:false → UP flag set"
+        0,
+        "strict-up up:false → UP flag CLEAR: the polled probe stays inert so it can't defeat alwaysUv"
     );
     assert_eq!(ad[32] & FLAG_UV, 0, "silent probe carries no UV");
 }

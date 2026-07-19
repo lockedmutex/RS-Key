@@ -85,6 +85,18 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   exempt from the PUAT refusal regardless of `strict-up`. `strict-up` still polls the
   button on the probe (its deliberate two-touch behavior); only the spurious refusal is
   gone. Reported for v0.3.7 ([#34](https://github.com/TheMaxMur/RS-Key/issues/34)).
+- **`strict-up` no longer weakens `alwaysUv` for the `up:false` pre-flight.** On a
+  `strict-up` build with alwaysUv enabled, the silent `up:false` discovery probe was
+  returned as a *usable* assertion with the user-presence (UP) flag **set** — because
+  `strict-up` forces the button poll and the emitted UP flag followed that poll rather
+  than the request's `up` option. A relying party that does not require user verification
+  would accept it, so a stolen key could authenticate without the PIN, defeating the
+  alwaysUv guarantee (a plain `always-uv` build was unaffected — it returns the probe with
+  UP clear). The emitted UP flag now follows the request's raw `up`, so the probe stays
+  inert (UP=0) even while `strict-up` still polls the button, and `ssh-sk` keeps working
+  (the platform discards the pre-flight regardless). No shipped flavor enabled this by
+  default (`firmware-strict-up` ships with alwaysUv off); found by an internal security
+  review — a follow-up to the [#34](https://github.com/TheMaxMur/RS-Key/issues/34) fix above.
 - **PIV stays detectable by OpenSC after the OpenPGP applet has been used.** The
   PIV `SELECT` application property template placed the NIST RID directly under
   tag `79` instead of the required nested `4F`. OpenSC's `piv_match_card` then

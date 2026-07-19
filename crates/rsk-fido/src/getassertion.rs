@@ -391,13 +391,12 @@ fn resolve_credential<S: Storage, R: Rng>(
     rp_id_hash: &[u8; 32],
     seed: &[u8; 32],
     uv: bool,
-    want_up: bool,
     best: &mut Best,
 ) {
     if req.allow_len > 0 {
         resolve_from_allowlist(ctx, req, rp_id_hash, seed, uv, best);
     } else {
-        resolve_by_discovery(ctx, req, rp_id_hash, seed, uv, want_up, best);
+        resolve_by_discovery(ctx, req, rp_id_hash, seed, uv, best);
     }
 }
 
@@ -460,7 +459,6 @@ fn resolve_by_discovery<S: Storage, R: Rng>(
     rp_id_hash: &[u8; 32],
     seed: &[u8; 32],
     uv: bool,
-    want_up: bool,
     best: &mut Best,
 ) {
     let mut scratch = [0u8; CRED_REC_MAX];
@@ -504,7 +502,6 @@ fn resolve_by_discovery<S: Storage, R: Rng>(
             req,
             rp_id_hash,
             uv,
-            want_up,
             ctx.now_ms,
         );
     }
@@ -520,7 +517,6 @@ fn arm_get_next_assertion(
     req: &Request,
     rp_id_hash: &[u8; 32],
     uv: bool,
-    want_up: bool,
     now_ms: u64,
 ) {
     cands.sort_unstable_by_key(|c| core::cmp::Reverse(c.1));
@@ -528,7 +524,9 @@ fn arm_get_next_assertion(
     gna.rp_id_hash = *rp_id_hash;
     gna.client_data_hash.copy_from_slice(req.client_data_hash);
     gna.uv = uv;
-    gna.up = want_up;
+    // Carry the request's RAW `up` (not want_up) so every getNextAssertion leg emits
+    // the same inert UP=0 as the Begin leg for an up:false pre-flight under strict-up.
+    gna.up = req.up;
     gna.total = cands.len() as u8;
     gna.counter = 1;
     gna.started_ms = now_ms;
@@ -565,12 +563,12 @@ fn get_assertion_inner<S: Storage, R: Rng>(
     uv: bool,
     out: &mut [u8],
 ) -> CtapResult {
-    // User-presence decision for the whole call (see `want_up`): honor `up:false`
-    // (the platform's silent pre-flight) unless `strict-up` forces a touch on
-    // every assertion. getNextAssertion reuses it via `gna.up`.
+    // Presence POLL decision: honor `up:false` (the silent pre-flight) unless
+    // `strict-up` forces a touch. The emitted UP flag follows raw `up` (below), NOT
+    // this — so a polled up:false probe stays inert (UP=0), preserving alwaysUv.
     let want_up = want_up(req);
     let mut best = Best::new();
-    resolve_credential(ctx, req, rp_id_hash, seed, uv, want_up, &mut best);
+    resolve_credential(ctx, req, rp_id_hash, seed, uv, &mut best);
 
     if !best.any {
         return Err(CtapError::NoCredentials);
@@ -677,7 +675,10 @@ fn get_assertion_inner<S: Storage, R: Rng>(
     };
     let mut ad = [0u8; 37 + 320 + 32];
     ad[..32].copy_from_slice(rp_id_hash);
-    let up_flag = if want_up { FLAG_UP } else { 0 };
+    // Emit UP from the request's raw `up`, NOT want_up: strict-up still polls the
+    // button (above) but an up:false pre-flight must stay inert (UP=0), else the
+    // alwaysUv exemption yields a signable assertion (CTAP 2.1 §6.2.2; ssh-sk unaffected).
+    let up_flag = if req.up { FLAG_UP } else { 0 };
     ad[32] = up_flag | ed | if uv { FLAG_UV } else { 0 };
     ad[33..37].copy_from_slice(&ctr.to_be_bytes());
     ad[37..37 + ext_len].copy_from_slice(&ext[..ext_len]);
