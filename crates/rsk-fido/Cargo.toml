@@ -44,6 +44,13 @@ advertise-pqc = []
 # rises to 6 and the vendor seed export is refused. A build profile, not a
 # FIPS validation — see docs/guides/fips.md.
 fips-profile = []
+# Raise the FIDO clientPIN floor to six code points (from CTAP's default four) and
+# refuse the most guessable PINs — a single repeated digit or a ±1 run like `123456`.
+# OFF by default; the default build keeps the CTAP-standard four-code-point minimum. A
+# narrow PIN-hardening knob, unlike `fips-profile` which also drops secp256k1 and the
+# seed export. Rationale: the RP2350 BOOTSEL flash snapshot/restore rolls back the
+# wrong-PIN counter (issue #37), so PIN entropy is the practical brute-force bound.
+strong-pin = []
 # FIDO Conformance Tool build profile, OFF by default. Suppresses the EdDSA (-8)
 # advertisement in getInfo `algorithms` (0x0A): the tool's shared
 # verifySignatureCOSE maps only -7/-35/-36, so it cannot verify a packed EdDSA

@@ -759,12 +759,15 @@ const DIGESTINFOS: [(&[u8], usize); 5] = [
 
 /// Build the RSA key from the imported exponent / primes (tags 0x91/0x92/0x93).
 pub fn rsa_from_pqe(e: &[u8], p: &[u8], q: &[u8]) -> Option<RsaPrivateKey> {
-    RsaPrivateKey::from_p_q(
-        BigUint::from_bytes_be(p),
-        BigUint::from_bytes_be(q),
-        BigUint::from_bytes_be(e),
-    )
-    .ok()
+    let p = BigUint::from_bytes_be(p);
+    let q = BigUint::from_bytes_be(q);
+    // from_p_q derives the totient via (p-1)(q-1); a zero prime MPI underflows
+    // num-bigint's unsigned subtraction (a panic, not an Err) and halts the device
+    // on import, so reject it here and let the caller's ok_or(EXEC_ERROR) do its job.
+    if p < BigUint::from(2u8) || q < BigUint::from(2u8) {
+        return None;
+    }
+    RsaPrivateKey::from_p_q(p, q, BigUint::from_bytes_be(e)).ok()
 }
 
 /// The RSA public exponent, fixed at 65537 (what `load_rsa_key` assumes).

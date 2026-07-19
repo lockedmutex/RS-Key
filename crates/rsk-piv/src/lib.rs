@@ -225,9 +225,13 @@ impl<'a> PivApplet<'a> {
 /// The SELECT application property template (`61 { … }`); the outer length
 /// byte is filled in (some implementations leave it 0).
 fn apt(res: &mut ResBuf) -> Sw {
+    // NIST SP 800-73-4 §3.1.1: 4F is the PIV AID/PIX and 79 (coexistent tag
+    // allocation authority) MUST wrap a nested 4F holding the NIST RID. A flat 79
+    // (no inner 4F) makes OpenSC's piv_match_card fall back to the OpenPGP applet.
     const BODY: &[u8] = &[
-        0x4F, 0x02, 0x01, 0x00, // application version
-        0x79, 0x09, 0xA0, 0x00, 0x00, 0x03, 0x08, 0x00, 0x00, 0x10, 0x00, // tag allocation
+        0x4F, 0x06, 0x00, 0x00, 0x10, 0x00, 0x01, 0x00, // PIV application AID (PIX)
+        0x79, 0x07, 0x4F, 0x05, 0xA0, 0x00, 0x00, 0x03,
+        0x08, // tag alloc authority → NIST RID
         0x50, 0x0A, b'R', b'S', b'-', b'K', b'e', b'y', b' ', b'P', b'I',
         b'V', // application label
         0xAC, 0x0C, 0x80, 0x07, 0x07, 0x08, 0x0A, 0x0C, 0x11, 0x14, 0x2E, 0x06, 0x01,

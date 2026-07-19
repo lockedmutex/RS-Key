@@ -627,6 +627,17 @@ fn write_pin_verifier<S: Storage>(
     fs.put(fid, &pin_data).map_err(|_| CtapError::Other)
 }
 
+/// A trivially guessable PIN — a single repeated code point (`000000`) or a ±1 run
+/// (`123456` / `654321`) — refused by the `strong-pin` / `fips-profile` builds atop the
+/// length floor. `pub` so the trusted-display PIN pad rejects them at entry too.
+#[cfg(any(feature = "strong-pin", feature = "fips-profile"))]
+pub fn pin_is_trivial(pin: &[u8]) -> bool {
+    pin.len() >= 2
+        && (pin.iter().all(|&b| b == pin[0])
+            || pin.windows(2).all(|w| w[0].checked_add(1) == Some(w[1]))
+            || pin.windows(2).all(|w| w[1].checked_add(1) == Some(w[0])))
+}
+
 /// Validate the padded new PIN and store the EF_PIN verifier (the host setPIN/changePIN
 /// path).
 fn store_new_pin<S: Storage, R: Rng>(
@@ -642,6 +653,10 @@ fn store_new_pin<S: Storage, R: Rng>(
         .unwrap_or(PADDED_PIN_LEN);
     let min_pin = min_pin_length(ctx.fs);
     if (pin_len as u8) < min_pin {
+        return Err(CtapError::PinPolicyViolation);
+    }
+    #[cfg(any(feature = "strong-pin", feature = "fips-profile"))]
+    if pin_is_trivial(&padded[..pin_len]) {
         return Err(CtapError::PinPolicyViolation);
     }
     write_pin_verifier(EF_PIN, &ctx.dev, ctx.fs, &padded[..pin_len])?;

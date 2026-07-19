@@ -46,6 +46,12 @@ pub struct Fs<S: Storage> {
     /// impossible. Cost: the first probe of each absent FID per boot pays one
     /// backend scan, then it is O(1). See [`known_absent`](Self::known_absent).
     decided: [u8; FID_PRESENT_BYTES],
+    /// Monotonic counter bumped on every content-changing `put`/`delete`. A caller
+    /// caching a derived view of the store (e.g. the credMgmt slot→rpIdHash index)
+    /// snapshots it and rebuilds when it moves, so no mutation path can leave that
+    /// cache stale. In-RAM only (resets to 0 each boot); `u32` never realistically
+    /// wraps between two reads of a mutation-free session.
+    write_gen: u32,
 }
 
 impl<S: Storage> Fs<S> {
@@ -55,7 +61,15 @@ impl<S: Storage> Fs<S> {
             dynamic: Vec::new(),
             present: [0u8; FID_PRESENT_BYTES],
             decided: [0u8; FID_PRESENT_BYTES],
+            write_gen: 0,
         }
+    }
+
+    /// The store's mutation generation — bumped by every content-changing
+    /// `put`/`delete`. Snapshot it beside a cached derived view and rebuild when it
+    /// changes (see [`write_gen`](Self#structfield.write_gen)).
+    pub fn write_gen(&self) -> u32 {
+        self.write_gen
     }
 
     /// Recover the backend (e.g. to rebuild the `Fs` — used in tests to model a
@@ -271,6 +285,7 @@ impl<S: Storage> Fs<S> {
         }
         self.storage.write(fid, data)?;
         self.mark_present(fid);
+        self.write_gen = self.write_gen.wrapping_add(1);
         if register {
             let _ = self.dynamic.push(fid); // cap checked above — cannot fail
         }
@@ -307,6 +322,7 @@ impl<S: Storage> Fs<S> {
         if self.present_bit(fid) {
             self.storage.remove(fid)?;
             self.mark_absent(fid);
+            self.write_gen = self.write_gen.wrapping_add(1);
         }
         self.dynamic.retain(|&f| f != fid);
         Ok(())

@@ -7,9 +7,11 @@ contained. Adding a new `unsafe` requires updating this page. (Safe Rust rules
 out memory-corruption bugs in this code. It is not a security audit; see the
 [threat model](threat-model.md).)
 
-**Runtime sites: 10.** Four concerns in the firmware proper (the interrupt
-handler pair counted honestly as two), two for the per-core prime sieves, one
-in the RSA assembly FFI, two in the standalone flash-wipe tool.
+**Runtime sites: 11.** Six in the firmware proper (`main.rs` + `presence.rs`):
+the interrupt-handler pair (2), the `Send` impl, the heap init, and the two
+GPIO-pin `steal`s (the presence button + the LED power-enable rail). Two for the
+per-core prime sieves, one in the RSA assembly FFI, two in the standalone
+flash-wipe tool.
 
 ```mermaid
 flowchart TB
@@ -17,7 +19,7 @@ flowchart TB
       a["interrupt executor (×2)"]
       b["Send for SendUsb"]
       c["heap init"]
-      d["GPIO presence pin steal"]
+      d["GPIO pin steal ×2 (presence, LED power)"]
     end
     subgraph kg["firmware/src/core1.rs"]
       e["per-core prime sieves (×2)"]
@@ -79,21 +81,30 @@ static buffer used by nothing else.
 *Safe alternative:* none; every embedded allocator initializes this way.
 *Containment:* one call, before any allocation can happen.
 
-### 5. GPIO presence pin type-erasure
+### 5. GPIO pin type-erasure (presence button + LED power rail + USR-LED-off, ×3)
 
 ```rust
 let any = unsafe { AnyPin::steal(pin) };
 ```
 
-The optional `PRESENCE_PIN=<gpio>` path chooses the presence button at runtime
-(instead of a concrete `PIN_n` type at compile time), so the code must convert a
-numeric pin to embassy's type-erased `AnyPin`. `AnyPin::steal` is `unsafe`
-because the caller must guarantee unique ownership of that hardware pin.
-*Safe alternative:* none for a runtime-selected GPIO; the safe constructors
-require a statically known pin type.
-*Containment:* one call site in `ButtonPresence::new_gpio`, gated by pin-range
-validation and the single-owner invariant from `main` (the chosen presence pin
-is never handed to the LED/backends; an LED/presence conflict panics at boot).
+Three build-configurable GPIOs are chosen by *number* at build time rather than as
+a concrete `PIN_n` type, so each must be converted to embassy's type-erased
+`AnyPin`: the optional `PRESENCE_PIN=<gpio>` presence button
+(`ButtonPresence::new_gpio`, `presence.rs`), the optional `LED_POWER_PIN`
+enable pin driven high to power a gated LED rail (the LED block in `main.rs`), and
+the optional `USR_LED_PIN` driven to a nuisance onboard LED's OFF level and held
+(the boot block in `main.rs`). `AnyPin::steal` is `unsafe` because the caller must
+guarantee unique ownership of that hardware pin — a `match` over `p.PIN_0..=PIN_29`
+(as the LED *data* pin uses) is impossible here, since it would double-move the
+peripheral set the LED block already claims.
+*Safe alternative:* none for a runtime/number-selected GPIO; the safe
+constructors require a statically known pin type.
+*Containment:* each is gated by pin-range validation and the single-owner
+invariant from `main` — none of the presence pin, the LED-power pin, nor the
+USR-LED pin is ever handed to another driver, and compile-time `assert!`s reject a
+build that collides `LED_POWER_PIN` or `USR_LED_PIN` with the LED data pin or a GPIO
+`PRESENCE_PIN` (and refuse `USR_LED_PIN` outright on a display build, whose panel
+owns those pads), as an LED/presence collision already panics at boot.
 
 ## Firmware dual-core keygen (`firmware/src/core1.rs`)
 

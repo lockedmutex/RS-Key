@@ -141,9 +141,10 @@ compatible across the upgrade.
 
 ## Capacity — why the flash is mostly empty
 
-The KV store is a fixed 1.5 MB whatever the `FLASH_SIZE` ([build.md](build.md)).
-A larger flash only grows the code region, most of which no firmware writes. That
-is deliberate. A security key's maximum *logical* state is small and hard-capped:
+The KV store is 1.5 MB by default whatever the `FLASH_SIZE`, so a larger flash only
+grows the code region, most of which no firmware writes ([build.md](build.md)). That
+is deliberate. (A 2 MB board is the one exception: it shrinks the main partition via
+`KVMAIN` to leave room for code — still far more than a key ever fills.) A security key's maximum *logical* state is small and hard-capped:
 `MAX_RESIDENT_CREDENTIALS` (256 passkeys), `MAX_DYNAMIC_FILES` (256 files across
 all applets), `MAX_OATH_CRED` (255), plus a handful of OpenPGP/PIV slots. So a
 fully provisioned device fills only a few hundred KB, well under the 1408 KB main

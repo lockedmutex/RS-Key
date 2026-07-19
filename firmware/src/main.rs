@@ -130,6 +130,13 @@ const XOSC_DELAY_MULT: u32 = env_u32(env!("PK_XOSC_DELAY_MULT"));
 // numbering (1=gpio, 2=pimoroni, 3=ws2812).
 #[cfg(not(led_kind = "none"))]
 const BUILD_LED_PIN: u8 = env_u16(env!("PK_LED_PIN")) as u8;
+// Optional LED power-enable pin: a GPIO driven high at boot to power a gated LED
+// rail (the Seeed XIAO RP2350's WS2812 sits behind GP23). Off unless `LED_POWER_PIN`
+// is set; the LED block claims and holds it. Only a rendered LED needs a rail.
+#[cfg(not(led_kind = "none"))]
+const BUILD_LED_POWER_ENABLED: bool = env_u16(env!("PK_LED_POWER_ENABLED")) != 0;
+#[cfg(not(led_kind = "none"))]
+const BUILD_LED_POWER_PIN: u8 = env_u16(env!("PK_LED_POWER_PIN")) as u8;
 const BUILD_PRESENCE_IS_GPIO: bool = env_u16(env!("PK_PRESENCE_IS_GPIO")) != 0;
 #[cfg(not(feature = "display"))]
 const BUILD_PRESENCE_PIN: u8 = env_u16(env!("PK_PRESENCE_PIN")) as u8;
@@ -172,6 +179,42 @@ const _: () = assert!(
     !BUILD_WAKE_ENABLED || BUILD_WAKE_PIN < 10 || BUILD_WAKE_PIN > 18,
     "WAKE_PIN collides with an LCD/touch GPIO (10..=18) owned by the display build"
 );
+
+// Optional nuisance user/status LED to hold OFF at boot (`USR_LED_PIN`): a plain
+// GPIO some boards wire to an onboard LED that lights by default (the Seeed XIAO
+// RP2350's active-low USR LED on GP25). Independent of the addressable status LED,
+// so it applies on a `none` build too; driven to its OFF level and held for the
+// device's lifetime. Off unless `USR_LED_PIN` is set.
+const BUILD_USR_LED_ENABLED: bool = env_u16(env!("PK_USR_LED_ENABLED")) != 0;
+const BUILD_USR_LED_PIN: u8 = env_u16(env!("PK_USR_LED_PIN")) as u8;
+const BUILD_USR_LED_ACTIVE_HIGH: bool = env_u16(env!("PK_USR_LED_ACTIVE_HIGH")) != 0;
+
+// USR_LED_PIN must own its pad — reject a build that aims it at any pin another
+// driver already claims, each check gated to where that pin exists.
+#[cfg(not(feature = "display"))]
+const _: () = assert!(
+    !(BUILD_USR_LED_ENABLED && BUILD_PRESENCE_IS_GPIO && BUILD_USR_LED_PIN == BUILD_PRESENCE_PIN),
+    "USR_LED_PIN must not equal a GPIO PRESENCE_PIN"
+);
+#[cfg(not(led_kind = "none"))]
+const _: () = assert!(
+    !(BUILD_USR_LED_ENABLED && BUILD_USR_LED_PIN == BUILD_LED_PIN),
+    "USR_LED_PIN must not equal LED_PIN"
+);
+#[cfg(not(led_kind = "none"))]
+const _: () = assert!(
+    !(BUILD_USR_LED_ENABLED && BUILD_LED_POWER_ENABLED && BUILD_USR_LED_PIN == BUILD_LED_POWER_PIN),
+    "USR_LED_PIN must not equal LED_POWER_PIN"
+);
+// A display build has no onboard nuisance LED to silence — the panel replaces the
+// LED and already drives the LCD/touch GPIOs (10..=18) plus the GP25 wake button —
+// so USR_LED_PIN there is only a chance to double-claim a panel pad; refuse it.
+#[cfg(feature = "display")]
+const _: () = assert!(
+    !BUILD_USR_LED_ENABLED,
+    "USR_LED_PIN is not supported on a display build (the panel replaces the onboard LED)"
+);
+
 #[cfg(led_kind = "ws2812")]
 const BUILD_DRIVER: u8 = 3;
 #[cfg(led_kind = "gpio")]
@@ -196,6 +239,13 @@ static HID_STATE: StaticCell<HidState> = StaticCell::new();
 static KBD_STATE: StaticCell<HidState> = StaticCell::new();
 static OTP_HID_HANDLER: StaticCell<otp_kbd::OtpHidHandler> = StaticCell::new();
 static USB_HANDLER: StaticCell<led::StatusHandler> = StaticCell::new();
+// Holds the LED power-enable `Output` for the device's lifetime; dropping it would
+// release the pad and let the gated LED rail fall (see the LED block below).
+#[cfg(not(led_kind = "none"))]
+static LED_PWR: StaticCell<embassy_rp::gpio::Output<'static>> = StaticCell::new();
+// Holds the USR-LED-off `Output` for the device's lifetime; dropping it would
+// release the pad and let a pulled nuisance LED light again (see the boot block).
+static USR_LED: StaticCell<embassy_rp::gpio::Output<'static>> = StaticCell::new();
 static FS: StaticCell<RefCell<Store>> = StaticCell::new();
 static FLASH_CELL: StaticCell<RefCell<flash_storage::AsyncFlash>> = StaticCell::new();
 static RNG_CELL: StaticCell<RefCell<FidoRng>> = StaticCell::new();
@@ -229,6 +279,16 @@ async fn ctap_task(mut ctap: CtapHid<'static, Drv, ClientCtap>) {
 #[embassy_executor::task]
 async fn ccid_task(mut ccid: Ccid<'static, Drv, ClientCcid>) {
     ccid.run().await;
+}
+
+// The worker is spawned, not awaited at the tail of `main`, so `main` returns and
+// its ~95 KiB one-time init stack frame is reclaimed off the shared MSP before any
+// crypto runs. Awaiting it inline kept that frame live under every dispatch, which
+// left ML-DSA-65 keygen flush against the stack ceiling (it halted on the next
+// interrupt). Must stay on the thread executor, never `hp`, so keepalives keep flowing.
+#[embassy_executor::task]
+async fn worker_task(mut worker: Worker<'static>) {
+    worker.run().await;
 }
 
 unsafe extern "C" {
@@ -380,7 +440,7 @@ async fn main(spawner: Spawner) {
     config.max_power = 100;
     config.max_packet_size_0 = 64;
     // bcdDevice build counter; also surfaced on the trusted-display Firmware screen.
-    let device_release: u16 = 0x0823;
+    let device_release: u16 = 0x082C;
     config.device_release = device_release;
 
     let mut builder = Builder::new(
@@ -469,6 +529,25 @@ async fn main(spawner: Spawner) {
         hp.spawn(otp_kbd::kbd_task(kbd).unwrap());
     }
 
+    // Hold a nuisance onboard user LED off (`USR_LED_PIN`), independent of the
+    // addressable status LED so it also applies on a `none` build. Drive the pad to
+    // the LED's OFF level and park the `Output` for the device's lifetime — dropping
+    // it would release the pad back to its (pulled) reset state and relight the LED.
+    if BUILD_USR_LED_ENABLED {
+        use embassy_rp::gpio::{Level, Output};
+        // Active-low LED (default) is off when HIGH; active-high is off when LOW.
+        let off = if BUILD_USR_LED_ACTIVE_HIGH {
+            Level::Low
+        } else {
+            Level::High
+        };
+        // Safety: this runs only when USR_LED is enabled, which the const asserts
+        // above forbid on a display build; on every other build they prove the pin
+        // collides with no LED data/power pin nor a GPIO presence pin.
+        let any = unsafe { embassy_rp::gpio::AnyPin::steal(BUILD_USR_LED_PIN) };
+        USR_LED.init(Output::new(any, off));
+    }
+
     // LED backend, selected at runtime from the phy record (PicoForge-compatible),
     // defaulting to the build LED_KIND / LED_PIN. A non-`none` build compiles all
     // three hardware backends so the driver + pin can change without reflashing; a
@@ -489,6 +568,29 @@ async fn main(spawner: Spawner) {
             !(BUILD_PRESENCE_IS_GPIO && BUILD_PRESENCE_PIN == BUILD_LED_PIN),
             "PK_PRESENCE_PIN must not equal PK_LED_PIN on a GPIO-presence build"
         );
+        // A power-enable pin (`LED_POWER_PIN`) must own its own pad — reject a build
+        // that points it at the LED data pin or a GPIO presence pin, same as above.
+        const _: () = assert!(
+            !BUILD_LED_POWER_ENABLED || BUILD_LED_POWER_PIN != BUILD_LED_PIN,
+            "PK_LED_POWER_PIN must not equal PK_LED_PIN"
+        );
+        const _: () = assert!(
+            !BUILD_LED_POWER_ENABLED
+                || !BUILD_PRESENCE_IS_GPIO
+                || BUILD_LED_POWER_PIN != BUILD_PRESENCE_PIN,
+            "PK_LED_POWER_PIN must not equal a GPIO PK_PRESENCE_PIN"
+        );
+        // Some boards gate the LED's power rail behind an enable GPIO (the Seeed XIAO
+        // RP2350's WS2812 is powered by GP23, driven high). Raise the rail BEFORE the
+        // driver below clocks data into an otherwise-unpowered LED. The `Output` is
+        // parked in a StaticCell for the device's lifetime — a dropped one would
+        // release the pad and drop the rail.
+        if BUILD_LED_POWER_ENABLED {
+            // Safety: the const asserts above guarantee this pin is handed to no other
+            // driver (never the LED data pin nor the GPIO presence pin).
+            let any = unsafe { embassy_rp::gpio::AnyPin::steal(BUILD_LED_POWER_PIN) };
+            LED_PWR.init(Output::new(any, Level::High));
+        }
         // PHY led_gpio overrides the build LED_PIN; an out-of-range pin is ignored,
         // and a host-written pin that collides with the GPIO presence pin is dropped
         // (they would fight over one pin) so it falls back to the build default rather
@@ -698,11 +800,6 @@ async fn main(spawner: Spawner) {
         spawner.spawn(display::status_task(ui).unwrap());
         ui
     };
-    // `spawner` is otherwise unused (the standard key spawns on the interrupt
-    // executor `hp`); consume it so `-D warnings` passes without the display task.
-    #[cfg(not(feature = "display"))]
-    let _ = spawner;
-
     core1::spawn(p.CORE1);
 
     // Standard key: BOOTSEL by default, or a dedicated `PRESENCE_PIN` GPIO button.
@@ -722,7 +819,7 @@ async fn main(spawner: Spawner) {
     let platform_ref = RESCUE_PLATFORM.init(RefCell::new(rescue_platform::RescuePlatform));
     let (kvm, kvc) = (kvmain_range(), kvcnt_range());
     let kv_total = (kvm.end - kvm.start) + (kvc.end - kvc.start);
-    let mut worker = Worker::new(
+    let worker = Worker::new(
         fs_ref,
         rng_ref,
         presence_ref,
@@ -733,5 +830,5 @@ async fn main(spawner: Spawner) {
         otp_devk,
         kv_total,
     );
-    worker.run().await;
+    spawner.spawn(worker_task(worker).unwrap());
 }

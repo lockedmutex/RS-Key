@@ -92,6 +92,10 @@ advertise-pqc = ["rsk-fido/advertise-pqc"]
 # locked algorithm policy into the image — and secure boot seals it there.
 # What it locks: docs/guides/fips.md. A profile, not a FIPS validation.
 fips-profile = ["rsk-fido/fips-profile", "rsk-piv/fips-profile"]
+# Raise the FIDO clientPIN floor to six code points and refuse trivially guessable
+# PINs (see rsk-fido's feature docs). A narrow PIN-hardening knob, orthogonal to
+# `fips-profile`. OFF by default. Build `--features strong-pin`.
+strong-pin = ["rsk-fido/strong-pin"]
 # Keygen microbenchmark vendor command (INS 0x13). Debug/measurement only —
 # never ship it: it exposes a timing oracle over the primality primitives.
 keygen-bench = []

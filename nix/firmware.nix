@@ -215,6 +215,56 @@ in
         "no-touch,fips-profile,advertise-pqc"
       ];
     };
+    # The `strong-pin` PIN-hardening policy as its own shipped pair (with/without
+    # advertise-pqc), mirroring fips/fips-pqc. `fips-profile` already bundles this
+    # same policy, so there is deliberately no strong-pin×fips flavor.
+    firmware-strong-pin = mkFirmware {
+      name = "firmware-strong-pin";
+      cargoFlags = [
+        "--features"
+        "strong-pin"
+      ];
+    };
+    firmware-strong-pin-pqc = mkFirmware {
+      name = "firmware-strong-pin-pqc";
+      cargoFlags = [
+        "--features"
+        "strong-pin,advertise-pqc"
+      ];
+    };
+    # Behavior-preference flavors, shipped standalone (each with a pqc pair), NOT
+    # crossed with the policy cube. `always-uv` bakes CTAP 2.1 alwaysUv on by
+    # default (spec-conformant hardening). `strict-up` requires a touch on EVERY
+    # assertion — deliberately NOT spec-conformant for the silent up:false
+    # pre-flight (a WebAuthn allowList login asks for two touches); ship-with-caveat.
+    firmware-always-uv = mkFirmware {
+      name = "firmware-always-uv";
+      cargoFlags = [
+        "--features"
+        "always-uv"
+      ];
+    };
+    firmware-always-uv-pqc = mkFirmware {
+      name = "firmware-always-uv-pqc";
+      cargoFlags = [
+        "--features"
+        "always-uv,advertise-pqc"
+      ];
+    };
+    firmware-strict-up = mkFirmware {
+      name = "firmware-strict-up";
+      cargoFlags = [
+        "--features"
+        "strict-up"
+      ];
+    };
+    firmware-strict-up-pqc = mkFirmware {
+      name = "firmware-strict-up-pqc";
+      cargoFlags = [
+        "--features"
+        "strict-up,advertise-pqc"
+      ];
+    };
     # Worked example of a declarative identity preset — copy this and tweak the
     # knobs for your own pinned config (vidpid / fwVersion / usbVid …).
     firmware-pico = mkFirmware {

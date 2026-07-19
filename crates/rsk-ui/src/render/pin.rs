@@ -178,6 +178,7 @@ fn pin_caption_text(c: PinCaption) -> &'static str {
         PinCaption::TriesRemaining { left } => TRIES[(left as usize).min(TRIES.len() - 1)],
         PinCaption::ChoosePin => "Choose a PIN",
         PinCaption::Reenter => "Re-enter to confirm",
+        PinCaption::TooWeak => "Too easy to guess",
     }
 }
 

@@ -13,6 +13,115 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
 
 ## [Unreleased]
 
+## [0.3.8] - 2026-07-19
+
+### Added
+
+- **`strong-pin` build feature — stronger PIN policy for the FIDO clientPIN.** A new
+  opt-in cargo feature that raises the clientPIN minimum to **6** code points (from
+  CTAP's default 4) and refuses trivially guessable PINs — a single repeated digit, or
+  a ±1 run like `123456` / `654321` — on both the host `setPIN`/`changePIN` path and the
+  trusted-display PIN pad. Off by default; the default build is unchanged. `fips-profile`
+  now bundles this same PIN policy. Motivated by the RP2350 BOOTSEL flash snapshot/restore
+  that rolls back the wrong-PIN counter ([#37](https://github.com/TheMaxMur/RS-Key/issues/37)):
+  with the retry ceiling removed, PIN entropy is the practical brute-force bound. See
+  [docs/build.md](docs/build.md) and [docs/threat-model.md](docs/threat-model.md).
+- **`LED_POWER_PIN` build knob — support boards whose LED is power-gated.** A new
+  compile-time env knob names an optional GPIO the firmware drives **high at boot**
+  to power a gated LED rail, then holds for the device's lifetime. This is what the
+  **Seeed Studio XIAO RP2350** needs: its onboard WS2812 data is on GP22 but its
+  power sits behind GP23, so the LED stayed dark ([#36](https://github.com/TheMaxMur/RS-Key/issues/36)).
+  Build it `LED_PIN=22 LED_ORDER=grb LED_POWER_PIN=23`. Off by default; the pin
+  must differ from `LED_PIN` and a GPIO `PRESENCE_PIN` (rejected at compile time).
+  See [docs/hardware.md](docs/hardware.md) and [docs/build.md](docs/build.md).
+- **`USR_LED_PIN` build knob — park a nuisance onboard LED off at boot.** A new
+  compile-time env knob names an optional GPIO wired to an onboard user/status LED
+  that comes up lit; the firmware drives it to the LED's **off** level at boot and
+  holds it. This is the **Seeed Studio XIAO RP2350**'s active-low USR LED on GP25,
+  which the board's weak pull-down otherwise keeps on ([#36](https://github.com/TheMaxMur/RS-Key/issues/36)).
+  Build it `USR_LED_PIN=25` (add `USR_LED_ACTIVE_HIGH=1` for an active-high LED).
+  Off by default and independent of the addressable LED, so it also works on a
+  `LED_KIND=none` build; the pin must differ from `LED_PIN`, `LED_POWER_PIN`, a GPIO
+  `PRESENCE_PIN`, and the display `WAKE_PIN` (rejected at compile time). See
+  [docs/hardware.md](docs/hardware.md) and [docs/build.md](docs/build.md).
+- **`KVMAIN` build knob — fit the firmware on a 2 MB flash.** The KV main partition
+  size is now a compile-time knob (default 1408K, the checked-in layout). A **2 MB**
+  board (Seeed XIAO RP2350, Waveshare RP2350-Zero-CM) can't fit the ~900K image under
+  the default KV store, so shrink it: `FLASH_SIZE=2M KVMAIN=896K` (896K creds + 128K
+  counters + 1024K code) ([#36](https://github.com/TheMaxMur/RS-Key/issues/36)). build.rs
+  bakes the size into both `memory.x` and `flash_storage.rs` so the two partitions
+  never drift, and rejects a split that leaves under 1 MB for code with a fix hint.
+  A fully provisioned key needs only a few hundred KB. See [docs/build.md](docs/build.md).
+
+### Changed
+
+- **Faster `authenticatorCredentialManagement` enumeration with many distinct RPs.**
+  `enumerateCredentials` re-read every resident-credential slot on each per-RP call,
+  so listing a store of *N* credentials spread over *N* distinct RPs was O(N²) flash
+  reads — on hardware a 256-passkey / 256-RP store took ~13 s (a store of the same
+  256 passkeys under one RP took ~1.3 s). The applet now builds a small in-RAM
+  slot→rpId-hash-prefix index once per enumeration (invalidated by a new `Fs`
+  mutation counter, so any add/delete rebuilds it) and reads flash only for the
+  target RP, making the walk O(N). Enumeration results and order are unchanged; a
+  4-byte prefix hit is still confirmed by the full rpId-hash compare. bcdDevice bump
+  only (no wire change).
+
+### Fixed
+
+- **Post-quantum ML-DSA-65 `makeCredential` no longer hard-faults the device.**
+  Requesting an ML-DSA-65 (COSE alg `-49`) credential wedged the FIDO worker on the
+  RP2350: the compute worker ran nested under `main`'s ~95 KiB one-time init stack
+  frame (it was `await`ed at the tail of `#[embassy_executor::main]`), which left
+  ML-DSA-65's ~92 KiB keygen chain flush against the shared main-stack ceiling — the
+  next USB/keepalive interrupt overran it into the heap and halted the core. (ML-DSA-44
+  fit with ~27 KiB to spare and was unaffected, which is why only the larger parameter
+  set failed.) The worker now runs as its own thread-executor task, so `main` returns
+  and that init frame is reclaimed, restoring ~90 KiB of headroom. Firmware-only; no
+  wire-format or at-rest change. Latent in shipped builds (ML-DSA is not advertised
+  without `advertise-pqc`, so no platform requested it).
+- **`always-uv` and `strict-up` built together no longer break `ssh-sk`.** With both
+  features on, `ssh -i` failed with "device not found": the platform's silent
+  `up:false` pre-flight (credential discovery) was refused with `CTAP2_ERR_PUAT_REQUIRED`
+  because the alwaysUv gate keyed on the `strict-up`-forced presence flag rather than the
+  request's raw `up` option. It now keys on `up` (CTAP 2.1 §6.2.2 step 5), so the probe is
+  exempt from the PUAT refusal regardless of `strict-up`. `strict-up` still polls the
+  button on the probe (its deliberate two-touch behavior); only the spurious refusal is
+  gone. Reported for v0.3.7 ([#34](https://github.com/TheMaxMur/RS-Key/issues/34)).
+- **`strict-up` no longer weakens `alwaysUv` for the `up:false` pre-flight.** On a
+  `strict-up` build with alwaysUv enabled, the silent `up:false` discovery probe was
+  returned as a *usable* assertion with the user-presence (UP) flag **set** — because
+  `strict-up` forces the button poll and the emitted UP flag followed that poll rather
+  than the request's `up` option. A relying party that does not require user verification
+  would accept it, so a stolen key could authenticate without the PIN, defeating the
+  alwaysUv guarantee (a plain `always-uv` build was unaffected — it returns the probe with
+  UP clear). The emitted UP flag now follows the request's raw `up`, so the probe stays
+  inert (UP=0) even while `strict-up` still polls the button, and `ssh-sk` keeps working
+  (the platform discards the pre-flight regardless). No shipped flavor enabled this by
+  default (`firmware-strict-up` ships with alwaysUv off); found by an internal security
+  review — a follow-up to the [#34](https://github.com/TheMaxMur/RS-Key/issues/34) fix above.
+- **PIV stays detectable by OpenSC after the OpenPGP applet has been used.** The
+  PIV `SELECT` application property template placed the NIST RID directly under
+  tag `79` instead of the required nested `4F`. OpenSC's `piv_match_card` then
+  failed to re-detect PIV whenever another applet was selected first (e.g. by
+  `gpg`/`scdaemon`), so `p11tool` / Chrome mTLS saw only OpenPGP until a
+  `ykman piv info` forced PIV back — a real YubiKey re-detects PIV fine. The
+  template now matches NIST SP 800-73-4 (and a YubiKey's response) for tags
+  `4F` / `79`.
+- **OpenPGP RSA key import can no longer halt the device on a zero-valued prime.**
+  A `PUT DATA` key import (admin/PW3) whose `P` or `Q` prime MPI was present but
+  numerically zero (a non-empty `00` that the applet's `is_empty()` check let
+  through) reached `RsaPrivateKey::from_p_q`, where computing `(p-1)(q-1)`
+  underflowed num-bigint's unsigned subtraction and panicked. Under `panic-halt`
+  that wedged the authenticator until replug. `rsa_from_pqe` now rejects a
+  degenerate prime as a bad key (`EXEC_ERROR`). Found by the new `openpgp_key_load`
+  fuzz target.
+- **The TUI cockpit can no longer be hung by a counterfeit device.** `rsk-tui`'s CCID
+  `get_data_full` chained `61xx` GET RESPONSE with no bound, so a device that answered
+  every GET RESPONSE with a bare `61 00` spun the synchronous event loop forever (and a
+  data-carrying variant grew memory without limit) — reached unauthenticated on startup
+  and on every 5 s refresh. The chaining is now bounded by a round and byte cap.
+  Host-tool only (`tools/tui` → 0.3.1); found by an internal security review.
+
 ## [0.3.7] - 2026-07-17
 
 ### Added
@@ -1726,7 +1835,8 @@ family that keeps the "enterprise" features in the open tree.
   signature of it, and a CycloneDX SBOM. See
   [docs/releases.md](docs/releases.md) to verify a download.
 
-[Unreleased]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.7...HEAD
+[Unreleased]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.8...HEAD
+[0.3.8]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.7...v0.3.8
 [0.3.7]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/TheMaxMur/RS-Key/compare/v0.3.4...v0.3.5

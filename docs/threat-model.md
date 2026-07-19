@@ -106,6 +106,46 @@ threat model includes a funded lab, buy a certified key.
 
 None. The device speaks USB only. There is no radio and no IP stack.
 
+## Flash snapshot rollback (the PIN-counter reset)
+
+Reported by Token2 ([issue #37](https://github.com/TheMaxMur/RS-Key/issues/37),
+[advisory PDF](https://github.com/user-attachments/files/30152894/T2-SA-RP2350-Dec2025.pdf)).
+An attacker with brief physical access and BOOTSEL runs `picotool save` to snapshot the
+whole flash, guesses PINs until the wrong-PIN counter locks, then `picotool load`s the old
+snapshot to reset the counter and repeats. That is unlimited offline PIN guessing. It
+defeats every applet's retry counter — FIDO clientPIN, PIV PIN/PUK, OpenPGP PW1/PW3, OATH —
+since all are ordinary flash records with no external freshness binding.
+
+The gap is **freshness**, not confidentiality or authenticity. Secure boot accepts the
+restored image (it is genuine and signed); the at-rest seal decrypts it (same chip). Neither
+notices a rollback. RS-Key's firmware anti-rollback ([anti-rollback.md](anti-rollback.md))
+versions the firmware *image*, not the flash *data*, so it is blind to the swap too. The clean
+fix is a monotonic counter in tamper-resistant NVM that the firmware checks on boot — exactly
+what a secure element has and the RP2350 lacks. Its OTP is write-once antifuse (a few dozen
+one-way bits for the board's whole life), so it cannot back a retry counter that must reset to
+eight on every correct PIN. We cannot close the rollback itself on this silicon; we raise its
+cost:
+
+- **OTP-seeded PIN verifier** (always on after the OTP burn). The stored verifier is
+  `HKDF(serial_hash, HMAC(kbase, pin))`, with `kbase` rooted in the fused OTP master key
+  ([production.md](production.md) stage 1). A flash dump does not contain that key, so it
+  cannot brute-force the PIN *offline* — the guessing must run on the device, one try at a
+  time.
+- **`strong-pin` / `fips-profile` builds** (opt-in). Raise the clientPIN floor to six code
+  points and refuse the most guessable PINs (a repeated digit, a `123456`-style run), so the
+  on-device search space is at least a million. By Token2's estimate an automated attack runs
+  ~34 days at six digits and ~10 years at eight, against ~8 hours at four
+  ([build.md](build.md)).
+- **Soft-lock** (opt-in). The FIDO seed is wrapped under a key only you hold
+  ([guides/soft-lock.md](guides/soft-lock.md)), so a brute-forced PIN yields nothing until you
+  present it. It covers the FIDO seed; the PIV, OpenPGP and OATH counters stay
+  rollback-resettable.
+
+The durable defense on a general-purpose MCU is PIN entropy, plus the soft-lock second factor
+for the FIDO seed. A device left in an attacker's hands, protected only by a short PIN, is not
+safe here. This is the same boundary as ["anyone with the device and your PIN is
+you"](limitations.md).
+
 ## Platform silicon: the RP2350 security challenges
 
 Raspberry Pi has publicly stress-tested the RP2350 die. The results bound

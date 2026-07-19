@@ -547,9 +547,11 @@ fn always_uv_requires_user_verification() {
 // WebAuthn platform locate the credential before prompting for UV (CTAP 2.1
 // §6.2.2 step 5 guards the PUAT_REQUIRED path on up=true). The returned assertion
 // is silent (UP+UV flags clear); an interactive up:true request with no
-// pinUvAuthParam is still refused with PUAT_REQUIRED. Not run under strict-up,
-// where every assertion asserts presence so the exemption does not apply — a
-// mutation there would resurface as the up:true arm below still holding.
+// pinUvAuthParam is still refused with PUAT_REQUIRED. Not run under strict-up:
+// the exemption still applies there, but strict-up polls the button on the probe,
+// so a Decline denies (OPERATION_DENIED) instead of returning the silent
+// assertion this test asserts — that path is covered by
+// `always_uv_strict_up_preflight_polls_button_not_puat`.
 #[cfg(not(feature = "strict-up"))]
 #[test]
 fn always_uv_allows_silent_up_false_preflight() {
@@ -599,6 +601,69 @@ fn always_uv_allows_silent_up_false_preflight() {
         Err(CtapError::PuatRequired),
         "an interactive up:true request under alwaysUv still demands UV",
     );
+}
+
+// alwaysUv + strict-up: the silent up:false pre-flight must NOT be refused with
+// PUAT_REQUIRED in enforce_pin — that re-broke ssh-sk ("device not found") when
+// the two features combined (issue #34 follow-up). strict-up still polls the
+// button on the probe (its kept two-touch behavior), so a Decline denies with
+// OPERATION_DENIED and a confirmed touch returns an assertion — either way, never
+// PUAT_REQUIRED. Crucially the returned assertion stays INERT (UP=0): emitting UP=1
+// here would let an up:false probe defeat alwaysUv (a usable no-UV assertion on a
+// stolen key), so the emitted UP flag keys on the raw `up`, not the button poll.
+#[cfg(feature = "strict-up")]
+#[test]
+fn always_uv_strict_up_preflight_polls_button_not_puat() {
+    let (mut fs, mut rng) = setup();
+    let cred_id = register_non_resident(&mut fs, &mut rng);
+    fs.put(EF_ALWAYS_UV, &[1]).unwrap();
+
+    // Declined touch → OPERATION_DENIED (reached the button poll), NOT
+    // PUAT_REQUIRED (enforce_pin rejected the probe outright before the fix).
+    let mut out = [0u8; 1024];
+    {
+        let mut state = crate::FidoState::new();
+        let mut presence = Decline;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 20,
+        };
+        assert_eq!(
+            get_assertion(&mut ctx, &ga_request_up(&cred_id, false), &mut out),
+            Err(CtapError::OperationDenied),
+            "always-uv+strict-up up:false probe polls the button, not PUAT_REQUIRED",
+        );
+    }
+
+    // A confirmed touch returns an assertion so ssh-sk's pre-flight proceeds instead
+    // of failing "device not found" — but the probe stays inert (UP flag clear even
+    // though the button was polled), so it can't be relayed as a real login.
+    let mut out2 = [0u8; 1024];
+    let n = {
+        let mut state = crate::FidoState::new();
+        let mut presence = crate::AlwaysConfirm;
+        let mut ctx = Ctx {
+            presence: &mut presence,
+            dev: dev(),
+            fs: &mut fs,
+            rng: &mut rng,
+            state: &mut state,
+            now_ms: 30,
+        };
+        get_assertion(&mut ctx, &ga_request_up(&cred_id, false), &mut out2)
+            .expect("always-uv+strict-up answers a confirmed up:false probe")
+    };
+    let ad = assertion_auth_data(&out2[..n]);
+    assert_eq!(
+        ad[32] & FLAG_UP,
+        0,
+        "strict-up up:false → UP flag CLEAR: the polled probe stays inert so it can't defeat alwaysUv"
+    );
+    assert_eq!(ad[32] & FLAG_UV, 0, "silent probe carries no UV");
 }
 
 #[test]

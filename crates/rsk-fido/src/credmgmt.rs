@@ -366,11 +366,39 @@ fn enumerate_creds<S: Storage, R: Rng>(
     let mut buf = [0u8; CRED_REC_MAX];
     let mut occupied = [false; MAX_RESIDENT_CREDENTIALS as usize];
     slot_map(ctx.fs, EF_CRED, &mut occupied);
+    // Build (or refresh) the slot→rpId-hash-prefix index once per enumeration, so
+    // each per-rp Begin filters slots in RAM and reads flash only for its own rp.
+    // Without it every Begin re-read all slots, making a many-distinct-rp walk
+    // O(rps·creds) (256 rps × 256 creds ≈ 13 s on hardware). `write_gen` moves on
+    // any put/delete, so a mid-walk mutation forces a rebuild rather than a stale
+    // read. See `CredMgmtState::rp_index`.
+    if !ctx.state.cm.rp_index_valid || ctx.state.cm.rp_index_gen != ctx.fs.write_gen() {
+        for i in 0..MAX_RESIDENT_CREDENTIALS {
+            let prefix = if occupied[i as usize] {
+                match ctx.fs.read(EF_CRED + i, &mut buf) {
+                    Some(n) if n >= 4 => u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
+                    _ => 0,
+                }
+            } else {
+                0
+            };
+            ctx.state.cm.rp_index[i as usize] = prefix;
+        }
+        ctx.state.cm.rp_index_gen = ctx.fs.write_gen();
+        ctx.state.cm.rp_index_valid = true;
+    }
+    let want_prefix =
+        u32::from_le_bytes([rp_id_hash[0], rp_id_hash[1], rp_id_hash[2], rp_id_hash[3]]);
     // Resume at cred_next_slot (0 on Begin, past the last match on getNext) so a
     // getNext is O(gap-to-next) not O(scan-from-0); Begin still makes one full
     // pass to count cred_total for this rp.
     for i in ctx.state.cm.cred_next_slot..MAX_RESIDENT_CREDENTIALS {
         if !occupied[i as usize] {
+            continue;
+        }
+        // Skip a slot whose cached rpId-hash prefix can't match — the read below is
+        // the store's costliest op. The full 32-byte compare still confirms a hit.
+        if ctx.state.cm.rp_index[i as usize] != want_prefix {
             continue;
         }
         let Some(n) = ctx.fs.read(EF_CRED + i, &mut buf) else {

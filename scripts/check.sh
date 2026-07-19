@@ -78,9 +78,16 @@ run "test (fido-conformance)"  cargo test -p rsk-fido --features fido-conformanc
 run "test (fips: rsk-fido)"    cargo test -p rsk-fido --features fips-profile --target "$HOST" fips
 run "test (fips: rsk-piv)"     cargo test -p rsk-piv --features fips-profile --target "$HOST" fips
 run "clippy (fips firmware)"   cargo clippy -p firmware --features fips-profile -- -D warnings
+# `strong-pin` raises the same 6-code-point floor and adds a trivial-PIN block, so it
+# reuses the fips name-filter dodge (regular fixtures assume the 4-char floor).
+run "test (strong-pin)"        cargo test -p rsk-fido --features strong-pin --target "$HOST" strong_pin
+run "clippy (strong-pin fw)"   cargo clippy -p firmware --features strong-pin -- -D warnings
 # The display path (panel driver + touch) is `LED_KIND=none`-only, so the default
 # embedded clippy above never lints it — gate it explicitly, like the fips firmware.
 run "clippy (display firmware)" env LED_KIND=none cargo clippy -p firmware --features display -- -D warnings
+# The trusted-display PIN pad's trivial-PIN reject is display+strong-pin-gated, so the
+# plain display clippy above never compiles it — lint the combination explicitly.
+run "clippy (display strong-pin)" env LED_KIND=none cargo clippy -p firmware --features display,strong-pin -- -D warnings
 run "build firmware (release)" cargo build --release -p firmware
 run "firmware size budget"     firmware_size_budget
 # The trusted-display flavor must keep building from the same tree. Built

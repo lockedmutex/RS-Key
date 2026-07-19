@@ -278,7 +278,18 @@ fn select_returns_apt() {
     assert_eq!(apt[0], 0x61);
     assert_eq!(apt[1] as usize, apt.len() - 2, "APT length backpatched");
     let body = &apt[2..];
-    assert!(find_tag(body, 0x4F).is_some());
+    // NIST SP 800-73-4 §3.1.1: outer 4F is the PIV AID/PIX, and 79 (coexistent
+    // tag allocation authority) MUST wrap a nested 4F with the NIST RID — OpenSC's
+    // piv_match_card rejects the card as PIV without it (falls back to OpenPGP).
+    assert_eq!(
+        find_tag(body, 0x4F).unwrap(),
+        &[0x00, 0x00, 0x10, 0x00, 0x01, 0x00]
+    );
+    let taa = find_tag(body, 0x79).expect("coexistent tag allocation authority");
+    assert_eq!(
+        find_tag(taa, 0x4F).expect("nested 4F with NIST RID"),
+        &[0xA0, 0x00, 0x00, 0x03, 0x08]
+    );
     assert_eq!(find_tag(body, 0x50).unwrap(), b"RS-Key PIV");
     assert!(find_tag(body, 0xAC).is_some());
 }

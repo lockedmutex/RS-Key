@@ -1383,6 +1383,7 @@ dependencies = [
  "embedded-storage-async",
  "libfuzzer-sys",
  "minicbor",
+ "rsa",
  "rsk-crypto",
  "rsk-fido",
  "rsk-fs",
@@ -1393,9 +1394,11 @@ dependencies = [
  "rsk-piv",
  "rsk-rescue",
  "rsk-sdk",
+ "rsk-sha512",
  "rsk-ui",
  "rsk-usb",
  "sequential-storage",
+ "sha2",
 ]
 
 [[package]]
