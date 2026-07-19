@@ -157,9 +157,15 @@ def cmd_enable(args):
     if args.scheme == "slip39":
         print(f"\n(any {args.threshold} of {args.shares} shares reconstruct the key)")
     if args.key_out:
-        with open(args.key_out, "w") as f:
+        # Create the file 0600 up front: chmod-after-close left a window where the
+        # lock key sat at the umask default (world-readable), and os.chmod follows
+        # a swapped-in symlink. O_EXCL refuses a pre-existing file or symlink.
+        try:
+            fd = os.open(args.key_out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except OSError as e:
+            die(f"cannot write --key-out {args.key_out}: {e}")
+        with os.fdopen(fd, "w") as f:
             f.write(key.hex() + "\n")
-        os.chmod(args.key_out, 0o600)
         print(f"\n(key hex also written to {args.key_out})")
 
     print("""

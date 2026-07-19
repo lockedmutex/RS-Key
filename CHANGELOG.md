@@ -30,6 +30,13 @@ tag: the USB `bcdDevice` build counter (bumped on every behavior change), and
   deletion — but a bounded lifetime closes the gap. Found comparing the FIDO
   clientPIN state machine against the upstream lineage's own token-expiry fix.
   **bcdDevice → 0x082E.**
+- **`rsk lock enable --key-out` no longer leaves the lock key briefly
+  world-readable.** The key file was `chmod 0600`-ed only *after* the write
+  finished and the descriptor closed, so the 32-byte host lock key (it wraps the
+  FIDO seed) sat at the umask default in between, and the `chmod` followed a
+  symlink swapped in during the window. The file is now created `0600` atomically
+  with `O_EXCL`. Host-only (`rsk` → 0.3.13); `--key-out` is a test-only flag and
+  the normal flow only prints the key to stdout, so exposure was minor.
 
 ## [0.3.9] - 2026-07-19
 
